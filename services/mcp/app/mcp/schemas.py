@@ -1,0 +1,16 @@
+from typing import Any, Optional
+from pydantic import BaseModel
+
+
+class JSONRPCRequest(BaseModel):
+    jsonrpc: str
+    id: Optional[int | str]
+    method: str
+    params: Optional[dict[str, Any]] = None
+
+
+class JSONRPCResponse(BaseModel):
+    jsonrpc: str = "2.0"
+    id: Optional[int | str]
+    result: Optional[Any] = None
+    error: Optional[dict[str, Any]] = None
