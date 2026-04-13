@@ -46,7 +46,34 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
     return JSONRPCResponse(
         id=request.id,
         result={
-            "tools": []
+            "tools": [
+                {
+                    "name": "query",
+                    "description": "Search through client conversation transcripts",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query"
+                            },
+                            "date_from": {
+                                "type": "string",
+                                "description": "ISO date, optional"
+                            },
+                            "date_to": {
+                                "type": "string",
+                                "description": "ISO date, optional"
+                            },
+                            "client_name": {
+                                "type": "string",
+                                "description": "Client name filter"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            ]
         }
     ).model_dump(exclude_none=True)
 
