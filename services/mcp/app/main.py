@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.mcp.handler import handle_mcp_request
+from services.mcp.app.mcp.handler import handle_mcp_request
 
 app = FastAPI()
 

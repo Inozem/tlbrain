@@ -1,4 +1,5 @@
-from app.mcp.schemas import JSONRPCRequest, JSONRPCResponse
+from services.mcp.app.mcp.schemas import JSONRPCRequest, JSONRPCResponse
+from core.domain.mock_data import get_mock_segments
 
 
 async def handle_mcp_request(request_dict: dict) -> dict:
@@ -78,7 +79,42 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
     ).model_dump(exclude_none=True)
 
 def handle_tools_call(request: JSONRPCRequest) -> dict:
+    params = request.params or {}
+    tool_name = params.get("name")
+    arguments = params.get("arguments", {})
+
+    if tool_name != "query":
+        return JSONRPCResponse(
+            id=request.id,
+            error={
+                "code": -32602,
+                "message": "Invalid tool"
+            }
+        ).model_dump(exclude_none=True)
+
+    # mock response
+    segments = get_mock_segments()
+
+    tlbrain_payload = {
+        "segments": segments,
+        "meta": {
+            "truncated": False,
+            "total_matches": len(segments),
+            "returned_segments": len(segments),
+            "limit_reason": None,
+            "suggestion": None
+        }
+    }
+
+    # MCP wrapper
     return JSONRPCResponse(
         id=request.id,
-        result={}
+        result={
+            "content": [
+                {
+                    "type": "json",
+                    "json": tlbrain_payload
+                }
+            ]
+        }
     ).model_dump(exclude_none=True)
