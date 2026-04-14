@@ -1,6 +1,9 @@
 from services.mcp.app.mcp.schemas import JSONRPCRequest, JSONRPCResponse
+from services.mcp.app.mcp.tools import (
+    build_mcp_content,
+    build_jsonrpc_result
+)
 from core.domain.mock_data import get_mock_segments
-
 
 async def handle_mcp_request(request_dict: dict) -> dict:
     try:
@@ -43,41 +46,6 @@ def handle_initialize(request: JSONRPCRequest) -> dict:
         }
     ).model_dump(exclude_none=True)
 
-def handle_tools_list(request: JSONRPCRequest) -> dict:
-    return JSONRPCResponse(
-        id=request.id,
-        result={
-            "tools": [
-                {
-                    "name": "query",
-                    "description": "Search through client conversation transcripts",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Search query"
-                            },
-                            "date_from": {
-                                "type": "string",
-                                "description": "ISO date, optional"
-                            },
-                            "date_to": {
-                                "type": "string",
-                                "description": "ISO date, optional"
-                            },
-                            "client_name": {
-                                "type": "string",
-                                "description": "Client name filter"
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                }
-            ]
-        }
-    ).model_dump(exclude_none=True)
-
 def handle_tools_call(request: JSONRPCRequest) -> dict:
     params = request.params or {}
     tool_name = params.get("name")
@@ -92,7 +60,6 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
             }
         ).model_dump(exclude_none=True)
 
-    # mock response
     segments = get_mock_segments()
 
     tlbrain_payload = {
@@ -106,15 +73,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
         }
     }
 
-    # MCP wrapper
-    return JSONRPCResponse(
-        id=request.id,
-        result={
-            "content": [
-                {
-                    "type": "json",
-                    "json": tlbrain_payload
-                }
-            ]
-        }
-    ).model_dump(exclude_none=True)
+    content = build_mcp_content(tlbrain_payload)
+
+    return build_jsonrpc_result(
+        request.id,
+        content
+    )
