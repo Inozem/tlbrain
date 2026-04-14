@@ -1,7 +1,6 @@
 from services.mcp.app.mcp.schemas import (
     JSONRPCRequest,
     JSONRPCResponse,
-    TLBrainMeta,
     TLBrainPayload,
 )
 from services.mcp.app.mcp.tools import (
@@ -11,18 +10,36 @@ from services.mcp.app.mcp.tools import (
 from core.domain.mock_data import query_handler
 
 
+def build_jsonrpc_error(
+    request_id,
+    code: int,
+    message: str,
+    details: str | None = None,
+) -> dict:
+    error = {
+        "code": code,
+        "message": message,
+    }
+
+    if details is not None:
+        error["details"] = details
+
+    return JSONRPCResponse(
+        id=request_id,
+        error=error,
+    ).model_dump(exclude_none=True)
+
+
 async def handle_mcp_request(request_dict: dict) -> dict:
     try:
         request = JSONRPCRequest(**request_dict)
     except Exception as e:
-        return JSONRPCResponse(
-            id=None,
-            error={
-                "code": -32600,
-                "message": "Invalid Request",
-                "details": str(e),
-            },
-        ).model_dump(exclude_none=True)
+        return build_jsonrpc_error(
+            request_id=None,
+            code=-32600,
+            message="Invalid Request",
+            details=str(e),
+        )
 
     method = request.method
 
@@ -35,13 +52,11 @@ async def handle_mcp_request(request_dict: dict) -> dict:
     if method == "tools/call":
         return handle_tools_call(request)
 
-    return JSONRPCResponse(
-        id=request.id,
-        error={
-            "code": -32601,
-            "message": "Method not found",
-        },
-    ).model_dump(exclude_none=True)
+    return build_jsonrpc_error(
+        request_id=request.id,
+        code=-32601,
+        message="Method not found",
+    )
 
 
 def handle_initialize(request: JSONRPCRequest) -> dict:
@@ -96,13 +111,11 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
     query = arguments.get("query", "")
 
     if tool_name != "query":
-        return JSONRPCResponse(
-            id=request.id,
-            error={
-                "code": -32602,
-                "message": "Invalid tool",
-            },
-        ).model_dump(exclude_none=True)
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="Invalid tool",
+        )
 
     segments, meta = query_handler(query)
 
