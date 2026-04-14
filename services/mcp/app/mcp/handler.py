@@ -92,8 +92,6 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
 def handle_tools_call(request: JSONRPCRequest) -> dict:
     params = request.params or {}
     tool_name = params.get("name")
-    arguments = params.get("arguments", {})
-    query = arguments.get("query", "")
 
     if tool_name != "query":
         return JSONRPCResponse(
@@ -104,10 +102,16 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
             },
         ).model_dump(exclude_none=True)
 
-    segments, meta = query_handler(query)
+    meta = TLBrainMeta(
+        truncated=False,
+        total_matches=0,
+        returned_segments=0,
+        limit_reason="no_results",
+        suggestion=None,
+    )
 
     tlbrain_payload = TLBrainPayload(
-        segments=segments,
+        segments=[],
         meta=meta,
     ).model_dump(exclude_none=True)
 
