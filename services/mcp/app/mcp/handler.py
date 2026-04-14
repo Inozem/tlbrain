@@ -1,9 +1,15 @@
-from services.mcp.app.mcp.schemas import JSONRPCRequest, JSONRPCResponse
+from services.mcp.app.mcp.schemas import (
+    JSONRPCRequest,
+    JSONRPCResponse,
+    TLBrainMeta,
+    TLBrainPayload,
+)
 from services.mcp.app.mcp.tools import (
     build_mcp_content,
-    build_jsonrpc_result
+    build_jsonrpc_result,
 )
 from core.domain.mock_data import get_mock_segments
+
 
 async def handle_mcp_request(request_dict: dict) -> dict:
     try:
@@ -14,8 +20,8 @@ async def handle_mcp_request(request_dict: dict) -> dict:
             error={
                 "code": -32600,
                 "message": "Invalid Request",
-                "details": str(e)
-            }
+                "details": str(e),
+            },
         ).model_dump(exclude_none=True)
 
     method = request.method
@@ -23,59 +29,94 @@ async def handle_mcp_request(request_dict: dict) -> dict:
     if method == "initialize":
         return handle_initialize(request)
 
-    elif method == "tools/list":
+    if method == "tools/list":
         return handle_tools_list(request)
 
-    elif method == "tools/call":
+    if method == "tools/call":
         return handle_tools_call(request)
 
-    else:
-        return JSONRPCResponse(
-            id=request.id,
-            error={
-                "code": -32601,
-                "message": "Method not found"
-            }
-        ).model_dump(exclude_none=True)
-
-def handle_initialize(request: JSONRPCRequest) -> dict:
     return JSONRPCResponse(
         id=request.id,
-        result={
-            "status": "ok"
-        }
+        error={
+            "code": -32601,
+            "message": "Method not found",
+        },
     ).model_dump(exclude_none=True)
+
+
+def handle_initialize(request: JSONRPCRequest) -> dict:
+    return build_jsonrpc_result(
+        request.id,
+        {
+            "status": "ok",
+        },
+    )
+
+
+def handle_tools_list(request: JSONRPCRequest) -> dict:
+    return build_jsonrpc_result(
+        request.id,
+        {
+            "tools": [
+                {
+                    "name": "query",
+                    "description": "Search through client conversation transcripts",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query",
+                            },
+                            "date_from": {
+                                "type": "string",
+                                "description": "ISO date, optional",
+                            },
+                            "date_to": {
+                                "type": "string",
+                                "description": "ISO date, optional",
+                            },
+                            "client_name": {
+                                "type": "string",
+                                "description": "Client name filter",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                }
+            ]
+        },
+    )
+
 
 def handle_tools_call(request: JSONRPCRequest) -> dict:
     params = request.params or {}
     tool_name = params.get("name")
-    arguments = params.get("arguments", {})
 
     if tool_name != "query":
         return JSONRPCResponse(
             id=request.id,
             error={
                 "code": -32602,
-                "message": "Invalid tool"
-            }
+                "message": "Invalid tool",
+            },
         ).model_dump(exclude_none=True)
 
     segments = get_mock_segments()
 
-    tlbrain_payload = {
-        "segments": segments,
-        "meta": {
-            "truncated": False,
-            "total_matches": len(segments),
-            "returned_segments": len(segments),
-            "limit_reason": None,
-            "suggestion": None
-        }
-    }
+    meta = TLBrainMeta(
+        truncated=False,
+        total_matches=len(segments),
+        returned_segments=len(segments),
+        limit_reason=None,
+        suggestion=None,
+    )
+
+    tlbrain_payload = TLBrainPayload(
+        segments=segments,
+        meta=meta,
+    ).model_dump(exclude_none=True)
 
     content = build_mcp_content(tlbrain_payload)
 
-    return build_jsonrpc_result(
-        request.id,
-        content
-    )
+    return build_jsonrpc_result(request.id, content)
