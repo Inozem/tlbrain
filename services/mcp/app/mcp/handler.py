@@ -8,7 +8,7 @@ from services.mcp.app.mcp.tools import (
     build_mcp_content,
     build_jsonrpc_result,
 )
-from core.domain.mock_data import get_mock_segments
+from core.domain.mock_data import query_handler
 
 
 async def handle_mcp_request(request_dict: dict) -> dict:
@@ -92,6 +92,8 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
 def handle_tools_call(request: JSONRPCRequest) -> dict:
     params = request.params or {}
     tool_name = params.get("name")
+    arguments = params.get("arguments", {})
+    query = arguments.get("query", "")
 
     if tool_name != "query":
         return JSONRPCResponse(
@@ -102,15 +104,7 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
             },
         ).model_dump(exclude_none=True)
 
-    segments = get_mock_segments()
-
-    meta = TLBrainMeta(
-        truncated=False,
-        total_matches=len(segments),
-        returned_segments=len(segments),
-        limit_reason=None,
-        suggestion=None,
-    )
+    segments, meta = query_handler(query)
 
     tlbrain_payload = TLBrainPayload(
         segments=segments,
