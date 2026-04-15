@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY requirements-common.txt /requirements-common.txt
+COPY requirements-common.txt /app/requirements-common.txt
 COPY services/mcp/requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir -r /app/requirements.txt
