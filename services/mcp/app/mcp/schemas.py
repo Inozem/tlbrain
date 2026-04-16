@@ -5,7 +5,7 @@ from pydantic import BaseModel
 # JSON-RPC layer
 class JSONRPCRequest(BaseModel):
     jsonrpc: str
-    id: Optional[int | str]
+    id: int | str | None = None
     method: str
     params: Optional[dict[str, Any]] = None
 

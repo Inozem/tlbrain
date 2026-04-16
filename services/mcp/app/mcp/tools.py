@@ -1,3 +1,5 @@
+import json
+
 from services.mcp.app.mcp.schemas import JSONRPCResponse
 
 
@@ -5,8 +7,8 @@ def build_mcp_content(payload: dict) -> dict:
     return {
         "content": [
             {
-                "type": "json",
-                "json": payload
+                "type": "text",
+                "text": json.dumps(payload, ensure_ascii=False)
             }
         ]
     }

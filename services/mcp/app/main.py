@@ -1,13 +1,22 @@
 import asyncio
 import json
+import time
 import uuid
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.mcp.app.mcp.handler import handle_mcp_request
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 active_sessions = {}
 
@@ -17,52 +26,43 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/mcp")
-async def mcp_endpoint(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            content={"error": "Invalid JSON body"},
-            status_code=400
-        )
-
-    response = await handle_mcp_request(body)
-    return JSONResponse(content=response)
-
-
 @app.get("/sse")
 async def sse_endpoint():
     session_id = str(uuid.uuid4())
-    active_sessions[session_id] = True
+    queue = asyncio.Queue()
+
+    active_sessions[session_id] = {
+        "queue": queue,
+        "created": time.time(),
+    }
 
     async def event_generator():
-        hello_event = {
-            "session_id": session_id,
-            "messages_url": f"/messages/{session_id}"
-        }
-
-        yield f"data: {json.dumps(hello_event)}\n\n"
+        yield f"event: endpoint\ndata: /messages/{session_id}\n\n"
 
         while True:
-            await asyncio.sleep(15)
-
-            if session_id not in active_sessions:
-                break
-
-            yield ":\n\n"
+            try:
+                message = await asyncio.wait_for(queue.get(), timeout=15)
+                yield f"data: {json.dumps(message)}\n\n"
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
 
     return StreamingResponse(
         event_generator(),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
     )
 
 
 @app.post("/messages/{session_id}")
 async def messages_endpoint(session_id: str, request: Request):
-    if session_id not in active_sessions:
+    session = active_sessions.get(session_id)
+
+    if not session:
         return JSONResponse(
-            content={"error": "Invalid session"},
+            content={"error": "Invalid session_id"},
             status_code=404
         )
 
@@ -74,6 +74,15 @@ async def messages_endpoint(session_id: str, request: Request):
             status_code=400
         )
 
-    response = await handle_mcp_request(body)
+    try:
+        response = await handle_mcp_request(body)
+    except Exception as e:
+        return JSONResponse(
+            content={"error": "Internal MCP error", "details": str(e)},
+            status_code=500
+        )
 
-    return JSONResponse(content=response)
+    if response is not None:
+        await session["queue"].put(response)
+
+    return JSONResponse(content={}, status_code=202)

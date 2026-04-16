@@ -46,6 +46,9 @@ async def handle_mcp_request(request_dict: dict) -> dict:
     if method == "initialize":
         return handle_initialize(request)
 
+    if method == "notifications/initialized":
+        return {}
+
     if method == "tools/list":
         return handle_tools_list(request)
 
@@ -63,7 +66,14 @@ def handle_initialize(request: JSONRPCRequest) -> dict:
     return build_jsonrpc_result(
         request.id,
         {
-            "status": "ok",
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {}
+            },
+            "serverInfo": {
+                "name": "tlbrain",
+                "version": "1.0.0",
+            },
         },
     )
 
@@ -76,7 +86,7 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                 {
                     "name": "query",
                     "description": "Search through client conversation transcripts",
-                    "input_schema": {
+                    "inputSchema": {
                         "type": "object",
                         "properties": {
                             "query": {
