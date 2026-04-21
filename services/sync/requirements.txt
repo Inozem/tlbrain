@@ -1,0 +1,9 @@
+google-api-python-client
+google-auth
+
+fastapi>=0.115
+
+python-docx
+python-dotenv
+
+uvicorn[standard]

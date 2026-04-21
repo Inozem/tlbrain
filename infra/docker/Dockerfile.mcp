@@ -7,7 +7,8 @@ COPY services/mcp/requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY . /app
+COPY core /app/core
+COPY services/mcp /app/services/mcp
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
