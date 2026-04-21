@@ -76,7 +76,8 @@ gcloud run deploy "${SYNC_SERVICE_NAME}" \
   --image "${SYNC_IMAGE}" \
   --region "${REGION}" \
   --platform managed \
-  --allow-unauthenticated
+  --allow-unauthenticated \
+  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}"
 
 # =========================
 # Final URLs
