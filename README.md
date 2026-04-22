@@ -6,10 +6,11 @@ TLBrain is a cost-efficient memory system for Claude (Cowork), designed to retri
 
 The system helps Claude "remember" past client conversations through a lightweight retrieval layer powered by:
 
-* TL;DV transcripts
-* Google Drive storage
-* MCP remote server
-* Dedicated sync/indexing service
+- TL;DV transcripts
+- Google Drive storage
+- Firestore state storage
+- MCP remote server
+- Dedicated sync/indexing service
 
 TLBrain is optimized for **single-user / consultant workflows** with large volumes of client conversations and aims to be a cheaper alternative to traditional RAG stacks.
 
@@ -17,7 +18,7 @@ TLBrain is optimized for **single-user / consultant workflows** with large volum
 
 # Architecture
 
-TLBrain uses a monorepo with two independent Cloud Run services:
+TLBrain uses a monorepo with two independent Cloud Run services.
 
 ## 1. MCP Service
 
@@ -25,10 +26,10 @@ Used by Claude / Cowork.
 
 Responsibilities:
 
-* remote MCP endpoint
-* retrieval tools
-* memory search
-* user-facing requests
+- remote MCP endpoint
+- retrieval tools
+- memory search
+- user-facing requests
 
 ## 2. Sync Service
 
@@ -36,10 +37,11 @@ Background indexing service.
 
 Responsibilities:
 
-* scan Google Drive folders
-* parse `.docx` transcripts
-* sync new / changed files
-* prepare searchable memory data
+- scan Google Drive folders
+- parse `.docx` transcripts
+- detect changes
+- sync searchable metadata
+- maintain Firestore index
 
 ---
 
@@ -71,15 +73,9 @@ Create a new project.
 
 Recommended name:
 
-```text
-tlbrain-prod
-```
+`tlbrain-prod`
 
-Copy your:
-
-```text
-PROJECT_ID
-```
+Copy your `PROJECT_ID`.
 
 ---
 
@@ -105,20 +101,34 @@ gcloud config set project YOUR_PROJECT_ID
 
 ## 3. Enable Required Services
 
-Run:
-
 ```bash
 gcloud services enable run.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
 gcloud services enable artifactregistry.googleapis.com
 gcloud services enable drive.googleapis.com
+gcloud services enable firestore.googleapis.com
 ```
 
 ---
 
-## 4. Configure Google Drive Folder
+## 4. Create Firestore Database
 
-Create a Google Drive folder for transcripts.
+Open:
+
+https://console.firebase.google.com/
+
+Use your existing Google Cloud project.
+
+Create Firestore database with:
+
+- Edition: Standard
+- Mode: Production
+- Region: europe-west1
+- Database ID: (default)
+
+---
+
+## 5. Configure Google Drive Folder
 
 Recommended structure:
 
@@ -130,17 +140,11 @@ Clients/
 │   └── meeting2.docx
 ```
 
-Copy folder URL:
-
-```text
-https://drive.google.com/drive/folders/YOUR_FOLDER_ID
-```
+Copy folder URL and use it as `ROOT_FOLDER_URL`.
 
 ---
 
-## 5. Deploy Services
-
-Run:
+## 6. Deploy Services
 
 ```bash
 bash infra/deploy/deploy.sh
@@ -148,14 +152,12 @@ bash infra/deploy/deploy.sh
 
 This deploys:
 
-* MCP service
-* Sync service
+- MCP service
+- Sync service
 
 ---
 
-## 6. Grant Google Drive Access to Cloud Run
-
-After first deploy, Cloud Run uses a service account identity.
+## 7. Grant Google Drive Access to Cloud Run
 
 Find sync service account:
 
@@ -165,27 +167,13 @@ gcloud run services describe tlbrain-sync \
 --format="value(spec.template.spec.serviceAccountName)"
 ```
 
-Often it looks like:
+Share your Google Drive folder with this email.
 
-```text
-PROJECT_NUMBER-compute@developer.gserviceaccount.com
-```
-
-Open your Google Drive folder → Share → add this email.
-
-Recommended permission:
-
-```text
-Editor
-```
-
-(Needed if TLBrain later creates technical metadata files.)
+Recommended permission: Viewer.
 
 ---
 
-## 7. Configure `.env`
-
-Create `.env` in project root:
+## 8. Configure `.env`
 
 ```env
 PROJECT_ID=tlbrain-prod
@@ -199,9 +187,7 @@ ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
 
 ---
 
-## 8. Redeploy After `.env` Changes
-
-Run again:
+## 9. Redeploy After `.env` Changes
 
 ```bash
 bash infra/deploy/deploy.sh
@@ -209,44 +195,21 @@ bash infra/deploy/deploy.sh
 
 ---
 
-## 9. Find URLs
+## 10. Endpoints
 
-Open:
+### MCP
 
-https://console.cloud.google.com/run
+`https://YOUR-MCP-URL.run.app/mcp`
 
-You should see:
+### Sync
 
-```text
-tlbrain-mcp
-tlbrain-sync
-```
+Manual trigger:
 
----
-
-## MCP Endpoint
-
-```text
-https://YOUR-MCP-URL.run.app/mcp
-```
-
-Use this URL in Claude / Cowork MCP settings.
-
----
-
-## Sync Endpoint
-
-Manual sync trigger:
-
-```text
-POST https://YOUR-SYNC-URL.run.app/sync
-```
+`POST https://YOUR-SYNC-URL.run.app/sync`
 
 Health check:
 
-```text
-GET https://YOUR-SYNC-URL.run.app/
-```
+`GET https://YOUR-SYNC-URL.run.app/`
 
 ---
 
@@ -254,11 +217,12 @@ GET https://YOUR-SYNC-URL.run.app/
 
 Implemented:
 
-* monorepo architecture
-* dual Cloud Run deployment
-* MCP remote server
-* sync service foundation
-* Google Drive connectivity
+- monorepo architecture
+- dual Cloud Run deployment
+- MCP remote server
+- sync service foundation
+- Google Drive connectivity
+- Firestore index storage
 
 ---
 
@@ -266,11 +230,11 @@ Implemented:
 
 Planned next:
 
-* `.docx` transcript parsing
-* hashing / change detection
-* vector indexing
-* semantic retrieval improvements
-* production scheduler
+- `.docx` transcript parsing
+- real content hashing
+- vector indexing
+- semantic retrieval improvements
+- production scheduler
 
 ---
 
