@@ -49,6 +49,17 @@ fi
 gcloud config set project "${PROJECT_ID}"
 
 # =========================
+# Enable required APIs
+# =========================
+echo "Enabling required APIs..."
+gcloud services enable \
+  run.googleapis.com \
+  cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com \
+  drive.googleapis.com \
+  firestore.googleapis.com
+
+# =========================
 # Build MCP
 # =========================
 docker build -f infra/docker/Dockerfile.mcp -t "${MCP_IMAGE}" .
@@ -82,14 +93,24 @@ gcloud run deploy "${SYNC_SERVICE_NAME}" \
 # =========================
 # Final URLs
 # =========================
-echo
-echo "MCP URL:"
-gcloud run services describe "${MCP_SERVICE_NAME}" \
+MCP_URL=$(gcloud run services describe "${MCP_SERVICE_NAME}" \
   --region "${REGION}" \
-  --format='value(status.url)'
+  --format='value(status.url)')
+
+SYNC_URL=$(gcloud run services describe "${SYNC_SERVICE_NAME}" \
+  --region "${REGION}" \
+  --format='value(status.url)')
 
 echo
-echo "SYNC URL:"
+echo "========================================="
+echo "Deploy complete"
+echo "========================================="
+echo
+echo "MCP endpoint:   ${MCP_URL}/mcp"
+echo "Sync trigger:   POST ${SYNC_URL}/sync"
+echo "Sync health:    GET  ${SYNC_URL}/"
+echo
+echo "Grant Drive access to sync service account:"
 gcloud run services describe "${SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
-  --format='value(status.url)'
+  --format='value(spec.template.spec.serviceAccountName)'

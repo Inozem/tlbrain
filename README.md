@@ -99,19 +99,7 @@ gcloud config set project YOUR_PROJECT_ID
 
 ---
 
-## 3. Enable Required Services
-
-```bash
-gcloud services enable run.googleapis.com
-gcloud services enable cloudbuild.googleapis.com
-gcloud services enable artifactregistry.googleapis.com
-gcloud services enable drive.googleapis.com
-gcloud services enable firestore.googleapis.com
-```
-
----
-
-## 4. Create Firestore Database
+## 3. Create Firestore Database
 
 Open:
 
@@ -128,7 +116,7 @@ Create Firestore database with:
 
 ---
 
-## 5. Configure Google Drive Folder
+## 4. Configure Google Drive Folder
 
 Recommended structure:
 
@@ -144,7 +132,7 @@ Copy folder URL and use it as `ROOT_FOLDER_URL`.
 
 ---
 
-## 6. Deploy Services
+## 5. Deploy Services
 
 ```bash
 bash infra/deploy/deploy.sh
@@ -157,7 +145,7 @@ This deploys:
 
 ---
 
-## 7. Grant Google Drive Access to Cloud Run
+## 6. Grant Google Drive Access to Cloud Run
 
 Find sync service account:
 
@@ -173,21 +161,31 @@ Recommended permission: Viewer.
 
 ---
 
-## 8. Configure `.env`
+## 7. Configure `.env`
 
 ```env
+# Google Cloud
 PROJECT_ID=tlbrain-prod
 REGION=europe-west1
 
+# Service names
 MCP_SERVICE_NAME=tlbrain-mcp
 SYNC_SERVICE_NAME=tlbrain-sync
 
+# Google Drive root folder URL
 ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
+
+# Runtime (optional, defaults shown)
+PORT=8080
+ENVIRONMENT=dev
+
+# Local development only (Cloud Run uses ADC automatically)
+# GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
 ```
 
 ---
 
-## 9. Redeploy After `.env` Changes
+## 8. Redeploy After `.env` Changes
 
 ```bash
 bash infra/deploy/deploy.sh
@@ -195,7 +193,7 @@ bash infra/deploy/deploy.sh
 
 ---
 
-## 10. Endpoints
+## 9. Endpoints
 
 ### MCP
 
@@ -205,36 +203,69 @@ bash infra/deploy/deploy.sh
 
 Manual trigger:
 
-`POST https://YOUR-SYNC-URL.run.app/sync`
+```bash
+curl -X POST https://YOUR-SYNC-URL.run.app/sync
+```
 
 Health check:
 
-`GET https://YOUR-SYNC-URL.run.app/`
+```bash
+curl https://YOUR-SYNC-URL.run.app/
+```
+
+Sync response example:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "files_found": 12,
+    "new": 2,
+    "updated": 1,
+    "skipped": 8,
+    "deleted": 0,
+    "ignored": 1
+  }
+}
+```
+
+---
+
+## 10. Check Logs
+
+```bash
+gcloud run services logs read tlbrain-sync --region europe-west1 --limit 50
+gcloud run services logs read tlbrain-mcp --region europe-west1 --limit 50
+```
 
 ---
 
 # Current Status
 
-Implemented:
+Implemented (v0.2):
 
 - monorepo architecture
 - dual Cloud Run deployment
-- MCP remote server
-- sync service foundation
+- MCP remote server (mock response)
 - Google Drive connectivity
+- `.docx` transcript parsing
+- content hashing (sha256)
 - Firestore index storage
+- sync diff engine (new / updated / deleted)
+- sync reporting and safe file filters
 
 ---
 
 # Roadmap
 
-Planned next:
-
-- `.docx` transcript parsing
-- real content hashing
-- vector indexing
-- semantic retrieval improvements
-- production scheduler
+- v0.3 — Gemini Memory Layer (utterances, summaries, structured facts)
+- v0.4 — Retrieval Validation
+- v0.5 — MCP Real Retrieval
+- v0.6 — Retrieval Quality + Facts
+- v0.7 — Full Retrieval Pipeline
+- v0.8 — Filters (client, date range)
+- v0.9 — Scheduler + Stability
+- v1.0 — Production MVP
 
 ---
 
