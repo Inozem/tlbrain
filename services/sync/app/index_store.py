@@ -52,3 +52,10 @@ def delete_index(doc_id: str) -> None:
     )
 
     logger.info("Index deleted: %s", doc_id)
+
+def list_all_index_ids() -> list[str]:
+    db = get_db()
+
+    docs = db.collection(COLLECTION_NAME).stream()
+
+    return [doc.id for doc in docs]

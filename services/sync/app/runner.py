@@ -4,7 +4,12 @@ from services.sync.app.drive_client import (
     scan_root_folder,
 )
 from services.sync.app.hashing import sha256_text
-from services.sync.app.index_store import load_index, save_index
+from services.sync.app.index_store import (
+    load_index,
+    save_index,
+    delete_index,
+    list_all_index_ids,
+)
 
 
 def run_sync():
@@ -24,7 +29,7 @@ def run_sync():
 
         existing = load_index(doc_id)
 
-        # Fast skip by modifiedTime
+        # Fast skip if modifiedTime unchanged
         if existing and existing.get("modifiedTime") == modified_time:
             stats["skipped"] += 1
             continue
@@ -35,7 +40,7 @@ def run_sync():
 
         content_hash = sha256_text(raw_text)
 
-        # modified changed but content same
+        # modifiedTime changed but content same
         if existing and existing.get("content_hash") == content_hash:
             payload = {
                 **existing,
@@ -75,10 +80,20 @@ def run_sync():
             }
         )
 
+    deleted = 0
+
+    drive_ids = {file["doc_id"] for file in files}
+    indexed_ids = set(list_all_index_ids())
+
+    for doc_id in indexed_ids - drive_ids:
+        delete_index(doc_id)
+        deleted += 1
+
     return {
         "files_found": len(files),
         "new": stats["new"],
         "updated": stats["updated"],
         "skipped": stats["skipped"],
+        "deleted": deleted,
         "processed": processed,
     }
