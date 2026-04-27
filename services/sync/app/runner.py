@@ -1,10 +1,7 @@
 import logging
 
-from services.sync.app.docx_parser import extract_text_from_docx_bytes
-from services.sync.app.drive_client import (
-    download_file_bytes,
-    scan_root_folder,
-)
+from core.google_drive.docs_reader import read_google_doc
+from services.sync.app.drive_client import scan_root_folder
 from services.sync.app.hashing import sha256_text
 from services.sync.app.index_store import (
     load_index,
@@ -16,16 +13,6 @@ from services.sync.app.index_store import (
 logger = logging.getLogger(__name__)
 
 
-def is_valid_docx(name: str) -> bool:
-    if not name.lower().endswith(".docx"):
-        return False
-    if name.startswith("~$"):
-        return False
-    if name.startswith("."):
-        return False
-    return True
-
-
 def run_sync():
     files = scan_root_folder()
 
@@ -33,21 +20,12 @@ def run_sync():
         "new": 0,
         "updated": 0,
         "skipped": 0,
-        "ignored": 0,
         "deleted": 0,
     }
 
     processed = []
-    valid_files = []
 
     for file in files:
-        if not is_valid_docx(file["name"]):
-            logger.info("Ignored file: %s (%s)", file["name"], file["doc_id"])
-            stats["ignored"] += 1
-            continue
-        valid_files.append(file)
-
-    for file in valid_files:
         doc_id = file["doc_id"]
         modified_time = file["modifiedTime"]
 
@@ -57,8 +35,7 @@ def run_sync():
             stats["skipped"] += 1
             continue
 
-        file_bytes = download_file_bytes(doc_id)
-        raw_text = extract_text_from_docx_bytes(file_bytes)
+        raw_text = read_google_doc(doc_id)
         content_hash = sha256_text(raw_text)
 
         if existing and existing.get("content_hash") == content_hash:
@@ -98,7 +75,7 @@ def run_sync():
             "preview": raw_text[:300],
         })
 
-    drive_ids = {f["doc_id"] for f in valid_files}
+    drive_ids = {f["doc_id"] for f in files}
     indexed_ids = set(list_all_index_ids())
 
     for doc_id in indexed_ids - drive_ids:
@@ -107,12 +84,11 @@ def run_sync():
         logger.info("File deleted from index: %s", doc_id)
 
     logger.info(
-        "Sync complete — new=%d updated=%d skipped=%d deleted=%d ignored=%d",
+        "Sync complete — new=%d updated=%d skipped=%d deleted=%d",
         stats["new"],
         stats["updated"],
         stats["skipped"],
         stats["deleted"],
-        stats["ignored"],
     )
 
     return {
@@ -121,6 +97,5 @@ def run_sync():
         "updated": stats["updated"],
         "skipped": stats["skipped"],
         "deleted": stats["deleted"],
-        "ignored": stats["ignored"],
         "processed": processed,
     }

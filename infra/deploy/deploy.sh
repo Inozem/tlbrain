@@ -57,6 +57,7 @@ gcloud services enable \
   cloudbuild.googleapis.com \
   artifactregistry.googleapis.com \
   drive.googleapis.com \
+  docs.googleapis.com \
   firestore.googleapis.com
 
 # =========================

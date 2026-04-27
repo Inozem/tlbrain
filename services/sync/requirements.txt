@@ -4,7 +4,6 @@ google-cloud-firestore
 
 fastapi>=0.115
 
-python-docx
 python-dotenv
 
 uvicorn[standard]

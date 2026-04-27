@@ -68,8 +68,7 @@ def scan_root_folder() -> list[dict[str, Any]]:
         files = service.files().list(
             q=(
                 f"'{folder_id}' in parents "
-                f"and mimeType="
-                f"'application/vnd.openxmlformats-officedocument.wordprocessingml.document'"
+                f"and mimeType='application/vnd.google-apps.document'"
             ),
             fields="files(id,name,createdTime,modifiedTime)",
         ).execute()["files"]
@@ -95,7 +94,3 @@ def scan_root_folder() -> list[dict[str, Any]]:
 
     return results
 
-def download_file_bytes(file_id: str) -> bytes:
-    service = build_drive_service()
-
-    return service.files().get_media(fileId=file_id).execute()
