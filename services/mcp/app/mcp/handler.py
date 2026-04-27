@@ -85,13 +85,13 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
             "tools": [
                 {
                     "name": "query",
-                    "description": "Search through client conversation transcripts",
+                    "description": "Search through client conversation transcripts. Always translate the query to English before calling this tool — the index is stored in English and translation ensures the best retrieval quality.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Search query",
+                                "description": "Search query in English",
                             },
                             "date_from": {
                                 "type": "string",
