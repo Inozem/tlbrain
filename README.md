@@ -240,6 +240,54 @@ gcloud run services logs read tlbrain-mcp --region europe-west1 --limit 50
 
 ---
 
+## 11. Set Up Qdrant Cloud (v0.3+)
+
+TLBrain uses Qdrant Cloud as the vector store for semantic search.
+
+### Create a Free Cluster
+
+Open:
+
+https://cloud.qdrant.io
+
+Sign up and create a free cluster:
+
+- Cluster Name: `TLBrain`
+- Cloud Provider: Google Cloud Platform
+- Region: Frankfurt (europe-west3)
+- Tier: Free (1 node, 4 GiB disk, 1 GiB RAM)
+
+Click **Create Free Cluster**.
+
+### Get Credentials
+
+After the cluster is created:
+
+1. Copy the **Cluster URL** (e.g. `https://ba911a96-xxxx.europe-west3.gcp.cloud.qdrant.io:6333`)
+2. Go to **API Keys** → create a new key → copy it
+
+### Add to `.env`
+
+```env
+QDRANT_URL=https://YOUR-CLUSTER-URL:6333
+QDRANT_API_KEY=your-api-key
+QDRANT_COLLECTION=TLBrain
+```
+
+### Verify Connection
+
+```bash
+python -c "
+from dotenv import load_dotenv
+load_dotenv()
+from core.qdrant.setup import ensure_collection
+ensure_collection()
+print('OK — collection created or already exists')
+"
+```
+
+---
+
 # Current Status
 
 Implemented (v0.2):

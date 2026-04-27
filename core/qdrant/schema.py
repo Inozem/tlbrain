@@ -1,0 +1,10 @@
+import os
+
+COLLECTION_NAME = os.environ["QDRANT_COLLECTION"]
+
+EMBEDDING_DIMENSIONS = 768
+
+COLLECTION_CONFIG = {
+    "size": EMBEDDING_DIMENSIONS,
+    "on_disk": True,
+}
