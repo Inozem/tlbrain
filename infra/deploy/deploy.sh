@@ -89,7 +89,7 @@ gcloud run deploy "${SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
   --platform managed \
   --allow-unauthenticated \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}"
+  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",GEMINI_API_KEY="${GEMINI_API_KEY}",QDRANT_URL="${QDRANT_URL}",QDRANT_API_KEY="${QDRANT_API_KEY}",QDRANT_COLLECTION="${QDRANT_COLLECTION}"
 
 # =========================
 # Final URLs

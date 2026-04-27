@@ -1,9 +1,5 @@
-google-api-python-client
-google-auth
-google-cloud-firestore
+-r requirements-common.txt
 
 fastapi>=0.115
-
 python-dotenv
-
 uvicorn[standard]
