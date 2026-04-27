@@ -59,3 +59,15 @@ def list_all_index_ids() -> list[str]:
     docs = db.collection(COLLECTION_NAME).stream()
 
     return [doc.id for doc in docs]
+
+
+def update_index(doc_id: str, fields: dict[str, Any]) -> None:
+    db = get_db()
+
+    (
+        db.collection(COLLECTION_NAME)
+        .document(doc_id)
+        .update(fields)
+    )
+
+    logger.info("Index fields updated: %s", doc_id)

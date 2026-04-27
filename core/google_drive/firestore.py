@@ -55,6 +55,17 @@ def mark_error(doc_id: str, error: str) -> None:
     logger.info("Marked error: %s — %s", doc_id, error)
 
 
+def list_imported() -> list[dict]:
+    """Return all docs with status=imported."""
+    db = _get_db()
+    docs = (
+        db.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("status", "==", "imported"))
+        .stream()
+    )
+    return [{"doc_id": doc.id, **doc.to_dict()} for doc in docs]
+
+
 def recover_stale_syncing() -> list[str]:
     db = _get_db()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_SYNCING_MINUTES)
