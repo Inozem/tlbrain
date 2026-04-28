@@ -1,7 +1,7 @@
 from typing import Any
 
 from core.config import get_retrieval_top_k
-from core.retrieval.pipeline import dedup_and_sort, fetch_all_utterances
+from core.retrieval.pipeline import dedup_and_sort, fetch_utterances, merge_ranges
 from core.retrieval.search import search_summaries_and_facts
 from core.retrieval.segments import build_segments
 
@@ -44,13 +44,13 @@ def run_retrieval(
     top_doc_ids = {doc_id for doc_id, _ in sorted_docs[:_MAX_RESULT_DOCS]}
     other_docs = sorted_docs[_MAX_RESULT_DOCS:]
 
+    top_hits = [h for h in hits if h["doc_id"] in top_doc_ids]
+    merged_by_doc = merge_ranges(top_hits)
+
     result_segments = []
-    for doc_id in top_doc_ids:
-        utterances = dedup_and_sort(fetch_all_utterances(doc_id))
-        if not utterances:
-            continue
-        full_range = [utterances[0]["order_index"], utterances[-1]["order_index"]]
-        result_segments.append(build_segments(doc_id, [full_range], utterances))
+    for doc_id, doc_ranges in merged_by_doc.items():
+        utterances = dedup_and_sort(fetch_utterances(doc_id, doc_ranges))
+        result_segments.append(build_segments(doc_id, doc_ranges, utterances))
 
     meta: dict[str, Any] = {
         "truncated": len(other_docs) > 0,

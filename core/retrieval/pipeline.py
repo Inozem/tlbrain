@@ -61,37 +61,6 @@ def fetch_utterances(doc_id: str, merged_ranges: list[list[int]]) -> list[dict[s
     return utterances
 
 
-def fetch_all_utterances(doc_id: str) -> list[dict[str, Any]]:
-    """
-    Fetches all utterance payloads for a given doc_id without range filtering.
-    """
-    utterances: list[dict[str, Any]] = []
-    offset = None
-
-    while True:
-        results, next_offset = get_client().scroll(
-            collection_name=get_collection_name(),
-            scroll_filter=Filter(
-                must=[
-                    FieldCondition(key="type", match=MatchValue(value="utterance")),
-                    FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
-                ]
-            ),
-            limit=1000,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for point in results:
-            if point.payload:
-                utterances.append(point.payload)
-        if next_offset is None:
-            break
-        offset = next_offset
-
-    return utterances
-
-
 def dedup_and_sort(utterances: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Removes duplicates by (doc_id, order_index) and sorts by order_index ASC.
