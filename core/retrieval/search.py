@@ -53,6 +53,8 @@ def search_summaries_and_facts(
         payload = point.payload or {}
         hits.append({
             "doc_id": payload.get("doc_id"),
+            "client_name": payload.get("client_name"),
+            "type": payload.get("type"),
             "center_index": payload.get("center_index"),
             "covered_range": payload.get("covered_range"),
             "score": point.score,
