@@ -288,11 +288,11 @@ print('OK — collection ready')
 
 # Current Status
 
-Implemented (v0.3):
+Implemented (v0.5):
 
 - monorepo architecture
 - dual Cloud Run deployment
-- MCP remote server (mock response)
+- MCP remote server with real semantic retrieval
 - Google Drive connectivity via Docs API
 - transcript parsing — utterances, metadata
 - anchor-based windowing → summaries and facts via Gemini
@@ -303,14 +303,16 @@ Implemented (v0.3):
 - stale syncing recovery (auto-reset after 15 min)
 - sync diff engine (new / updated / deleted)
 - idempotent reindexing (append new → delete old versions)
+- semantic search over summaries and facts (top-3 documents by score)
+- retrieval pipeline: merge ranges → fetch utterances → dedup → segments
 
 ---
 
 # Roadmap
 
 - ~~v0.3 — Gemini Memory Layer (utterances, summaries, structured facts)~~ ✓
-- v0.4 — Retrieval Validation
-- v0.5 — MCP Real Retrieval
+- ~~v0.4 — Retrieval Validation~~ ✓
+- ~~v0.5 — MCP Real Retrieval~~ ✓
 - v0.6 — Retrieval Quality + Facts
 - v0.7 — Full Retrieval Pipeline
 - v0.8 — Filters (client, date range)
