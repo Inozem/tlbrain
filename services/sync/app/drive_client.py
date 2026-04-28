@@ -1,11 +1,10 @@
 import logging
-import os
-import re
 from typing import Any
 
 import google.auth
 from googleapiclient.discovery import build
 
+from core.config import get_root_folder_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,24 +19,6 @@ def build_drive_service():
     credentials, _ = google.auth.default(scopes=SCOPES)
 
     return build("drive", "v3", credentials=credentials)
-
-
-def get_root_folder_id() -> str:
-    root_folder_url = os.getenv("ROOT_FOLDER_URL", "")
-
-    logger.info("Reading ROOT_FOLDER_URL")
-
-    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", root_folder_url)
-
-    if not match:
-        logger.error("Invalid ROOT_FOLDER_URL")
-        raise ValueError("Invalid ROOT_FOLDER_URL")
-
-    root_folder_id = match.group(1)
-
-    logger.info("Resolved root folder id: %s", root_folder_id)
-
-    return root_folder_id
 
 
 def scan_root_folder() -> list[dict[str, Any]]:

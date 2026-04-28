@@ -1,22 +1,13 @@
-import os
-import re
 from typing import Any
 
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, Range
 
+from core.config import get_root_folder_id
 from core.gemini.embeddings import embed
 from core.qdrant.client import get_client
 from core.qdrant.schema import get_collection_name
 
 _SEARCHABLE_TYPES = ["summary", "facts"]
-
-
-def _get_root_folder_id() -> str:
-    url = os.environ["ROOT_FOLDER_URL"]
-    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
-    if not match:
-        raise ValueError(f"Cannot extract folder ID from ROOT_FOLDER_URL: {url}")
-    return match.group(1)
 
 
 def search_summaries_and_facts(
@@ -35,7 +26,7 @@ def search_summaries_and_facts(
 
     must: list[FieldCondition] = [
         FieldCondition(key="type", match=MatchAny(any=_SEARCHABLE_TYPES)),
-        FieldCondition(key="root_folder_id", match=MatchValue(value=_get_root_folder_id())),
+        FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
     ]
 
     if client_name is not None:
