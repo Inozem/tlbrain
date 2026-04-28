@@ -7,7 +7,7 @@ from services.mcp.app.mcp.tools import (
     build_mcp_content,
     build_jsonrpc_result,
 )
-from core.domain.mock_data import query_handler
+from core.retrieval.run import run_retrieval
 
 
 def build_jsonrpc_error(
@@ -127,7 +127,24 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
             message="Invalid tool",
         )
 
-    segments, meta = query_handler(query)
+    client_name = arguments.get("client_name") or None
+    date_from = arguments.get("date_from") or None
+    date_to = arguments.get("date_to") or None
+
+    try:
+        segments, meta = run_retrieval(
+            query=query,
+            client_name=client_name,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Retrieval failed",
+            details=str(e),
+        )
 
     tlbrain_payload = TLBrainPayload(
         segments=segments,

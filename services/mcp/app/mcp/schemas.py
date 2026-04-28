@@ -24,6 +24,7 @@ class TLBrainMeta(BaseModel):
     returned_segments: int
     limit_reason: Optional[str] = None
     suggestion: Optional[str] = None
+    other_matches: Optional[list[dict[str, Any]]] = None
 
 
 class TLBrainPayload(BaseModel):
