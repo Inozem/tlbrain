@@ -4,6 +4,7 @@ from core.qdrant.client import get_client
 from core.qdrant.schema import COLLECTION_CONFIG, get_collection_name
 
 _KEYWORD_INDEXES = ["doc_id", "version", "root_folder_id", "type", "client_name", "dialog_date"]
+_INTEGER_INDEXES = ["order_index"]
 
 
 def ensure_collection() -> None:
@@ -30,4 +31,11 @@ def _ensure_indexes(client) -> None:
                 collection_name=get_collection_name(),
                 field_name=field,
                 field_schema=PayloadSchemaType.KEYWORD,
+            )
+    for field in _INTEGER_INDEXES:
+        if field not in existing:
+            client.create_payload_index(
+                collection_name=get_collection_name(),
+                field_name=field,
+                field_schema=PayloadSchemaType.INTEGER,
             )
