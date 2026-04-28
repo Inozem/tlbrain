@@ -22,7 +22,7 @@ def merge_ranges(hits: list[dict[str, Any]]) -> dict[str, list[list[int]]]:
 
         if covered_range is None:
             center = hit["center_index"]
-            covered_range = [center - _HALF_WINDOW, center + _HALF_WINDOW]
+            covered_range = [max(0, center - _HALF_WINDOW), center + _HALF_WINDOW]
 
         ranges_by_doc.setdefault(doc_id, []).append(covered_range)
 
