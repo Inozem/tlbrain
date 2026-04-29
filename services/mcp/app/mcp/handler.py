@@ -9,6 +9,7 @@ from services.mcp.app.mcp.tools import (
 )
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
+from core.retrieval.clients import list_clients
 
 
 def build_jsonrpc_error(
@@ -139,6 +140,14 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                         },
                     },
                 },
+                {
+                    "name": "list_clients",
+                    "description": "List all clients in the knowledge base with their dialog count and last dialog date. Call this first to discover available clients before querying.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
             ]
         },
     )
@@ -154,6 +163,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "get_transcript":
         return _handle_get_transcript(request, arguments)
+
+    if tool_name == "list_clients":
+        return _handle_list_clients(request)
 
     return build_jsonrpc_error(
         request_id=request.id,
@@ -211,4 +223,19 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
         )
 
     content = build_mcp_content(TLBrainPayload(segments=segments, meta=meta).model_dump(exclude_none=True))
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_list_clients(request: JSONRPCRequest) -> dict:
+    try:
+        clients = list_clients()
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to list clients",
+            details=str(e),
+        )
+
+    content = build_mcp_content({"clients": clients})
     return build_jsonrpc_result(request.id, content)
