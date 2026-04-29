@@ -185,6 +185,10 @@ QDRANT_URL=https://YOUR-CLUSTER-URL:6333
 QDRANT_API_KEY=your-qdrant-api-key
 QDRANT_COLLECTION=TLBrain
 
+# Retrieval tuning
+RETRIEVAL_TOP_K=15
+RETRIEVAL_SCORE_THRESHOLD=0.6
+
 # Local development only (Cloud Run uses ADC automatically)
 # GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
 ```
@@ -288,7 +292,7 @@ print('OK — collection ready')
 
 # Current Status
 
-Implemented (v0.5):
+Implemented (v0.6):
 
 - monorepo architecture
 - dual Cloud Run deployment
@@ -305,6 +309,9 @@ Implemented (v0.5):
 - idempotent reindexing (append new → delete old versions)
 - semantic search over summaries and facts (top-3 documents by score)
 - retrieval pipeline: merge ranges → fetch utterances → dedup → segments
+- each fact stored as individual Qdrant point with dedicated embedding
+- enriched summary prompts (topic + specifics + decisions/next steps)
+- score threshold filtering (`RETRIEVAL_SCORE_THRESHOLD`)
 
 ---
 
@@ -313,9 +320,9 @@ Implemented (v0.5):
 - ~~v0.3 — Gemini Memory Layer (utterances, summaries, structured facts)~~ ✓
 - ~~v0.4 — Retrieval Validation~~ ✓
 - ~~v0.5 — MCP Real Retrieval~~ ✓
-- v0.6 — Retrieval Quality + Facts
+- ~~v0.6 — Retrieval Quality + Facts~~ ✓
 - v0.7 — Full Retrieval Pipeline
-- v0.8 — Filters (client, date range)
+- v0.8 — Filters + get_transcript tool
 - v0.9 — Scheduler + Stability
 - v1.0 — Production MVP
 
