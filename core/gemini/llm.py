@@ -11,10 +11,19 @@ _RETRIES = 3
 _BACKOFFS = [1, 2, 4]
 
 _SUMMARY_PROMPT = """\
-You are analyzing a fragment of a dialogue. Write exactly one sentence summarizing what is discussed.
-Use speaker names exactly as they appear in the dialogue — do not infer or rename roles.
-Always reply in English regardless of the dialogue language.
-Reply with plain text only, no JSON, no markdown.
+You are analyzing a fragment of a dialogue. Write 2-3 sentences that capture the essence of this fragment \
+for future search and retrieval.
+
+Cover the following in order — skip a point only if genuinely absent:
+1. The main topic or activity being discussed.
+2. Any specific details worth remembering: prices, numbers, deadlines, product names, objections, decisions.
+3. Any agreements, next steps, or unresolved issues.
+
+Rules:
+- Do not retell the dialogue — write only the essence.
+- Use speaker names exactly as they appear — do not infer or rename roles.
+- Always reply in English regardless of the dialogue language.
+- Reply with plain text only, no JSON, no markdown.
 
 Dialogue:
 {dialog}"""
