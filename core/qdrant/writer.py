@@ -42,7 +42,7 @@ def upsert_facts(facts: list[dict[str, Any]], vectors: list[list[float]]) -> Non
         return
     points = [
         PointStruct(
-            id=_point_id("facts", f["doc_id"], f["summary_id"]),
+            id=_point_id("fact", f["doc_id"], f"{f['summary_id']}:{f['text']}"),
             vector=vector,
             payload=f,
         )

@@ -69,17 +69,19 @@ def process_document(
             logger.warning("facts failed for summary_key=%s, skipping facts", summary_key, exc_info=True)
             continue
 
-        facts.append({
-            "type": "facts",
-            "root_folder_id": root_folder_id,
-            "doc_id": doc_id,
-            "summary_id": summary_key,
-            "center_index": center_index,
-            "client_name": client_name,
-            "dialog_date": dialog_date,
-            "version": version,
-            "facts": facts_list,
-        })
+        for fact_text in facts_list:
+            facts.append({
+                "type": "fact",
+                "text": fact_text,
+                "root_folder_id": root_folder_id,
+                "doc_id": doc_id,
+                "summary_id": summary_key,
+                "center_index": center_index,
+                "covered_range": window["covered_range"],
+                "client_name": client_name,
+                "dialog_date": dialog_date,
+                "version": version,
+            })
 
     return utterance_payloads, summaries, facts
 

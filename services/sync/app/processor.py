@@ -40,7 +40,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
         )
 
         summary_vectors = embed([s["text"] for s in summaries]) if summaries else []
-        facts_vectors = embed([str(f["facts"]) for f in facts]) if facts else []
+        facts_vectors = embed([f["text"] for f in facts]) if facts else []
 
         upsert_utterances(utterance_payloads)
         upsert_summaries(summaries, summary_vectors)

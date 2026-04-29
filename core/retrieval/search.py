@@ -7,7 +7,7 @@ from core.gemini.embeddings import embed
 from core.qdrant.client import get_client
 from core.qdrant.schema import get_collection_name
 
-_SEARCHABLE_TYPES = ["summary", "facts"]
+_SEARCHABLE_TYPES = ["summary", "fact"]
 
 
 def search_summaries_and_facts(
