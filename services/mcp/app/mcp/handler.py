@@ -8,6 +8,7 @@ from services.mcp.app.mcp.tools import (
     build_jsonrpc_result,
 )
 from core.retrieval.run import run_retrieval
+from core.retrieval.transcripts import get_transcripts
 
 
 def build_jsonrpc_error(
@@ -108,7 +109,36 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                         },
                         "required": ["query"],
                     },
-                }
+                },
+                {
+                    "name": "get_transcript",
+                    "description": "Retrieve full conversation transcripts without semantic search. Use when you need the complete text of a specific dialog or the most recent dialogs for a client.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "doc_id": {
+                                "type": "string",
+                                "description": "Specific document ID. If provided, all other params are ignored.",
+                            },
+                            "client_name": {
+                                "type": "string",
+                                "description": "Filter by client name",
+                            },
+                            "date_from": {
+                                "type": "string",
+                                "description": "ISO date, optional",
+                            },
+                            "date_to": {
+                                "type": "string",
+                                "description": "ISO date, optional",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max number of most recent transcripts to return (default: 1)",
+                            },
+                        },
+                    },
+                },
             ]
         },
     )
@@ -118,15 +148,22 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
     params = request.params or {}
     tool_name = params.get("name")
     arguments = params.get("arguments", {})
+
+    if tool_name == "query":
+        return _handle_query(request, arguments)
+
+    if tool_name == "get_transcript":
+        return _handle_get_transcript(request, arguments)
+
+    return build_jsonrpc_error(
+        request_id=request.id,
+        code=-32602,
+        message="Invalid tool",
+    )
+
+
+def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
     query = arguments.get("query", "")
-
-    if tool_name != "query":
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message="Invalid tool",
-        )
-
     client_name = arguments.get("client_name") or None
     date_from = arguments.get("date_from") or None
     date_to = arguments.get("date_to") or None
@@ -146,11 +183,32 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
             details=str(e),
         )
 
-    tlbrain_payload = TLBrainPayload(
-        segments=segments,
-        meta=meta,
-    ).model_dump(exclude_none=True)
+    content = build_mcp_content(TLBrainPayload(segments=segments, meta=meta).model_dump(exclude_none=True))
+    return build_jsonrpc_result(request.id, content)
 
-    content = build_mcp_content(tlbrain_payload)
 
+def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
+    doc_id = arguments.get("doc_id") or None
+    client_name = arguments.get("client_name") or None
+    date_from = arguments.get("date_from") or None
+    date_to = arguments.get("date_to") or None
+    limit = arguments.get("limit") or 1
+
+    try:
+        segments, meta = get_transcripts(
+            doc_id=doc_id,
+            client_name=client_name,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+        )
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Transcript retrieval failed",
+            details=str(e),
+        )
+
+    content = build_mcp_content(TLBrainPayload(segments=segments, meta=meta).model_dump(exclude_none=True))
     return build_jsonrpc_result(request.id, content)
