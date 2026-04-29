@@ -1,6 +1,6 @@
 from typing import Any
 
-from core.config import get_retrieval_top_k
+from core.config import get_retrieval_score_threshold, get_retrieval_top_k
 from core.retrieval.pipeline import dedup_and_sort, fetch_utterances, merge_ranges
 from core.retrieval.search import search_summaries_and_facts
 from core.retrieval.segments import build_segments
@@ -21,6 +21,10 @@ def run_retrieval(
         date_to=date_to,
         top_k=get_retrieval_top_k(),
     )
+
+    threshold = get_retrieval_score_threshold()
+    if threshold is not None:
+        hits = [h for h in hits if h["score"] >= threshold]
 
     if not hits:
         return [], {
