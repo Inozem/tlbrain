@@ -290,9 +290,19 @@ print('OK — collection ready')
 
 ---
 
+# MCP Tools
+
+| Tool | Description |
+|---|---|
+| `query` | Semantic search over client conversation transcripts. Supports `client_name`, `date_from`, `date_to` filters. |
+| `get_transcript` | Retrieve full transcripts without semantic search. By `doc_id`, or by `client_name` with optional `limit` and date range. |
+| `list_clients` | List all clients in the knowledge base with dialog count and last dialog date. |
+
+---
+
 # Current Status
 
-Implemented (v0.6):
+Implemented (v0.8):
 
 - monorepo architecture
 - dual Cloud Run deployment
@@ -312,6 +322,9 @@ Implemented (v0.6):
 - each fact stored as individual Qdrant point with dedicated embedding
 - enriched summary prompts (topic + specifics + decisions/next steps)
 - score threshold filtering (`RETRIEVAL_SCORE_THRESHOLD`)
+- `query` tool filters: `client_name`, `date_from`, `date_to`
+- `get_transcript` tool — full transcripts by doc_id or client + date range
+- `list_clients` tool — clients with dialog count and last dialog date
 
 ---
 
@@ -321,8 +334,8 @@ Implemented (v0.6):
 - ~~v0.4 — Retrieval Validation~~ ✓
 - ~~v0.5 — MCP Real Retrieval~~ ✓
 - ~~v0.6 — Retrieval Quality + Facts~~ ✓
-- v0.7 — Full Retrieval Pipeline
-- v0.8 — Filters + get_transcript tool
+- ~~v0.7 — Full Retrieval Pipeline~~ ✓
+- ~~v0.8 — Filters + get_transcript + list_clients~~ ✓
 - v0.9 — Scheduler + Stability
 - v1.0 — Production MVP
 
