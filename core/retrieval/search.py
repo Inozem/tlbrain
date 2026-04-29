@@ -32,13 +32,13 @@ def search_summaries_and_facts(
     if client_name is not None:
         must.append(FieldCondition(key="client_name", match=MatchValue(value=client_name)))
 
-    date_range: dict[str, str] = {}
+    date_range: dict[str, int] = {}
     if date_from is not None:
-        date_range["gte"] = date_from
+        date_range["gte"] = int(date_from.replace("-", ""))
     if date_to is not None:
-        date_range["lte"] = date_to
+        date_range["lte"] = int(date_to.replace("-", ""))
     if date_range:
-        must.append(FieldCondition(key="dialog_date", range=Range(**date_range)))
+        must.append(FieldCondition(key="dialog_date_num", range=Range(**date_range)))
 
     results = get_client().query_points(
         collection_name=get_collection_name(),

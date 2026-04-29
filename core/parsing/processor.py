@@ -4,6 +4,14 @@ from typing import Any
 from core.gemini.llm import generate_facts, generate_summary
 from core.parsing.windowing import generate_windows
 
+
+def _date_to_num(dialog_date: str) -> int | None:
+    """Convert 'YYYY-MM-DD' to integer YYYYMMDD for range filtering."""
+    try:
+        return int(dialog_date.replace("-", ""))
+    except (ValueError, AttributeError):
+        return None
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,8 +35,9 @@ def process_document(
     if existing_summary_keys is None:
         existing_summary_keys = set()
 
+    dialog_date_num = _date_to_num(dialog_date)
     utterance_payloads = _build_utterance_payloads(
-        utterances, doc_id, version, client_name, dialog_date, root_folder_id
+        utterances, doc_id, version, client_name, dialog_date, dialog_date_num, root_folder_id
     )
 
     summaries: list[dict[str, Any]] = []
@@ -60,6 +69,7 @@ def process_document(
             "covered_range": window["covered_range"],
             "client_name": client_name,
             "dialog_date": dialog_date,
+            "dialog_date_num": dialog_date_num,
             "version": version,
         })
 
@@ -80,6 +90,7 @@ def process_document(
                 "covered_range": window["covered_range"],
                 "client_name": client_name,
                 "dialog_date": dialog_date,
+                "dialog_date_num": dialog_date_num,
                 "version": version,
             })
 
@@ -92,6 +103,7 @@ def _build_utterance_payloads(
     version: str,
     client_name: str,
     dialog_date: str,
+    dialog_date_num: int | None,
     root_folder_id: str,
 ) -> list[dict[str, Any]]:
     return [
@@ -102,6 +114,7 @@ def _build_utterance_payloads(
             "version": version,
             "client_name": client_name,
             "dialog_date": dialog_date,
+            "dialog_date_num": dialog_date_num,
             "speaker": u["speaker"],
             "text": u["text"],
             "order_index": u["order_index"],
