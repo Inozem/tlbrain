@@ -74,4 +74,3 @@ def scan_root_folder() -> list[dict[str, Any]]:
     logger.info("Total files found: %s", len(results))
 
     return results
-
