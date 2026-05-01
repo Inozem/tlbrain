@@ -1,6 +1,8 @@
 import google.auth
 from googleapiclient.discovery import build
 
+from core.utils.retry import with_retry
+
 SCOPES = ["https://www.googleapis.com/auth/documents.readonly"]
 
 
@@ -9,6 +11,7 @@ def _build_docs_service():
     return build("docs", "v1", credentials=credentials)
 
 
+@with_retry
 def read_google_doc(doc_id: str) -> str:
     service = _build_docs_service()
     doc = service.documents().get(documentId=doc_id).execute()

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 from typing import Any
@@ -6,9 +7,11 @@ from typing import Any
 from google import genai
 from google.genai import types
 
+from core.utils.retry import BACKOFFS, RETRIES, with_retry
+
+logger = logging.getLogger(__name__)
+
 _LLM_MODEL = "gemini-2.5-flash"
-_RETRIES = 3
-_BACKOFFS = [1, 2, 4]
 
 _SUMMARY_PROMPT = """\
 You are analyzing a fragment of a dialogue. Write 2-3 sentences that capture the essence of this fragment \
@@ -54,14 +57,14 @@ def generate_summary(utterances: list[dict[str, Any]]) -> str:
     client = _client()
     dialog = _format_dialog(utterances)
     prompt = _SUMMARY_PROMPT.format(dialog=dialog)
-    return _call_with_retry(client, prompt, _validate_summary)
+    return _call_with_validation_retry(client, prompt, _validate_summary)
 
 
 def generate_facts(utterances: list[dict[str, Any]]) -> list[str]:
     client = _client()
     dialog = _format_dialog(utterances)
     prompt = _FACTS_PROMPT.format(dialog=dialog)
-    raw = _call_with_retry(client, prompt, _validate_facts)
+    raw = _call_with_validation_retry(client, prompt, _validate_facts)
     return json.loads(_strip_fences(raw))["facts"]
 
 
@@ -73,29 +76,35 @@ def _format_dialog(utterances: list[dict[str, Any]]) -> str:
     return "\n".join(f"{u['speaker']}: {u['text']}" for u in utterances)
 
 
-def _call_with_retry(
-    client: genai.Client,
-    prompt: str,
-    validate,
-) -> str:
+@with_retry
+def _generate_content(client: genai.Client, prompt: str) -> str:
+    response = client.models.generate_content(
+        model=_LLM_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            top_p=1,
+        ),
+    )
+    return response.text.strip()
+
+
+def _call_with_validation_retry(client: genai.Client, prompt: str, validate) -> str:
     last_exc: Exception | None = None
-    for attempt in range(_RETRIES):
+    for attempt in range(RETRIES):
         try:
-            response = client.models.generate_content(
-                model=_LLM_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    top_p=1,
-                ),
-            )
-            text = response.text.strip()
+            text = _generate_content(client, prompt)
             validate(text)
             return text
-        except Exception as exc:
+        except ValueError as exc:
             last_exc = exc
-            time.sleep(_BACKOFFS[attempt])
-    raise RuntimeError(f"Gemini LLM failed after {_RETRIES} attempts") from last_exc
+            logger.warning(
+                "Validation error on attempt %d/%d: %s",
+                attempt + 1, RETRIES, exc,
+            )
+            if attempt < RETRIES - 1:
+                time.sleep(BACKOFFS[attempt])
+    raise RuntimeError(f"LLM validation failed after {RETRIES} attempts") from last_exc
 
 
 def _strip_fences(text: str) -> str:

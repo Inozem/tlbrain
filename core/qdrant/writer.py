@@ -5,10 +5,12 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct
 
 from core.qdrant.client import get_client
 from core.qdrant.schema import EMBEDDING_DIMENSIONS, get_collection_name
+from core.utils.retry import with_retry
 
 _ZERO_VECTOR = [0.0] * EMBEDDING_DIMENSIONS
 
 
+@with_retry
 def upsert_utterances(utterances: list[dict[str, Any]]) -> None:
     if not utterances:
         return
@@ -23,6 +25,7 @@ def upsert_utterances(utterances: list[dict[str, Any]]) -> None:
     get_client().upsert(collection_name=get_collection_name(), points=points)
 
 
+@with_retry
 def upsert_summaries(summaries: list[dict[str, Any]], vectors: list[list[float]]) -> None:
     if not summaries:
         return
@@ -37,6 +40,7 @@ def upsert_summaries(summaries: list[dict[str, Any]], vectors: list[list[float]]
     get_client().upsert(collection_name=get_collection_name(), points=points)
 
 
+@with_retry
 def upsert_facts(facts: list[dict[str, Any]], vectors: list[list[float]]) -> None:
     if not facts:
         return
@@ -51,8 +55,8 @@ def upsert_facts(facts: list[dict[str, Any]], vectors: list[list[float]]) -> Non
     get_client().upsert(collection_name=get_collection_name(), points=points)
 
 
+@with_retry
 def delete_old_versions(doc_id: str, new_version: str, root_folder_id: str) -> None:
-    """Delete all points for doc_id whose version differs from new_version."""
     get_client().delete(
         collection_name=get_collection_name(),
         points_selector=Filter(
