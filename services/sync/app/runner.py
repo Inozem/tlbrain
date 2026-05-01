@@ -20,11 +20,13 @@ def run_sync():
     files = scan_root_folder()
     root_folder_id = get_root_folder_id()
 
+    unchanged = 0
     for file in files:
         doc_id = file["doc_id"]
         existing = load_index(doc_id)
 
         if existing and existing.get("modifiedTime") == file["modifiedTime"]:
+            unchanged += 1
             continue
 
         save_index(doc_id, {
@@ -37,6 +39,8 @@ def run_sync():
         })
 
         logger.info("Marked imported: %s client=%s", doc_id, file["client_name"])
+
+    logger.info("Drive scan — found=%d unchanged=%d marked_imported=%d", len(files), unchanged, len(files) - unchanged)
 
     imported = list_imported()
     stats = {"processed": 0, "skipped": 0, "not_acquired": 0, "error": 0}
@@ -64,6 +68,7 @@ def run_sync():
 
     return {
         "files_found": len(files),
+        "unchanged": unchanged,
         "imported_found": len(imported),
         **stats,
     }
