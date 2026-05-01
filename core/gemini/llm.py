@@ -13,59 +13,45 @@ logger = logging.getLogger(__name__)
 
 _LLM_MODEL = "gemini-2.5-flash"
 
-_SUMMARY_PROMPT = """\
-You are analyzing a fragment of a dialogue. Write 2-3 sentences that capture the essence of this fragment \
-for future search and retrieval.
+_PROMPT = """\
+You are analyzing a fragment of a dialogue. Produce two things:
 
-Cover the following in order — skip a point only if genuinely absent:
-1. The main topic or activity being discussed.
-2. Any specific details worth remembering: prices, numbers, deadlines, product names, objections, decisions.
-3. Any agreements, next steps, or unresolved issues.
+1. A summary: 2-3 sentences capturing the essence of this fragment for future search and retrieval.
+   Cover in order (skip only if genuinely absent):
+   - The main topic or activity being discussed.
+   - Any specific details worth remembering: prices, numbers, deadlines, product names, objections, decisions.
+   - Any agreements, next steps, or unresolved issues.
+   Do not retell the dialogue — write only the essence.
+
+2. Facts: up to 10 notable facts mentioned in the fragment.
+   A fact is any specific, concrete piece of information worth remembering: contacts, interests, industries,
+   decisions, numbers, problems, relationships, plans, or anything unusual.
+   Write each fact as a short noun phrase or brief clause — no attribution, no "X said that", just the fact itself.
+   Use speaker names only when the person themselves (not their statement) is the fact.
+   Empty list if nothing notable found.
 
 Rules:
-- Do not retell the dialogue — write only the essence.
 - Use speaker names exactly as they appear — do not infer or rename roles.
 - Always reply in English regardless of the dialogue language.
-- Reply with plain text only, no JSON, no markdown.
-
-Dialogue:
-{dialog}"""
-
-_FACTS_PROMPT = """\
-You are analyzing a fragment of a dialogue. Extract up to 10 notable facts mentioned in it.
-A fact is any specific, concrete piece of information worth remembering: contacts, interests, industries, \
-decisions, numbers, problems, relationships, plans, or anything unusual.
-Write each fact as a short noun phrase or brief clause — no attribution, no "X said that", just the fact itself.
-Use speaker names only when the person themselves (not their statement) is the fact.
-Always reply in English regardless of the dialogue language.
-Reply with valid JSON only, no markdown, no explanation.
+- Reply with valid JSON only, no markdown, no explanation.
 
 Required JSON structure:
 {{
+  "summary": "...",
   "facts": []
 }}
-
-Empty list if nothing notable found.
 
 Dialogue:
 {dialog}"""
 
-_REQUIRED_FACTS_FIELDS = {"facts"}
 
-
-def generate_summary(utterances: list[dict[str, Any]]) -> str:
+def generate_summary_and_facts(utterances: list[dict[str, Any]]) -> tuple[str, list[str]]:
     client = _client()
     dialog = _format_dialog(utterances)
-    prompt = _SUMMARY_PROMPT.format(dialog=dialog)
-    return _call_with_validation_retry(client, prompt, _validate_summary)
-
-
-def generate_facts(utterances: list[dict[str, Any]]) -> list[str]:
-    client = _client()
-    dialog = _format_dialog(utterances)
-    prompt = _FACTS_PROMPT.format(dialog=dialog)
-    raw = _call_with_validation_retry(client, prompt, _validate_facts)
-    return json.loads(_strip_fences(raw))["facts"]
+    prompt = _PROMPT.format(dialog=dialog)
+    raw = _call_with_validation_retry(client, prompt)
+    data = json.loads(_strip_fences(raw))
+    return data["summary"], data["facts"]
 
 
 def _client() -> genai.Client:
@@ -89,12 +75,12 @@ def _generate_content(client: genai.Client, prompt: str) -> str:
     return response.text.strip()
 
 
-def _call_with_validation_retry(client: genai.Client, prompt: str, validate) -> str:
+def _call_with_validation_retry(client: genai.Client, prompt: str) -> str:
     last_exc: Exception | None = None
     for attempt in range(RETRIES):
         try:
             text = _generate_content(client, prompt)
-            validate(text)
+            _validate(text)
             return text
         except ValueError as exc:
             last_exc = exc
@@ -117,15 +103,14 @@ def _strip_fences(text: str) -> str:
     return cleaned.strip()
 
 
-def _validate_summary(text: str) -> None:
-    if not text:
-        raise ValueError("Empty summary")
-
-
-def _validate_facts(text: str) -> None:
+def _validate(text: str) -> None:
     data = json.loads(_strip_fences(text))
+    if "summary" not in data:
+        raise ValueError("Missing 'summary' field")
+    if not data["summary"]:
+        raise ValueError("Empty summary")
     if "facts" not in data:
-        raise ValueError("Missing 'facts' field in response")
+        raise ValueError("Missing 'facts' field")
     if not isinstance(data["facts"], list):
         raise ValueError("'facts' must be a list")
     if len(data["facts"]) > 10:

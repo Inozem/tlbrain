@@ -1,7 +1,7 @@
 import logging
 from typing import Any
 
-from core.gemini.llm import generate_facts, generate_summary
+from core.gemini.llm import generate_summary_and_facts
 from core.parsing.windowing import generate_windows
 
 
@@ -54,9 +54,9 @@ def process_document(
         window_utterances = window["utterances"]
 
         try:
-            summary_text = generate_summary(window_utterances)
+            summary_text, facts_list = generate_summary_and_facts(window_utterances)
         except Exception:
-            logger.warning("summary failed for summary_key=%s, skipping window", summary_key, exc_info=True)
+            logger.warning("llm failed for summary_key=%s, skipping window", summary_key, exc_info=True)
             continue
 
         summaries.append({
@@ -72,12 +72,6 @@ def process_document(
             "dialog_date_num": dialog_date_num,
             "version": version,
         })
-
-        try:
-            facts_list = generate_facts(window_utterances)
-        except Exception:
-            logger.warning("facts failed for summary_key=%s, skipping facts", summary_key, exc_info=True)
-            continue
 
         for fact_text in facts_list:
             facts.append({
