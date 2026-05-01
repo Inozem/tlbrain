@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from core.utils.logging import configure_logging
 from services.sync.app.runner import run_sync
+
+configure_logging()
 
 app = FastAPI()
 

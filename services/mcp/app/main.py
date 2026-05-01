@@ -5,7 +5,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from core.utils.logging import configure_logging
 from services.mcp.app.mcp.handler import handle_mcp_request
+
+configure_logging()
 
 app = FastAPI()
 

@@ -1,3 +1,6 @@
+import logging
+import time
+
 from services.mcp.app.mcp.schemas import (
     JSONRPCRequest,
     JSONRPCResponse,
@@ -10,6 +13,8 @@ from services.mcp.app.mcp.tools import (
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
+
+logger = logging.getLogger(__name__)
 
 
 def build_jsonrpc_error(
@@ -180,6 +185,7 @@ def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
     date_from = arguments.get("date_from") or None
     date_to = arguments.get("date_to") or None
 
+    t0 = time.monotonic()
     try:
         segments, meta = run_retrieval(
             query=query,
@@ -195,6 +201,22 @@ def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
             details=str(e),
         )
 
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    docs_returned = len({s["doc_id"] for s in segments})
+    logger.info(
+        "tool call: query",
+        extra={
+            "tool": "query",
+            "query": query,
+            "client_name": client_name,
+            "hits_total": meta.get("total_matches", 0),
+            "docs_returned": docs_returned,
+            "segments_returned": meta.get("returned_segments", 0),
+            "truncated": meta.get("truncated", False),
+            "latency_ms": latency_ms,
+        },
+    )
+
     content = build_mcp_content(TLBrainPayload(segments=segments, meta=meta).model_dump(exclude_none=True))
     return build_jsonrpc_result(request.id, content)
 
@@ -206,6 +228,7 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     date_to = arguments.get("date_to") or None
     limit = arguments.get("limit") or 1
 
+    t0 = time.monotonic()
     try:
         segments, meta = get_transcripts(
             doc_id=doc_id,
@@ -222,11 +245,27 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
             details=str(e),
         )
 
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    docs_returned = len({s["doc_id"] for s in segments})
+    logger.info(
+        "tool call: get_transcript",
+        extra={
+            "tool": "get_transcript",
+            "client_name": client_name,
+            "hits_total": meta.get("total_matches", 0),
+            "docs_returned": docs_returned,
+            "segments_returned": meta.get("returned_segments", 0),
+            "truncated": meta.get("truncated", False),
+            "latency_ms": latency_ms,
+        },
+    )
+
     content = build_mcp_content(TLBrainPayload(segments=segments, meta=meta).model_dump(exclude_none=True))
     return build_jsonrpc_result(request.id, content)
 
 
 def _handle_list_clients(request: JSONRPCRequest) -> dict:
+    t0 = time.monotonic()
     try:
         clients = list_clients()
     except Exception as e:
@@ -236,6 +275,16 @@ def _handle_list_clients(request: JSONRPCRequest) -> dict:
             message="Failed to list clients",
             details=str(e),
         )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: list_clients",
+        extra={
+            "tool": "list_clients",
+            "docs_returned": len(clients),
+            "latency_ms": latency_ms,
+        },
+    )
 
     content = build_mcp_content({"clients": clients})
     return build_jsonrpc_result(request.id, content)
