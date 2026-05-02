@@ -1,5 +1,4 @@
--r requirements-common.txt
-
-fastapi>=0.115
-python-dotenv
-uvicorn[standard]
+-r ../../requirements-common.txt
+-r ../../core/gemini/requirements.txt
+-r ../../core/google_drive/requirements.txt
+-r ../../core/qdrant/requirements.txt

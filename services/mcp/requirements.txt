@@ -1,4 +1,3 @@
--r requirements-common.txt
-
-fastapi>=0.115
-uvicorn[standard]>=0.30
+-r ../../requirements-common.txt
+-r ../../core/gemini/requirements.txt
+-r ../../core/qdrant/requirements.txt
