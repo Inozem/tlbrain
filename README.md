@@ -189,6 +189,14 @@ QDRANT_COLLECTION=TLBrain
 RETRIEVAL_TOP_K=15
 RETRIEVAL_SCORE_THRESHOLD=0.6
 
+# OAuth — restrict MCP access to a single Google account
+ALLOWED_EMAIL=your-email@gmail.com
+
+# Scheduler
+CLOUD_TASKS_QUEUE=tlbrain-sync-queue
+CLOUD_TASKS_MAX_CONCURRENT=2
+SYNC_INTERVAL_MINUTES=15
+
 # Local development only (Cloud Run uses ADC automatically)
 # GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
 ```
@@ -242,7 +250,39 @@ Sync response example:
 
 ---
 
-## 10. Check Logs
+## 10. Connect Claude Cowork to MCP
+
+### Set up Google OAuth Client
+
+1. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
+2. Click **Create Credentials → OAuth 2.0 Client ID**
+3. Application type: **Web application**
+4. Name: `TLBrain MCP`
+5. Add to **Authorized redirect URIs**: `https://claude.ai/api/mcp/auth_callback`
+6. Save and copy the **Client ID** and **Client Secret** — you'll need them when connecting
+
+### Set ALLOWED_EMAIL
+
+Add to `.env`:
+
+```env
+ALLOWED_EMAIL=your-email@gmail.com
+```
+
+Redeploy after this change.
+
+### Connect in Claude Cowork
+
+1. Open Claude Cowork → Settings → MCP Servers
+2. Add server URL: `https://YOUR-MCP-URL.run.app/mcp`
+3. Claude Cowork will detect OAuth automatically and prompt you to sign in with Google
+4. Sign in with the same email as `ALLOWED_EMAIL`
+
+> If `ALLOWED_EMAIL` is not set, the MCP endpoint is open without authentication.
+
+---
+
+## 11. Check Logs
 
 ```bash
 gcloud run services logs read tlbrain-sync --region europe-west1 --limit 50
@@ -251,7 +291,7 @@ gcloud run services logs read tlbrain-mcp --region europe-west1 --limit 50
 
 ---
 
-## 11. Set Up Qdrant Cloud
+## 12. Set Up Qdrant Cloud
 
 TLBrain uses Qdrant Cloud as the vector store for semantic search.
 
@@ -302,7 +342,7 @@ print('OK — collection ready')
 
 # Current Status
 
-Implemented (v0.8):
+Implemented (v0.9):
 
 - monorepo architecture
 - dual Cloud Run deployment
@@ -325,6 +365,12 @@ Implemented (v0.8):
 - `query` tool filters: `client_name`, `date_from`, `date_to`
 - `get_transcript` tool — full transcripts by doc_id or client + date range
 - `list_clients` tool — clients with dialog count and last dialog date
+- retry with exponential backoff for transient external call failures
+- structured JSON logging (Cloud Run / Cloud Logging compatible)
+- combined summary + facts LLM call (single Gemini request per window)
+- Cloud Tasks queue for parallel document sync
+- Cloud Function checker — scans Drive every 15 min, dispatches sync tasks
+- Google OAuth 2.0 for MCP endpoint (single-user access via ALLOWED_EMAIL)
 
 ---
 
@@ -336,7 +382,7 @@ Implemented (v0.8):
 - ~~v0.6 — Retrieval Quality + Facts~~ ✓
 - ~~v0.7 — Full Retrieval Pipeline~~ ✓
 - ~~v0.8 — Filters + get_transcript + list_clients~~ ✓
-- v0.9 — Scheduler + Stability
+- ~~v0.9 — Scheduler + Stability~~ ✓
 - v1.0 — Production MVP
 
 ---
