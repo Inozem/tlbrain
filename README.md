@@ -396,7 +396,9 @@ Implemented (v0.9):
 - ~~v0.7 — Full Retrieval Pipeline~~ ✓
 - ~~v0.8 — Filters + get_transcript + list_clients~~ ✓
 - ~~v0.9 — Scheduler + Stability~~ ✓
-- v1.0 — Production MVP
+- v0.10 — Production Ready
+- v0.11 — TL;DV Connector
+- v0.12 — MCP Management Tools
 
 ---
 
