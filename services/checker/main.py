@@ -1,58 +1,23 @@
 import logging
 import os
-import re
 
 import functions_framework
 import google.api_core.exceptions
 import google.auth
 from google.cloud import firestore, tasks_v2
-from googleapiclient.discovery import build
+
+from core.config import get_root_folder_id
+from core.google_drive.drive_client import scan_root_folder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _COLLECTION = "transcript_index"
-_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-
-
-def _root_folder_id() -> str:
-    url = os.environ["ROOT_FOLDER_URL"]
-    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
-    if not match:
-        raise ValueError(f"Cannot extract folder ID from ROOT_FOLDER_URL: {url}")
-    return match.group(1)
-
-
-def _scan_drive(root_folder_id: str) -> list[dict]:
-    creds, _ = google.auth.default(scopes=_DRIVE_SCOPES)
-    service = build("drive", "v3", credentials=creds)
-
-    folders = service.files().list(
-        q=f"'{root_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
-        fields="files(id,name)",
-    ).execute()["files"]
-
-    results = []
-    for folder in folders:
-        files = service.files().list(
-            q=(
-                f"'{folder['id']}' in parents"
-                f" and mimeType='application/vnd.google-apps.document'"
-            ),
-            fields="files(id,modifiedTime)",
-        ).execute()["files"]
-        for f in files:
-            results.append({
-                "doc_id": f["id"],
-                "client_name": folder["name"],
-                "modifiedTime": f["modifiedTime"],
-            })
-    return results
 
 
 @functions_framework.http
 def checker(request):
-    root_folder_id = _root_folder_id()
+    root_folder_id = get_root_folder_id()
     sync_url = os.environ["SYNC_URL"]
     _, project_id = google.auth.default()
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", project_id)
@@ -63,7 +28,7 @@ def checker(request):
     tasks_client = tasks_v2.CloudTasksClient()
     queue_path = tasks_client.queue_path(project_id, region, queue_name)
 
-    files = _scan_drive(root_folder_id)
+    files = scan_root_folder()
     marked = 0
     queued = 0
 

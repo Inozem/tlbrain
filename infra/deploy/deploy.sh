@@ -124,15 +124,7 @@ gcloud tasks queues update "${CLOUD_TASKS_QUEUE}" \
 # =========================
 # Deploy Checker (Cloud Function)
 # =========================
-gcloud functions deploy "${CHECKER_FUNCTION_NAME}" \
-  --gen2 \
-  --runtime python312 \
-  --region "${REGION}" \
-  --source services/checker \
-  --entry-point checker \
-  --trigger-http \
-  --allow-unauthenticated \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",SYNC_URL="${SYNC_URL}",CLOUD_TASKS_QUEUE="${CLOUD_TASKS_QUEUE}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
+bash infra/deploy/deploy_checker.sh
 
 # =========================
 # Get Checker URL

@@ -45,6 +45,18 @@ Responsibilities:
 - maintain Firestore index with status machine (`imported → syncing → synced / error`)
 - recover stale syncing tasks automatically
 
+## 3. Checker (Cloud Function)
+
+Lightweight scheduler triggered every 15 minutes by Cloud Scheduler.
+
+Responsibilities:
+
+- scan Google Drive for new or modified documents
+- mark changed documents as `imported` in Firestore
+- dispatch per-document sync tasks to Cloud Tasks queue
+
+Intentionally deployed as a Cloud Function rather than Cloud Run to minimize cost — it runs on a fixed schedule with no idle traffic, so a always-on container would be wasteful.
+
 ---
 
 # Repository Structure
@@ -54,7 +66,8 @@ tlbrain/
 ├── core/
 ├── services/
 │   ├── mcp/
-│   └── sync/
+│   ├── sync/
+│   └── checker/
 ├── infra/
 │   ├── docker/
 │   └── deploy/
