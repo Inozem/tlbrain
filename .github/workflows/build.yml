@@ -2,6 +2,13 @@ name: Build and push Docker images
 
 on:
   push:
+    branches:
+      - main
+    paths:
+      - "core/**"
+      - "services/**"
+      - "requirements-common.txt"
+      - "infra/docker/**"
     tags:
       - "v*"
 
@@ -23,6 +30,8 @@ jobs:
         with:
           images: inozem/tlbrain-mcp
           tags: |
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
 
       - name: Build and push
@@ -50,6 +59,8 @@ jobs:
         with:
           images: inozem/tlbrain-sync
           tags: |
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
 
       - name: Build and push
