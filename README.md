@@ -179,6 +179,9 @@ Recommended permission: Viewer.
 ## 7. Configure `.env`
 
 ```env
+# Version to deploy (must match a Docker Hub tag, e.g. v0.10)
+VERSION=v0.10
+
 # Google Cloud
 PROJECT_ID=tlbrain-prod
 REGION=europe-west1
@@ -221,6 +224,8 @@ SYNC_INTERVAL_MINUTES=15
 ```bash
 bash infra/deploy/deploy.sh
 ```
+
+> After redeploying, remove the MCP server in Claude Cowork and add it again — the session expires on redeploy and needs to be re-authenticated.
 
 ---
 
@@ -355,7 +360,7 @@ print('OK — collection ready')
 
 # Current Status
 
-Implemented (v0.9):
+Implemented (v0.10):
 
 - monorepo architecture
 - dual Cloud Run deployment
@@ -396,7 +401,7 @@ Implemented (v0.9):
 - ~~v0.7 — Full Retrieval Pipeline~~ ✓
 - ~~v0.8 — Filters + get_transcript + list_clients~~ ✓
 - ~~v0.9 — Scheduler + Stability~~ ✓
-- v0.10 — Production Ready
+- ~~v0.10 — Production Ready~~ ✓
 - v0.11 — TL;DV Connector
 - v0.12 — MCP Management Tools
 
