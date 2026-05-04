@@ -3,13 +3,13 @@ import logging
 from core.google_drive.firestore import list_imported, recover_stale_syncing
 from core.config import get_root_folder_id
 from core.google_drive.drive_client import scan_root_folder
-from services.sync.app.index_store import (
+from services.vector_sync.app.index_store import (
     delete_index,
     list_all_index_ids,
     load_index,
     save_index,
 )
-from services.sync.app.processor import process_one
+from services.vector_sync.app.processor import process_one
 
 logger = logging.getLogger(__name__)
 

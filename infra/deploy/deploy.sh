@@ -124,7 +124,7 @@ gcloud tasks queues update "${VECTOR_SYNC_QUEUE}" \
 # =========================
 # Deploy Checker (Cloud Function)
 # =========================
-bash infra/deploy/deploy_checker.sh
+bash infra/deploy/deploy_vector_sync_checker.sh
 
 # =========================
 # Get Checker URL

@@ -6,8 +6,8 @@ from core.google_drive.firestore import acquire_for_syncing, mark_error, mark_sy
 from core.parsing.parser import parse_document
 from core.parsing.processor import process_document as _process_doc
 from core.qdrant.writer import delete_old_versions, upsert_facts, upsert_summaries, upsert_utterances
-from services.sync.app.hashing import sha256_text
-from services.sync.app.index_store import load_index, update_index
+from services.vector_sync.app.hashing import sha256_text
+from services.vector_sync.app.index_store import load_index, update_index
 
 logger = logging.getLogger(__name__)
 

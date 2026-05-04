@@ -79,7 +79,7 @@ docker push "${MCP_IMAGE}"
 # =========================
 # Build Sync
 # =========================
-docker build -f infra/docker/Dockerfile.sync -t "${SYNC_IMAGE}" .
+docker build -f infra/docker/Dockerfile.vector_sync -t "${SYNC_IMAGE}" .
 docker push "${SYNC_IMAGE}"
 
 # =========================
@@ -124,7 +124,7 @@ gcloud tasks queues update "${VECTOR_SYNC_QUEUE}" \
 # =========================
 # Deploy Checker (Cloud Function)
 # =========================
-bash infra/deploy/deploy_checker.sh
+bash infra/deploy/deploy_vector_sync_checker.sh
 
 # =========================
 # Get Checker URL

@@ -21,8 +21,8 @@ VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
 STAGE=$(mktemp -d)
 trap "rm -rf ${STAGE}" EXIT
 
-cp services/checker/main.py "${STAGE}/"
-cp services/checker/requirements.txt "${STAGE}/"
+cp services/vector_sync_checker/main.py "${STAGE}/"
+cp services/vector_sync_checker/requirements.txt "${STAGE}/"
 
 mkdir -p "${STAGE}/core/google_drive"
 cp core/__init__.py "${STAGE}/core/"
@@ -38,6 +38,6 @@ gcloud functions deploy "${VECTOR_SYNC_CHECKER_NAME}" \
   --entry-point checker \
   --trigger-http \
   --allow-unauthenticated \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",VECTOR_VECTOR_SYNC_URL="${VECTOR_SYNC_URL}",VECTOR_SYNC_QUEUE="${VECTOR_SYNC_QUEUE}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
+  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",VECTOR_SYNC_URL="${VECTOR_SYNC_URL}",VECTOR_SYNC_QUEUE="${VECTOR_SYNC_QUEUE}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
 
 echo "Checker deployed: ${VECTOR_SYNC_CHECKER_NAME}"

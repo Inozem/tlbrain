@@ -6,14 +6,14 @@ COPY requirements-common.txt /app/requirements-common.txt
 COPY core/gemini/requirements.txt /app/core/gemini/requirements.txt
 COPY core/google_drive/requirements.txt /app/core/google_drive/requirements.txt
 COPY core/qdrant/requirements.txt /app/core/qdrant/requirements.txt
-COPY services/sync/requirements.txt /app/services/sync/requirements.txt
+COPY services/vector_sync/requirements.txt /app/services/vector_sync/requirements.txt
 
-RUN pip install --no-cache-dir -r /app/services/sync/requirements.txt
+RUN pip install --no-cache-dir -r /app/services/vector_sync/requirements.txt
 
 COPY core /app/core
-COPY services/sync /app/services/sync
+COPY services/vector_sync /app/services/vector_sync
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
 
-CMD ["python", "-m", "uvicorn", "services.sync.app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "uvicorn", "services.vector_sync.app.main:app", "--host", "0.0.0.0", "--port", "8080"]

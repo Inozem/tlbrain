@@ -3,9 +3,9 @@ from fastapi.responses import JSONResponse
 
 from core.config import get_root_folder_id
 from core.utils.logging import configure_logging
-from services.sync.app.index_store import load_index
-from services.sync.app.processor import process_one
-from services.sync.app.runner import run_sync
+from services.vector_sync.app.index_store import load_index
+from services.vector_sync.app.processor import process_one
+from services.vector_sync.app.runner import run_sync
 
 configure_logging()
 
