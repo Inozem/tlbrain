@@ -286,16 +286,16 @@ GOOGLE_CLIENT_ID=your-client-id
 GOOGLE_CLIENT_SECRET=your-client-secret
 ```
 
-### Add yourself as a Test User
-
-The OAuth app is in Testing mode — only explicitly added users can authorize.
+### Publish the OAuth App
 
 1. Open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience)
-2. Scroll to **Test users** → click **Add users**
-3. Add your Google account email
-4. Save
+2. Click **Publish App** → confirm
 
-> Without this step, authorization will fail with `403: access_denied`.
+This is required to avoid refresh tokens expiring every 7 days (Testing mode limitation).
+
+> After publishing, Google will show an "This app isn't verified" warning on first authorization because Drive is a sensitive scope. Click **Advanced → Continue** to proceed — this is expected for self-hosted personal tools.
+
+> If you skip publishing and stay in Testing mode, you must add your email under **Test users** and re-authorize every 7 days.
 
 ---
 
