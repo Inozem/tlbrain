@@ -8,12 +8,12 @@ fi
 
 PROJECT_ID=${PROJECT_ID:-tlbrain-prod}
 REGION=${REGION:-europe-west1}
-CHECKER_FUNCTION_NAME=${CHECKER_FUNCTION_NAME:-tlbrain-sync-checker}
-CLOUD_TASKS_QUEUE=${CLOUD_TASKS_QUEUE:-tlbrain-sync-queue}
-SYNC_SERVICE_NAME=${SYNC_SERVICE_NAME:-tlbrain-sync}
+VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME:-tlbrain-vector-sync-checker}
+VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE:-tlbrain-vector-sync-queue}
+VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}
 SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-15}
 
-SYNC_URL=$(gcloud run services describe "${SYNC_SERVICE_NAME}" \
+VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
   --format='value(status.url)')
 
@@ -30,7 +30,7 @@ cp core/config.py "${STAGE}/core/"
 cp core/google_drive/__init__.py "${STAGE}/core/google_drive/"
 cp core/google_drive/drive_client.py "${STAGE}/core/google_drive/"
 
-gcloud functions deploy "${CHECKER_FUNCTION_NAME}" \
+gcloud functions deploy "${VECTOR_SYNC_CHECKER_NAME}" \
   --gen2 \
   --runtime python312 \
   --region "${REGION}" \
@@ -38,6 +38,6 @@ gcloud functions deploy "${CHECKER_FUNCTION_NAME}" \
   --entry-point checker \
   --trigger-http \
   --allow-unauthenticated \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",SYNC_URL="${SYNC_URL}",CLOUD_TASKS_QUEUE="${CLOUD_TASKS_QUEUE}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
+  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",VECTOR_VECTOR_SYNC_URL="${VECTOR_SYNC_URL}",VECTOR_SYNC_QUEUE="${VECTOR_SYNC_QUEUE}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
 
-echo "Checker deployed: ${CHECKER_FUNCTION_NAME}"
+echo "Checker deployed: ${VECTOR_SYNC_CHECKER_NAME}"

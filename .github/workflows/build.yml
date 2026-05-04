@@ -42,7 +42,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
 
-  build-sync:
+  build-vector-sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: inozem/tlbrain-sync
+          images: inozem/tlbrain-vector-sync
           tags: |
             type=sha
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}

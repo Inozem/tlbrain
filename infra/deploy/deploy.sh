@@ -26,14 +26,14 @@ PROJECT_ID=${PROJECT_ID:-tlbrain-prod}
 REGION=${REGION:-europe-west1}
 
 MCP_SERVICE_NAME=${MCP_SERVICE_NAME:-tlbrain-mcp}
-SYNC_SERVICE_NAME=${SYNC_SERVICE_NAME:-tlbrain-sync}
-CHECKER_FUNCTION_NAME=${CHECKER_FUNCTION_NAME:-tlbrain-sync-checker}
-CLOUD_TASKS_QUEUE=${CLOUD_TASKS_QUEUE:-tlbrain-sync-queue}
+VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}
+VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME:-tlbrain-vector-sync-checker}
+VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE:-tlbrain-vector-sync-queue}
 CLOUD_TASKS_MAX_CONCURRENT=${CLOUD_TASKS_MAX_CONCURRENT:-2}
 SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-15}
 
 MCP_IMAGE="${DOCKERHUB_USERNAME}/tlbrain-mcp:${VERSION}"
-SYNC_IMAGE="${DOCKERHUB_USERNAME}/tlbrain-sync:${VERSION}"
+SYNC_IMAGE="${DOCKERHUB_USERNAME}/tlbrain-vector-sync:${VERSION}"
 
 # =========================
 # Show config
@@ -46,9 +46,9 @@ echo "SYNC_IMAGE=${SYNC_IMAGE}"
 echo "PROJECT_ID=${PROJECT_ID}"
 echo "REGION=${REGION}"
 echo "MCP_SERVICE_NAME=${MCP_SERVICE_NAME}"
-echo "SYNC_SERVICE_NAME=${SYNC_SERVICE_NAME}"
-echo "CHECKER_FUNCTION_NAME=${CHECKER_FUNCTION_NAME}"
-echo "CLOUD_TASKS_QUEUE=${CLOUD_TASKS_QUEUE}"
+echo "VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME}"
+echo "VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME}"
+echo "VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE}"
 echo "SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES}"
 echo
 
@@ -90,12 +90,12 @@ gcloud run deploy "${MCP_SERVICE_NAME}" \
   --region "${REGION}" \
   --platform managed \
   --allow-unauthenticated \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",GEMINI_API_KEY="${GEMINI_API_KEY}",QDRANT_URL="${QDRANT_URL}",QDRANT_API_KEY="${QDRANT_API_KEY}",QDRANT_COLLECTION="${QDRANT_COLLECTION}",RETRIEVAL_TOP_K="${RETRIEVAL_TOP_K}",RETRIEVAL_SCORE_THRESHOLD="${RETRIEVAL_SCORE_THRESHOLD}",ALLOWED_EMAIL="${ALLOWED_EMAIL}"
+  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",GEMINI_API_KEY="${GEMINI_API_KEY}",QDRANT_URL="${QDRANT_URL}",QDRANT_API_KEY="${QDRANT_API_KEY}",QDRANT_COLLECTION="${QDRANT_COLLECTION}",RETRIEVAL_TOP_K="${RETRIEVAL_TOP_K}",RETRIEVAL_SCORE_THRESHOLD="${RETRIEVAL_SCORE_THRESHOLD}",ALLOWED_EMAIL="${ALLOWED_EMAIL:-}"
 
 # =========================
 # Deploy Sync
 # =========================
-gcloud run deploy "${SYNC_SERVICE_NAME}" \
+gcloud run deploy "${VECTOR_SYNC_SERVICE_NAME}" \
   --image "${SYNC_IMAGE}" \
   --region "${REGION}" \
   --platform managed \
@@ -105,7 +105,7 @@ gcloud run deploy "${SYNC_SERVICE_NAME}" \
 # =========================
 # Get Sync URL
 # =========================
-SYNC_URL=$(gcloud run services describe "${SYNC_SERVICE_NAME}" \
+VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
   --format='value(status.url)')
 
@@ -113,11 +113,11 @@ SYNC_URL=$(gcloud run services describe "${SYNC_SERVICE_NAME}" \
 # Create Cloud Tasks queue
 # =========================
 echo "Creating Cloud Tasks queue..."
-gcloud tasks queues create "${CLOUD_TASKS_QUEUE}" \
+gcloud tasks queues create "${VECTOR_SYNC_QUEUE}" \
   --location="${REGION}" \
   --max-concurrent-dispatches="${CLOUD_TASKS_MAX_CONCURRENT}" \
   2>/dev/null || \
-gcloud tasks queues update "${CLOUD_TASKS_QUEUE}" \
+gcloud tasks queues update "${VECTOR_SYNC_QUEUE}" \
   --location="${REGION}" \
   --max-concurrent-dispatches="${CLOUD_TASKS_MAX_CONCURRENT}"
 
@@ -129,7 +129,7 @@ bash infra/deploy/deploy_checker.sh
 # =========================
 # Get Checker URL
 # =========================
-CHECKER_URL=$(gcloud functions describe "${CHECKER_FUNCTION_NAME}" \
+CHECKER_URL=$(gcloud functions describe "${VECTOR_SYNC_CHECKER_NAME}" \
   --region "${REGION}" \
   --format='value(serviceConfig.uri)')
 
@@ -137,13 +137,13 @@ CHECKER_URL=$(gcloud functions describe "${CHECKER_FUNCTION_NAME}" \
 # Create Cloud Scheduler job
 # =========================
 echo "Creating Cloud Scheduler job..."
-gcloud scheduler jobs create http "${CHECKER_FUNCTION_NAME}-schedule" \
+gcloud scheduler jobs create http "${VECTOR_SYNC_CHECKER_NAME}-schedule" \
   --location="${REGION}" \
   --schedule="every ${SYNC_INTERVAL_MINUTES} minutes" \
   --uri="${CHECKER_URL}" \
   --http-method=POST \
   2>/dev/null || \
-gcloud scheduler jobs update http "${CHECKER_FUNCTION_NAME}-schedule" \
+gcloud scheduler jobs update http "${VECTOR_SYNC_CHECKER_NAME}-schedule" \
   --location="${REGION}" \
   --schedule="every ${SYNC_INTERVAL_MINUTES} minutes" \
   --uri="${CHECKER_URL}" \
@@ -162,11 +162,11 @@ echo "Deploy complete"
 echo "========================================="
 echo
 echo "MCP endpoint:   ${MCP_URL}/mcp"
-echo "Sync trigger:   POST ${SYNC_URL}/sync"
-echo "Sync health:    GET  ${SYNC_URL}/"
+echo "Sync trigger:   POST ${VECTOR_SYNC_URL}/sync"
+echo "Sync health:    GET  ${VECTOR_SYNC_URL}/"
 echo "Checker:        ${CHECKER_URL}"
 echo
 echo "Grant Drive access to sync service account:"
-gcloud run services describe "${SYNC_SERVICE_NAME}" \
+gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
   --format='value(spec.template.spec.serviceAccountName)'

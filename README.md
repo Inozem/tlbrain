@@ -188,7 +188,7 @@ REGION=europe-west1
 
 # Service names
 MCP_SERVICE_NAME=tlbrain-mcp
-SYNC_SERVICE_NAME=tlbrain-sync
+VECTOR_SYNC_SERVICE_NAME=tlbrain-vector-sync
 
 # Google Drive root folder URL
 ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
@@ -209,7 +209,7 @@ RETRIEVAL_SCORE_THRESHOLD=0.6
 ALLOWED_EMAIL=your-email@gmail.com
 
 # Scheduler
-CLOUD_TASKS_QUEUE=tlbrain-sync-queue
+VECTOR_SYNC_QUEUE=tlbrain-vector-sync-queue
 CLOUD_TASKS_MAX_CONCURRENT=2
 SYNC_INTERVAL_MINUTES=15
 

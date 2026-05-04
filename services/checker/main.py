@@ -18,11 +18,11 @@ _COLLECTION = "transcript_index"
 @functions_framework.http
 def checker(request):
     root_folder_id = get_root_folder_id()
-    sync_url = os.environ["SYNC_URL"]
+    sync_url = os.environ["VECTOR_SYNC_URL"]
     _, project_id = google.auth.default()
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", project_id)
     region = os.environ["REGION"]
-    queue_name = os.environ["CLOUD_TASKS_QUEUE"]
+    queue_name = os.environ["VECTOR_SYNC_QUEUE"]
 
     db = firestore.Client()
     tasks_client = tasks_v2.CloudTasksClient()
