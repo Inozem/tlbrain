@@ -268,16 +268,42 @@ Sync response example:
 
 ---
 
-## 10. Connect Claude Cowork to MCP
+## 10. Set Up Google OAuth Client
 
-### Set up Google OAuth Client
+One OAuth client is used for both MCP authentication and TL;DV Drive access.
 
 1. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
 2. Click **Create Credentials → OAuth 2.0 Client ID**
 3. Application type: **Web application**
 4. Name: `TLBrain MCP`
-5. Add to **Authorized redirect URIs**: `https://claude.ai/api/mcp/auth_callback`
-6. Save and copy the **Client ID** and **Client Secret** — you'll need them when connecting
+5. Add both URIs to **Authorized redirect URIs**:
+   - `https://claude.ai/api/mcp/auth_callback` — for Claude Cowork
+   - `http://localhost:8085` — for local Drive token setup
+6. Save and copy the **Client ID** and **Client Secret** into `.env`:
+
+```env
+GOOGLE_CLIENT_ID=your-client-id
+GOOGLE_CLIENT_SECRET=your-client-secret
+```
+
+### Add yourself as a Test User
+
+The OAuth app is in Testing mode — only explicitly added users can authorize.
+
+1. Open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience)
+2. Scroll to **Test users** → click **Add users**
+3. Add your Google account email
+4. Save
+
+> Without this step, authorization will fail with `403: access_denied`.
+
+---
+
+## 11. Connect Claude Cowork to MCP
+
+### Set up Google OAuth Client
+
+Already done in step 10.
 
 ### Set ALLOWED_EMAIL
 
