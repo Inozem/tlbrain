@@ -22,7 +22,7 @@ STAGE=$(mktemp -d)
 trap "rm -rf ${STAGE}" EXIT
 
 cp services/vector_sync_checker/main.py "${STAGE}/"
-cp services/vector_sync_checker/requirements.txt "${STAGE}/"
+cat services/vector_sync_checker/requirements.txt core/google_drive/requirements.txt > "${STAGE}/requirements.txt"
 
 mkdir -p "${STAGE}/core/google_drive"
 cp core/__init__.py "${STAGE}/core/"
