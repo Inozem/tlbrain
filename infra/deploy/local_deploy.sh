@@ -25,9 +25,13 @@ SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-15}
 TLDV_WEBHOOK_FUNCTION_NAME=${TLDV_WEBHOOK_FUNCTION_NAME:-tlbrain-tldv-webhook}
 GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
 GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
-
-MCP_IMAGE="gcr.io/${PROJECT_ID}/${MCP_SERVICE_NAME}"
-SYNC_IMAGE="gcr.io/${PROJECT_ID}/${VECTOR_SYNC_SERVICE_NAME}"
+GOOGLE_REFRESH_TOKEN=${GOOGLE_REFRESH_TOKEN:-}
+GEMINI_API_KEY=${GEMINI_API_KEY:-}
+QDRANT_URL=${QDRANT_URL:-}
+QDRANT_API_KEY=${QDRANT_API_KEY:-}
+TLDV_API_KEY=${TLDV_API_KEY:-}
+ROOT_FOLDER_URL=${ROOT_FOLDER_URL:-}
+ALLOWED_EMAIL=${ALLOWED_EMAIL:-}
 
 mask() { local v="$1"; local l=${#v}; if [ $l -le 8 ]; then echo "****"; else echo "${v:0:4}****${v: -4}"; fi; }
 
@@ -35,14 +39,22 @@ mask() { local v="$1"; local l=${#v}; if [ $l -le 8 ]; then echo "****"; else ec
 # Show config
 # =========================
 echo
-echo "Deploy config:"
-echo "PROJECT_ID=${PROJECT_ID}"
-echo "REGION=${REGION}"
-echo "MCP_SERVICE_NAME=${MCP_SERVICE_NAME}"
-echo "VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME}"
-echo "VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME}"
-echo "VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE}"
-echo "SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES}"
+echo "========================================="
+echo "Deploy config"
+echo "========================================="
+echo "  Project:        ${PROJECT_ID}"
+echo "  Region:         ${REGION}"
+echo ""
+echo "  Root folder:    ${ROOT_FOLDER_URL}"
+echo "  Allowed email:  ${ALLOWED_EMAIL}"
+echo "  Qdrant URL:     ${QDRANT_URL}"
+echo ""
+echo "  Gemini key:     $(mask "${GEMINI_API_KEY}")"
+echo "  Qdrant key:     $(mask "${QDRANT_API_KEY}")"
+echo "  TL;DV key:      $(mask "${TLDV_API_KEY}")"
+echo "  Client ID:      $(mask "${GOOGLE_CLIENT_ID}")"
+echo "  Client Secret:  $(mask "${GOOGLE_CLIENT_SECRET}")"
+echo "  Refresh token:  $(mask "${GOOGLE_REFRESH_TOKEN}")"
 echo
 
 # =========================
@@ -76,60 +88,10 @@ gcloud services enable \
   cloudscheduler.googleapis.com
 
 # =========================
-# Build MCP
+# Deploy core
 # =========================
-docker build -f infra/docker/Dockerfile.mcp -t "${MCP_IMAGE}" .
-docker push "${MCP_IMAGE}"
-
-# =========================
-# Build Sync
-# =========================
-docker build -f infra/docker/Dockerfile.vector_sync -t "${SYNC_IMAGE}" .
-docker push "${SYNC_IMAGE}"
-
-# =========================
-# Deploy MCP
-# =========================
-gcloud run deploy "${MCP_SERVICE_NAME}" \
-  --image "${MCP_IMAGE}" \
-  --region "${REGION}" \
-  --platform managed \
-  --allow-unauthenticated \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",GEMINI_API_KEY="${GEMINI_API_KEY}",QDRANT_URL="${QDRANT_URL}",QDRANT_API_KEY="${QDRANT_API_KEY}",QDRANT_COLLECTION="${QDRANT_COLLECTION}",RETRIEVAL_TOP_K="${RETRIEVAL_TOP_K}",RETRIEVAL_SCORE_THRESHOLD="${RETRIEVAL_SCORE_THRESHOLD}",ALLOWED_EMAIL="${ALLOWED_EMAIL:-}"
-
-# =========================
-# Deploy Sync
-# =========================
-gcloud run deploy "${VECTOR_SYNC_SERVICE_NAME}" \
-  --image "${SYNC_IMAGE}" \
-  --region "${REGION}" \
-  --platform managed \
-  --allow-unauthenticated \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",GEMINI_API_KEY="${GEMINI_API_KEY}",QDRANT_URL="${QDRANT_URL}",QDRANT_API_KEY="${QDRANT_API_KEY}",QDRANT_COLLECTION="${QDRANT_COLLECTION}"
-
-# =========================
-# Get Sync URL
-# =========================
-VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
-  --region "${REGION}" \
-  --format='value(status.url)')
-
-# =========================
-# Create Cloud Tasks queue
-# =========================
-echo "Creating Cloud Tasks queue..."
-gcloud tasks queues create "${VECTOR_SYNC_QUEUE}" \
-  --location="${REGION}" \
-  --max-concurrent-dispatches="${CLOUD_TASKS_MAX_CONCURRENT}" \
-  2>/dev/null || \
-gcloud tasks queues update "${VECTOR_SYNC_QUEUE}" \
-  --location="${REGION}" \
-  --max-concurrent-dispatches="${CLOUD_TASKS_MAX_CONCURRENT}"
-
-# =========================
-# Deploy Checker (Cloud Function)
-# =========================
-bash infra/deploy/deploy_vector_sync_checker.sh
+bash infra/deploy/core/local_deploy_mcp.sh
+bash infra/deploy/core/local_deploy_vector_sync.sh
 
 # =========================
 # Deploy TL;DV Connector
@@ -137,34 +99,19 @@ bash infra/deploy/deploy_vector_sync_checker.sh
 SKIP_CONFIRM=1 bash infra/deploy/connectors/local_deploy_tldv.sh
 
 # =========================
-# Get Checker URL
-# =========================
-CHECKER_URL=$(gcloud functions describe "${VECTOR_SYNC_CHECKER_NAME}" \
-  --region "${REGION}" \
-  --format='value(serviceConfig.uri)')
-
-# =========================
-# Create Cloud Scheduler job
-# =========================
-echo "Creating Cloud Scheduler job..."
-gcloud scheduler jobs create http "${VECTOR_SYNC_CHECKER_NAME}-schedule" \
-  --location="${REGION}" \
-  --schedule="every ${SYNC_INTERVAL_MINUTES} minutes" \
-  --uri="${CHECKER_URL}" \
-  --http-method=POST \
-  2>/dev/null || \
-gcloud scheduler jobs update http "${VECTOR_SYNC_CHECKER_NAME}-schedule" \
-  --location="${REGION}" \
-  --schedule="every ${SYNC_INTERVAL_MINUTES} minutes" \
-  --uri="${CHECKER_URL}" \
-  --http-method=POST
-
-# =========================
 # Final URLs
 # =========================
 MCP_URL=$(gcloud run services describe "${MCP_SERVICE_NAME}" \
   --region "${REGION}" \
   --format='value(status.url)')
+
+VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
+  --region "${REGION}" \
+  --format='value(status.url)')
+
+CHECKER_URL=$(gcloud functions describe "${VECTOR_SYNC_CHECKER_NAME}" \
+  --region "${REGION}" \
+  --format='value(serviceConfig.uri)')
 
 WEBHOOK_URL=$(gcloud functions describe "${TLDV_WEBHOOK_FUNCTION_NAME}" \
   --region "${REGION}" \

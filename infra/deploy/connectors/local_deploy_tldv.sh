@@ -43,7 +43,7 @@ if [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
 
   echo "Google Drive credentials not found, running setup (browser will open)..."
   python3 -m pip install -q requests
-  python3 "${REPO_ROOT}/setup_tokens.py"
+  python3 "${REPO_ROOT}/infra/deploy/setup_tokens.py"
   export $(grep -v '^#' "${REPO_ROOT}/.env" | xargs)
 fi
 
