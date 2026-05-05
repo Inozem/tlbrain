@@ -2,33 +2,30 @@
 
 set -euo pipefail
 
-if [ -f .env ]; then
-  export $(grep -v '^#' .env | xargs)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+
+if [ -f "${REPO_ROOT}/.env" ]; then
+  export $(grep -v '^#' "${REPO_ROOT}/.env" | xargs)
 fi
 
 PROJECT_ID=${PROJECT_ID:-tlbrain-prod}
 REGION=${REGION:-europe-west1}
 TLDV_WEBHOOK_FUNCTION_NAME=${TLDV_WEBHOOK_FUNCTION_NAME:-tlbrain-tldv-webhook}
 TLDV_IMPORT_QUEUE=${TLDV_IMPORT_QUEUE:-tlbrain-tldv-import-queue}
-TLDV_IMPORT_SERVICE_URL=${TLDV_IMPORT_SERVICE_URL:-}
+TLDV_IMPORT_SERVICE_NAME=${TLDV_IMPORT_SERVICE_NAME:-tlbrain-tldv-import}
 
-# =========================
-# Create Cloud Tasks queue
-# =========================
-echo "Creating Cloud Tasks queue ${TLDV_IMPORT_QUEUE}..."
-gcloud tasks queues create "${TLDV_IMPORT_QUEUE}" \
-  --location="${REGION}" \
-  --max-concurrent-dispatches=2 \
-  2>/dev/null || echo "Queue already exists, skipping."
+echo "--- Deploying TL;DV Webhook Function ---"
 
-# =========================
-# Deploy Webhook Function
-# =========================
+IMPORT_SERVICE_URL=$(gcloud run services describe "${TLDV_IMPORT_SERVICE_NAME}" \
+  --region "${REGION}" \
+  --format='value(status.url)')
+
 STAGE=$(mktemp -d)
 trap "rm -rf ${STAGE}" EXIT
 
-cp services/connectors/tldv/webhook/main.py "${STAGE}/"
-cp services/connectors/tldv/webhook/requirements.txt "${STAGE}/"
+cp "${REPO_ROOT}/services/connectors/tldv/webhook/main.py" "${STAGE}/"
+cp "${REPO_ROOT}/services/connectors/tldv/webhook/requirements.txt" "${STAGE}/"
 
 gcloud functions deploy "${TLDV_WEBHOOK_FUNCTION_NAME}" \
   --gen2 \
@@ -38,7 +35,7 @@ gcloud functions deploy "${TLDV_WEBHOOK_FUNCTION_NAME}" \
   --entry-point tldv_webhook \
   --trigger-http \
   --allow-unauthenticated \
-  --set-env-vars TLDV_IMPORT_QUEUE="${TLDV_IMPORT_QUEUE}",TLDV_IMPORT_SERVICE_URL="${TLDV_IMPORT_SERVICE_URL}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
+  --set-env-vars TLDV_IMPORT_QUEUE="${TLDV_IMPORT_QUEUE}",TLDV_IMPORT_SERVICE_URL="${IMPORT_SERVICE_URL}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
 
 WEBHOOK_URL=$(gcloud functions describe "${TLDV_WEBHOOK_FUNCTION_NAME}" \
   --region "${REGION}" \
