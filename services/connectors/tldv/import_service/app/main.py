@@ -1,45 +1,24 @@
 import os
-import re
 from datetime import datetime, timezone
 
 import google.api_core.exceptions
 import google.auth
-import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from google.cloud import firestore, tasks_v2
+from google.cloud import firestore
 from googleapiclient.discovery import build
 
-_TLDV_API_BASE = "https://pasta.tldv.io/v1alpha1"
-_COLLECTION = "transcript_index"
-_CLIENT_NAME = "tldv"
+from core.config import get_root_folder_id
+from core.google_drive.firestore import COLLECTION_NAME
+from core.utils.tasks import enqueue_task
+from tldv_client import tldv_get
+
 _SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/documents",
 ]
 
 app = FastAPI()
-
-
-def _get_root_folder_id() -> str:
-    url = os.environ["ROOT_FOLDER_URL"]
-    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
-    if not match:
-        raise ValueError(f"Cannot extract folder ID from ROOT_FOLDER_URL: {url}")
-    return match.group(1)
-
-
-def _tldv_get(path: str) -> dict:
-    api_key = os.environ["TLDV_API_KEY"]
-    resp = requests.get(
-        f"{_TLDV_API_BASE}{path}",
-        headers={"x-api-key": api_key},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    if not resp.content:
-        return {}
-    return resp.json()
 
 
 def _build_credentials():
@@ -144,9 +123,9 @@ def _create_google_doc(drive, folder_id: str, title: str, text: str, speaker_ran
     doc_id = file_meta["id"]
     modified_time = file_meta.get("modifiedTime", "")
 
-    requests = [{"insertText": {"location": {"index": 1}, "text": text}}]
+    requests_body = [{"insertText": {"location": {"index": 1}, "text": text}}]
     for start, end in speaker_ranges:
-        requests.append({
+        requests_body.append({
             "updateTextStyle": {
                 "range": {"startIndex": start + 1, "endIndex": end + 1},
                 "textStyle": {"bold": True},
@@ -154,7 +133,7 @@ def _create_google_doc(drive, folder_id: str, title: str, text: str, speaker_ran
             }
         })
 
-    docs.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
+    docs.documents().batchUpdate(documentId=doc_id, body={"requests": requests_body}).execute()
 
     return doc_id, modified_time
 
@@ -175,7 +154,7 @@ async def import_meeting(request: Request):
 
     db = firestore.Client()
     existing = list(
-        db.collection(_COLLECTION)
+        db.collection(COLLECTION_NAME)
         .where(filter=firestore.FieldFilter("tldv_meeting_id", "==", meeting_id))
         .limit(1)
         .stream()
@@ -184,10 +163,10 @@ async def import_meeting(request: Request):
         print(f"Already imported: {meeting_id}", flush=True)
         return {"ok": True, "skipped": True}
 
-    meeting = _tldv_get(f"/meetings/{meeting_id}")
+    meeting = tldv_get(f"/meetings/{meeting_id}")
     print(f"Meeting: {meeting.get('name')!r}", flush=True)
 
-    transcript_resp = _tldv_get(f"/meetings/{meeting_id}/transcript")
+    transcript_resp = tldv_get(f"/meetings/{meeting_id}/transcript")
     utterances = transcript_resp.get("results", transcript_resp.get("data", []))
     print(f"Utterances: {len(utterances)}", flush=True)
 
@@ -195,21 +174,22 @@ async def import_meeting(request: Request):
         print(f"No transcript yet for meeting_id={meeting_id}, skipping", flush=True)
         return {"ok": True, "skipped": True, "reason": "no_transcript"}
 
+    client_name = os.environ.get("TLDV_CLIENT_NAME", "_unassigned")
     title = meeting.get("name") or f"TL;DV {meeting_id}"
     text, speaker_ranges = _format_transcript(meeting, utterances)
     dialog_date, _ = _parse_happened_at(meeting.get("happenedAt", ""))
 
-    root_folder_id = _get_root_folder_id()
+    root_folder_id = get_root_folder_id()
     drive = _build_drive()
-    client_folder_id = _get_or_create_folder(drive, root_folder_id, _CLIENT_NAME)
+    client_folder_id = _get_or_create_folder(drive, root_folder_id, client_name)
 
     doc_id, modified_time = _create_google_doc(drive, client_folder_id, title, text, speaker_ranges)
     print(f"Created Google Doc: doc_id={doc_id} title={title!r}", flush=True)
 
-    db.collection(_COLLECTION).document(doc_id).set({
+    db.collection(COLLECTION_NAME).document(doc_id).set({
         "doc_id": doc_id,
         "root_folder_id": root_folder_id,
-        "client_name": _CLIENT_NAME,
+        "client_name": client_name,
         "drive_folder": client_folder_id,
         "dialog_date": dialog_date,
         "provider": "tldv",
@@ -226,25 +206,14 @@ async def import_meeting(request: Request):
 
     vector_sync_url = os.environ.get("VECTOR_SYNC_URL", "")
     vector_sync_queue = os.environ.get("VECTOR_SYNC_QUEUE", "")
-    region = os.environ["REGION"]
-    _, project_id = google.auth.default()
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", project_id)
 
     if vector_sync_url and vector_sync_queue:
-        tasks_client = tasks_v2.CloudTasksClient()
-        queue_path = tasks_client.queue_path(project_id, region, vector_sync_queue)
-        task = {
-            "name": tasks_client.task_path(project_id, region, vector_sync_queue, doc_id),
-            "http_request": {
-                "http_method": tasks_v2.HttpMethod.POST,
-                "url": f"{vector_sync_url}/sync/doc/{doc_id}",
-            },
-        }
-        try:
-            tasks_client.create_task(parent=queue_path, task=task)
-            print(f"Queued vector sync: doc_id={doc_id}", flush=True)
-        except google.api_core.exceptions.AlreadyExists:
-            print(f"Vector sync task already exists: doc_id={doc_id}", flush=True)
+        enqueue_task(
+            queue_name=vector_sync_queue,
+            task_id=doc_id,
+            url=f"{vector_sync_url}/sync/doc/{doc_id}",
+        )
+        print(f"Queued vector sync: doc_id={doc_id}", flush=True)
     else:
         print("VECTOR_SYNC_URL or VECTOR_SYNC_QUEUE not set, skipping sync queue", flush=True)
 

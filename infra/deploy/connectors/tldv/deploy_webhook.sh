@@ -25,7 +25,13 @@ STAGE=$(mktemp -d)
 trap "rm -rf ${STAGE}" EXIT
 
 cp "${REPO_ROOT}/services/connectors/tldv/webhook/main.py" "${STAGE}/"
-cp "${REPO_ROOT}/services/connectors/tldv/webhook/requirements.txt" "${STAGE}/"
+cat "${REPO_ROOT}/services/connectors/tldv/webhook/requirements.txt" \
+    "${REPO_ROOT}/core/utils/requirements.txt" > "${STAGE}/requirements.txt"
+
+mkdir -p "${STAGE}/core/utils"
+cp "${REPO_ROOT}/core/__init__.py" "${STAGE}/core/"
+cp "${REPO_ROOT}/core/utils/__init__.py" "${STAGE}/core/utils/"
+cp "${REPO_ROOT}/core/utils/tasks.py" "${STAGE}/core/utils/"
 
 gcloud functions deploy "${TLDV_WEBHOOK_FUNCTION_NAME}" \
   --gen2 \

@@ -2,9 +2,8 @@ import json
 import os
 
 import functions_framework
-import google.api_core.exceptions
-import google.auth
-from google.cloud import tasks_v2
+
+from core.utils.tasks import enqueue_task
 
 
 @functions_framework.http
@@ -17,34 +16,22 @@ def tldv_webhook(request):
         print("No meetingId in payload:", payload, flush=True)
         return {"error": "missing meetingId"}, 400
 
-    _, project_id = google.auth.default()
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", project_id)
-    region = os.environ["REGION"]
-    queue_name = os.environ["TLDV_IMPORT_QUEUE"]
     import_service_url = os.environ.get("TLDV_IMPORT_SERVICE_URL", "")
+    queue_name = os.environ["TLDV_IMPORT_QUEUE"]
 
     if not import_service_url:
         print(f"TLDV_IMPORT_SERVICE_URL not set, skipping task for meeting_id={meeting_id}", flush=True)
         return {"ok": True}, 200
 
-    tasks_client = tasks_v2.CloudTasksClient()
-    queue_path = tasks_client.queue_path(project_id, region, queue_name)
-    task_name = tasks_client.task_path(project_id, region, queue_name, f"tldv-import-{meeting_id}")
-
-    task = {
-        "name": task_name,
-        "http_request": {
-            "http_method": tasks_v2.HttpMethod.POST,
-            "url": f"{import_service_url}/import",
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"meeting_id": meeting_id}).encode(),
-        },
-    }
-
-    try:
-        tasks_client.create_task(parent=queue_path, task=task)
+    queued = enqueue_task(
+        queue_name=queue_name,
+        task_id=f"tldv-import-{meeting_id}",
+        url=f"{import_service_url}/import",
+        body={"meeting_id": meeting_id},
+    )
+    if queued:
         print(f"Task created for meeting_id={meeting_id}", flush=True)
-    except google.api_core.exceptions.AlreadyExists:
+    else:
         print(f"Task already exists for meeting_id={meeting_id}, skipping", flush=True)
 
     return {"ok": True}, 200
