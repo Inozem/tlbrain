@@ -37,6 +37,8 @@ def _tldv_get(path: str) -> dict:
         timeout=30,
     )
     resp.raise_for_status()
+    if not resp.content:
+        return {}
     return resp.json()
 
 
@@ -96,27 +98,39 @@ def _parse_happened_at(happened_at: str) -> tuple[str, str]:
         return "", ""
 
 
-def _format_transcript(meeting: dict, utterances: list[dict]) -> str:
+def _format_transcript(meeting: dict, utterances: list[dict]) -> tuple[str, list[tuple[int, int]]]:
     source_file = meeting.get("name") or f"TL;DV {meeting.get('id', '')}"
     dialog_date, dialog_time = _parse_happened_at(meeting.get("happenedAt", ""))
 
-    lines = [
+    header = "\n".join([
         f"DATE: {dialog_date}",
         f"TIME: {dialog_time}",
         "PROVIDER: tldv",
         f"SOURCE_FILE: {source_file}",
         "---",
-    ]
+    ]) + "\n"
+
+    speaker_ranges: list[tuple[int, int]] = []
+    body_parts: list[str] = []
+    pos = len(header)
+
     for u in utterances:
         speaker = (u.get("speaker") or u.get("speakerName", "")).replace("::", "")
         text = u.get("text") or u.get("transcript", "")
-        if text:
-            lines.append(f"{speaker} :: {text}" if speaker else text)
+        if not text:
+            continue
+        if speaker:
+            speaker_ranges.append((pos, pos + len(speaker)))
+            line = f"{speaker} :: {text}"
+        else:
+            line = text
+        body_parts.append(line)
+        pos += len(line) + 2  # +2 for \n\n separator
 
-    return "\n".join(lines)
+    return header + "\n\n".join(body_parts), speaker_ranges
 
 
-def _create_google_doc(drive, folder_id: str, title: str, text: str) -> tuple[str, str]:
+def _create_google_doc(drive, folder_id: str, title: str, text: str, speaker_ranges: list[tuple[int, int]]) -> tuple[str, str]:
     docs = _build_docs()
 
     file_meta = drive.files().create(
@@ -130,10 +144,17 @@ def _create_google_doc(drive, folder_id: str, title: str, text: str) -> tuple[st
     doc_id = file_meta["id"]
     modified_time = file_meta.get("modifiedTime", "")
 
-    docs.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": [{"insertText": {"location": {"index": 1}, "text": text}}]},
-    ).execute()
+    requests = [{"insertText": {"location": {"index": 1}, "text": text}}]
+    for start, end in speaker_ranges:
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": start + 1, "endIndex": end + 1},
+                "textStyle": {"bold": True},
+                "fields": "bold",
+            }
+        })
+
+    docs.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
 
     return doc_id, modified_time
 
@@ -170,15 +191,19 @@ async def import_meeting(request: Request):
     utterances = transcript_resp.get("results", transcript_resp.get("data", []))
     print(f"Utterances: {len(utterances)}", flush=True)
 
+    if not utterances:
+        print(f"No transcript yet for meeting_id={meeting_id}, skipping", flush=True)
+        return {"ok": True, "skipped": True, "reason": "no_transcript"}
+
     title = meeting.get("name") or f"TL;DV {meeting_id}"
-    text = _format_transcript(meeting, utterances)
+    text, speaker_ranges = _format_transcript(meeting, utterances)
     dialog_date, _ = _parse_happened_at(meeting.get("happenedAt", ""))
 
     root_folder_id = _get_root_folder_id()
     drive = _build_drive()
     client_folder_id = _get_or_create_folder(drive, root_folder_id, _CLIENT_NAME)
 
-    doc_id, modified_time = _create_google_doc(drive, client_folder_id, title, text)
+    doc_id, modified_time = _create_google_doc(drive, client_folder_id, title, text, speaker_ranges)
     print(f"Created Google Doc: doc_id={doc_id} title={title!r}", flush=True)
 
     db.collection(_COLLECTION).document(doc_id).set({
