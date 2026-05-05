@@ -47,7 +47,7 @@ Responsibilities:
 
 ## 3. Checker (Cloud Function)
 
-Lightweight scheduler triggered every 15 minutes by Cloud Scheduler.
+Lightweight scheduler triggered daily at 4am by Cloud Scheduler (configurable via `SYNC_CHECKER_SCHEDULE`).
 
 Responsibilities:
 
@@ -211,7 +211,7 @@ ALLOWED_EMAIL=your-email@gmail.com
 # Scheduler
 VECTOR_SYNC_QUEUE=tlbrain-vector-sync-queue
 CLOUD_TASKS_MAX_CONCURRENT=2
-SYNC_INTERVAL_MINUTES=15
+SYNC_CHECKER_SCHEDULE="0 4 * * *"
 
 # Local development only (Cloud Run uses ADC automatically)
 # GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
@@ -413,7 +413,7 @@ Implemented (v0.10):
 - structured JSON logging (Cloud Run / Cloud Logging compatible)
 - combined summary + facts LLM call (single Gemini request per window)
 - Cloud Tasks queue for parallel document sync
-- Cloud Function checker — scans Drive every 15 min, dispatches sync tasks
+- Cloud Function checker — scans Drive daily at 4am, dispatches sync tasks for missed imports
 - Google OAuth 2.0 for MCP endpoint (single-user access via ALLOWED_EMAIL)
 
 ---
