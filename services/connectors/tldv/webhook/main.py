@@ -1,26 +1,31 @@
 import json
+import logging
 import os
 
 import functions_framework
 
+from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 
 @functions_framework.http
 def tldv_webhook(request):
     payload = request.get_json(silent=True) or {}
-    print("TL;DV webhook payload:", json.dumps(payload), flush=True)
+    logger.info("TL;DV webhook payload: %s", json.dumps(payload))
 
     meeting_id = payload.get("data", {}).get("meetingId")
     if not meeting_id:
-        print("No meetingId in payload:", payload, flush=True)
+        logger.warning("No meetingId in payload: %s", payload)
         return {"error": "missing meetingId"}, 400
 
     import_service_url = os.environ.get("TLDV_IMPORT_SERVICE_URL", "")
     queue_name = os.environ["TLDV_IMPORT_QUEUE"]
 
     if not import_service_url:
-        print(f"TLDV_IMPORT_SERVICE_URL not set, skipping task for meeting_id={meeting_id}", flush=True)
+        logger.warning("TLDV_IMPORT_SERVICE_URL not set, skipping task for meeting_id=%s", meeting_id)
         return {"ok": True}, 200
 
     queued = enqueue_task(
@@ -30,8 +35,8 @@ def tldv_webhook(request):
         body={"meeting_id": meeting_id},
     )
     if queued:
-        print(f"Task created for meeting_id={meeting_id}", flush=True)
+        logger.info("Task created for meeting_id=%s", meeting_id)
     else:
-        print(f"Task already exists for meeting_id={meeting_id}, skipping", flush=True)
+        logger.info("Task already exists for meeting_id=%s, skipping", meeting_id)
 
     return {"ok": True}, 200

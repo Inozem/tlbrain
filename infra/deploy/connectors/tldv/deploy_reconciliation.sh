@@ -37,6 +37,7 @@ mkdir -p "${STAGE}/core/google_drive"
 cp "${REPO_ROOT}/core/__init__.py" "${STAGE}/core/"
 cp "${REPO_ROOT}/core/utils/__init__.py" "${STAGE}/core/utils/"
 cp "${REPO_ROOT}/core/utils/tasks.py" "${STAGE}/core/utils/"
+cp "${REPO_ROOT}/core/utils/logging.py" "${STAGE}/core/utils/"
 cp "${REPO_ROOT}/core/google_drive/__init__.py" "${STAGE}/core/google_drive/"
 cp "${REPO_ROOT}/core/google_drive/firestore.py" "${STAGE}/core/google_drive/"
 

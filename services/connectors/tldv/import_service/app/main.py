@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -10,8 +11,12 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.google_drive.firestore import COLLECTION_NAME
+from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import tldv_get
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 _SCOPES = [
     "https://www.googleapis.com/auth/drive",
@@ -150,7 +155,7 @@ async def import_meeting(request: Request):
     if not meeting_id:
         return JSONResponse({"error": "missing meeting_id"}, status_code=400)
 
-    print(f"Importing meeting_id={meeting_id}", flush=True)
+    logger.info("Importing meeting_id=%s", meeting_id)
 
     db = firestore.Client()
     existing = list(
@@ -160,18 +165,18 @@ async def import_meeting(request: Request):
         .stream()
     )
     if existing:
-        print(f"Already imported: {meeting_id}", flush=True)
+        logger.info("Already imported: %s", meeting_id)
         return {"ok": True, "skipped": True}
 
     meeting = tldv_get(f"/meetings/{meeting_id}")
-    print(f"Meeting: {meeting.get('name')!r}", flush=True)
+    logger.info("Meeting: %r", meeting.get("name"))
 
     transcript_resp = tldv_get(f"/meetings/{meeting_id}/transcript")
     utterances = transcript_resp.get("results", transcript_resp.get("data", []))
-    print(f"Utterances: {len(utterances)}", flush=True)
+    logger.info("Utterances: %d", len(utterances))
 
     if not utterances:
-        print(f"No transcript yet for meeting_id={meeting_id}, skipping", flush=True)
+        logger.warning("No transcript yet for meeting_id=%s, skipping", meeting_id)
         return {"ok": True, "skipped": True, "reason": "no_transcript"}
 
     client_name = os.environ.get("TLDV_CLIENT_NAME", "_unassigned")
@@ -184,7 +189,7 @@ async def import_meeting(request: Request):
     client_folder_id = _get_or_create_folder(drive, root_folder_id, client_name)
 
     doc_id, modified_time = _create_google_doc(drive, client_folder_id, title, text, speaker_ranges)
-    print(f"Created Google Doc: doc_id={doc_id} title={title!r}", flush=True)
+    logger.info("Created Google Doc: doc_id=%s title=%r", doc_id, title)
 
     db.collection(COLLECTION_NAME).document(doc_id).set({
         "doc_id": doc_id,
@@ -202,7 +207,7 @@ async def import_meeting(request: Request):
         "synced_at": None,
         "error": None,
     })
-    print(f"Saved to Firestore: doc_id={doc_id}", flush=True)
+    logger.info("Saved to Firestore: doc_id=%s", doc_id)
 
     vector_sync_url = os.environ.get("VECTOR_SYNC_URL", "")
     vector_sync_queue = os.environ.get("VECTOR_SYNC_QUEUE", "")
@@ -213,8 +218,8 @@ async def import_meeting(request: Request):
             task_id=doc_id,
             url=f"{vector_sync_url}/sync/doc/{doc_id}",
         )
-        print(f"Queued vector sync: doc_id={doc_id}", flush=True)
+        logger.info("Queued vector sync: doc_id=%s", doc_id)
     else:
-        print("VECTOR_SYNC_URL or VECTOR_SYNC_QUEUE not set, skipping sync queue", flush=True)
+        logger.warning("VECTOR_SYNC_URL or VECTOR_SYNC_QUEUE not set, skipping sync queue")
 
     return {"ok": True, "doc_id": doc_id, "meeting_id": meeting_id}

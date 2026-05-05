@@ -32,6 +32,7 @@ mkdir -p "${STAGE}/core/utils"
 cp "${REPO_ROOT}/core/__init__.py" "${STAGE}/core/"
 cp "${REPO_ROOT}/core/utils/__init__.py" "${STAGE}/core/utils/"
 cp "${REPO_ROOT}/core/utils/tasks.py" "${STAGE}/core/utils/"
+cp "${REPO_ROOT}/core/utils/logging.py" "${STAGE}/core/utils/"
 
 gcloud functions deploy "${TLDV_WEBHOOK_FUNCTION_NAME}" \
   --gen2 \

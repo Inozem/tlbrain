@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -5,8 +6,12 @@ import functions_framework
 from google.cloud import firestore
 
 from core.google_drive.firestore import COLLECTION_NAME
+from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import get_meetings
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 
 @functions_framework.http
@@ -15,10 +20,10 @@ def tldv_reconciliation(request):
     queue_name = os.environ["TLDV_IMPORT_QUEUE"]
 
     since = datetime.now(timezone.utc) - timedelta(hours=48)
-    print(f"Fetching TL;DV meetings since {since.isoformat()}", flush=True)
+    logger.info("Fetching TL;DV meetings since %s", since.isoformat())
 
     meetings = get_meetings(since)
-    print(f"Found {len(meetings)} meetings in TL;DV", flush=True)
+    logger.info("Found %d meetings in TL;DV", len(meetings))
 
     db = firestore.Client()
     existing = {
@@ -28,10 +33,10 @@ def tldv_reconciliation(request):
     }
 
     missing = [m for m in meetings if m["id"] not in existing]
-    print(f"Missing in Firestore: {len(missing)}", flush=True)
+    logger.info("Missing in Firestore: %d", len(missing))
 
     if not import_service_url:
-        print("TLDV_IMPORT_SERVICE_URL not set, skipping task creation", flush=True)
+        logger.warning("TLDV_IMPORT_SERVICE_URL not set, skipping task creation")
         return {"meetings": len(meetings), "missing": len(missing), "queued": 0}, 200
 
     queued = 0
@@ -44,9 +49,9 @@ def tldv_reconciliation(request):
             body={"meeting_id": meeting_id},
         ):
             queued += 1
-            print(f"Task created for meeting_id={meeting_id}", flush=True)
+            logger.info("Task created for meeting_id=%s", meeting_id)
         else:
-            print(f"Task already exists for meeting_id={meeting_id}, skipping", flush=True)
+            logger.info("Task already exists for meeting_id=%s, skipping", meeting_id)
 
-    print(f"Reconciliation done — meetings={len(meetings)} missing={len(missing)} queued={queued}", flush=True)
+    logger.info("Reconciliation done — meetings=%d missing=%d queued=%d", len(meetings), len(missing), queued)
     return {"meetings": len(meetings), "missing": len(missing), "queued": queued}, 200
