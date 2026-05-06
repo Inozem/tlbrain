@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements-common.txt /app/requirements-common.txt
 COPY core/utils/requirements.txt /app/core/utils/requirements.txt
 COPY core/google_drive/requirements.txt /app/core/google_drive/requirements.txt
+COPY core/gemini/requirements.txt /app/core/gemini/requirements.txt
 COPY services/connectors/tldv/import_service/requirements.txt /app/services/connectors/tldv/import_service/requirements.txt
 
 RUN pip install --no-cache-dir -r /app/services/connectors/tldv/import_service/requirements.txt

@@ -2,14 +2,15 @@ import logging
 import os
 from datetime import datetime, timezone
 
-import google.api_core.exceptions
 import google.auth
+import requests as http_requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from google.cloud import firestore
 from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
+from core.gemini.llm import call_gemini_json
 from core.google_drive.firestore import COLLECTION_NAME
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
@@ -143,6 +144,136 @@ def _create_google_doc(drive, folder_id: str, title: str, text: str, speaker_ran
     return doc_id, modified_time
 
 
+_CONFIDENCE_THRESHOLD = 0.8
+
+_DETECT_PROMPT_STAGE1 = """\
+You are classifying a business meeting to a known client.
+
+Meeting name: {meeting_name}
+Known clients: {clients}
+
+Which client does this meeting belong to? Reply with valid JSON only:
+{{"client_name": "...", "confidence": 0.0}}
+
+Rules:
+- client_name must be exactly one of the known clients, or null if unsure
+- confidence 0.0-1.0; only use >=0.8 when highly certain
+- If no known clients match or you are unsure, use null and low confidence
+"""
+
+_DETECT_PROMPT_STAGE2 = """\
+You are classifying a business meeting to a known client.
+
+Meeting name: {meeting_name}
+Transcript excerpt:
+{transcript}
+
+Known clients: {clients}
+
+Which client does this meeting belong to? Reply with valid JSON only:
+{{"client_name": "...", "confidence": 0.0}}
+
+Rules:
+- client_name must be exactly one of the known clients, or null if unsure
+- confidence 0.0-1.0; only use >=0.8 when highly certain
+- If no known clients match or you are unsure, use null and low confidence
+"""
+
+
+_SPEAKER_MIN_CLIENTS = 1
+_SPEAKER_MAX_CLIENTS = 4
+
+
+def _get_existing_clients(db: firestore.Client) -> list[str]:
+    docs = db.collection(COLLECTION_NAME).select(["client_name"]).stream()
+    clients = {d.to_dict().get("client_name") for d in docs}
+    clients.discard(None)
+    clients.discard("_unassigned")
+    return sorted(clients)
+
+
+def _get_speakers(utterances: list[dict]) -> list[str]:
+    speakers = {
+        (u.get("speaker") or u.get("speakerName", "")).replace("::", "").strip()
+        for u in utterances
+        if u.get("text")
+    }
+    speakers.discard("")
+    return sorted(speakers)
+
+
+def _get_candidate_clients(db: firestore.Client, speakers: list[str]) -> list[str] | None:
+    """Return candidate clients based on speaker frequency. None means no signal — use all clients."""
+    candidates: set[str] = set()
+    for speaker in speakers:
+        docs = db.collection(COLLECTION_NAME) \
+            .where(filter=firestore.FieldFilter("speakers", "array_contains", speaker)) \
+            .select(["client_name"]) \
+            .stream()
+        client_names = {
+            d.to_dict().get("client_name") for d in docs
+        } - {None, "_unassigned"}
+        count = len(client_names)
+        if _SPEAKER_MIN_CLIENTS <= count <= _SPEAKER_MAX_CLIENTS:
+            candidates.update(client_names)
+    return sorted(candidates) if candidates else None
+
+
+def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[dict]) -> str:
+    existing_clients = _get_existing_clients(db)
+    if not existing_clients:
+        return "_unassigned"
+
+    meeting_name = meeting.get("name", "")
+
+    # Stage 1: speaker frequency analysis
+    speakers = _get_speakers(utterances)
+    candidates = _get_candidate_clients(db, speakers)
+    if candidates is not None and len(candidates) == 1:
+        logger.info("Client detected via speakers: %s", candidates[0])
+        return candidates[0]
+
+    clients_to_check = candidates if candidates else existing_clients
+    clients_str = ", ".join(clients_to_check)
+
+    # Stage 2: Gemini by meeting name (restricted to candidates or all)
+    try:
+        result = call_gemini_json(_DETECT_PROMPT_STAGE1.format(
+            meeting_name=meeting_name,
+            clients=clients_str,
+        ))
+        client_name = result.get("client_name")
+        confidence = result.get("confidence", 0)
+        if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
+            logger.info("Client detected via meeting name: %s (confidence=%.2f)", client_name, confidence)
+            return client_name
+    except Exception as exc:
+        logger.warning("Stage 2 client detection failed: %s", exc)
+
+    # Stage 3: Gemini by first 15 utterances (restricted to candidates or all)
+    excerpt = "\n".join(
+        f"{u.get('speaker', '')}: {u.get('text', '')}"
+        for u in utterances[:15]
+        if u.get("text")
+    )
+    try:
+        result = call_gemini_json(_DETECT_PROMPT_STAGE2.format(
+            meeting_name=meeting_name,
+            transcript=excerpt,
+            clients=clients_str,
+        ))
+        client_name = result.get("client_name")
+        confidence = result.get("confidence", 0)
+        if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
+            logger.info("Client detected via transcript: %s (confidence=%.2f)", client_name, confidence)
+            return client_name
+    except Exception as exc:
+        logger.warning("Stage 3 client detection failed: %s", exc)
+
+    logger.info("Client not detected, falling back to _unassigned")
+    return "_unassigned"
+
+
 @app.get("/")
 async def health():
     return {"status": "ok"}
@@ -168,10 +299,22 @@ async def import_meeting(request: Request):
         logger.info("Already imported: %s", meeting_id)
         return {"ok": True, "skipped": True}
 
-    meeting = tldv_get(f"/meetings/{meeting_id}")
+    try:
+        meeting = tldv_get(f"/meetings/{meeting_id}")
+    except http_requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            logger.warning("Meeting not found in TL;DV API, skipping: %s", meeting_id)
+            return {"ok": True, "skipped": True, "reason": "meeting_not_found"}
+        raise
     logger.info("Meeting: %r", meeting.get("name"))
 
-    transcript_resp = tldv_get(f"/meetings/{meeting_id}/transcript")
+    try:
+        transcript_resp = tldv_get(f"/meetings/{meeting_id}/transcript")
+    except http_requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            logger.warning("Transcript not found for meeting_id=%s, skipping", meeting_id)
+            return {"ok": True, "skipped": True, "reason": "transcript_not_found"}
+        raise
     utterances = transcript_resp.get("results", transcript_resp.get("data", []))
     logger.info("Utterances: %d", len(utterances))
 
@@ -179,7 +322,7 @@ async def import_meeting(request: Request):
         logger.warning("No transcript yet for meeting_id=%s, skipping", meeting_id)
         return {"ok": True, "skipped": True, "reason": "no_transcript"}
 
-    client_name = os.environ.get("TLDV_CLIENT_NAME", "_unassigned")
+    client_name = _detect_client_name(db, meeting, utterances)
     title = meeting.get("name") or f"TL;DV {meeting_id}"
     text, speaker_ranges = _format_transcript(meeting, utterances)
     dialog_date, _ = _parse_happened_at(meeting.get("happenedAt", ""))
@@ -200,6 +343,7 @@ async def import_meeting(request: Request):
         "provider": "tldv",
         "source_file": title,
         "tldv_meeting_id": meeting_id,
+        "speakers": _get_speakers(utterances),
         "modifiedTime": modified_time,
         "status": "imported",
         "imported_at": datetime.now(timezone.utc).isoformat(),

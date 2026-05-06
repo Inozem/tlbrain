@@ -45,6 +45,21 @@ Dialogue:
 {dialog}"""
 
 
+def call_gemini_json(prompt: str) -> dict:
+    client = _client()
+    last_exc: Exception | None = None
+    for attempt in range(RETRIES):
+        try:
+            text = _generate_content(client, prompt)
+            return json.loads(_strip_fences(text))
+        except (ValueError, KeyError) as exc:
+            last_exc = exc
+            logger.warning("JSON parse error on attempt %d/%d: %s", attempt + 1, RETRIES, exc)
+            if attempt < RETRIES - 1:
+                time.sleep(BACKOFFS[attempt])
+    raise RuntimeError(f"Gemini JSON call failed after {RETRIES} attempts") from last_exc
+
+
 def generate_summary_and_facts(utterances: list[dict[str, Any]]) -> tuple[str, list[str]]:
     client = _client()
     dialog = _format_dialog(utterances)

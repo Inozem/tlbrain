@@ -1,4 +1,5 @@
 -r ../../../../requirements-common.txt
 -r ../../../../core/utils/requirements.txt
 -r ../../../../core/google_drive/requirements.txt
+-r ../../../../core/gemini/requirements.txt
 requests==2.32.3
