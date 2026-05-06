@@ -47,7 +47,7 @@ Responsibilities:
 
 ## 3. Checker (Cloud Function)
 
-Lightweight scheduler triggered daily at 4am by Cloud Scheduler (configurable via `SYNC_CHECKER_SCHEDULE`).
+Lightweight scheduler triggered by Cloud Scheduler on a configurable interval (`VECTOR_SYNC_CHECKER_SCHEDULE`, default: every 15 minutes).
 
 Responsibilities:
 
@@ -55,7 +55,9 @@ Responsibilities:
 - mark changed documents as `imported` in Firestore
 - dispatch per-document sync tasks to Cloud Tasks queue
 
-Intentionally deployed as a Cloud Function rather than Cloud Run to minimize cost — it runs on a fixed schedule with no idle traffic, so a always-on container would be wasteful.
+**The interval directly controls how quickly changes in Google Drive appear in the knowledge base.** After a transcript is added or updated in Drive, the Checker will pick it up on the next scheduled run. To get faster updates, set a shorter interval (minimum recommended: 5 minutes).
+
+Intentionally deployed as a Cloud Function rather than Cloud Run to minimize cost — it runs on a fixed schedule with no idle traffic, so an always-on container would be wasteful.
 
 ---
 
@@ -211,7 +213,9 @@ ALLOWED_EMAIL=your-email@gmail.com
 # Scheduler
 VECTOR_SYNC_QUEUE=tlbrain-vector-sync-queue
 CLOUD_TASKS_MAX_CONCURRENT=2
-SYNC_CHECKER_SCHEDULE="0 4 * * *"
+# How often Checker scans Drive — controls update latency after Drive changes.
+# "*/5 * * * *" = every 5 min (fast), "*/15 * * * *" = every 15 min (default), "0 4 * * *" = daily
+VECTOR_SYNC_CHECKER_SCHEDULE="*/15 * * * *"
 
 # Local development only (Cloud Run uses ADC automatically)
 # GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
@@ -413,7 +417,7 @@ Implemented (v0.10):
 - structured JSON logging (Cloud Run / Cloud Logging compatible)
 - combined summary + facts LLM call (single Gemini request per window)
 - Cloud Tasks queue for parallel document sync
-- Cloud Function checker — scans Drive daily at 4am, dispatches sync tasks for missed imports
+- Cloud Function checker — scans Drive on a configurable schedule (default: every 15 min), dispatches sync tasks via Cloud Tasks
 - Google OAuth 2.0 for MCP endpoint (single-user access via ALLOWED_EMAIL)
 
 ---

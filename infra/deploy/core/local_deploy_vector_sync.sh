@@ -15,7 +15,7 @@ VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}
 VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME:-tlbrain-vector-sync-checker}
 VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE:-tlbrain-vector-sync-queue}
 CLOUD_TASKS_MAX_CONCURRENT=${CLOUD_TASKS_MAX_CONCURRENT:-2}
-SYNC_CHECKER_SCHEDULE=${SYNC_CHECKER_SCHEDULE:-"0 4 * * *"}
+
 SYNC_IMAGE="gcr.io/${PROJECT_ID}/${VECTOR_SYNC_SERVICE_NAME}"
 
 echo "--- Building Vector Sync image ---"
@@ -49,19 +49,6 @@ bash "${SCRIPT_DIR}/deploy_vector_sync_checker.sh"
 CHECKER_URL=$(gcloud functions describe "${VECTOR_SYNC_CHECKER_NAME}" \
   --region "${REGION}" \
   --format='value(serviceConfig.uri)')
-
-echo "Creating Cloud Scheduler job..."
-gcloud scheduler jobs create http "${VECTOR_SYNC_CHECKER_NAME}-schedule" \
-  --location="${REGION}" \
-  --schedule="${SYNC_CHECKER_SCHEDULE}" \
-  --uri="${CHECKER_URL}" \
-  --http-method=POST \
-  2>/dev/null || \
-gcloud scheduler jobs update http "${VECTOR_SYNC_CHECKER_NAME}-schedule" \
-  --location="${REGION}" \
-  --schedule="${SYNC_CHECKER_SCHEDULE}" \
-  --uri="${CHECKER_URL}" \
-  --http-method=POST
 
 echo
 echo "Vector Sync: POST ${VECTOR_SYNC_URL}/sync"

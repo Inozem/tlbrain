@@ -14,6 +14,7 @@ REGION=${REGION:-europe-west1}
 VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME:-tlbrain-vector-sync-checker}
 VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE:-tlbrain-vector-sync-queue}
 VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}
+VECTOR_SYNC_CHECKER_SCHEDULE=${VECTOR_SYNC_CHECKER_SCHEDULE:-"*/15 * * * *"}
 
 echo "--- Deploying Vector Sync Checker ---"
 
@@ -55,3 +56,17 @@ CHECKER_URL=$(gcloud functions describe "${VECTOR_SYNC_CHECKER_NAME}" \
 
 echo
 echo "Checker: ${CHECKER_URL}"
+
+gcloud scheduler jobs create http "${VECTOR_SYNC_CHECKER_NAME}-schedule" \
+  --location="${REGION}" \
+  --schedule="${VECTOR_SYNC_CHECKER_SCHEDULE}" \
+  --uri="${CHECKER_URL}" \
+  --http-method=POST \
+  2>/dev/null || \
+gcloud scheduler jobs update http "${VECTOR_SYNC_CHECKER_NAME}-schedule" \
+  --location="${REGION}" \
+  --schedule="${VECTOR_SYNC_CHECKER_SCHEDULE}" \
+  --uri="${CHECKER_URL}" \
+  --http-method=POST
+
+echo "Scheduler set: ${VECTOR_SYNC_CHECKER_SCHEDULE}"

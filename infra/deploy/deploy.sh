@@ -30,7 +30,7 @@ VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}
 VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME:-tlbrain-vector-sync-checker}
 VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE:-tlbrain-vector-sync-queue}
 CLOUD_TASKS_MAX_CONCURRENT=${CLOUD_TASKS_MAX_CONCURRENT:-2}
-SYNC_CHECKER_SCHEDULE=${SYNC_CHECKER_SCHEDULE:-"0 4 * * *"}
+VECTOR_SYNC_CHECKER_SCHEDULE=${VECTOR_SYNC_CHECKER_SCHEDULE:-"*/15 * * * *"}
 TLDV_WEBHOOK_FUNCTION_NAME=${TLDV_WEBHOOK_FUNCTION_NAME:-tlbrain-tldv-webhook}
 GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
 GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
@@ -64,7 +64,7 @@ echo "  Qdrant key:     $(mask "${QDRANT_API_KEY}")"
 echo "  TL;DV key:      $(mask "${TLDV_API_KEY}")"
 echo "  Client ID:      $(mask "${GOOGLE_CLIENT_ID}")"
 echo "  Client Secret:  $(mask "${GOOGLE_CLIENT_SECRET}")"
-echo "  Refresh token:  $(mask "${GOOGLE_REFRESH_TOKEN}")"
+if [ -n "${GOOGLE_REFRESH_TOKEN}" ]; then echo "  Refresh token:  $(mask "${GOOGLE_REFRESH_TOKEN}")"; else echo "  Refresh token:  (not set — will be generated on first run)"; fi
 echo
 
 # =========================
