@@ -26,13 +26,17 @@ trap "rm -rf ${STAGE}" EXIT
 
 cp "${REPO_ROOT}/services/connectors/tldv/webhook/main.py" "${STAGE}/"
 cat "${REPO_ROOT}/services/connectors/tldv/webhook/requirements.txt" \
-    "${REPO_ROOT}/core/utils/requirements.txt" > "${STAGE}/requirements.txt"
+    "${REPO_ROOT}/core/utils/requirements.txt" \
+    "${REPO_ROOT}/core/google_drive/requirements.txt" > "${STAGE}/requirements.txt"
 
 mkdir -p "${STAGE}/core/utils"
+mkdir -p "${STAGE}/core/google_drive"
 cp "${REPO_ROOT}/core/__init__.py" "${STAGE}/core/"
 cp "${REPO_ROOT}/core/utils/__init__.py" "${STAGE}/core/utils/"
 cp "${REPO_ROOT}/core/utils/tasks.py" "${STAGE}/core/utils/"
 cp "${REPO_ROOT}/core/utils/logging.py" "${STAGE}/core/utils/"
+cp "${REPO_ROOT}/core/google_drive/__init__.py" "${STAGE}/core/google_drive/"
+cp "${REPO_ROOT}/core/google_drive/firestore.py" "${STAGE}/core/google_drive/"
 
 gcloud functions deploy "${TLDV_WEBHOOK_FUNCTION_NAME}" \
   --gen2 \

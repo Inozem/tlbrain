@@ -55,6 +55,41 @@ def mark_error(doc_id: str, error: str) -> None:
     logger.info("Marked error: %s — %s", doc_id, error)
 
 
+def write_queued(meeting_id: str) -> bool:
+    """Create a placeholder queued record for a meeting. Returns True if created, False if already existed."""
+    db = _get_db()
+    ref = db.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        if ref.get(transaction=transaction).exists:
+            return False
+        transaction.set(ref, {
+            "tldv_meeting_id": meeting_id,
+            "status": "queued",
+            "queued_at": firestore.SERVER_TIMESTAMP,
+        })
+        return True
+
+    result = _txn(db.transaction())
+    if result:
+        logger.info("Queued: %s", meeting_id)
+    return result
+
+
+def mark_downloading(meeting_id: str) -> None:
+    _get_db().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
+        "status": "downloading",
+        "downloading_started_at": firestore.SERVER_TIMESTAMP,
+    })
+    logger.info("Marked downloading: %s", meeting_id)
+
+
+def delete_queued_placeholder(meeting_id: str) -> None:
+    _get_db().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").delete()
+    logger.info("Deleted queued placeholder: %s", meeting_id)
+
+
 def list_imported() -> list[dict]:
     """Return all docs with status=imported."""
     db = _get_db()

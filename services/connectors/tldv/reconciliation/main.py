@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import functions_framework
 from google.cloud import firestore
 
-from core.google_drive.firestore import COLLECTION_NAME
+from core.google_drive.firestore import COLLECTION_NAME, write_queued
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import get_meetings
@@ -48,6 +48,7 @@ def tldv_reconciliation(request):
             url=f"{import_service_url}/import",
             body={"meeting_id": meeting_id},
         ):
+            write_queued(meeting_id)
             queued += 1
             logger.info("Task created for meeting_id=%s", meeting_id)
         else:

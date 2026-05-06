@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.gemini.llm import call_gemini_json
-from core.google_drive.firestore import COLLECTION_NAME
+from core.google_drive.firestore import COLLECTION_NAME, delete_queued_placeholder, mark_downloading
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import tldv_get
@@ -292,12 +292,13 @@ async def import_meeting(request: Request):
     existing = list(
         db.collection(COLLECTION_NAME)
         .where(filter=firestore.FieldFilter("tldv_meeting_id", "==", meeting_id))
-        .limit(1)
         .stream()
     )
-    if existing:
+    if any(d.to_dict().get("status") != "queued" for d in existing):
         logger.info("Already imported: %s", meeting_id)
         return {"ok": True, "skipped": True}
+
+    mark_downloading(meeting_id)
 
     try:
         meeting = tldv_get(f"/meetings/{meeting_id}")
@@ -352,6 +353,7 @@ async def import_meeting(request: Request):
         "error": None,
     })
     logger.info("Saved to Firestore: doc_id=%s", doc_id)
+    delete_queued_placeholder(meeting_id)
 
     vector_sync_url = os.environ.get("VECTOR_SYNC_URL", "")
     vector_sync_queue = os.environ.get("VECTOR_SYNC_QUEUE", "")

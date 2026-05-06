@@ -4,6 +4,7 @@ import os
 
 import functions_framework
 
+from core.google_drive.firestore import write_queued
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 
@@ -35,6 +36,7 @@ def tldv_webhook(request):
         body={"meeting_id": meeting_id},
     )
     if queued:
+        write_queued(meeting_id)
         logger.info("Task created for meeting_id=%s", meeting_id)
     else:
         logger.info("Task already exists for meeting_id=%s, skipping", meeting_id)
