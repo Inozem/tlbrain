@@ -18,7 +18,7 @@ TLBrain is optimized for **single-user / consultant workflows** with large volum
 
 # Architecture
 
-TLBrain uses a monorepo with two independent Cloud Run services.
+TLBrain uses a monorepo with two independent Cloud Run services, a Cloud Function checker, and a TL;DV connector.
 
 ## 1. MCP Service
 
@@ -31,7 +31,7 @@ Responsibilities:
 - memory search
 - user-facing requests
 
-## 2. Sync Service
+## 2. Vector Sync Service
 
 Background indexing service.
 
@@ -42,10 +42,10 @@ Responsibilities:
 - parse utterances, generate summaries and structured facts via Gemini
 - embed summaries and facts into Qdrant (vector store)
 - detect content changes via SHA-256 hash
-- maintain Firestore index with status machine (`imported → syncing → synced / error`)
+- maintain Firestore index with status machine (`queued → downloading → imported → syncing → synced / error`)
 - recover stale syncing tasks automatically
 
-## 3. Checker (Cloud Function)
+## 3. Vector Sync Checker (Cloud Function)
 
 Lightweight scheduler triggered by Cloud Scheduler on a configurable interval (`VECTOR_SYNC_CHECKER_SCHEDULE`, default: every 15 minutes).
 
@@ -59,6 +59,29 @@ Responsibilities:
 
 Intentionally deployed as a Cloud Function rather than Cloud Run to minimize cost — it runs on a fixed schedule with no idle traffic, so an always-on container would be wasteful.
 
+## 4. TL;DV Connector
+
+Three components that bring TL;DV transcripts into the system automatically.
+
+### TL;DV Webhook (Cloud Function)
+
+Receives `TranscriptReady` webhook from TL;DV, writes `status=queued` to Firestore, and dispatches an import task to Cloud Tasks. Idempotent.
+
+### TL;DV Reconciliation (Cloud Function)
+
+Runs daily at 03:00. Fetches TL;DV meetings from the last 48 hours, compares with Firestore, and dispatches import tasks for any missing transcripts. Idempotent.
+
+### TL;DV Import Service (Cloud Run, scale to 0)
+
+Receives an import task from Cloud Tasks with a `meeting_id`. Downloads the transcript from TL;DV API, detects the client name via a 3-stage chain (speaker frequency → Gemini by meeting name → Gemini by transcript excerpt → `_unassigned`), creates a native Google Doc in `ROOT_FOLDER/{client_name}/`, and writes `status=imported` to Firestore. The Vector Sync pipeline picks it up from there.
+
+**Firestore status machine:**
+
+```
+queued → downloading → imported → syncing → synced
+                                           ↘ error
+```
+
 ---
 
 # Repository Structure
@@ -68,8 +91,13 @@ tlbrain/
 ├── core/
 ├── services/
 │   ├── mcp/
-│   ├── sync/
-│   └── checker/
+│   ├── vector_sync/
+│   ├── vector_sync_checker/
+│   └── connectors/
+│       └── tldv/
+│           ├── import_service/
+│           ├── reconciliation/
+│           └── webhook/
 ├── infra/
 │   ├── docker/
 │   └── deploy/
@@ -181,8 +209,8 @@ Recommended permission: Viewer.
 ## 7. Configure `.env`
 
 ```env
-# Version to deploy (must match a Docker Hub tag, e.g. v0.10)
-VERSION=v0.10
+# Version to deploy (must match a Docker Hub tag, e.g. v0.11)
+VERSION=v0.11
 
 # Google Cloud
 PROJECT_ID=tlbrain-prod
@@ -216,6 +244,15 @@ CLOUD_TASKS_MAX_CONCURRENT=2
 # How often Checker scans Drive — controls update latency after Drive changes.
 # "*/5 * * * *" = every 5 min (fast), "*/15 * * * *" = every 15 min (default), "0 4 * * *" = daily
 VECTOR_SYNC_CHECKER_SCHEDULE="*/15 * * * *"
+
+# TL;DV Connector
+TLDV_API_KEY=your-tldv-api-key
+TLDV_IMPORT_QUEUE=tlbrain-tldv-import-queue
+TLDV_IMPORT_SERVICE_NAME=tlbrain-tldv-import
+TLDV_WEBHOOK_FUNCTION_NAME=tlbrain-tldv-webhook
+TLDV_RECONCILIATION_FUNCTION_NAME=tlbrain-tldv-reconciliation
+# Daily reconciliation schedule (default: 03:00)
+TLDV_RECONCILIATION_SCHEDULE="0 3 * * *"
 
 # Local development only (Cloud Run uses ADC automatically)
 # GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
@@ -303,7 +340,31 @@ This is required to avoid refresh tokens expiring every 7 days (Testing mode lim
 
 ---
 
-## 11. Connect Claude Cowork to MCP
+## 11. Set Up TL;DV Webhook
+
+Deploy the TL;DV connector:
+
+```bash
+bash infra/deploy/connectors/deploy_tldv.sh
+```
+
+This deploys:
+
+- TL;DV Import Service (Cloud Run)
+- TL;DV Webhook Function (Cloud Function)
+- TL;DV Reconciliation Function (Cloud Function + Cloud Scheduler)
+
+After deploy, copy the webhook URL printed at the end and add it in TL;DV:
+
+1. Open TL;DV → Settings → Integrations → Webhooks
+2. Add webhook URL: `https://YOUR-WEBHOOK-URL`
+3. Select event: `TranscriptReady`
+
+From this point, every new TL;DV recording will automatically appear in the knowledge base within minutes. The daily reconciliation at 03:00 catches any missed webhooks.
+
+---
+
+## 12. Connect Claude Cowork to MCP
 
 ### Set up Google OAuth Client
 
@@ -330,7 +391,7 @@ Redeploy after this change.
 
 ---
 
-## 11. Check Logs
+## 13. Check Logs
 
 ```bash
 gcloud run services logs read tlbrain-sync --region europe-west1 --limit 50
@@ -339,7 +400,7 @@ gcloud run services logs read tlbrain-mcp --region europe-west1 --limit 50
 
 ---
 
-## 12. Set Up Qdrant Cloud
+## 14. Set Up Qdrant Cloud
 
 TLBrain uses Qdrant Cloud as the vector store for semantic search.
 
@@ -384,11 +445,20 @@ print('OK — collection ready')
 |---|---|
 | `query` | Semantic search over client conversation transcripts. Supports `client_name`, `date_from`, `date_to` filters. |
 | `get_transcript` | Retrieve full transcripts without semantic search. By `doc_id`, or by `client_name` with optional `limit` and date range. |
-| `list_clients` | List all clients in the knowledge base with dialog count and last dialog date. |
+| `list_clients` | List all clients with dialog count and last dialog date. If unassigned transcripts exist, returns a `suggestion` and a `transcripts` list with `doc_id` and `dialog_date` to help assign them. |
 
 ---
 
 # Current Status
+
+Implemented (v0.11):
+
+- TL;DV Webhook Function — receives `TranscriptReady`, writes `queued` to Firestore, dispatches import task
+- TL;DV Reconciliation Function — daily sync of last 48h, catches missed webhooks
+- TL;DV Import Service — downloads transcript, detects client via 3-stage chain, creates Google Doc
+- 3-stage client detection: speaker frequency → Gemini by meeting name → Gemini by transcript → `_unassigned`
+- Firestore `queued` and `downloading` statuses — full state machine before `imported`
+- `list_clients` — unassigned transcripts list with `doc_id` and `dialog_date`, `suggestion` field
 
 Implemented (v0.10):
 
@@ -432,7 +502,7 @@ Implemented (v0.10):
 - ~~v0.8 — Filters + get_transcript + list_clients~~ ✓
 - ~~v0.9 — Scheduler + Stability~~ ✓
 - ~~v0.10 — Production Ready~~ ✓
-- v0.11 — TL;DV Connector
+- ~~v0.11 — TL;DV Connector~~ ✓
 - v0.12 — MCP Management Tools
 
 ---
