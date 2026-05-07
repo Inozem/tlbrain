@@ -49,10 +49,17 @@ def list_clients() -> list[dict[str, Any]]:
     result = []
     for client_name in sorted(seen):
         docs = seen[client_name]
-        result.append({
+        entry: dict = {
             "client_name": client_name,
             "dialog_count": len(docs),
             "last_dialog_date": max(docs.values()) if docs else "",
-        })
+        }
+        if client_name == "_unassigned":
+            entry["transcripts"] = sorted(
+                [{"doc_id": doc_id, "dialog_date": date} for doc_id, date in docs.items()],
+                key=lambda x: x["dialog_date"],
+                reverse=True,
+            )
+        result.append(entry)
 
     return result

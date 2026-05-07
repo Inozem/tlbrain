@@ -147,7 +147,7 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                 },
                 {
                     "name": "list_clients",
-                    "description": "List all clients in the knowledge base with their dialog count and last dialog date. Call this first to discover available clients before querying.",
+                    "description": "List all clients in the knowledge base with their dialog count and last dialog date. Call this first to discover available clients before querying. If the response contains a 'suggestion' field, present it to the user.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -286,5 +286,13 @@ def _handle_list_clients(request: JSONRPCRequest) -> dict:
         },
     )
 
-    content = build_mcp_content({"clients": clients})
+    payload: dict = {"clients": clients}
+    unassigned = next((c for c in clients if c["client_name"] == "_unassigned"), None)
+    if unassigned and unassigned.get("dialog_count", 0) > 0:
+        payload["suggestion"] = (
+            f"{unassigned['dialog_count']} transcript(s) are unassigned. "
+            f"Ask the user to review and assign them to a client. "
+            f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
+        )
+    content = build_mcp_content(payload)
     return build_jsonrpc_result(request.id, content)
