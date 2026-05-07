@@ -184,14 +184,6 @@ _SPEAKER_MIN_CLIENTS = 1
 _SPEAKER_MAX_CLIENTS = 4
 
 
-def _get_existing_clients(db: firestore.Client) -> list[str]:
-    docs = db.collection(COLLECTION_NAME).select(["client_name"]).stream()
-    clients = {d.to_dict().get("client_name") for d in docs}
-    clients.discard(None)
-    clients.discard("_unassigned")
-    return sorted(clients)
-
-
 def _get_speakers(utterances: list[dict]) -> list[str]:
     speakers = {
         (u.get("speaker") or u.get("speakerName", "")).replace("::", "").strip()
@@ -202,9 +194,16 @@ def _get_speakers(utterances: list[dict]) -> list[str]:
     return sorted(speakers)
 
 
-def _get_candidate_clients(db: firestore.Client, speakers: list[str]) -> list[str] | None:
-    """Return candidate clients based on speaker frequency. None means no signal — use all clients."""
+def _get_clients_by_speakers(db: firestore.Client, speakers: list[str]) -> tuple[list[str], list[str]]:
+    """Query transcript_index by speakers.
+
+    Returns (candidates, all_clients):
+    - candidates: clients where at least one speaker appears in 1-4 unique clients
+    - all_clients: all unique clients seen across all speaker queries (fallback for Gemini)
+    """
+    all_clients: set[str] = set()
     candidates: set[str] = set()
+
     for speaker in speakers:
         docs = db.collection(COLLECTION_NAME) \
             .where(filter=firestore.FieldFilter("speakers", "array_contains", speaker)) \
@@ -213,27 +212,29 @@ def _get_candidate_clients(db: firestore.Client, speakers: list[str]) -> list[st
         client_names = {
             d.to_dict().get("client_name") for d in docs
         } - {None, "_unassigned"}
-        count = len(client_names)
-        if _SPEAKER_MIN_CLIENTS <= count <= _SPEAKER_MAX_CLIENTS:
+        all_clients.update(client_names)
+        if _SPEAKER_MIN_CLIENTS <= len(client_names) <= _SPEAKER_MAX_CLIENTS:
             candidates.update(client_names)
-    return sorted(candidates) if candidates else None
+
+    return sorted(candidates), sorted(all_clients)
 
 
 def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[dict]) -> str:
-    existing_clients = _get_existing_clients(db)
-    if not existing_clients:
-        return "_unassigned"
-
     meeting_name = meeting.get("name", "")
 
     # Stage 1: speaker frequency analysis
     speakers = _get_speakers(utterances)
-    candidates = _get_candidate_clients(db, speakers)
-    if candidates is not None and len(candidates) == 1:
+    candidates, all_clients = _get_clients_by_speakers(db, speakers)
+
+    if not all_clients:
+        logger.info("No speaker signal, falling back to _unassigned")
+        return "_unassigned"
+
+    if len(candidates) == 1:
         logger.info("Client detected via speakers: %s", candidates[0])
         return candidates[0]
 
-    clients_to_check = candidates if candidates else existing_clients
+    clients_to_check = candidates if candidates else all_clients
     clients_str = ", ".join(clients_to_check)
 
     # Stage 2: Gemini by meeting name (restricted to candidates or all)
