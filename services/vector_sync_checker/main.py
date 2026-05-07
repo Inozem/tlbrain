@@ -5,8 +5,8 @@ import functions_framework
 from google.cloud import firestore
 
 from core.config import get_root_folder_id
-from core.google_drive.drive_client import scan_root_folder
-from core.google_drive.firestore import COLLECTION_NAME
+from core.google_drive.drive_client import scan_root_folder, list_client_folders
+from core.google_drive.firestore import COLLECTION_NAME, sync_clients_from_drive
 from core.utils.tasks import enqueue_task
 
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +20,11 @@ def checker(request):
     queue_name = os.environ["VECTOR_SYNC_QUEUE"]
 
     db = firestore.Client()
+
+    folders = list_client_folders()
+    clients_synced = sync_clients_from_drive([f["name"] for f in folders])
+    if clients_synced:
+        logger.info("Auto-registered %d client(s) from Drive", clients_synced)
 
     files = scan_root_folder()
     marked = 0

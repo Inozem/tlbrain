@@ -13,6 +13,8 @@ from services.mcp.app.mcp.tools import (
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
+from core.google_drive.drive_client import create_client_folder
+from core.google_drive.firestore import create_client
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +155,24 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                         "properties": {},
                     },
                 },
+                {
+                    "name": "create_client",
+                    "description": "Create a new client: makes a folder in Google Drive and registers the client in the database. Returns an error if a client with this name already exists.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "client_name": {
+                                "type": "string",
+                                "description": "Client name (used as folder name in Drive)",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Optional description",
+                            },
+                        },
+                        "required": ["client_name"],
+                    },
+                },
             ]
         },
     )
@@ -171,6 +191,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "list_clients":
         return _handle_list_clients(request)
+
+    if tool_name == "create_client":
+        return _handle_create_client(request, arguments)
 
     return build_jsonrpc_error(
         request_id=request.id,
@@ -295,4 +318,50 @@ def _handle_list_clients(request: JSONRPCRequest) -> dict:
             f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
         )
     content = build_mcp_content(payload)
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_create_client(request: JSONRPCRequest, arguments: dict) -> dict:
+    client_name = arguments.get("client_name", "").strip()
+    description = arguments.get("description") or None
+
+    if not client_name:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="client_name is required",
+        )
+
+    t0 = time.monotonic()
+    try:
+        _, folder_created = create_client_folder(client_name)
+        registered = create_client(client_name, description)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to create client",
+            details=str(e),
+        )
+
+    if not registered:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Client already exists: {client_name}",
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: create_client",
+        extra={
+            "tool": "create_client",
+            "client_name": client_name,
+            "folder_created": folder_created,
+            "latency_ms": latency_ms,
+        },
+    )
+
+    status = "ok" if folder_created else "registered_from_drive"
+    content = build_mcp_content({"status": status, "client_name": client_name})
     return build_jsonrpc_result(request.id, content)

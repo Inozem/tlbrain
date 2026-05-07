@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements-common.txt /app/requirements-common.txt
 COPY core/gemini/requirements.txt /app/core/gemini/requirements.txt
 COPY core/qdrant/requirements.txt /app/core/qdrant/requirements.txt
+COPY core/google_drive/requirements.txt /app/core/google_drive/requirements.txt
 COPY services/mcp/requirements.txt /app/services/mcp/requirements.txt
 
 RUN pip install --no-cache-dir -r /app/services/mcp/requirements.txt
@@ -15,6 +16,7 @@ COPY core/utils /app/core/utils
 COPY core/gemini /app/core/gemini
 COPY core/qdrant /app/core/qdrant
 COPY core/retrieval /app/core/retrieval
+COPY core/google_drive /app/core/google_drive
 COPY services/mcp /app/services/mcp
 
 ENV PYTHONUNBUFFERED=1

@@ -6,6 +6,7 @@ from google.cloud import firestore
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "transcript_index"
+CLIENTS_COLLECTION = "clients"
 STALE_SYNCING_MINUTES = 15
 
 
@@ -123,3 +124,40 @@ def recover_stale_syncing() -> list[str]:
             logger.info("Recovered stale syncing: %s", doc.id)
 
     return recovered
+
+
+def sync_clients_from_drive(client_names: list[str]) -> int:
+    """Upsert clients/{name} for each Drive folder. Skips already registered. Returns count of new records."""
+    db = _get_db()
+    created = 0
+    for name in client_names:
+        ref = db.collection(CLIENTS_COLLECTION).document(name)
+        if not ref.get().exists:
+            ref.set({"status": "active", "created_at": firestore.SERVER_TIMESTAMP})
+            logger.info("Auto-registered client from Drive: %s", name)
+            created += 1
+    return created
+
+
+def create_client(client_name: str, description: str | None = None) -> bool:
+    """Create clients/{client_name} record. Returns True if created, False if already existed."""
+    db = _get_db()
+    ref = db.collection(CLIENTS_COLLECTION).document(client_name)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        if ref.get(transaction=transaction).exists:
+            return False
+        data: dict = {
+            "status": "active",
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+        if description:
+            data["description"] = description
+        transaction.set(ref, data)
+        return True
+
+    result = _txn(db.transaction())
+    if result:
+        logger.info("Created client: %s", client_name)
+    return result
