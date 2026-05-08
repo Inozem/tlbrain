@@ -94,6 +94,20 @@ def scan_root_folder() -> list[dict[str, Any]]:
     return results
 
 
+def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
+    """Move a Drive file to new_folder_id, removing all current parents."""
+    service = build_drive_service_rw()
+    file = service.files().get(fileId=doc_id, fields="parents").execute()
+    old_parents = ",".join(file.get("parents", []))
+    service.files().update(
+        fileId=doc_id,
+        addParents=new_folder_id,
+        removeParents=old_parents,
+        fields="id",
+    ).execute()
+    logger.info("Moved file %s to folder %s", doc_id, new_folder_id)
+
+
 def create_client_folder(client_name: str) -> tuple[str, bool]:
     """Ensure ROOT_FOLDER/{client_name}/ exists in Drive.
 

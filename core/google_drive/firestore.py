@@ -91,6 +91,40 @@ def delete_queued_placeholder(meeting_id: str) -> None:
     logger.info("Deleted queued placeholder: %s", meeting_id)
 
 
+def move_transcript_record(doc_id: str, new_client_name: str, new_drive_folder: str) -> None:
+    """Update client_name and drive_folder, reset status to imported for reindexing.
+
+    modifiedTime is deleted so the checker detects a change and re-enqueues sync,
+    even though moving a file in Drive does not update its modifiedTime.
+    """
+    _get_db().collection(COLLECTION_NAME).document(doc_id).update({
+        "client_name": new_client_name,
+        "drive_folder": new_drive_folder,
+        "status": "imported",
+        "modifiedTime": firestore.DELETE_FIELD,
+        "content_hash": firestore.DELETE_FIELD,
+        "version": firestore.DELETE_FIELD,
+        "synced_at": None,
+        "syncing_started_at": None,
+        "error": None,
+    })
+    logger.info("Moved transcript record: %s → %s", doc_id, new_client_name)
+
+
+def count_unassigned() -> int:
+    """Count transcripts in _unassigned that are past the import stage."""
+    db = _get_db()
+    docs = (
+        db.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("client_name", "==", "_unassigned"))
+        .stream()
+    )
+    return sum(
+        1 for d in docs
+        if d.to_dict().get("status") not in ("queued", "downloading")
+    )
+
+
 def list_imported() -> list[dict]:
     """Return all docs with status=imported."""
     db = _get_db()

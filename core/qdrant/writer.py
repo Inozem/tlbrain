@@ -71,5 +71,18 @@ def delete_old_versions(doc_id: str, new_version: str, root_folder_id: str) -> N
     )
 
 
+@with_retry
+def delete_by_doc_id(doc_id: str, root_folder_id: str) -> None:
+    get_client().delete(
+        collection_name=get_collection_name(),
+        points_selector=Filter(
+            must=[
+                FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+                FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
+            ]
+        ),
+    )
+
+
 def _point_id(type_: str, doc_id: str, key: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"{type_}:{doc_id}:{key}"))
