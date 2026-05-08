@@ -98,15 +98,19 @@ gcloud services enable \
   cloudscheduler.googleapis.com
 
 # =========================
-# Deploy core
+# Deploy core (except MCP)
 # =========================
-bash infra/deploy/core/deploy_mcp.sh
 bash infra/deploy/core/deploy_vector_sync.sh
 
 # =========================
 # Deploy TL;DV Connector
 # =========================
 SKIP_CONFIRM=1 bash infra/deploy/connectors/deploy_tldv.sh
+
+# =========================
+# Deploy MCP (last — needs URLs from services above)
+# =========================
+bash infra/deploy/core/deploy_mcp.sh
 
 # =========================
 # Final URLs

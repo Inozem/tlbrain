@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import functions_framework
 from google.cloud import firestore
@@ -19,8 +19,14 @@ def tldv_reconciliation(request):
     import_service_url = os.environ.get("TLDV_IMPORT_SERVICE_URL", "")
     queue_name = os.environ["TLDV_IMPORT_QUEUE"]
 
-    since = datetime.now(timezone.utc) - timedelta(hours=48)
-    logger.info("Fetching TL;DV meetings since %s", since.isoformat())
+    body = request.get_json(silent=True) or {}
+    since_str = body.get("since")
+    if since_str:
+        since = datetime.fromisoformat(since_str)
+        logger.info("Fetching TL;DV meetings since %s", since.isoformat())
+    else:
+        since = None
+        logger.info("Fetching all TL;DV meetings (no date filter)")
 
     meetings = get_meetings(since)
     logger.info("Found %d meetings in TL;DV", len(meetings))

@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 from services.mcp.app.mcp.schemas import (
@@ -164,6 +165,14 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     },
                 },
                 {
+                    "name": "import_all_transcripts",
+                    "description": "Trigger a full import of all transcripts from connected providers. Only transcripts not yet in the database will be imported. Use for initial onboarding or after a long offline period.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+                {
                     "name": "move_transcript",
                     "description": "Move a transcript to a different client folder. Updates Google Drive, resets the record for reindexing, and removes old vectors from the search index.",
                     "inputSchema": {
@@ -217,6 +226,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "list_clients":
         return _handle_list_clients(request)
+
+    if tool_name == "import_all_transcripts":
+        return _handle_sync_tldv_all(request)
 
     if tool_name == "move_transcript":
         return _handle_move_transcript(request, arguments)
@@ -347,6 +359,43 @@ def _handle_list_clients(request: JSONRPCRequest) -> dict:
             f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
         )
     content = build_mcp_content(payload)
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_sync_tldv_all(request: JSONRPCRequest) -> dict:
+    reconciliation_url = os.environ.get("TLDV_RECONCILIATION_URL", "")
+    if not reconciliation_url:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="TLDV_RECONCILIATION_URL is not configured",
+        )
+
+    t0 = time.monotonic()
+    try:
+        import httpx
+        resp = httpx.post(reconciliation_url, json={}, timeout=300)
+        resp.raise_for_status()
+        result = resp.json()
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to trigger sync",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: sync_tldv_all",
+        extra={"tool": "sync_tldv_all", "latency_ms": latency_ms, **result},
+    )
+
+    content = build_mcp_content({
+        "status": "ok",
+        "meetings_found": result.get("meetings", 0),
+        "queued": result.get("queued", 0),
+    })
     return build_jsonrpc_result(request.id, content)
 
 

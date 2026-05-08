@@ -17,7 +17,8 @@ def tldv_get(path: str) -> dict:
     return resp.json() if resp.content else {}
 
 
-def get_meetings(since: datetime) -> list[dict]:
+def get_meetings(since: datetime | None = None) -> list[dict]:
+    """Fetch meetings from TL;DV API. If since is None, returns all meetings."""
     api_key = os.environ["TLDV_API_KEY"]
     meetings = []
     page = 1
@@ -35,17 +36,20 @@ def get_meetings(since: datetime) -> list[dict]:
         total_pages = data.get("pages", 1)
 
         for m in results:
-            try:
-                t = datetime.strptime(m.get("happenedAt", ""), _DATE_FMT).replace(tzinfo=timezone.utc)
-                if t >= since:
-                    meetings.append(m)
-            except ValueError:
-                pass
+            if since is None:
+                meetings.append(m)
+            else:
+                try:
+                    t = datetime.strptime(m.get("happenedAt", ""), _DATE_FMT).replace(tzinfo=timezone.utc)
+                    if t >= since:
+                        meetings.append(m)
+                except ValueError:
+                    pass
 
         if page >= total_pages:
             break
 
-        if results:
+        if since is not None and results:
             try:
                 last_t = datetime.strptime(results[-1].get("happenedAt", ""), _DATE_FMT).replace(tzinfo=timezone.utc)
                 if last_t < since:
