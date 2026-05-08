@@ -111,18 +111,24 @@ def move_transcript_record(doc_id: str, new_client_name: str, new_drive_folder: 
     logger.info("Moved transcript record: %s → %s", doc_id, new_client_name)
 
 
-def count_unassigned() -> int:
-    """Count transcripts in _unassigned that are past the import stage."""
+def get_unassigned() -> dict:
+    """Return count and list of unassigned transcripts (past the import stage).
+
+    Returns: {"count": int, "transcripts": [{"doc_id": str, "dialog_date": str}]}
+    """
     db = _get_db()
     docs = (
         db.collection(COLLECTION_NAME)
         .where(filter=firestore.FieldFilter("client_name", "==", "_unassigned"))
         .stream()
     )
-    return sum(
-        1 for d in docs
+    transcripts = [
+        {"doc_id": d.id, "dialog_date": d.to_dict().get("dialog_date", "")}
+        for d in docs
         if d.to_dict().get("status") not in ("queued", "downloading")
-    )
+    ]
+    transcripts.sort(key=lambda x: x["dialog_date"], reverse=True)
+    return {"count": len(transcripts), "transcripts": transcripts}
 
 
 def list_imported() -> list[dict]:
@@ -160,20 +166,41 @@ def recover_stale_syncing() -> list[str]:
     return recovered
 
 
-def sync_clients_from_drive(client_names: list[str]) -> int:
-    """Upsert clients/{name} for each Drive folder. Skips already registered. Returns count of new records."""
+def sync_clients_from_drive(folders: list[dict[str, str]]) -> int:
+    """Upsert clients/{name} for each Drive folder. Updates folder_id if changed. Returns count of new records.
+
+    Each folder dict must have: {name: str, id: str}
+    """
     db = _get_db()
     created = 0
-    for name in client_names:
+    for folder in folders:
+        name = folder["name"]
+        folder_id = folder["id"]
         ref = db.collection(CLIENTS_COLLECTION).document(name)
-        if not ref.get().exists:
-            ref.set({"status": "active", "created_at": firestore.SERVER_TIMESTAMP})
-            logger.info("Auto-registered client from Drive: %s", name)
+        snapshot = ref.get()
+        if not snapshot.exists:
+            ref.set({
+                "status": "active",
+                "folder_id": folder_id,
+                "created_at": firestore.SERVER_TIMESTAMP,
+            })
+            logger.info("Auto-registered client from Drive: %s (%s)", name, folder_id)
             created += 1
+        elif snapshot.to_dict().get("folder_id") != folder_id:
+            ref.update({"folder_id": folder_id})
+            logger.info("Updated folder_id for client: %s (%s)", name, folder_id)
     return created
 
 
-def create_client(client_name: str, description: str | None = None) -> bool:
+def get_client_folder_id(client_name: str) -> str | None:
+    """Return Drive folder_id for a client, or None if not found."""
+    doc = _get_db().collection(CLIENTS_COLLECTION).document(client_name).get()
+    if not doc.exists:
+        return None
+    return doc.to_dict().get("folder_id")
+
+
+def create_client(client_name: str, folder_id: str, description: str | None = None) -> bool:
     """Create clients/{client_name} record. Returns True if created, False if already existed."""
     db = _get_db()
     ref = db.collection(CLIENTS_COLLECTION).document(client_name)
@@ -184,6 +211,7 @@ def create_client(client_name: str, description: str | None = None) -> bool:
             return False
         data: dict = {
             "status": "active",
+            "folder_id": folder_id,
             "created_at": firestore.SERVER_TIMESTAMP,
         }
         if description:
@@ -193,5 +221,5 @@ def create_client(client_name: str, description: str | None = None) -> bool:
 
     result = _txn(db.transaction())
     if result:
-        logger.info("Created client: %s", client_name)
+        logger.info("Created client: %s (%s)", client_name, folder_id)
     return result

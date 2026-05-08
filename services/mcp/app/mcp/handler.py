@@ -17,8 +17,9 @@ from core.google_drive.drive_client import create_client_folder, move_file_to_fo
 from core.google_drive.firestore import (
     COLLECTION_NAME,
     create_client,
+    get_client_folder_id,
     move_transcript_record,
-    count_unassigned,
+    get_unassigned,
 )
 from core.qdrant.writer import delete_by_doc_id
 from core.config import get_root_folder_id
@@ -373,12 +374,14 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
             )
         root_folder_id = get_root_folder_id()
 
-        new_folder_id, _ = create_client_folder(new_client_name)
+        new_folder_id = get_client_folder_id(new_client_name)
+        if not new_folder_id:
+            new_folder_id, _ = create_client_folder(new_client_name)
         move_file_to_folder(doc_id, new_folder_id)
         delete_by_doc_id(doc_id, root_folder_id)
         move_transcript_record(doc_id, new_client_name, new_folder_id)
 
-        unassigned_remaining = count_unassigned()
+        unassigned = get_unassigned()
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -398,12 +401,19 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
         },
     )
 
-    content = build_mcp_content({
+    payload: dict = {
         "status": "ok",
         "doc_id": doc_id,
         "new_client_name": new_client_name,
-        "unassigned_remaining": unassigned_remaining,
-    })
+        "unassigned_remaining": unassigned["count"],
+    }
+    if unassigned["count"] > 0:
+        payload["unassigned_transcripts"] = unassigned["transcripts"]
+        payload["suggestion"] = (
+            f"{unassigned['count']} transcript(s) are still unassigned. "
+            f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
+        )
+    content = build_mcp_content(payload)
     return build_jsonrpc_result(request.id, content)
 
 
@@ -420,8 +430,8 @@ def _handle_create_client(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        _, folder_created = create_client_folder(client_name)
-        registered = create_client(client_name, description)
+        folder_id, folder_created = create_client_folder(client_name)
+        registered = create_client(client_name, folder_id, description)
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,

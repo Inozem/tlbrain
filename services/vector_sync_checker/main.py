@@ -22,7 +22,7 @@ def checker(request):
     db = firestore.Client()
 
     folders = list_client_folders()
-    clients_synced = sync_clients_from_drive([f["name"] for f in folders])
+    clients_synced = sync_clients_from_drive(folders)
     if clients_synced:
         logger.info("Auto-registered %d client(s) from Drive", clients_synced)
 
