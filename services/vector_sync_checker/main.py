@@ -6,7 +6,7 @@ from google.cloud import firestore
 
 from core.config import get_root_folder_id
 from core.google_drive.drive_client import scan_root_folder, list_client_folders
-from core.google_drive.firestore import COLLECTION_NAME, recover_stale_syncing, sync_clients_from_drive
+from core.google_drive.firestore import COLLECTION_NAME, recover_errors, recover_stale_downloading, recover_stale_syncing, sync_clients_from_drive
 from core.utils.tasks import enqueue_task
 
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +24,14 @@ def checker(request):
     recovered = recover_stale_syncing()
     if recovered:
         logger.info("Recovered stale syncing: %d doc(s)", len(recovered))
+
+    recovered_errors = recover_errors()
+    if recovered_errors:
+        logger.info("Recovered errors: %d doc(s)", len(recovered_errors))
+
+    recovered_downloading = recover_stale_downloading()
+    if recovered_downloading:
+        logger.info("Recovered stale downloading: %d doc(s)", len(recovered_downloading))
 
     folders = list_client_folders()
     clients_synced = sync_clients_from_drive(folders)
@@ -65,5 +73,15 @@ def checker(request):
         if enqueue_task(queue_name=queue_name, task_id=doc.id, url=f"{sync_url}/sync/doc/{doc.id}"):
             queued += 1
 
-    logger.info("Checker done — files=%d marked=%d queued=%d recovered=%d", len(files), marked, queued, len(recovered))
-    return {"files": len(files), "marked": marked, "queued": queued, "recovered": len(recovered)}, 200
+    logger.info(
+        "Checker done — files=%d marked=%d queued=%d recovered_syncing=%d recovered_errors=%d recovered_downloading=%d",
+        len(files), marked, queued, len(recovered), len(recovered_errors), len(recovered_downloading),
+    )
+    return {
+        "files": len(files),
+        "marked": marked,
+        "queued": queued,
+        "recovered_syncing": len(recovered),
+        "recovered_errors": len(recovered_errors),
+        "recovered_downloading": len(recovered_downloading),
+    }, 200

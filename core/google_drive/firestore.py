@@ -47,13 +47,14 @@ def mark_synced(doc_id: str) -> None:
     logger.info("Marked synced: %s", doc_id)
 
 
-def mark_error(doc_id: str, error: str) -> None:
+def mark_error(doc_id: str, error: str, error_stage: str = "vector_sync") -> None:
     _get_db().collection(COLLECTION_NAME).document(doc_id).update({
         "status": "error",
         "error": error,
+        "error_stage": error_stage,
         "syncing_started_at": None,
     })
-    logger.info("Marked error: %s — %s", doc_id, error)
+    logger.info("Marked error: %s — %s (stage=%s)", doc_id, error, error_stage)
 
 
 def write_queued(meeting_id: str) -> bool:
@@ -163,6 +164,51 @@ def recover_stale_syncing() -> list[str]:
             recovered.append(doc.id)
             logger.info("Recovered stale syncing: %s", doc.id)
 
+    return recovered
+
+
+def recover_errors() -> list[str]:
+    """Reset error docs back to their pre-error status based on error_stage."""
+    db = _get_db()
+    error_docs = (
+        db.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("status", "==", "error"))
+        .stream()
+    )
+    recovered = []
+    for doc in error_docs:
+        data = doc.to_dict()
+        stage = data.get("error_stage", "vector_sync")
+        reset_status = "imported" if stage == "vector_sync" else "queued"
+        db.collection(COLLECTION_NAME).document(doc.id).update({
+            "status": reset_status,
+            "error": None,
+            "error_stage": firestore.DELETE_FIELD,
+        })
+        recovered.append(doc.id)
+        logger.info("Recovered error doc: %s (stage=%s) → %s", doc.id, stage, reset_status)
+    return recovered
+
+
+def recover_stale_downloading() -> list[str]:
+    """Reset stale downloading docs (>15 min) back to queued."""
+    db = _get_db()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_SYNCING_MINUTES)
+    downloading_docs = (
+        db.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("status", "==", "downloading"))
+        .stream()
+    )
+    recovered = []
+    for doc in downloading_docs:
+        started_at = doc.to_dict().get("downloading_started_at")
+        if started_at and started_at < cutoff:
+            db.collection(COLLECTION_NAME).document(doc.id).update({
+                "status": "queued",
+                "downloading_started_at": None,
+            })
+            recovered.append(doc.id)
+            logger.info("Recovered stale downloading: %s", doc.id)
     return recovered
 
 
