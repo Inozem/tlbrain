@@ -23,7 +23,10 @@ You are analyzing a fragment of a dialogue. Produce two things:
    - Any agreements, next steps, or unresolved issues.
    Do not retell the dialogue — write only the essence.
 
-2. Facts: up to 10 notable facts mentioned in the fragment.
+2. Facts: notable facts mentioned in the fragment, ordered from most to least important using this priority:
+   decisions and agreements first, then specific numbers and deadlines,
+   then pain points and objections, then next steps, then key people,
+   then business context, then general details.
    A fact is any specific, concrete piece of information worth remembering: contacts, interests, industries,
    decisions, numbers, problems, relationships, plans, or anything unusual.
    Write each fact as a short noun phrase or brief clause — no attribution, no "X said that", just the fact itself.
@@ -66,7 +69,11 @@ def generate_summary_and_facts(utterances: list[dict[str, Any]]) -> tuple[str, l
     prompt = _PROMPT.format(dialog=dialog)
     raw = _call_with_validation_retry(client, prompt)
     data = json.loads(_strip_fences(raw))
-    return data["summary"], data["facts"]
+    facts = data["facts"]
+    if len(facts) > 10:
+        logger.debug("Truncating facts from %d to 10", len(facts))
+        facts = facts[:10]
+    return data["summary"], facts
 
 
 def _client() -> genai.Client:
@@ -128,5 +135,3 @@ def _validate(text: str) -> None:
         raise ValueError("Missing 'facts' field")
     if not isinstance(data["facts"], list):
         raise ValueError("'facts' must be a list")
-    if len(data["facts"]) > 10:
-        raise ValueError(f"Too many facts: {len(data['facts'])}")
