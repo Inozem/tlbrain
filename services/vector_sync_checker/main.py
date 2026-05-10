@@ -6,7 +6,7 @@ from google.cloud import firestore
 
 from core.config import get_root_folder_id
 from core.google_drive.drive_client import scan_root_folder, list_client_folders
-from core.google_drive.firestore import COLLECTION_NAME, sync_clients_from_drive
+from core.google_drive.firestore import COLLECTION_NAME, recover_stale_syncing, sync_clients_from_drive
 from core.utils.tasks import enqueue_task
 
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +20,10 @@ def checker(request):
     queue_name = os.environ["VECTOR_SYNC_QUEUE"]
 
     db = firestore.Client()
+
+    recovered = recover_stale_syncing()
+    if recovered:
+        logger.info("Recovered stale syncing: %d doc(s)", len(recovered))
 
     folders = list_client_folders()
     clients_synced = sync_clients_from_drive(folders)
@@ -52,5 +56,14 @@ def checker(request):
         if enqueue_task(queue_name=queue_name, task_id=doc_id, url=f"{sync_url}/sync/doc/{doc_id}"):
             queued += 1
 
-    logger.info("Checker done — files=%d marked=%d queued=%d", len(files), marked, queued)
-    return {"files": len(files), "marked": marked, "queued": queued}, 200
+    imported_docs = (
+        db.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("status", "==", "imported"))
+        .stream()
+    )
+    for doc in imported_docs:
+        if enqueue_task(queue_name=queue_name, task_id=doc.id, url=f"{sync_url}/sync/doc/{doc.id}"):
+            queued += 1
+
+    logger.info("Checker done — files=%d marked=%d queued=%d recovered=%d", len(files), marked, queued, len(recovered))
+    return {"files": len(files), "marked": marked, "queued": queued, "recovered": len(recovered)}, 200
