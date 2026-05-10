@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import functions_framework
 from google.cloud import firestore
@@ -8,7 +8,7 @@ from google.cloud import firestore
 from core.google_drive.firestore import COLLECTION_NAME, write_queued
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
-from tldv_client import get_meetings
+from tldv_client import get_meetings, iter_meeting_pages
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -21,15 +21,18 @@ def tldv_reconciliation(request):
 
     body = request.get_json(silent=True) or {}
     since_str = body.get("since")
+    full_scan = body.get("full_scan", False)
     if since_str:
         since = datetime.fromisoformat(since_str)
         logger.info("Fetching TL;DV meetings since %s", since.isoformat())
-    else:
+    elif full_scan:
         since = None
-        logger.info("Fetching all TL;DV meetings (no date filter)")
+        logger.info("Fetching all TL;DV meetings (full scan)")
+    else:
+        since = datetime.now(timezone.utc) - timedelta(hours=48)
+        logger.info("Fetching TL;DV meetings since 48h ago (%s)", since.isoformat())
 
-    meetings = get_meetings(since)
-    logger.info("Found %d meetings in TL;DV", len(meetings))
+    limit = body.get("limit")
 
     db = firestore.Client()
     existing = {
@@ -38,15 +41,34 @@ def tldv_reconciliation(request):
         if doc.to_dict().get("tldv_meeting_id")
     }
 
-    missing = [m for m in meetings if m["id"] not in existing]
-    logger.info("Missing in Firestore: %d", len(missing))
+    missing = []
+    meetings_count = 0
+    stopped_early = False
+
+    if limit:
+        for page in iter_meeting_pages(since):
+            meetings_count += len(page)
+            for m in page:
+                if m["id"] not in existing:
+                    missing.append(m)
+            if len(missing) >= limit:
+                stopped_early = True
+                break
+    else:
+        meetings = get_meetings(since)
+        meetings_count = len(meetings)
+        missing = [m for m in meetings if m["id"] not in existing]
+
+    batch = missing[:limit] if limit else missing
+    remaining = None if stopped_early else len(missing) - len(batch)
+    logger.info("Found %d meetings (scanned), missing=%d, stopped_early=%s", meetings_count, len(missing), stopped_early)
 
     if not import_service_url:
         logger.warning("TLDV_IMPORT_SERVICE_URL not set, skipping task creation")
-        return {"meetings": len(meetings), "missing": len(missing), "queued": 0}, 200
+        return {"meetings": meetings_count, "missing": len(missing), "queued": 0, "remaining": remaining}, 200
 
     queued = 0
-    for meeting in missing:
+    for meeting in batch:
         meeting_id = meeting["id"]
         if enqueue_task(
             queue_name=queue_name,
@@ -60,5 +82,5 @@ def tldv_reconciliation(request):
         else:
             logger.info("Task already exists for meeting_id=%s, skipping", meeting_id)
 
-    logger.info("Reconciliation done — meetings=%d missing=%d queued=%d", len(meetings), len(missing), queued)
-    return {"meetings": len(meetings), "missing": len(missing), "queued": queued}, 200
+    logger.info("Reconciliation done — meetings=%d missing=%d queued=%d remaining=%s", meetings_count, len(missing), queued, remaining)
+    return {"meetings": meetings_count, "missing": len(missing), "queued": queued, "remaining": remaining}, 200

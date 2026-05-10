@@ -166,10 +166,19 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                 },
                 {
                     "name": "import_all_transcripts",
-                    "description": "Trigger a full import of all transcripts from connected providers. Only transcripts not yet in the database will be imported. Use for initial onboarding or after a long offline period.",
+                    "description": "Trigger a full import of all transcripts from connected providers. Only transcripts not yet in the database will be imported. Use for initial onboarding or after a long offline period. Import in small batches (default 10), then review and assign transcripts before importing the next batch.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max number of transcripts to import in this batch (default: 10)",
+                            },
+                            "since": {
+                                "type": "string",
+                                "description": "ISO date to import from (e.g. 2025-01-01). If not set, imports all transcripts.",
+                            },
+                        },
                     },
                 },
                 {
@@ -228,7 +237,7 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
         return _handle_list_clients(request)
 
     if tool_name == "import_all_transcripts":
-        return _handle_sync_tldv_all(request)
+        return _handle_sync_tldv_all(request, arguments)
 
     if tool_name == "move_transcript":
         return _handle_move_transcript(request, arguments)
@@ -362,7 +371,7 @@ def _handle_list_clients(request: JSONRPCRequest) -> dict:
     return build_jsonrpc_result(request.id, content)
 
 
-def _handle_sync_tldv_all(request: JSONRPCRequest) -> dict:
+def _handle_sync_tldv_all(request: JSONRPCRequest, arguments: dict) -> dict:
     reconciliation_url = os.environ.get("TLDV_RECONCILIATION_URL", "")
     if not reconciliation_url:
         return build_jsonrpc_error(
@@ -371,10 +380,15 @@ def _handle_sync_tldv_all(request: JSONRPCRequest) -> dict:
             message="TLDV_RECONCILIATION_URL is not configured",
         )
 
+    limit = arguments.get("limit") or 10
+    since = arguments.get("since") or None
     t0 = time.monotonic()
     try:
         import httpx
-        resp = httpx.post(reconciliation_url, json={}, timeout=300)
+        body = {"limit": limit, "full_scan": True}
+        if since:
+            body["since"] = since
+        resp = httpx.post(reconciliation_url, json=body, timeout=300)
         resp.raise_for_status()
         result = resp.json()
     except Exception as e:
@@ -386,16 +400,36 @@ def _handle_sync_tldv_all(request: JSONRPCRequest) -> dict:
         )
 
     latency_ms = int((time.monotonic() - t0) * 1000)
+    queued = result.get("queued", 0)
+    remaining = result.get("remaining", 0)
     logger.info(
-        "tool call: sync_tldv_all",
-        extra={"tool": "sync_tldv_all", "latency_ms": latency_ms, **result},
+        "tool call: import_all_transcripts",
+        extra={"tool": "import_all_transcripts", "latency_ms": latency_ms, "queued": queued, "remaining": remaining},
     )
 
-    content = build_mcp_content({
+    payload: dict = {
         "status": "ok",
         "meetings_found": result.get("meetings", 0),
-        "queued": result.get("queued", 0),
-    })
+        "queued": queued,
+    }
+    if remaining is not None:
+        payload["remaining"] = remaining
+
+    if queued > 0:
+        if remaining is None:
+            remaining_clause = ", there may be more not yet imported"
+        elif remaining > 0:
+            remaining_clause = f", {remaining} more remaining"
+        else:
+            remaining_clause = ""
+        payload["suggestion"] = (
+            f"Import started for {queued} transcript(s){remaining_clause}. "
+            f"While they are downloading, check two things via list_clients: "
+            f"1. Transcripts in `_unassigned` — the system could not detect the client, assign them manually via move_transcript. "
+            f"2. Transcripts that were assigned automatically — verify they went to the correct client. "
+            f"The more accurately transcripts are assigned, the better the system will detect clients for future imports."
+        )
+    content = build_mcp_content(payload)
     return build_jsonrpc_result(request.id, content)
 
 
