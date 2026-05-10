@@ -1,10 +1,10 @@
 import logging
 
-from core.gemini.embeddings import embed
+from core.gemini.embeddings import embed, make_client
 from core.google_drive.docs_reader import read_google_doc
 from core.google_drive.firestore import acquire_for_syncing, mark_error, mark_synced
 from core.parsing.parser import parse_document
-from core.parsing.processor import process_document as _process_doc
+from core.parsing.processor import build_utterance_payloads, iter_windows
 from core.qdrant.writer import delete_old_versions, upsert_facts, upsert_summaries, upsert_utterances
 from services.vector_sync.app.hashing import sha256_text
 from services.vector_sync.app.index_store import load_index, update_index
@@ -32,28 +32,39 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
             return "skipped"
 
         metadata, utterances = parse_document(raw_text)
+        del raw_text
         dialog_date = metadata.get("date", "")
         version = content_hash
 
-        utterance_payloads, summaries, facts = _process_doc(
+        utterance_payloads = build_utterance_payloads(
             utterances, doc_id, version, client_name, dialog_date, root_folder_id
         )
-
-        summary_vectors = embed([s["text"] for s in summaries]) if summaries else []
-        facts_vectors = embed([f["text"] for f in facts]) if facts else []
-
         upsert_utterances(utterance_payloads)
-        upsert_summaries(summaries, summary_vectors)
-        upsert_facts(facts, facts_vectors)
+
+        embed_client = make_client()
+        summaries_count = 0
+        facts_count = 0
+
+        for summary, facts in iter_windows(
+            utterances, doc_id, version, client_name, dialog_date, root_folder_id
+        ):
+            summary_vector = embed([summary["text"]], client=embed_client)[0]
+            upsert_summaries([summary], [summary_vector])
+
+            if facts:
+                fact_vectors = embed([f["text"] for f in facts], client=embed_client)
+                upsert_facts(facts, fact_vectors)
+
+            summaries_count += 1
+            facts_count += len(facts)
 
         delete_old_versions(doc_id, version, root_folder_id)
-
         update_index(doc_id, {"content_hash": content_hash, "version": version})
         mark_synced(doc_id)
 
         logger.info(
             "Processed: %s | utterances=%d summaries=%d facts=%d",
-            doc_id, len(utterance_payloads), len(summaries), len(facts),
+            doc_id, len(utterance_payloads), summaries_count, facts_count,
         )
         return "processed"
 
