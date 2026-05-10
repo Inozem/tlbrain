@@ -26,14 +26,11 @@ def embed(texts: list[str], client: genai.Client | None = None) -> list[list[flo
 
 @with_retry
 def _embed_batch(client: genai.Client, texts: list[str]) -> list[list[float]]:
-    response = client.models.batch_embed_contents(
-        model=_EMBEDDING_MODEL,
-        requests=[
-            types.EmbedContentRequest(
-                content=text,
-                config=types.EmbedContentConfig(output_dimensionality=_OUTPUT_DIMS),
-            )
-            for text in texts
-        ],
-    )
-    return [e.values for e in response.embeddings]
+    return [
+        client.models.embed_content(
+            model=_EMBEDDING_MODEL,
+            contents=text,
+            config=types.EmbedContentConfig(output_dimensionality=_OUTPUT_DIMS),
+        ).embeddings[0].values
+        for text in texts
+    ]
