@@ -409,21 +409,12 @@ def _handle_sync_tldv_all(request: JSONRPCRequest, arguments: dict) -> dict:
 
     payload: dict = {
         "status": "ok",
-        "meetings_found": result.get("meetings", 0),
         "queued": queued,
     }
-    if remaining is not None:
-        payload["remaining"] = remaining
 
     if queued > 0:
-        if remaining is None:
-            remaining_clause = ", there may be more not yet imported"
-        elif remaining > 0:
-            remaining_clause = f", {remaining} more remaining"
-        else:
-            remaining_clause = ""
         payload["suggestion"] = (
-            f"Import started for {queued} transcript(s){remaining_clause}. "
+            f"Import started for {queued} transcript(s). "
             f"While they are downloading, check two things via list_clients: "
             f"1. Transcripts in `_unassigned` — the system could not detect the client, assign them manually via move_transcript. "
             f"2. Transcripts that were assigned automatically — verify they went to the correct client. "
