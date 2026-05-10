@@ -192,6 +192,15 @@ def sync_clients_from_drive(folders: list[dict[str, str]]) -> int:
     return created
 
 
+def get_all_client_names() -> list[str]:
+    """Return all known client names from the clients collection."""
+    db = _get_db()
+    return sorted(
+        doc.id for doc in db.collection(CLIENTS_COLLECTION).select([]).stream()
+        if doc.id != "_unassigned"
+    )
+
+
 def get_client_folder_id(client_name: str) -> str | None:
     """Return Drive folder_id for a client, or None if not found."""
     doc = _get_db().collection(CLIENTS_COLLECTION).document(client_name).get()

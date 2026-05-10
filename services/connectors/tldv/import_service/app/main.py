@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.gemini.llm import call_gemini_json
-from core.google_drive.firestore import COLLECTION_NAME, delete_queued_placeholder, mark_downloading
+from core.google_drive.firestore import COLLECTION_NAME, delete_queued_placeholder, get_all_client_names, mark_downloading
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import tldv_get
@@ -226,13 +226,16 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
     speakers = _get_speakers(utterances)
     candidates, all_clients = _get_clients_by_speakers(db, speakers)
 
-    if not all_clients:
-        logger.info("No speaker signal, falling back to _unassigned")
-        return "_unassigned"
-
     if len(candidates) == 1:
         logger.info("Client detected via speakers: %s", candidates[0])
         return candidates[0]
+
+    if not all_clients:
+        all_clients = get_all_client_names()
+
+    if not all_clients:
+        logger.info("No known clients, falling back to _unassigned")
+        return "_unassigned"
 
     clients_to_check = candidates if candidates else all_clients
     clients_str = ", ".join(clients_to_check)
