@@ -2,6 +2,7 @@ import logging
 from typing import Any
 
 import google.auth
+import httplib2
 from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
@@ -14,17 +15,19 @@ SCOPES_RO = ["https://www.googleapis.com/auth/drive.readonly"]
 SCOPES_RW = ["https://www.googleapis.com/auth/drive"]
 
 
+def _build_http(credentials) -> httplib2.Http:
+    return credentials.authorize(httplib2.Http(timeout=60))
+
+
 def build_drive_service():
     logger.info("Building Google Drive service")
-
     credentials, _ = google.auth.default(scopes=SCOPES_RO)
-
-    return build("drive", "v3", credentials=credentials)
+    return build("drive", "v3", http=_build_http(credentials))
 
 
 def build_drive_service_rw():
     credentials, _ = google.auth.default(scopes=SCOPES_RW)
-    return build("drive", "v3", credentials=credentials)
+    return build("drive", "v3", http=_build_http(credentials))
 
 
 def list_client_folders() -> list[dict[str, str]]:
