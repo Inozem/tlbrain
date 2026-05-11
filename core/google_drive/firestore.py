@@ -233,6 +233,30 @@ def get_client_folder_id(client_name: str) -> str | None:
     return doc.to_dict().get("folder_id")
 
 
+def get_sync_status() -> dict:
+    """Aggregate transcript_index counts by status in a single scan."""
+    db = _get_db()
+    counts: dict[str, int] = {
+        "queued": 0, "downloading": 0, "imported": 0,
+        "syncing": 0, "synced": 0, "error": 0,
+    }
+    unassigned = 0
+
+    for doc in db.collection(COLLECTION_NAME).stream():
+        data = doc.to_dict()
+        status = data.get("status", "")
+        if status in counts:
+            counts[status] += 1
+        if data.get("client_name") == "_unassigned" and status not in ("queued", "downloading"):
+            unassigned += 1
+
+    return {
+        "total": sum(counts.values()),
+        **counts,
+        "_unassigned_count": unassigned,
+    }
+
+
 def create_client(client_name: str, folder_id: str, description: str | None = None) -> bool:
     """Create clients/{client_name} record. Returns True if created, False if already existed."""
     db = _get_db()

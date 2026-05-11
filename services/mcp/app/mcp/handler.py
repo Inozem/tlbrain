@@ -19,6 +19,7 @@ from core.google_drive.firestore import (
     COLLECTION_NAME,
     create_client,
     get_client_folder_id,
+    get_sync_status,
     move_transcript_record,
     get_unassigned,
 )
@@ -200,6 +201,14 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     },
                 },
                 {
+                    "name": "sync_status",
+                    "description": "Show the current sync status: how many transcripts are in each stage (queued, downloading, imported, syncing, synced, error) and how many are unassigned. Use to diagnose stuck imports or check overall system health.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+                {
                     "name": "create_client",
                     "description": "Create a new client: makes a folder in Google Drive and registers the client in the database. Returns an error if a client with this name already exists.",
                     "inputSchema": {
@@ -241,6 +250,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "move_transcript":
         return _handle_move_transcript(request, arguments)
+
+    if tool_name == "sync_status":
+        return _handle_sync_status(request)
 
     if tool_name == "create_client":
         return _handle_create_client(request, arguments)
@@ -488,6 +500,35 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
             f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
         )
     content = build_mcp_content(payload)
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_sync_status(request: JSONRPCRequest) -> dict:
+    t0 = time.monotonic()
+    try:
+        status = get_sync_status()
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to get sync status",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: sync_status",
+        extra={"tool": "sync_status", "latency_ms": latency_ms, "total": status.get("total", 0)},
+    )
+
+    unassigned = status.pop("_unassigned_count", 0)
+    if unassigned > 0:
+        status["suggestion"] = (
+            f"Assigning transcripts to the correct client improves search accuracy and helps the system detect clients automatically in future imports. "
+            f"{unassigned} transcript(s) are currently unassigned — ask the user to assign them via move_transcript."
+        )
+
+    content = build_mcp_content(status)
     return build_jsonrpc_result(request.id, content)
 
 
