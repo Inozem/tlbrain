@@ -28,6 +28,7 @@ def acquire_for_syncing(doc_id: str) -> bool:
         transaction.update(ref, {
             "status": "syncing",
             "syncing_started_at": firestore.SERVER_TIMESTAMP,
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
         })
         return True
 
@@ -43,6 +44,7 @@ def mark_synced(doc_id: str) -> None:
         "synced_at": firestore.SERVER_TIMESTAMP,
         "syncing_started_at": None,
         "error": None,
+        "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Marked synced: %s", doc_id)
 
@@ -53,6 +55,7 @@ def mark_error(doc_id: str, error: str, error_stage: str = "vector_sync") -> Non
         "error": error,
         "error_stage": error_stage,
         "syncing_started_at": None,
+        "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Marked error: %s — %s (stage=%s)", doc_id, error, error_stage)
 
@@ -70,6 +73,7 @@ def write_queued(meeting_id: str) -> bool:
             "meeting_id": meeting_id,
             "status": "queued",
             "queued_at": firestore.SERVER_TIMESTAMP,
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
         })
         return True
 
@@ -83,6 +87,7 @@ def mark_downloading(meeting_id: str) -> None:
     _get_db().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
         "status": "downloading",
         "downloading_started_at": firestore.SERVER_TIMESTAMP,
+        "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Marked downloading: %s", meeting_id)
 
@@ -108,6 +113,7 @@ def move_transcript_record(doc_id: str, new_client_name: str, new_drive_folder: 
         "synced_at": None,
         "syncing_started_at": None,
         "error": None,
+        "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Moved transcript record: %s → %s", doc_id, new_client_name)
 
@@ -160,6 +166,7 @@ def recover_stale_syncing() -> list[str]:
             db.collection(COLLECTION_NAME).document(doc.id).update({
                 "status": "imported",
                 "syncing_started_at": None,
+                "status_changed_at": firestore.SERVER_TIMESTAMP,
             })
             recovered.append(doc.id)
             logger.info("Recovered stale syncing: %s", doc.id)
@@ -184,6 +191,7 @@ def recover_errors() -> list[str]:
             "status": reset_status,
             "error": None,
             "error_stage": firestore.DELETE_FIELD,
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
         })
         recovered.append(doc.id)
         logger.info("Recovered error doc: %s (stage=%s) → %s", doc.id, stage, reset_status)
@@ -206,6 +214,7 @@ def recover_stale_downloading() -> list[str]:
             db.collection(COLLECTION_NAME).document(doc.id).update({
                 "status": "queued",
                 "downloading_started_at": None,
+                "status_changed_at": firestore.SERVER_TIMESTAMP,
             })
             recovered.append(doc.id)
             logger.info("Recovered stale downloading: %s", doc.id)

@@ -355,6 +355,7 @@ async def import_meeting(request: Request):
         "syncing_started_at": None,
         "synced_at": None,
         "error": None,
+        "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Saved to Firestore: doc_id=%s", doc_id)
     delete_queued_placeholder(meeting_id)

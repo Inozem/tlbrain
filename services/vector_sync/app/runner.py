@@ -1,6 +1,8 @@
 import logging
 from datetime import datetime, timezone
 
+from google.cloud import firestore as firestore_module
+
 from core.google_drive.firestore import list_imported, recover_stale_syncing
 from core.config import get_root_folder_id
 from core.google_drive.drive_client import scan_root_folder
@@ -41,6 +43,7 @@ def run_sync():
             "root_folder_id": root_folder_id,
             "status": "imported",
             "imported_at": (existing or {}).get("imported_at") or datetime.now(timezone.utc).isoformat(),
+            "status_changed_at": firestore_module.SERVER_TIMESTAMP,
         })
 
         logger.info("Marked imported: %s client=%s", doc_id, file["client_name"])

@@ -58,6 +58,7 @@ def checker(request):
             "modifiedTime": file["modifiedTime"],
             "root_folder_id": root_folder_id,
             "status": "imported",
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
         })
         marked += 1
 
