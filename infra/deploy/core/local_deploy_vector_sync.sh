@@ -45,12 +45,5 @@ gcloud tasks queues update "${VECTOR_SYNC_QUEUE}" \
   --location="${REGION}" \
   --max-concurrent-dispatches="${CLOUD_TASKS_MAX_CONCURRENT}"
 
-bash "${SCRIPT_DIR}/deploy_vector_sync_checker.sh"
-
-CHECKER_URL=$(gcloud functions describe "${VECTOR_SYNC_CHECKER_NAME}" \
-  --region "${REGION}" \
-  --format='value(serviceConfig.uri)')
-
 echo
 echo "Vector Sync: POST ${VECTOR_SYNC_URL}/sync"
-echo "Checker:     ${CHECKER_URL}"

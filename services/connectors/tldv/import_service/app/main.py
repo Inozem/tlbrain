@@ -351,9 +351,6 @@ async def import_meeting(request: Request):
         "speakers": _get_speakers(utterances),
         "modifiedTime": modified_time,
         "status": "imported",
-        "imported_at": datetime.now(timezone.utc).isoformat(),
-        "syncing_started_at": None,
-        "synced_at": None,
         "error": None,
         "status_changed_at": firestore.SERVER_TIMESTAMP,
     })

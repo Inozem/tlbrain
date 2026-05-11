@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime, timezone
 
 from google.cloud import firestore as firestore_module
 
@@ -33,8 +32,6 @@ def run_sync():
             continue
 
         save_index(doc_id, {
-            "syncing_started_at": None,
-            "synced_at": None,
             "error": None,
             **(existing or {}),
             "doc_id": doc_id,
@@ -42,7 +39,6 @@ def run_sync():
             "modifiedTime": file["modifiedTime"],
             "root_folder_id": root_folder_id,
             "status": "imported",
-            "imported_at": (existing or {}).get("imported_at") or datetime.now(timezone.utc).isoformat(),
             "status_changed_at": firestore_module.SERVER_TIMESTAMP,
         })
 

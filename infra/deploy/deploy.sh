@@ -108,6 +108,11 @@ bash infra/deploy/core/deploy_vector_sync.sh
 SKIP_CONFIRM=1 bash infra/deploy/connectors/deploy_tldv.sh
 
 # =========================
+# Deploy Checker (after TL;DV — needs TLDV_IMPORT_SERVICE_URL)
+# =========================
+bash infra/deploy/core/deploy_vector_sync_checker.sh
+
+# =========================
 # Deploy MCP (last — needs URLs from services above)
 # =========================
 bash infra/deploy/core/deploy_mcp.sh
