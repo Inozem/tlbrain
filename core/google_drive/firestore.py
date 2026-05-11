@@ -257,6 +257,38 @@ def get_sync_status() -> dict:
     }
 
 
+TOKENS_COLLECTION = "tokens"
+DRIVE_SYNC_TOKEN_DOC = "drive_sync"
+
+
+def get_drive_sync_token() -> str | None:
+    doc = _get_db().collection(TOKENS_COLLECTION).document(DRIVE_SYNC_TOKEN_DOC).get()
+    if not doc.exists:
+        return None
+    return doc.to_dict().get("page_token")
+
+
+def set_drive_sync_token(token: str) -> None:
+    _get_db().collection(TOKENS_COLLECTION).document(DRIVE_SYNC_TOKEN_DOC).set({
+        "page_token": token,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+
+
+def get_client_name_by_folder_id(folder_id: str) -> str | None:
+    """Reverse lookup: folder_id → client_name from clients collection."""
+    db = _get_db()
+    docs = (
+        db.collection(CLIENTS_COLLECTION)
+        .where(filter=firestore.FieldFilter("folder_id", "==", folder_id))
+        .limit(1)
+        .stream()
+    )
+    for doc in docs:
+        return doc.id
+    return None
+
+
 def create_client(client_name: str, folder_id: str, description: str | None = None) -> bool:
     """Create clients/{client_name} record. Returns True if created, False if already existed."""
     db = _get_db()

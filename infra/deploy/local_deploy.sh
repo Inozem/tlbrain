@@ -18,10 +18,10 @@ REGION=${REGION:-europe-west1}
 
 MCP_SERVICE_NAME=${MCP_SERVICE_NAME:-tlbrain-mcp}
 VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}
-VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME:-tlbrain-vector-sync-checker}
+SYNC_CHECKER_NAME=${SYNC_CHECKER_NAME:-tlbrain-sync-checker}
 VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE:-tlbrain-vector-sync-queue}
 CLOUD_TASKS_MAX_CONCURRENT=${CLOUD_TASKS_MAX_CONCURRENT:-2}
-VECTOR_SYNC_CHECKER_SCHEDULE=${VECTOR_SYNC_CHECKER_SCHEDULE:-"*/15 * * * *"}
+SYNC_CHECKER_SCHEDULE=${SYNC_CHECKER_SCHEDULE:-"*/15 * * * *"}
 TLDV_WEBHOOK_FUNCTION_NAME=${TLDV_WEBHOOK_FUNCTION_NAME:-tlbrain-tldv-webhook}
 GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
 GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
@@ -100,7 +100,7 @@ SKIP_CONFIRM=1 bash infra/deploy/connectors/local_deploy_tldv.sh
 # =========================
 # Deploy Checker (after TL;DV — needs TLDV_IMPORT_SERVICE_URL)
 # =========================
-bash infra/deploy/core/deploy_vector_sync_checker.sh
+bash infra/deploy/core/deploy_sync_checker.sh
 
 # =========================
 # Deploy MCP (last — needs URLs from services above)
@@ -118,7 +118,7 @@ VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
   --format='value(status.url)')
 
-CHECKER_URL=$(gcloud functions describe "${VECTOR_SYNC_CHECKER_NAME}" \
+CHECKER_URL=$(gcloud functions describe "${SYNC_CHECKER_NAME}" \
   --region "${REGION}" \
   --format='value(serviceConfig.uri)')
 

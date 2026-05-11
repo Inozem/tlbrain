@@ -2,6 +2,7 @@ import logging
 from typing import Any
 
 import google.auth
+import google_auth_httplib2
 import httplib2
 from googleapiclient.discovery import build
 
@@ -15,8 +16,8 @@ SCOPES_RO = ["https://www.googleapis.com/auth/drive.readonly"]
 SCOPES_RW = ["https://www.googleapis.com/auth/drive"]
 
 
-def _build_http(credentials) -> httplib2.Http:
-    return credentials.authorize(httplib2.Http(timeout=60))
+def _build_http(credentials) -> google_auth_httplib2.AuthorizedHttp:
+    return google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http(timeout=60))
 
 
 def build_drive_service():
@@ -95,6 +96,27 @@ def scan_root_folder() -> list[dict[str, Any]]:
     logger.info("Total files found: %s", len(results))
 
     return results
+
+
+def get_start_page_token() -> str:
+    service = build_drive_service()
+    return service.changes().getStartPageToken().execute()["startPageToken"]
+
+
+def get_drive_changes(page_token: str) -> tuple[list[dict], str]:
+    """Fetch all changes since page_token. Returns (changes, new_token)."""
+    service = build_drive_service()
+    changes = []
+    while page_token:
+        response = service.changes().list(
+            pageToken=page_token,
+            fields="nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,mimeType,parents,trashed))",
+            spaces="drive",
+            includeItemsFromAllDrives=False,
+        ).execute()
+        changes.extend(response.get("changes", []))
+        page_token = response.get("nextPageToken")
+    return changes, response["newStartPageToken"]
 
 
 def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
