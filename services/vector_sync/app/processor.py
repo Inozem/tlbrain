@@ -34,7 +34,15 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
         metadata, utterances = parse_document(raw_text)
         del raw_text
         dialog_date = metadata.get("date", "")
+        provider = metadata.get("provider", "")
+        source_file = metadata.get("source_file", "")
         version = content_hash
+
+        update_index(doc_id, {
+            "dialog_date": dialog_date,
+            "provider": provider,
+            "source_file": source_file,
+        })
 
         utterance_payloads = build_utterance_payloads(
             utterances, doc_id, version, client_name, dialog_date, root_folder_id

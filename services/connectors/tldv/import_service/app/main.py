@@ -295,7 +295,7 @@ async def import_meeting(request: Request):
     db = firestore.Client()
     existing = list(
         db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("tldv_meeting_id", "==", meeting_id))
+        .where(filter=firestore.FieldFilter("meeting_id", "==", meeting_id))
         .stream()
     )
     if any(d.to_dict().get("status") != "queued" for d in existing):
@@ -347,7 +347,7 @@ async def import_meeting(request: Request):
         "dialog_date": dialog_date,
         "provider": "tldv",
         "source_file": title,
-        "tldv_meeting_id": meeting_id,
+        "meeting_id": meeting_id,
         "speakers": _get_speakers(utterances),
         "modifiedTime": modified_time,
         "status": "imported",

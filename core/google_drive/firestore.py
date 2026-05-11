@@ -67,7 +67,7 @@ def write_queued(meeting_id: str) -> bool:
         if ref.get(transaction=transaction).exists:
             return False
         transaction.set(ref, {
-            "tldv_meeting_id": meeting_id,
+            "meeting_id": meeting_id,
             "status": "queued",
             "queued_at": firestore.SERVER_TIMESTAMP,
         })

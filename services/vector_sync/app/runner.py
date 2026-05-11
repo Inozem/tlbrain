@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 
 from core.google_drive.firestore import list_imported, recover_stale_syncing
 from core.config import get_root_folder_id
@@ -30,12 +31,16 @@ def run_sync():
             continue
 
         save_index(doc_id, {
+            "syncing_started_at": None,
+            "synced_at": None,
+            "error": None,
             **(existing or {}),
             "doc_id": doc_id,
             "client_name": file["client_name"],
             "modifiedTime": file["modifiedTime"],
             "root_folder_id": root_folder_id,
             "status": "imported",
+            "imported_at": (existing or {}).get("imported_at") or datetime.now(timezone.utc).isoformat(),
         })
 
         logger.info("Marked imported: %s client=%s", doc_id, file["client_name"])

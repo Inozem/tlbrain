@@ -36,9 +36,9 @@ def tldv_reconciliation(request):
 
     db = firestore.Client()
     existing = {
-        doc.to_dict().get("tldv_meeting_id")
+        doc.to_dict().get("meeting_id")
         for doc in db.collection(COLLECTION_NAME).stream()
-        if doc.to_dict().get("tldv_meeting_id")
+        if doc.to_dict().get("meeting_id")
     }
 
     missing = []
