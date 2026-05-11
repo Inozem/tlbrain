@@ -23,7 +23,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
 
     try:
         raw_text = read_google_doc(doc_id)
-        content_hash = sha256_text(raw_text)
+        content_hash = sha256_text(raw_text + client_name)
 
         existing = load_index(doc_id)
         if existing and existing.get("content_hash") == content_hash:
