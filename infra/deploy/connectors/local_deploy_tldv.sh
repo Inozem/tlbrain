@@ -30,7 +30,7 @@ if [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
   echo "ERROR: GOOGLE_REFRESH_TOKEN not found in .env"
   echo ""
   echo "Run this once on your local machine to get a token:"
-  echo "  python infra/deploy/setup_tokens.py"
+  echo "  bash infra/deploy/setup_tokens.sh"
   echo ""
   echo "Then re-run this deploy script."
   echo ""
