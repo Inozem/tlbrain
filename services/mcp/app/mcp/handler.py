@@ -26,6 +26,7 @@ from core.google_drive.firestore import (
 )
 from core.qdrant.writer import delete_by_doc_id
 from core.config import get_root_folder_id
+from core.utils.tasks import enqueue_task
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +487,11 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
             update_client_speakers(old_client_name, speakers, delta=-1)
         if speakers and new_client_name != "_unassigned":
             update_client_speakers(new_client_name, speakers)
+
+        vector_sync_url = os.environ.get("VECTOR_SYNC_URL", "")
+        vector_sync_queue = os.environ.get("VECTOR_SYNC_QUEUE", "")
+        if vector_sync_url and vector_sync_queue:
+            enqueue_task(queue_name=vector_sync_queue, url=f"{vector_sync_url}/sync/doc/{doc_id}")
 
         unassigned = get_unassigned()
     except Exception as e:
