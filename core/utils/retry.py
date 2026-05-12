@@ -26,6 +26,12 @@ def _is_transient(exc: Exception) -> bool:
             return True
     except ImportError:
         pass
+    try:
+        from google.genai.errors import ServerError
+        if isinstance(exc, ServerError):
+            return True
+    except ImportError:
+        pass
     return False
 
 

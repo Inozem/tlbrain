@@ -26,25 +26,15 @@ mask() { local v="$1"; local l=${#v}; if [ $l -le 8 ]; then echo "****"; else ec
 # Google Drive auth setup
 # =========================
 if [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
-  if [ -z "${GOOGLE_CLIENT_ID}" ] || [ -z "${GOOGLE_CLIENT_SECRET}" ]; then
-    echo ""
-    echo "ERROR: Google OAuth credentials not found in .env"
-    echo ""
-    echo "One-time setup:"
-    echo "  1. Go to Google Cloud Console → APIs & Services → Credentials"
-    echo "  2. Create Credentials → OAuth 2.0 Client ID → Desktop app"
-    echo "  3. Add to .env:"
-    echo "       GOOGLE_CLIENT_ID=..."
-    echo "       GOOGLE_CLIENT_SECRET=..."
-    echo "  4. Re-run this script"
-    echo ""
-    exit 1
-  fi
-
-  echo "Google Drive credentials not found, running setup (browser will open)..."
-  python3 -m pip install -q requests
-  python3 "${REPO_ROOT}/infra/deploy/setup_tokens.py"
-  export $(grep -v '^#' "${REPO_ROOT}/.env" | xargs)
+  echo ""
+  echo "ERROR: GOOGLE_REFRESH_TOKEN not found in .env"
+  echo ""
+  echo "Run this once on your local machine to get a token:"
+  echo "  python infra/deploy/setup_tokens.py"
+  echo ""
+  echo "Then re-run this deploy script."
+  echo ""
+  exit 1
 fi
 
 echo

@@ -107,7 +107,11 @@ def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestor
         snapshot = ref.get()
         existing = snapshot.to_dict() if snapshot.exists else None
 
-        if existing and existing.get("modifiedTime") == file["modifiedTime"]:
+        if (
+            existing
+            and existing.get("modifiedTime") == file["modifiedTime"]
+            and existing.get("client_name") == file["client_name"]
+        ):
             continue
 
         ref.set({
@@ -165,14 +169,20 @@ def _process_changes(
         snapshot = ref.get()
         existing = snapshot.to_dict() if snapshot.exists else None
 
-        ref.set({
+        if existing and existing.get("status") == "syncing":
+            continue
+
+        record = {
             **(existing or {}),
             "doc_id": doc_id,
             "client_name": client_name,
             "root_folder_id": root_folder_id,
             "status": "imported",
             "status_changed_at": firestore.SERVER_TIMESTAMP,
-        })
+        }
+        if file.get("modifiedTime"):
+            record["modifiedTime"] = file["modifiedTime"]
+        ref.set(record)
         marked += 1
 
     return marked, queued
@@ -228,7 +238,6 @@ def _recover_stale_downloading(
         if provider == "tldv" and meeting_id and tldv_import_queue and tldv_import_url:
             enqueue_task(
                 queue_name=tldv_import_queue,
-                task_id=f"tldv-import-{meeting_id}",
                 url=f"{tldv_import_url}/import",
                 body={"meeting_id": meeting_id},
             )

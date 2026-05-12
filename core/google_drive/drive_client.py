@@ -110,7 +110,7 @@ def get_drive_changes(page_token: str) -> tuple[list[dict], str]:
     while page_token:
         response = service.changes().list(
             pageToken=page_token,
-            fields="nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,mimeType,parents,trashed))",
+            fields="nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,mimeType,modifiedTime,parents,trashed))",
             spaces="drive",
             includeItemsFromAllDrives=False,
         ).execute()

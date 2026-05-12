@@ -64,8 +64,23 @@ echo "  Qdrant key:     $(mask "${QDRANT_API_KEY}")"
 echo "  TL;DV key:      $(mask "${TLDV_API_KEY}")"
 echo "  Client ID:      $(mask "${GOOGLE_CLIENT_ID}")"
 echo "  Client Secret:  $(mask "${GOOGLE_CLIENT_SECRET}")"
-if [ -n "${GOOGLE_REFRESH_TOKEN}" ]; then echo "  Refresh token:  $(mask "${GOOGLE_REFRESH_TOKEN}")"; else echo "  Refresh token:  (not set — will be generated on first run)"; fi
+if [ -n "${GOOGLE_REFRESH_TOKEN}" ]; then echo "  Refresh token:  $(mask "${GOOGLE_REFRESH_TOKEN}")"; else echo "  Refresh token:  (not set)"; fi
 echo
+
+# =========================
+# Google OAuth setup (if needed)
+# =========================
+if [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
+  if [ -z "${GOOGLE_CLIENT_ID}" ] || [ -z "${GOOGLE_CLIENT_SECRET}" ]; then
+    echo "ERROR: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in .env"
+    exit 1
+  fi
+  echo "GOOGLE_REFRESH_TOKEN not set — running OAuth setup (browser will open)..."
+  bash infra/deploy/setup_tokens.sh
+  export $(grep -v '^#' .env | xargs)
+  echo "Token saved. Continuing deploy..."
+  echo
+fi
 
 # =========================
 # Confirm

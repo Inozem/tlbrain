@@ -201,6 +201,14 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     },
                 },
                 {
+                    "name": "sync_changes",
+                    "description": "Trigger sync of transcripts from Google Drive. Use when you've made changes (moved a transcript, renamed a file) and don't want to wait for the next scheduled run.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+                {
                     "name": "sync_status",
                     "description": "Show the current sync status: how many transcripts are in each stage (queued, downloading, imported, syncing, synced, error) and how many are unassigned. Use to diagnose stuck imports or check overall system health.",
                     "inputSchema": {
@@ -250,6 +258,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "move_transcript":
         return _handle_move_transcript(request, arguments)
+
+    if tool_name == "sync_changes":
+        return _handle_sync_changes(request)
 
     if tool_name == "sync_status":
         return _handle_sync_status(request)
@@ -500,6 +511,39 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
             f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
         )
     content = build_mcp_content(payload)
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_sync_changes(request: JSONRPCRequest) -> dict:
+    checker_url = os.environ.get("SYNC_CHECKER_URL", "")
+    if not checker_url:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="SYNC_CHECKER_URL is not configured",
+        )
+
+    t0 = time.monotonic()
+    try:
+        import httpx
+        resp = httpx.post(checker_url, timeout=300)
+        resp.raise_for_status()
+        result = resp.json()
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to trigger sync",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: sync_changes",
+        extra={"tool": "sync_changes", "latency_ms": latency_ms, "queued": result.get("queued", 0)},
+    )
+
+    content = build_mcp_content({"status": "ok", **result})
     return build_jsonrpc_result(request.id, content)
 
 

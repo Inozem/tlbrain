@@ -1,0 +1,4 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY infra/deploy/setup_tokens_server.py .
+ENTRYPOINT ["python", "setup_tokens_server.py"]
