@@ -2,7 +2,7 @@ import logging
 
 from core.gemini.embeddings import embed, make_client
 from core.google_drive.docs_reader import read_google_doc
-from core.google_drive.firestore import acquire_for_syncing, increment_client_speakers, mark_error, mark_synced
+from core.google_drive.firestore import acquire_for_syncing, update_client_speakers, mark_error, mark_synced
 from core.parsing.parser import parse_document
 from core.parsing.processor import build_utterance_payloads, iter_windows
 from core.qdrant.writer import delete_old_versions, upsert_facts, upsert_summaries, upsert_utterances
@@ -75,7 +75,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
         new_speakers = [s for s in speakers if s not in prev_speakers]
         update_index(doc_id, {"speakers": speakers, "speakers_indexed": True})
         if new_speakers:
-            increment_client_speakers(client_name, new_speakers)
+            update_client_speakers(client_name, new_speakers)
 
         logger.info(
             "Processed: %s | utterances=%d summaries=%d facts=%d",

@@ -21,6 +21,7 @@ from core.google_drive.firestore import (
     get_client_folder_id,
     get_sync_status,
     move_transcript_record,
+    update_client_speakers,
     get_unassigned,
 )
 from core.qdrant.writer import delete_by_doc_id
@@ -469,6 +470,9 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
                 code=-32602,
                 message=f"Transcript not found: {doc_id}",
             )
+        doc_data = doc.to_dict()
+        old_client_name = doc_data.get("client_name", "")
+        speakers = doc_data.get("speakers", [])
         root_folder_id = get_root_folder_id()
 
         new_folder_id = get_client_folder_id(new_client_name)
@@ -477,6 +481,11 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
         move_file_to_folder(doc_id, new_folder_id)
         delete_by_doc_id(doc_id, root_folder_id)
         move_transcript_record(doc_id, new_client_name, new_folder_id)
+
+        if speakers and old_client_name and old_client_name != "_unassigned":
+            update_client_speakers(old_client_name, speakers, delta=-1)
+        if speakers and new_client_name != "_unassigned":
+            update_client_speakers(new_client_name, speakers)
 
         unassigned = get_unassigned()
     except Exception as e:

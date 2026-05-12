@@ -190,15 +190,19 @@ def recover_errors() -> list[str]:
 
 
 
-def increment_client_speakers(client_name: str, speakers: list[str]) -> None:
-    """Increment speaker counts in clients/{client_name}.speakers."""
+def _speaker_key(name: str) -> str:
+    import hashlib
+    return "s" + hashlib.md5(name.encode()).hexdigest()[:12]
+
+
+def update_client_speakers(client_name: str, speakers: list[str], delta: int = 1) -> None:
+    """Increment or decrement speaker counts in clients/{client_name}.speakers."""
     if not speakers:
         return
     db = _get_db()
-    ref = db.collection(CLIENTS_COLLECTION).document(client_name)
-    updates = {f"speakers.{speaker}": firestore.Increment(1) for speaker in speakers}
-    ref.set(updates, merge=True)
-    logger.debug("Incremented speakers for %s: %s", client_name, speakers)
+    updates = {f"speakers.{_speaker_key(s)}": firestore.Increment(delta) for s in speakers}
+    db.collection(CLIENTS_COLLECTION).document(client_name).set(updates, merge=True)
+    logger.debug("Updated speakers for %s (delta=%d): %s", client_name, delta, speakers)
 
 
 def migrate_speaker_index() -> int:
@@ -221,7 +225,7 @@ def migrate_speaker_index() -> int:
         client_name = data.get("client_name", "")
         if not client_name:
             continue
-        increment_client_speakers(client_name, speakers)
+        update_client_speakers(client_name, speakers)
         db.collection(COLLECTION_NAME).document(doc.id).update({"speakers_indexed": True})
         migrated += 1
         logger.info("Migrated speaker index: %s → %s (%d speakers)", doc.id, client_name, len(speakers))

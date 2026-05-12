@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.gemini.llm import call_gemini_json
-from core.google_drive.firestore import COLLECTION_NAME, delete_queued_placeholder, get_all_client_names, mark_downloading
+from core.google_drive.firestore import CLIENTS_COLLECTION, COLLECTION_NAME, _speaker_key, delete_queued_placeholder, get_all_client_names, mark_downloading, update_client_speakers
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import tldv_get
@@ -195,7 +195,7 @@ def _get_speakers(utterances: list[dict]) -> list[str]:
 
 
 def _get_clients_by_speakers(db: firestore.Client, speakers: list[str]) -> tuple[list[str], list[str]]:
-    """Query transcript_index by speakers.
+    """Query clients collection by speaker index.
 
     Returns (candidates, all_clients):
     - candidates: clients where at least one speaker appears in 1-4 unique clients
@@ -205,13 +205,15 @@ def _get_clients_by_speakers(db: firestore.Client, speakers: list[str]) -> tuple
     candidates: set[str] = set()
 
     for speaker in speakers:
-        docs = db.collection(COLLECTION_NAME) \
-            .where(filter=firestore.FieldFilter("speakers", "array_contains", speaker)) \
-            .select(["client_name"]) \
+        client_names: set[str] = set()
+        docs = db.collection(CLIENTS_COLLECTION) \
+            .where(filter=firestore.FieldFilter(f"speakers.{_speaker_key(speaker)}", ">", 0)) \
             .stream()
-        client_names = {
-            d.to_dict().get("client_name") for d in docs
-        } - {None, "_unassigned"}
+        for doc in docs:
+            if doc.id != "_unassigned":
+                client_names.add(doc.id)
+            if len(client_names) >= 5:
+                break
         all_clients.update(client_names)
         if _SPEAKER_MIN_CLIENTS <= len(client_names) <= _SPEAKER_MAX_CLIENTS:
             candidates.update(client_names)
@@ -339,6 +341,7 @@ async def import_meeting(request: Request):
     doc_id, modified_time = _create_google_doc(drive, client_folder_id, title, text, speaker_ranges)
     logger.info("Created Google Doc: doc_id=%s title=%r", doc_id, title)
 
+    speakers = _get_speakers(utterances)
     db.collection(COLLECTION_NAME).document(doc_id).set({
         "doc_id": doc_id,
         "root_folder_id": root_folder_id,
@@ -348,13 +351,15 @@ async def import_meeting(request: Request):
         "provider": "tldv",
         "source_file": title,
         "meeting_id": meeting_id,
-        "speakers": _get_speakers(utterances),
+        "speakers": speakers,
+        "speakers_indexed": True,
         "modifiedTime": modified_time,
         "status": "imported",
         "error": None,
         "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Saved to Firestore: doc_id=%s", doc_id)
+    update_client_speakers(client_name, speakers)
     delete_queued_placeholder(meeting_id)
 
     vector_sync_url = os.environ.get("VECTOR_SYNC_URL", "")
