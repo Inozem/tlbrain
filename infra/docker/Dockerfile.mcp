@@ -6,9 +6,12 @@ COPY requirements-common.txt /app/requirements-common.txt
 COPY core/gemini/requirements.txt /app/core/gemini/requirements.txt
 COPY core/qdrant/requirements.txt /app/core/qdrant/requirements.txt
 COPY core/google_drive/requirements.txt /app/core/google_drive/requirements.txt
+COPY core/utils/requirements.txt /app/core/utils/requirements.txt
 COPY services/mcp/requirements.txt /app/services/mcp/requirements.txt
 
 RUN pip install --no-cache-dir -r /app/services/mcp/requirements.txt
+
+RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='Qdrant/bm25')"
 
 COPY core/__init__.py /app/core/__init__.py
 COPY core/config.py /app/core/config.py

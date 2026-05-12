@@ -1,9 +1,13 @@
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from core.config import get_retrieval_score_threshold, get_retrieval_top_k
 from core.retrieval.pipeline import dedup_and_sort, fetch_utterances, merge_ranges
-from core.retrieval.search import search_summaries_and_facts
+from core.retrieval.search import keyword_search_utterances, search_summaries_and_facts
 from core.retrieval.segments import build_segments
+
+logger = logging.getLogger(__name__)
 
 _MAX_RESULT_DOCS = 3
 
@@ -14,19 +18,36 @@ def run_retrieval(
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    hits = search_summaries_and_facts(
-        query=query,
-        client_name=client_name,
-        date_from=date_from,
-        date_to=date_to,
-        top_k=get_retrieval_top_k(),
+    # Stage 1: parallel semantic + keyword search
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        semantic_future = executor.submit(
+            search_summaries_and_facts,
+            query=query,
+            client_name=client_name,
+            date_from=date_from,
+            date_to=date_to,
+            top_k=get_retrieval_top_k(),
+        )
+        keyword_future = executor.submit(
+            keyword_search_utterances,
+            query=query,
+            client_name=client_name,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
+    semantic_hits = semantic_future.result()
+    keyword_hits = keyword_future.result()
+
+    logger.info(
+        "query=%r semantic_hits=%d keyword_hits=%d",
+        query, len(semantic_hits), len(keyword_hits),
     )
 
     threshold = get_retrieval_score_threshold()
-    if threshold is not None:
-        hits = [h for h in hits if h["score"] >= threshold]
+    semantic_hits = [h for h in semantic_hits if h["score"] >= threshold]
 
-    if not hits:
+    if not semantic_hits and not keyword_hits:
         return [], {
             "truncated": False,
             "total_matches": 0,
@@ -35,20 +56,27 @@ def run_retrieval(
             "suggestion": "Нет данных за выбранный период или клиента",
         }
 
-    # Pick top _MAX_RESULT_DOCS documents by best hit score
+    # Pick top _MAX_RESULT_DOCS documents by best semantic score;
+    # keyword-only docs get score 0 and fill remaining slots if any.
     doc_best_score: dict[str, float] = {}
     doc_client: dict[str, str] = {}
-    for hit in hits:
+    for hit in semantic_hits:
         doc_id = hit["doc_id"]
         if hit["score"] > doc_best_score.get(doc_id, -1):
             doc_best_score[doc_id] = hit["score"]
             doc_client[doc_id] = hit["client_name"] or ""
+    for hit in keyword_hits:
+        doc_id = hit["doc_id"]
+        if doc_id not in doc_best_score:
+            doc_best_score[doc_id] = 0.0
+            doc_client[doc_id] = hit.get("client_name") or ""
 
     sorted_docs = sorted(doc_best_score.items(), key=lambda x: x[1], reverse=True)
     top_doc_ids = {doc_id for doc_id, _ in sorted_docs[:_MAX_RESULT_DOCS]}
     other_docs = sorted_docs[_MAX_RESULT_DOCS:]
 
-    top_hits = [h for h in hits if h["doc_id"] in top_doc_ids]
+    all_hits = semantic_hits + keyword_hits
+    top_hits = [h for h in all_hits if h["doc_id"] in top_doc_ids]
     merged_by_doc = merge_ranges(top_hits)
 
     result_segments = []

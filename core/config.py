@@ -14,8 +14,5 @@ def get_retrieval_top_k() -> int:
     return int(os.environ.get("RETRIEVAL_TOP_K", "15"))
 
 
-def get_retrieval_score_threshold() -> float | None:
-    value = os.environ.get("RETRIEVAL_SCORE_THRESHOLD")
-    if value is None:
-        return None
-    return float(value)
+def get_retrieval_score_threshold() -> float:
+    return float(os.environ.get("RETRIEVAL_SCORE_THRESHOLD", "0.6"))
