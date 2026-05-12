@@ -1,4 +1,4 @@
-from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
+from qdrant_client.models import Distance, PayloadSchemaType, SparseIndexParams, SparseVectorParams, VectorParams
 
 from core.qdrant.client import get_client
 from core.qdrant.schema import COLLECTION_CONFIG, get_collection_name
@@ -13,11 +13,16 @@ def ensure_collection() -> None:
     if get_collection_name() not in existing:
         client.create_collection(
             collection_name=get_collection_name(),
-            vectors_config=VectorParams(
-                size=COLLECTION_CONFIG["size"],
-                distance=Distance.COSINE,
-                on_disk=COLLECTION_CONFIG["on_disk"],
-            ),
+            vectors_config={
+                "dense": VectorParams(
+                    size=COLLECTION_CONFIG["size"],
+                    distance=Distance.COSINE,
+                    on_disk=COLLECTION_CONFIG["on_disk"],
+                )
+            },
+            sparse_vectors_config={
+                "bm25": SparseVectorParams(index=SparseIndexParams(on_disk=True))
+            },
         )
     _ensure_indexes(client)
 

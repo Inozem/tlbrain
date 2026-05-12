@@ -10,6 +10,8 @@ COPY services/vector_sync/requirements.txt /app/services/vector_sync/requirement
 
 RUN pip install --no-cache-dir -r /app/services/vector_sync/requirements.txt
 
+RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='Qdrant/bm25')"
+
 COPY core /app/core
 COPY services/vector_sync /app/services/vector_sync
 

@@ -1,5 +1,8 @@
 import logging
 
+from fastembed import SparseTextEmbedding
+from qdrant_client.models import SparseVector
+
 from core.gemini.embeddings import embed, make_client
 from core.google_drive.docs_reader import read_google_doc
 from core.google_drive.firestore import acquire_for_syncing, update_client_speakers, mark_error, mark_synced
@@ -10,6 +13,15 @@ from services.vector_sync.app.hashing import sha256_text
 from services.vector_sync.app.index_store import load_index, update_index
 
 logger = logging.getLogger(__name__)
+
+_bm25_model: SparseTextEmbedding | None = None
+
+
+def _get_bm25_model() -> SparseTextEmbedding:
+    global _bm25_model
+    if _bm25_model is None:
+        _bm25_model = SparseTextEmbedding(model_name="Qdrant/bm25")
+    return _bm25_model
 
 
 def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
@@ -47,7 +59,12 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
         utterance_payloads = build_utterance_payloads(
             utterances, doc_id, version, client_name, dialog_date, root_folder_id
         )
-        upsert_utterances(utterance_payloads)
+        bm25_embeddings = list(_get_bm25_model().embed([u["text"] for u in utterance_payloads]))
+        sparse_vectors = [
+            SparseVector(indices=e.indices.tolist(), values=e.values.tolist())
+            for e in bm25_embeddings
+        ]
+        upsert_utterances(utterance_payloads, sparse_vectors)
 
         embed_client = make_client()
         summaries_count = 0

@@ -1,26 +1,24 @@
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct
+from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct, SparseVector
 
 from core.qdrant.client import get_client
-from core.qdrant.schema import EMBEDDING_DIMENSIONS, get_collection_name
+from core.qdrant.schema import get_collection_name
 from core.utils.retry import with_retry
-
-_ZERO_VECTOR = [0.0] * EMBEDDING_DIMENSIONS
 
 
 @with_retry
-def upsert_utterances(utterances: list[dict[str, Any]]) -> None:
+def upsert_utterances(utterances: list[dict[str, Any]], sparse_vectors: list[SparseVector]) -> None:
     if not utterances:
         return
     points = [
         PointStruct(
             id=_point_id("utterance", u["doc_id"], str(u["order_index"])),
-            vector=_ZERO_VECTOR,
+            vector={"bm25": sv},
             payload=u,
         )
-        for u in utterances
+        for u, sv in zip(utterances, sparse_vectors)
     ]
     get_client().upsert(collection_name=get_collection_name(), points=points)
 
@@ -32,7 +30,7 @@ def upsert_summaries(summaries: list[dict[str, Any]], vectors: list[list[float]]
     points = [
         PointStruct(
             id=_point_id("summary", s["doc_id"], s["summary_id"]),
-            vector=vector,
+            vector={"dense": vector},
             payload=s,
         )
         for s, vector in zip(summaries, vectors)
@@ -47,7 +45,7 @@ def upsert_facts(facts: list[dict[str, Any]], vectors: list[list[float]]) -> Non
     points = [
         PointStruct(
             id=_point_id("fact", f["doc_id"], f"{f['summary_id']}:{f['text']}"),
-            vector=vector,
+            vector={"dense": vector},
             payload=f,
         )
         for f, vector in zip(facts, vectors)
