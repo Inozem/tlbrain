@@ -190,6 +190,44 @@ def recover_errors() -> list[str]:
 
 
 
+def increment_client_speakers(client_name: str, speakers: list[str]) -> None:
+    """Increment speaker counts in clients/{client_name}.speakers."""
+    if not speakers:
+        return
+    db = _get_db()
+    ref = db.collection(CLIENTS_COLLECTION).document(client_name)
+    updates = {f"speakers.{speaker}": firestore.Increment(1) for speaker in speakers}
+    ref.set(updates, merge=True)
+    logger.debug("Incremented speakers for %s: %s", client_name, speakers)
+
+
+def migrate_speaker_index() -> int:
+    """Populate clients.speakers from transcript_index docs that have speakers stored.
+
+    Idempotent: skips docs where speakers_indexed=True.
+    Returns count of migrated docs.
+    """
+    db = _get_db()
+    migrated = 0
+    for doc in db.collection(COLLECTION_NAME).stream():
+        data = doc.to_dict()
+        if data.get("status") in ("queued", "downloading"):
+            continue
+        if data.get("speakers_indexed"):
+            continue
+        speakers = data.get("speakers")
+        if not speakers:
+            continue
+        client_name = data.get("client_name", "")
+        if not client_name:
+            continue
+        increment_client_speakers(client_name, speakers)
+        db.collection(COLLECTION_NAME).document(doc.id).update({"speakers_indexed": True})
+        migrated += 1
+        logger.info("Migrated speaker index: %s → %s (%d speakers)", doc.id, client_name, len(speakers))
+    return migrated
+
+
 def sync_clients_from_drive(folders: list[dict[str, str]]) -> int:
     """Upsert clients/{name} for each Drive folder. Updates folder_id if changed. Returns count of new records.
 
@@ -213,6 +251,11 @@ def sync_clients_from_drive(folders: list[dict[str, str]]) -> int:
         elif snapshot.to_dict().get("folder_id") != folder_id:
             ref.update({"folder_id": folder_id})
             logger.info("Updated folder_id for client: %s (%s)", name, folder_id)
+
+    migrated = migrate_speaker_index()
+    if migrated:
+        logger.info("Migrated speaker index for %d doc(s)", migrated)
+
     return created
 
 
