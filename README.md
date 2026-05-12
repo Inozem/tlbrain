@@ -1,6 +1,5 @@
 # tlbrain
 
-> 🚧 This project is under active development.
 
 TLBrain is a cost-efficient memory system for Claude (Cowork), designed to retrieve structured knowledge from conversation transcripts.
 
@@ -45,17 +44,19 @@ Responsibilities:
 - maintain Firestore index with status machine (`queued → downloading → imported → syncing → synced / error`)
 - recover stale syncing tasks automatically
 
-## 3. Vector Sync Checker (Cloud Function)
+## 3. Sync Checker (Cloud Function)
 
-Lightweight scheduler triggered by Cloud Scheduler on a configurable interval (`VECTOR_SYNC_CHECKER_SCHEDULE`, default: every 15 minutes).
+Lightweight scheduler triggered by Cloud Scheduler on a configurable interval (`SYNC_CHECKER_SCHEDULE`, default: every 15 minutes).
 
 Responsibilities:
 
-- scan Google Drive for new or modified documents
+- detect new and modified documents via Drive Changes API (incremental, not full scan)
 - mark changed documents as `imported` in Firestore
 - dispatch per-document sync tasks to Cloud Tasks queue
+- recover stale `syncing` and `downloading` documents automatically
+- sync client registry from Drive folders
 
-**The interval directly controls how quickly changes in Google Drive appear in the knowledge base.** After a transcript is added or updated in Drive, the Checker will pick it up on the next scheduled run. To get faster updates, set a shorter interval (minimum recommended: 5 minutes).
+**Drive Changes API** replaces the previous full Drive scan — only actual changes are processed, making the checker faster and cheaper. The page token is stored in Firestore (`tokens/drive_sync`).
 
 Intentionally deployed as a Cloud Function rather than Cloud Run to minimize cost — it runs on a fixed schedule with no idle traffic, so an always-on container would be wasteful.
 
@@ -219,6 +220,7 @@ REGION=europe-west1
 # Service names
 MCP_SERVICE_NAME=tlbrain-mcp
 VECTOR_SYNC_SERVICE_NAME=tlbrain-vector-sync
+SYNC_CHECKER_NAME=tlbrain-sync-checker
 
 # Google Drive root folder URL
 ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
@@ -241,9 +243,9 @@ ALLOWED_EMAIL=your-email@gmail.com
 # Scheduler
 VECTOR_SYNC_QUEUE=tlbrain-vector-sync-queue
 CLOUD_TASKS_MAX_CONCURRENT=2
-# How often Checker scans Drive — controls update latency after Drive changes.
+# How often Checker runs — controls update latency after Drive changes.
 # "*/5 * * * *" = every 5 min (fast), "*/15 * * * *" = every 15 min (default), "0 4 * * *" = daily
-VECTOR_SYNC_CHECKER_SCHEDULE="*/15 * * * *"
+SYNC_CHECKER_SCHEDULE="*/15 * * * *"
 
 # TL;DV Connector
 TLDV_API_KEY=your-tldv-api-key
@@ -446,10 +448,27 @@ print('OK — collection ready')
 | `query` | Semantic search over client conversation transcripts. Supports `client_name`, `date_from`, `date_to` filters. |
 | `get_transcript` | Retrieve full transcripts without semantic search. By `doc_id`, or by `client_name` with optional `limit` and date range. |
 | `list_clients` | List all clients with dialog count and last dialog date. If unassigned transcripts exist, returns a `suggestion` and a `transcripts` list with `doc_id` and `dialog_date` to help assign them. |
+| `create_client` | Create a new client: makes a folder in Google Drive and registers the client in the database. |
+| `move_transcript` | Move a transcript to a different client folder. Updates Drive, resets the record for reindexing, removes old vectors, and enqueues sync immediately. |
+| `import_all_transcripts` | Trigger a full import of all transcripts from TL;DV. Supports `limit` (default: 10) and `since` (ISO date) parameters. Idempotent. |
+| `sync_changes` | Trigger an immediate sync run without waiting for the next scheduled check. Use after making changes in Drive. |
+| `sync_status` | Show current sync status: counts by stage (queued, downloading, imported, syncing, synced, error) and unassigned transcript count. |
 
 ---
 
 # Current Status
+
+Implemented (v0.12):
+
+- `create_client` MCP tool — creates Drive folder + Firestore record
+- `move_transcript` MCP tool — moves file in Drive, updates Firestore, removes old vectors, enqueues sync immediately
+- `import_all_transcripts` MCP tool — full TL;DV import with `limit` and `since` parameters
+- `sync_changes` MCP tool — triggers immediate sync run on demand
+- `sync_status` MCP tool — aggregated status counts from Firestore
+- Drive Changes API in Checker — replaces full Drive scan with incremental change detection
+- Speaker index in `clients` collection — enables fast client detection by speaker without scanning transcripts
+- `setup_tokens.sh` — native OAuth setup without Docker or Python (PowerShell on Windows, Python3 on macOS/Linux)
+- Qdrant collection auto-created on vector sync service startup
 
 Implemented (v0.11):
 
@@ -503,7 +522,8 @@ Implemented (v0.10):
 - ~~v0.9 — Scheduler + Stability~~ ✓
 - ~~v0.10 — Production Ready~~ ✓
 - ~~v0.11 — TL;DV Connector~~ ✓
-- v0.12 — MCP Management Tools
+- ~~v0.12 — MCP Management Tools~~ ✓
+- v0.13 — Hybrid Search (BM25 + Semantic)
 
 ---
 
