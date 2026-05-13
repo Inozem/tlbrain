@@ -9,7 +9,7 @@ from core.google_drive.firestore import acquire_for_syncing, update_client_speak
 from core.parsing.parser import parse_document
 from core.parsing.processor import build_utterance_payloads, iter_windows
 from core.qdrant.writer import delete_old_versions, upsert_facts, upsert_summaries, upsert_utterances
-from services.vector_sync.app.hashing import sha256_text
+from services.vector_sync.app.hashing import sha256_text, sha256_utterance
 from services.vector_sync.app.index_store import load_index, update_index
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,12 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
         delete_old_versions(doc_id, version, root_folder_id)
         update_index(doc_id, {"content_hash": content_hash, "version": version})
         mark_synced(doc_id)
+
+        utterance_hashes = {
+            str(u["order_index"]): sha256_utterance(u["order_index"], u["speaker"], u["text"])
+            for u in utterance_payloads
+        }
+        update_index(doc_id, {"utterance_hashes": utterance_hashes})
 
         speakers = sorted({u["speaker"] for u in utterances if u.get("speaker")})
         prev_speakers = set((existing or {}).get("speakers", []))
