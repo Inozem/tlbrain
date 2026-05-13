@@ -49,6 +49,7 @@ def iter_windows(
     dialog_date: str,
     root_folder_id: str,
     existing_summary_keys: set[str] | None = None,
+    allowed_center_indexes: set[int] | None = None,
 ) -> Generator[tuple[dict[str, Any], list[dict[str, Any]]], None, None]:
     """Generator: yield (summary_dict, facts_list) one window at a time."""
     if existing_summary_keys is None:
@@ -58,6 +59,10 @@ def iter_windows(
 
     for window in generate_windows(utterances):
         center_index = window["center_index"]
+
+        if allowed_center_indexes is not None and center_index not in allowed_center_indexes:
+            continue
+
         summary_key = f"{doc_id}:{center_index}:{version}"
 
         if summary_key in existing_summary_keys:

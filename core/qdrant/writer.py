@@ -1,7 +1,7 @@
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct, SparseVector
+from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, PointStruct, SparseVector
 
 from core.qdrant.client import get_client
 from core.qdrant.schema import get_collection_name
@@ -79,6 +79,40 @@ def delete_by_doc_id(doc_id: str, root_folder_id: str) -> None:
                 FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
             ]
         ),
+    )
+
+
+@with_retry
+def delete_utterances_by_order_indexes(
+    doc_id: str, root_folder_id: str, order_indexes: list[int]
+) -> None:
+    if not order_indexes:
+        return
+    get_client().delete(
+        collection_name=get_collection_name(),
+        points_selector=Filter(must=[
+            FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+            FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
+            FieldCondition(key="order_index", match=MatchAny(any=order_indexes)),
+            FieldCondition(key="type", match=MatchValue(value="utterance")),
+        ]),
+    )
+
+
+@with_retry
+def delete_summaries_by_center_indexes(
+    doc_id: str, root_folder_id: str, center_indexes: list[int]
+) -> None:
+    if not center_indexes:
+        return
+    get_client().delete(
+        collection_name=get_collection_name(),
+        points_selector=Filter(must=[
+            FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+            FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
+            FieldCondition(key="center_index", match=MatchAny(any=center_indexes)),
+            FieldCondition(key="type", match=MatchAny(any=["summary", "fact"])),
+        ]),
     )
 
 

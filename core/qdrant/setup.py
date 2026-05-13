@@ -4,7 +4,7 @@ from core.qdrant.client import get_client
 from core.qdrant.schema import COLLECTION_CONFIG, get_collection_name
 
 _KEYWORD_INDEXES = ["doc_id", "version", "root_folder_id", "type", "client_name", "dialog_date"]
-_INTEGER_INDEXES = ["order_index", "dialog_date_num"]
+_INTEGER_INDEXES = ["order_index", "dialog_date_num", "center_index"]
 
 
 def ensure_collection() -> None:
