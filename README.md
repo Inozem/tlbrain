@@ -445,7 +445,7 @@ print('OK — collection ready')
 
 | Tool | Description |
 |---|---|
-| `query` | Semantic search over client conversation transcripts. Supports `client_name`, `date_from`, `date_to` filters. |
+| `query` | Hybrid search (semantic + BM25 keyword) over client conversation transcripts. Supports `client_name`, `date_from`, `date_to` filters. |
 | `get_transcript` | Retrieve full transcripts without semantic search. By `doc_id`, or by `client_name` with optional `limit` and date range. |
 | `list_clients` | List all clients with dialog count and last dialog date. If unassigned transcripts exist, returns a `suggestion` and a `transcripts` list with `doc_id` and `dialog_date` to help assign them. |
 | `create_client` | Create a new client: makes a folder in Google Drive and registers the client in the database. |
@@ -457,6 +457,15 @@ print('OK — collection ready')
 ---
 
 # Current Status
+
+Implemented (v0.13):
+
+- Hybrid retrieval in Stage 1 — parallel semantic search (dense, top-15, score ≥ 0.6) + BM25 keyword search (sparse, top-10) over utterances
+- Named vectors in Qdrant collection — `dense` for summaries and facts, `bm25` sparse for utterances
+- BM25 sparse vectors generated via fastembed (`Qdrant/bm25`) during indexing and at query time
+- Keyword hits expanded to window `[i-2, i+2]` and merged with semantic covered ranges before fetch
+- Default score threshold 0.6 for semantic hits (overridable via `RETRIEVAL_SCORE_THRESHOLD`)
+- Retrieval logging — `query`, `semantic_hits`, `keyword_hits` counts per request
 
 Implemented (v0.12):
 
@@ -523,7 +532,7 @@ Implemented (v0.10):
 - ~~v0.10 — Production Ready~~ ✓
 - ~~v0.11 — TL;DV Connector~~ ✓
 - ~~v0.12 — MCP Management Tools~~ ✓
-- v0.13 — Hybrid Search (BM25 + Semantic)
+- ~~v0.13 — Hybrid Search (BM25 + Semantic)~~ ✓
 
 ---
 
