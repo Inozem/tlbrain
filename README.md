@@ -292,16 +292,19 @@ TLBrain is designed so you don't pay for what a single-user scenario doesn't nee
 - Utterances stored with BM25 sparse vectors (not dense) → 4× less space
 - Embeddings only for summaries and facts → ~10–20% of utterance volume
 - Enough for most single-user scenarios
+
 **Gemini (~$0.10 per transcript):**
 - You only pay for Gemini when indexing new transcripts
 - ~$0.10 per transcript depending on conversation length
 - `text-embedding-004`, `output_dimensionality=768` → 4× cheaper than 3072
 - One Gemini request per window (summary + facts together)
 - If a file hasn't changed, it's skipped — Gemini is never called again
+
 **Google Cloud (~$0/month):**
 - Cloud Run: free tier covers all single-user traffic
 - Cloud Functions, Cloud Tasks, Cloud Scheduler: included in free tier
 - Firestore: free tier covers 50k reads and 20k writes per day — more than enough for single-user at 15 calls/week
+
 As long as you stay within the free tier limits, you only pay for syncing new transcripts — roughly $0.10 per call. Everything else is free. You can go on a six-month vacation, come back, and nothing will be lost and nothing will have cost you a penny while you were away.
  
 ---
@@ -325,18 +328,22 @@ As long as you stay within the free tier limits, you only pay for syncing new tr
 - Remote MCP endpoint for Claude clients
 - Retrieval pipeline (semantic + BM25 + pin)
 - Google OAuth 2.0 (single-user via `ALLOWED_EMAIL`)
+
 **Vector Sync Service (Cloud Run, scale to 0)**
 - `POST /sync/doc/{doc_id}` — index a single document
 - Parsing, windowing, summary/facts generation, write to Qdrant
 - Firestore transactions to prevent double-processing
+
 **Sync Checker (Cloud Function gen2)**
 - Triggered by `SYNC_CHECKER_SCHEDULE` (default: `*/15 * * * *`)
 - Drive Changes API — only changed files
 - Recovery of stale tasks
+
 **TL;DV Connector:**
 - Webhook Function — receives `TranscriptReady`, creates a Cloud Tasks job
 - Reconciliation Function — daily check of the last 48h
 - Import Service (Cloud Run) — downloads transcript, detects client, creates Google Doc
+
 ### Retrieval Pipeline
  
 When Claude calls `query`, six stages run:
@@ -345,6 +352,7 @@ When Claude calls `query`, six stages run:
 - Semantic (dense): search over summaries + facts, top-15, score ≥ 0.6 → `covered_range`
 - Keyword (BM25 sparse): search over utterances, top-10 → window `[i-2, i+2]` around each hit
 - Pin (user_facts): dense search over `type=user_fact`, top-10 — no score threshold; documents with matches are always included
+
 **Stage 2 — Range merge:** merge overlapping ranges within the same document. `[121–125]` + `[123–127]` → `[121–127]`.
  
 **Stage 3 — Fetch:** retrieve utterances by merged ranges — no second search query.
@@ -362,9 +370,11 @@ During indexing, each document is processed through anchor-based windowing:
 - **Anchor** = every Nth utterance (e.g. every 3rd)
 - **Window** = `[i-2, i-1, i, i+1, i+2]` around the anchor
 - Overlap between adjacent windows happens automatically
+
 For each window — one Gemini request returning:
 - **Summary** — brief description of the topic, decisions, and next steps
 - **Facts** — list of structured facts (prices, objections, agreements)
+
 Generation parameters: `temperature=0`, `top_p=1`. Prompts are versioned (`prompt_version`). Idempotency: `summary_key = doc_id + center_index + version` — if it already exists, it's skipped.
  
 Utterances are always saved. A failure in summary/facts generation does not block indexing.
@@ -376,6 +386,7 @@ Utterances are always saved. A failure in summary/facts generation does not bloc
 2. For each changed file, computes `content_hash = sha256(file_content + client_name)`
 3. If hash matches → skip; if different → enqueue reindex
 4. Runs recovery: resets stale `syncing` and `downloading` records
+
 **Vector Sync Service** (Cloud Run):
 1. Receives a task from Cloud Tasks: `POST /sync/doc/{doc_id}`
 2. Atomically acquires the document via Firestore transaction (`imported → syncing`)
@@ -383,6 +394,7 @@ Utterances are always saved. A failure in summary/facts generation does not bloc
 4. Generates summaries, facts, BM25 sparse vectors
 5. **Append new → delete old**: uploads new chunks with new `version` first, then deletes old ones by `doc_id + old_version`
 6. Updates status: `syncing → synced`
+
 Status machine: `queued → downloading → imported → syncing → synced / error`
  
 ### MCP Lifecycle
