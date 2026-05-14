@@ -192,7 +192,7 @@ gcloud run services describe tlbrain-vector-sync \
   --format="value(spec.template.spec.serviceAccountName)"
 ```
  
-Share your root Drive folder with this email. Recommended permission: **Viewer**.
+Share your root Drive folder with this email. Recommended permission: **Editor**.
  
 ### 10. Connect TL;DV
  
