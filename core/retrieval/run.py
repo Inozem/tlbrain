@@ -4,7 +4,7 @@ from typing import Any
 
 from core.config import get_retrieval_score_threshold, get_retrieval_top_k
 from core.retrieval.pipeline import dedup_and_sort, fetch_utterances, merge_ranges
-from core.retrieval.search import keyword_search_utterances, search_summaries_and_facts
+from core.retrieval.search import keyword_search_utterances, search_summaries_and_facts, search_summaries_for_doc, search_user_facts
 from core.retrieval.segments import build_segments
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,20 @@ def run_retrieval(
     semantic_hits = semantic_future.result()
     keyword_hits = keyword_future.result()
 
+    # Pin: documents with user_facts matching the query bypass the score threshold
+    pinned_hits: list[dict[str, Any]] = []
+    user_fact_hits = search_user_facts(query, client_name=client_name, date_from=date_from, date_to=date_to)
+    if user_fact_hits:
+        hits_by_doc: dict[str, int] = {}
+        for h in user_fact_hits:
+            doc_id = h["doc_id"]
+            if doc_id:
+                hits_by_doc[doc_id] = hits_by_doc.get(doc_id, 0) + 1
+        for doc_id, hit_count in hits_by_doc.items():
+            extra = search_summaries_for_doc(doc_id, query, top_k=min(hit_count * 5, 20))
+            pinned_hits.extend(extra)
+        logger.info("query=%r user_fact_pins=%d", query, len(hits_by_doc))
+
     logger.info(
         "query=%r semantic_hits=%d keyword_hits=%d",
         query, len(semantic_hits), len(keyword_hits),
@@ -46,6 +60,9 @@ def run_retrieval(
 
     threshold = get_retrieval_score_threshold()
     semantic_hits = [h for h in semantic_hits if h["score"] >= threshold]
+
+    # Pinned hits are appended after threshold filtering — they are never filtered out
+    semantic_hits = semantic_hits + pinned_hits
 
     if not semantic_hits and not keyword_hits:
         return [], {

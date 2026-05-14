@@ -61,12 +61,28 @@ def delete_old_versions(doc_id: str, new_version: str, root_folder_id: str) -> N
             must=[
                 FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
                 FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
+                FieldCondition(key="type", match=MatchAny(any=["utterance", "summary", "fact"])),
             ],
             must_not=[
                 FieldCondition(key="version", match=MatchValue(value=new_version)),
             ],
         ),
     )
+
+
+@with_retry
+def upsert_user_facts(user_facts: list[dict[str, Any]], vectors: list[list[float]]) -> None:
+    if not user_facts:
+        return
+    points = [
+        PointStruct(
+            id=_point_id("user_fact", f["doc_id"], f["text"]),
+            vector={"dense": vector},
+            payload=f,
+        )
+        for f, vector in zip(user_facts, vectors)
+    ]
+    get_client().upsert(collection_name=get_collection_name(), points=points)
 
 
 @with_retry

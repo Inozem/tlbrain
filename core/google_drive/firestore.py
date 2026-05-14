@@ -346,6 +346,14 @@ def get_client_name_by_folder_id(folder_id: str) -> str | None:
     return None
 
 
+def get_transcript_record(doc_id: str) -> dict | None:
+    """Return transcript_index record for a doc, or None if not found."""
+    doc = _get_db().collection(COLLECTION_NAME).document(doc_id).get()
+    if not doc.exists:
+        return None
+    return doc.to_dict()
+
+
 def create_client(client_name: str, folder_id: str, description: str | None = None) -> bool:
     """Create clients/{client_name} record. Returns True if created, False if already existed."""
     db = _get_db()

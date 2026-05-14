@@ -4,7 +4,7 @@ from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
 from core.google_drive.drive_client import get_file_parent_folder_id
-from core.google_drive.firestore import get_client_name_by_folder_id
+from core.google_drive.firestore import get_client_name_by_folder_id, update_client_speakers
 from core.qdrant.setup import ensure_collection
 from core.qdrant.writer import delete_by_doc_id
 from core.utils.logging import configure_logging
@@ -22,21 +22,33 @@ async def health():
     return {"status": "ok"}
 
 
-
 @app.post("/sync/doc/{doc_id}")
 async def sync_doc_endpoint(doc_id: str):
     root_folder_id = get_root_folder_id()
 
+    should_delete = False
+    folder_id = None
+
     try:
-        folder_id = get_file_parent_folder_id(doc_id)
+        folder_id, is_trashed = get_file_parent_folder_id(doc_id)
+        if is_trashed:
+            should_delete = True
     except HttpError as e:
         if e.resp.status == 404:
-            existing = load_index(doc_id)
-            if existing:
-                delete_by_doc_id(doc_id, root_folder_id)
-                delete_index(doc_id)
-            return JSONResponse(content={"status": "ok", "result": "deleted"})
-        raise
+            should_delete = True
+        else:
+            raise
+
+    if should_delete:
+        existing = load_index(doc_id)
+        if existing:
+            speakers = existing.get("speakers", [])
+            client_name_existing = existing.get("client_name", "")
+            delete_by_doc_id(doc_id, root_folder_id)
+            if speakers and client_name_existing and client_name_existing != "_unassigned":
+                update_client_speakers(client_name_existing, speakers, delta=-1)
+            delete_index(doc_id)
+        return JSONResponse(content={"status": "ok", "result": "deleted"})
 
     client_name = get_client_name_by_folder_id(folder_id) if folder_id else None
 

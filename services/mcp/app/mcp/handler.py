@@ -11,6 +11,8 @@ from services.mcp.app.mcp.tools import (
     build_mcp_content,
     build_jsonrpc_result,
 )
+from core.config import get_root_folder_id
+from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
@@ -19,9 +21,11 @@ from core.google_drive.firestore import (
     create_client,
     get_client_folder_id,
     get_sync_status,
+    get_transcript_record,
     update_client_speakers,
     get_unassigned,
 )
+from core.qdrant.writer import upsert_user_facts
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +218,24 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     },
                 },
                 {
+                    "name": "add_fact",
+                    "description": "Manually add a fact to a specific transcript. Use when semantic search missed an important detail — pins the document to relevant future queries.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "doc_id": {
+                                "type": "string",
+                                "description": "Document ID to attach the fact to",
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "The fact to remember, in English",
+                            },
+                        },
+                        "required": ["doc_id", "text"],
+                    },
+                },
+                {
                     "name": "create_client",
                     "description": "Create a new client: makes a folder in Google Drive and registers the client in the database. Returns an error if a client with this name already exists.",
                     "inputSchema": {
@@ -261,6 +283,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "sync_status":
         return _handle_sync_status(request)
+
+    if tool_name == "add_fact":
+        return _handle_add_fact(request, arguments)
 
     if tool_name == "create_client":
         return _handle_create_client(request, arguments)
@@ -562,6 +587,67 @@ def _handle_sync_status(request: JSONRPCRequest) -> dict:
         )
 
     content = build_mcp_content(status)
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
+    doc_id = arguments.get("doc_id", "").strip()
+    text = arguments.get("text", "").strip()
+
+    if not doc_id or not text:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="doc_id and text are required",
+        )
+
+    t0 = time.monotonic()
+    try:
+        record = get_transcript_record(doc_id)
+        if not record:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Document not found: {doc_id}",
+            )
+        if record.get("status") != "synced":
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Document is not synced yet (status={record.get('status')}). Try again after sync completes.",
+            )
+
+        dialog_date = record.get("dialog_date", "")
+        client_name = record.get("client_name", "")
+        root_folder_id = get_root_folder_id()
+
+        payload = {
+            "type": "user_fact",
+            "doc_id": doc_id,
+            "text": text,
+            "root_folder_id": root_folder_id,
+            "client_name": client_name,
+            "dialog_date": dialog_date,
+            "dialog_date_num": int(dialog_date.replace("-", "")) if dialog_date else 0,
+        }
+
+        vector = embed([text])[0]
+        upsert_user_facts([payload], [vector])
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to add fact",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: add_fact",
+        extra={"tool": "add_fact", "doc_id": doc_id, "latency_ms": latency_ms},
+    )
+
+    content = build_mcp_content({"status": "ok", "doc_id": doc_id})
     return build_jsonrpc_result(request.id, content)
 
 
