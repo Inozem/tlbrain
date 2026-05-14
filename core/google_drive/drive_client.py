@@ -119,6 +119,14 @@ def get_drive_changes(page_token: str) -> tuple[list[dict], str]:
     return changes, response["newStartPageToken"]
 
 
+def get_file_parent_folder_id(doc_id: str) -> str | None:
+    """Return the first parent folder_id of a Drive file, or None if not found."""
+    service = build_drive_service()
+    file = service.files().get(fileId=doc_id, fields="parents").execute()
+    parents = file.get("parents", [])
+    return parents[0] if parents else None
+
+
 def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
     """Move a Drive file to new_folder_id, removing all current parents."""
     service = build_drive_service_rw()

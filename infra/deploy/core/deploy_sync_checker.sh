@@ -34,12 +34,10 @@ trap "rm -rf ${STAGE}" EXIT
 cp "${REPO_ROOT}/services/sync_checker/main.py" "${STAGE}/"
 cat "${REPO_ROOT}/services/sync_checker/requirements.txt" \
     "${REPO_ROOT}/core/google_drive/requirements.txt" \
-    "${REPO_ROOT}/core/utils/requirements.txt" \
-    "${REPO_ROOT}/core/qdrant/requirements.txt" > "${STAGE}/requirements.txt"
+    "${REPO_ROOT}/core/utils/requirements.txt" > "${STAGE}/requirements.txt"
 
 mkdir -p "${STAGE}/core/google_drive"
 mkdir -p "${STAGE}/core/utils"
-mkdir -p "${STAGE}/core/qdrant"
 cp "${REPO_ROOT}/core/__init__.py" "${STAGE}/core/"
 cp "${REPO_ROOT}/core/config.py" "${STAGE}/core/"
 cp "${REPO_ROOT}/core/google_drive/__init__.py" "${STAGE}/core/google_drive/"
@@ -47,9 +45,6 @@ cp "${REPO_ROOT}/core/google_drive/drive_client.py" "${STAGE}/core/google_drive/
 cp "${REPO_ROOT}/core/google_drive/firestore.py" "${STAGE}/core/google_drive/"
 cp "${REPO_ROOT}/core/utils/__init__.py" "${STAGE}/core/utils/"
 cp "${REPO_ROOT}/core/utils/tasks.py" "${STAGE}/core/utils/"
-cp "${REPO_ROOT}/core/qdrant/__init__.py" "${STAGE}/core/qdrant/"
-cp "${REPO_ROOT}/core/qdrant/client.py" "${STAGE}/core/qdrant/"
-cp "${REPO_ROOT}/core/qdrant/writer.py" "${STAGE}/core/qdrant/"
 
 gcloud functions deploy "${SYNC_CHECKER_NAME}" \
   --gen2 \

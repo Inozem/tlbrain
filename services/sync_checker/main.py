@@ -17,8 +17,8 @@ from core.google_drive.firestore import (
     COLLECTION_NAME,
     get_client_name_by_folder_id,
     get_drive_sync_token,
-    recover_errors,
-    recover_stale_syncing,
+    get_error_docs,
+    get_stale_syncing,
     set_drive_sync_token,
     sync_clients_from_drive,
 )
@@ -41,13 +41,17 @@ def checker(request):
 
     db = firestore.Client()
 
-    recovered = recover_stale_syncing()
-    if recovered:
-        logger.info("Recovered stale syncing: %d doc(s)", len(recovered))
+    stale_syncing = get_stale_syncing()
+    for doc_id in stale_syncing:
+        enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
+    if stale_syncing:
+        logger.info("Re-enqueued stale syncing: %d doc(s)", len(stale_syncing))
 
-    recovered_errors = recover_errors()
-    if recovered_errors:
-        logger.info("Recovered errors: %d doc(s)", len(recovered_errors))
+    error_docs = get_error_docs()
+    for doc_id in error_docs:
+        enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
+    if error_docs:
+        logger.info("Re-enqueued error docs: %d doc(s)", len(error_docs))
 
     recovered_downloading = _recover_stale_downloading(db, tldv_import_queue, tldv_import_url)
     if recovered_downloading:
@@ -60,84 +64,64 @@ def checker(request):
 
     page_token = get_drive_sync_token()
     queued = 0
-    marked = 0
 
     if page_token:
         try:
             changes, new_token = get_drive_changes(page_token)
-            marked, queued = _process_changes(changes, root_folder_id, sync_url, queue_name, db)
+            queued = _process_changes(changes, sync_url, queue_name)
             set_drive_sync_token(new_token)
             logger.info("Incremental sync: %d change(s) processed", len(changes))
         except HttpError as e:
             if e.resp.status == 400:
                 logger.warning("Drive page token expired, falling back to full scan")
-                marked, queued = _full_scan(root_folder_id, sync_url, queue_name, db)
+                queued = _full_scan(root_folder_id, sync_url, queue_name, db)
             else:
                 raise
     else:
         logger.info("No page token found, running full scan")
-        marked, queued = _full_scan(root_folder_id, sync_url, queue_name, db)
-
-    queued += _enqueue_imported(sync_url, queue_name, db)
+        queued = _full_scan(root_folder_id, sync_url, queue_name, db)
 
     logger.info(
-        "Checker done — marked=%d queued=%d recovered_syncing=%d recovered_errors=%d recovered_downloading=%d",
-        marked, queued, len(recovered), len(recovered_errors), len(recovered_downloading),
+        "Checker done — queued=%d stale_syncing=%d error_docs=%d recovered_downloading=%d",
+        queued, len(stale_syncing), len(error_docs), len(recovered_downloading),
     )
     return {
-        "marked": marked,
         "queued": queued,
-        "recovered_syncing": len(recovered),
-        "recovered_errors": len(recovered_errors),
+        "stale_syncing": len(stale_syncing),
+        "error_docs": len(error_docs),
         "recovered_downloading": len(recovered_downloading),
     }, 200
 
 
-def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestore.Client) -> tuple[int, int]:
-    """Full Drive scan: mark changed docs as imported and enqueue. Saves new page token."""
+def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestore.Client) -> int:
+    """Full Drive scan: enqueue changed docs. Saves new page token."""
     start_token = get_start_page_token()
 
     files = scan_root_folder()
-    marked = 0
     queued = 0
 
     for file in files:
         doc_id = file["doc_id"]
-        ref = db.collection(COLLECTION_NAME).document(doc_id)
-        snapshot = ref.get()
+        snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
         existing = snapshot.to_dict() if snapshot.exists else None
 
         if (
             existing
             and existing.get("modifiedTime") == file["modifiedTime"]
             and existing.get("client_name") == file["client_name"]
+            and existing.get("status") == "synced"
         ):
             continue
 
-        ref.set({
-            **(existing or {}),
-            "doc_id": doc_id,
-            "client_name": file["client_name"],
-            "modifiedTime": file["modifiedTime"],
-            "root_folder_id": root_folder_id,
-            "status": "imported",
-            "status_changed_at": firestore.SERVER_TIMESTAMP,
-        })
-        marked += 1
+        if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}"):
+            queued += 1
 
     set_drive_sync_token(start_token)
-    return marked, queued
+    return queued
 
 
-def _process_changes(
-    changes: list[dict],
-    root_folder_id: str,
-    sync_url: str,
-    queue_name: str,
-    db: firestore.Client,
-) -> tuple[int, int]:
-    """Process incremental Drive changes. Returns (marked, queued)."""
-    marked = 0
+def _process_changes(changes: list[dict], sync_url: str, queue_name: str) -> int:
+    """Enqueue tasks for incremental Drive changes. Returns count queued."""
     queued = 0
 
     for change in changes:
@@ -146,12 +130,14 @@ def _process_changes(
             continue
 
         if change.get("removed"):
-            _handle_deletion(doc_id, db)
+            enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
+            queued += 1
             continue
 
         file = change.get("file", {})
         if file.get("trashed"):
-            _handle_deletion(doc_id, db)
+            enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
+            queued += 1
             continue
 
         if file.get("mimeType") != GOOGLE_DOC_MIME:
@@ -161,56 +147,12 @@ def _process_changes(
         if not parents:
             continue
 
-        client_name = get_client_name_by_folder_id(parents[0])
-        if not client_name:
+        if not get_client_name_by_folder_id(parents[0]):
             continue
 
-        ref = db.collection(COLLECTION_NAME).document(doc_id)
-        snapshot = ref.get()
-        existing = snapshot.to_dict() if snapshot.exists else None
-
-        if existing and existing.get("status") == "syncing":
-            continue
-
-        record = {
-            **(existing or {}),
-            "doc_id": doc_id,
-            "client_name": client_name,
-            "root_folder_id": root_folder_id,
-            "status": "imported",
-            "status_changed_at": firestore.SERVER_TIMESTAMP,
-        }
-        if file.get("modifiedTime"):
-            record["modifiedTime"] = file["modifiedTime"]
-        ref.set(record)
-        marked += 1
-
-    return marked, queued
-
-
-def _handle_deletion(doc_id: str, db: firestore.Client) -> None:
-    """Remove deleted file from Firestore and Qdrant."""
-    from core.config import get_root_folder_id as _get_root
-    from core.qdrant.writer import delete_by_doc_id
-    try:
-        delete_by_doc_id(doc_id, _get_root())
-        db.collection(COLLECTION_NAME).document(doc_id).delete()
-        logger.info("Deleted removed file: %s", doc_id)
-    except Exception as e:
-        logger.warning("Failed to delete %s: %s", doc_id, e)
-
-
-def _enqueue_imported(sync_url: str, queue_name: str, db: firestore.Client) -> int:
-    """Enqueue any docs stuck in imported status."""
-    queued = 0
-    imported_docs = (
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("status", "==", "imported"))
-        .stream()
-    )
-    for doc in imported_docs:
-        if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc.id}"):
+        if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}"):
             queued += 1
+
     return queued
 
 

@@ -83,6 +83,18 @@ def delete_by_doc_id(doc_id: str, root_folder_id: str) -> None:
 
 
 @with_retry
+def set_payload_client_name(doc_id: str, root_folder_id: str, new_client_name: str) -> None:
+    get_client().set_payload(
+        collection_name=get_collection_name(),
+        payload={"client_name": new_client_name},
+        points=Filter(must=[
+            FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+            FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
+        ]),
+    )
+
+
+@with_retry
 def delete_utterances_by_order_indexes(
     doc_id: str, root_folder_id: str, order_indexes: list[int]
 ) -> None:

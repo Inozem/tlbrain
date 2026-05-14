@@ -2,7 +2,7 @@ import logging
 
 from google.cloud import firestore as firestore_module
 
-from core.google_drive.firestore import list_imported, recover_stale_syncing
+from core.google_drive.firestore import list_imported
 from core.config import get_root_folder_id
 from core.google_drive.drive_client import scan_root_folder
 from services.vector_sync.app.index_store import (
@@ -17,8 +17,6 @@ logger = logging.getLogger(__name__)
 
 
 def run_sync():
-    recover_stale_syncing()
-
     files = scan_root_folder()
     root_folder_id = get_root_folder_id()
 

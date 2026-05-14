@@ -17,18 +17,23 @@ def _get_db() -> firestore.Client:
 def acquire_for_syncing(doc_id: str) -> bool:
     db = _get_db()
     ref = db.collection(COLLECTION_NAME).document(doc_id)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_SYNCING_MINUTES)
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction) -> bool:
         snapshot = ref.get(transaction=transaction)
-        if not snapshot.exists:
-            return False
-        if snapshot.to_dict().get("status") != "imported":
-            return False
-        transaction.update(ref, {
-            "status": "syncing",
-            "status_changed_at": firestore.SERVER_TIMESTAMP,
-        })
+        data = snapshot.to_dict() if snapshot.exists else {}
+
+        if data.get("status") == "syncing":
+            changed_at = data.get("status_changed_at")
+            if changed_at and changed_at > cutoff:
+                return False  # recently acquired
+
+        update = {"doc_id": doc_id, "status": "syncing", "status_changed_at": firestore.SERVER_TIMESTAMP}
+        if snapshot.exists:
+            transaction.update(ref, update)
+        else:
+            transaction.set(ref, update)
         return True
 
     result = _txn(db.transaction())
@@ -110,6 +115,21 @@ def move_transcript_record(doc_id: str, new_client_name: str, new_drive_folder: 
     logger.info("Moved transcript record: %s → %s", doc_id, new_client_name)
 
 
+def update_transcript_client(
+    doc_id: str,
+    new_client_name: str,
+    new_drive_folder: str,
+    new_content_hash: str,
+) -> None:
+    """Update client_name, drive_folder and content_hash without resetting status or utterance_hashes."""
+    _get_db().collection(COLLECTION_NAME).document(doc_id).update({
+        "client_name": new_client_name,
+        "drive_folder": new_drive_folder,
+        "content_hash": new_content_hash,
+    })
+    logger.info("Updated transcript client: %s → %s", doc_id, new_client_name)
+
+
 def get_unassigned() -> dict:
     """Return count and list of unassigned transcripts (past the import stage).
 
@@ -141,7 +161,8 @@ def list_imported() -> list[dict]:
     return [{"doc_id": doc.id, **doc.to_dict()} for doc in docs]
 
 
-def recover_stale_syncing() -> list[str]:
+def get_stale_syncing() -> list[str]:
+    """Return doc IDs stuck in syncing beyond the stale threshold."""
     db = _get_db()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_SYNCING_MINUTES)
 
@@ -151,42 +172,31 @@ def recover_stale_syncing() -> list[str]:
         .stream()
     )
 
-    recovered = []
+    stale = []
     for doc in syncing_docs:
         changed_at = doc.to_dict().get("status_changed_at")
         if changed_at and changed_at < cutoff:
-            db.collection(COLLECTION_NAME).document(doc.id).update({
-                "status": "imported",
-                "status_changed_at": firestore.SERVER_TIMESTAMP,
-            })
-            recovered.append(doc.id)
-            logger.info("Recovered stale syncing: %s", doc.id)
+            stale.append(doc.id)
+            logger.info("Stale syncing detected: %s", doc.id)
+
+    return stale
 
     return recovered
 
 
-def recover_errors() -> list[str]:
-    """Reset error docs back to their pre-error status based on error_stage."""
+def get_error_docs() -> list[str]:
+    """Return doc IDs with error status."""
     db = _get_db()
     error_docs = (
         db.collection(COLLECTION_NAME)
         .where(filter=firestore.FieldFilter("status", "==", "error"))
         .stream()
     )
-    recovered = []
+    result = []
     for doc in error_docs:
-        data = doc.to_dict()
-        stage = data.get("error_stage", "vector_sync")
-        reset_status = "imported" if stage == "vector_sync" else "queued"
-        db.collection(COLLECTION_NAME).document(doc.id).update({
-            "status": reset_status,
-            "error": None,
-            "error_stage": firestore.DELETE_FIELD,
-            "status_changed_at": firestore.SERVER_TIMESTAMP,
-        })
-        recovered.append(doc.id)
-        logger.info("Recovered error doc: %s (stage=%s) → %s", doc.id, stage, reset_status)
-    return recovered
+        result.append(doc.id)
+        logger.info("Error doc detected: %s", doc.id)
+    return result
 
 
 

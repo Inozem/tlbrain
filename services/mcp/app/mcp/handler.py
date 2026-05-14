@@ -16,17 +16,12 @@ from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
 from core.google_drive.drive_client import create_client_folder, move_file_to_folder
 from core.google_drive.firestore import (
-    COLLECTION_NAME,
     create_client,
     get_client_folder_id,
     get_sync_status,
-    move_transcript_record,
     update_client_speakers,
     get_unassigned,
 )
-from core.qdrant.writer import delete_by_doc_id
-from core.config import get_root_folder_id
-from core.utils.tasks import enqueue_task
 
 logger = logging.getLogger(__name__)
 
@@ -462,36 +457,15 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        from google.cloud import firestore as _fs
-        db = _fs.Client()
-        doc = db.collection(COLLECTION_NAME).document(doc_id).get()
-        if not doc.exists:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Transcript not found: {doc_id}",
-            )
-        doc_data = doc.to_dict()
-        old_client_name = doc_data.get("client_name", "")
-        speakers = doc_data.get("speakers", [])
-        root_folder_id = get_root_folder_id()
-
         new_folder_id = get_client_folder_id(new_client_name)
         if not new_folder_id:
             new_folder_id, _ = create_client_folder(new_client_name)
         move_file_to_folder(doc_id, new_folder_id)
-        delete_by_doc_id(doc_id, root_folder_id)
-        move_transcript_record(doc_id, new_client_name, new_folder_id)
 
-        if speakers and old_client_name and old_client_name != "_unassigned":
-            update_client_speakers(old_client_name, speakers, delta=-1)
-        if speakers and new_client_name != "_unassigned":
-            update_client_speakers(new_client_name, speakers)
-
-        vector_sync_url = os.environ.get("VECTOR_SYNC_URL", "")
-        vector_sync_queue = os.environ.get("VECTOR_SYNC_QUEUE", "")
-        if vector_sync_url and vector_sync_queue:
-            enqueue_task(queue_name=vector_sync_queue, url=f"{vector_sync_url}/sync/doc/{doc_id}")
+        checker_url = os.environ.get("SYNC_CHECKER_URL", "")
+        if checker_url:
+            import httpx
+            httpx.post(checker_url, timeout=300)
 
         unassigned = get_unassigned()
     except Exception as e:

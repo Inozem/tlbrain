@@ -12,6 +12,7 @@ from core.qdrant.writer import (
     delete_old_versions,
     delete_summaries_by_center_indexes,
     delete_utterances_by_order_indexes,
+    set_payload_client_name,
     upsert_facts,
     upsert_summaries,
     upsert_utterances,
@@ -37,12 +38,23 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
     Returns: "processed" | "skipped" | "not_acquired"
     """
     if not acquire_for_syncing(doc_id):
-        logger.info("Not acquired (status != imported): %s", doc_id)
+        logger.info("Not acquired (already syncing): %s", doc_id)
         return "not_acquired"
 
     try:
         existing = load_index(doc_id)
         existing_utterance_hashes = (existing or {}).get("utterance_hashes")
+        stored_client_name = (existing or {}).get("client_name", "")
+
+        client_name_changed = bool(client_name and client_name != stored_client_name)
+        if client_name_changed:
+            set_payload_client_name(doc_id, root_folder_id, client_name)
+            stored_speakers = (existing or {}).get("speakers", [])
+            if stored_speakers and stored_client_name and stored_client_name != "_unassigned":
+                update_client_speakers(stored_client_name, stored_speakers, delta=-1)
+            if stored_speakers and client_name != "_unassigned":
+                update_client_speakers(client_name, stored_speakers)
+            logger.info("Updated client_name in Qdrant: %s → %s (%s)", stored_client_name, client_name, doc_id)
 
         raw_text = read_google_doc(doc_id)
         content_hash = sha256_text(raw_text + client_name)
@@ -70,21 +82,22 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
             changed_indexes = [int(k) for k in changed_str_keys]
 
             if not changed_indexes:
+                update_index(doc_id, {"client_name": client_name, "content_hash": content_hash, "version": version})
                 mark_synced(doc_id)
                 logger.info("Incremental skip (no changes): %s", doc_id)
                 return "skipped"
-
-            affected_centers: set[int] = set()
-            for i in changed_indexes:
-                for c in range(i - 2, i + 3):
-                    if c >= 0:
-                        affected_centers.add(c)
 
             update_index(doc_id, {
                 "dialog_date": dialog_date,
                 "provider": provider,
                 "source_file": source_file,
             })
+
+            affected_centers: set[int] = set()
+            for i in changed_indexes:
+                for c in range(i - 2, i + 3):
+                    if c >= 0:
+                        affected_centers.add(c)
 
             delete_utterances_by_order_indexes(doc_id, root_folder_id, changed_indexes)
             delete_summaries_by_center_indexes(doc_id, root_folder_id, list(affected_centers))
@@ -120,16 +133,15 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
                 summaries_count += 1
                 facts_count += len(facts)
 
-            update_index(doc_id, {"content_hash": content_hash, "version": version})
+            update_index(doc_id, {"client_name": client_name, "content_hash": content_hash, "version": version})
             mark_synced(doc_id)
-            # Финальная перезапись — убирает хэши удалённых реплик
             update_index(doc_id, {"utterance_hashes": new_hashes})
 
             speakers = sorted({u["speaker"] for u in utterances if u.get("speaker")})
             prev_speakers = set((existing or {}).get("speakers", []))
             new_speakers = [s for s in speakers if s not in prev_speakers]
             update_index(doc_id, {"speakers": speakers, "speakers_indexed": True})
-            if new_speakers:
+            if new_speakers and client_name != "_unassigned":
                 update_client_speakers(client_name, new_speakers)
 
             logger.info(
@@ -139,7 +151,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
             return "processed"
 
         else:
-            # --- Full reindex path (первый sync или legacy-документ) ---
+            # --- Full reindex path ---
             if existing and existing.get("content_hash") == content_hash:
                 mark_synced(doc_id)
                 logger.info("Skipped unchanged: %s", doc_id)
@@ -183,7 +195,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
                 facts_count += len(facts)
 
             delete_old_versions(doc_id, version, root_folder_id)
-            update_index(doc_id, {"content_hash": content_hash, "version": version})
+            update_index(doc_id, {"client_name": client_name, "content_hash": content_hash, "version": version})
             mark_synced(doc_id)
 
             utterance_hashes = {
@@ -196,7 +208,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
             prev_speakers = set((existing or {}).get("speakers", []))
             new_speakers = [s for s in speakers if s not in prev_speakers]
             update_index(doc_id, {"speakers": speakers, "speakers_indexed": True})
-            if new_speakers:
+            if new_speakers and client_name != "_unassigned":
                 update_client_speakers(client_name, new_speakers)
 
             logger.info(
