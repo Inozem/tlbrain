@@ -35,7 +35,7 @@ GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 def checker(request):
     root_folder_id = get_root_folder_id()
     sync_url = os.environ["VECTOR_SYNC_URL"]
-    queue_name = os.environ["VECTOR_SYNC_QUEUE"]
+    queue_name = os.environ.get("VECTOR_SYNC_QUEUE", "tlbrain-vector-sync-queue")
     tldv_import_queue = os.environ.get("TLDV_IMPORT_QUEUE")
     tldv_import_url = os.environ.get("TLDV_IMPORT_SERVICE_URL")
 

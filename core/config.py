@@ -11,8 +11,8 @@ def get_root_folder_id() -> str:
 
 
 def get_retrieval_top_k() -> int:
-    return int(os.environ.get("RETRIEVAL_TOP_K", "15"))
+    return int(os.environ["RETRIEVAL_TOP_K"])
 
 
 def get_retrieval_score_threshold() -> float:
-    return float(os.environ.get("RETRIEVAL_SCORE_THRESHOLD", "0.6"))
+    return float(os.environ["RETRIEVAL_SCORE_THRESHOLD"])

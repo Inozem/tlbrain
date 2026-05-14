@@ -23,7 +23,7 @@ def tldv_webhook(request):
         return {"error": "missing meetingId"}, 400
 
     import_service_url = os.environ.get("TLDV_IMPORT_SERVICE_URL", "")
-    queue_name = os.environ["TLDV_IMPORT_QUEUE"]
+    queue_name = os.environ.get("TLDV_IMPORT_QUEUE", "tlbrain-tldv-import-queue")
 
     if not import_service_url:
         logger.warning("TLDV_IMPORT_SERVICE_URL not set, skipping task for meeting_id=%s", meeting_id)

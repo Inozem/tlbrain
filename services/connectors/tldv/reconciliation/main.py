@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 @functions_framework.http
 def tldv_reconciliation(request):
     import_service_url = os.environ.get("TLDV_IMPORT_SERVICE_URL", "")
-    queue_name = os.environ["TLDV_IMPORT_QUEUE"]
+    queue_name = os.environ.get("TLDV_IMPORT_QUEUE", "tlbrain-tldv-import-queue")
 
     body = request.get_json(silent=True) or {}
     since_str = body.get("since")

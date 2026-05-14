@@ -13,12 +13,7 @@ fi
 # =========================
 # Defaults
 # =========================
-VERSION=${VERSION:-}
-
-if [ -z "${VERSION}" ]; then
-  echo "Error: VERSION is not set. Add VERSION=v0.10 to your .env file."
-  exit 1
-fi
+VERSION=${VERSION:-latest}
 
 DOCKERHUB_USERNAME=inozem
 
@@ -41,6 +36,22 @@ QDRANT_API_KEY=${QDRANT_API_KEY:-}
 TLDV_API_KEY=${TLDV_API_KEY:-}
 ROOT_FOLDER_URL=${ROOT_FOLDER_URL:-}
 ALLOWED_EMAIL=${ALLOWED_EMAIL:-}
+
+prompt_if_empty() {
+  local var="$1"; local label="$2"
+  if [ -z "${!var}" ]; then
+    read -p "${label}: " val
+    export "$var"="$val"
+  fi
+}
+
+prompt_if_empty ROOT_FOLDER_URL    "ROOT_FOLDER_URL (Google Drive folder URL)"
+prompt_if_empty GEMINI_API_KEY     "GEMINI_API_KEY"
+prompt_if_empty QDRANT_URL         "QDRANT_URL"
+prompt_if_empty QDRANT_API_KEY     "QDRANT_API_KEY"
+prompt_if_empty QDRANT_COLLECTION  "QDRANT_COLLECTION"
+prompt_if_empty GOOGLE_CLIENT_ID   "GOOGLE_CLIENT_ID"
+prompt_if_empty GOOGLE_CLIENT_SECRET "GOOGLE_CLIENT_SECRET"
 
 mask() { local v="$1"; local l=${#v}; if [ $l -le 8 ]; then echo "****"; else echo "${v:0:4}****${v: -4}"; fi; }
 
