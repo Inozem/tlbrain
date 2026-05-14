@@ -51,7 +51,6 @@ Lightweight scheduler triggered by Cloud Scheduler on a configurable interval (`
 Responsibilities:
 
 - detect new and modified documents via Drive Changes API (incremental, not full scan)
-- mark changed documents as `imported` in Firestore
 - dispatch per-document sync tasks to Cloud Tasks queue
 - recover stale `syncing` and `downloading` documents automatically
 - sync client registry from Drive folders
@@ -280,33 +279,16 @@ bash infra/deploy/deploy.sh
 
 ### Sync
 
-Manual trigger:
-
-```bash
-curl -X POST https://YOUR-SYNC-URL.run.app/sync
-```
-
 Health check:
 
 ```bash
 curl https://YOUR-SYNC-URL.run.app/
 ```
 
-Sync response example:
+Sync a specific document manually:
 
-```json
-{
-  "status": "ok",
-  "result": {
-    "files_found": 12,
-    "imported": 3,
-    "processed": 2,
-    "skipped": 1,
-    "deleted": 0,
-    "recovered": 0,
-    "errors": 0
-  }
-}
+```bash
+curl -X POST https://YOUR-SYNC-URL.run.app/sync/doc/{doc_id}
 ```
 
 ---
@@ -445,9 +427,10 @@ print('OK — collection ready')
 
 | Tool | Description |
 |---|---|
-| `query` | Hybrid search (semantic + BM25 keyword) over client conversation transcripts. Supports `client_name`, `date_from`, `date_to` filters. |
+| `query` | Hybrid search (semantic + BM25 keyword) over client conversation transcripts. Supports `client_name`, `date_from`, `date_to` filters. Documents with manually pinned `user_facts` matching the query are always included regardless of score threshold. |
 | `get_transcript` | Retrieve full transcripts without semantic search. By `doc_id`, or by `client_name` with optional `limit` and date range. |
 | `list_clients` | List all clients with dialog count and last dialog date. If unassigned transcripts exist, returns a `suggestion` and a `transcripts` list with `doc_id` and `dialog_date` to help assign them. |
+| `add_fact` | Manually pin a fact to a specific transcript. The fact is stored as a `user_fact` vector in Qdrant and ensures the document always surfaces in relevant future queries. Idempotent — same `doc_id + text` produces the same point. |
 | `create_client` | Create a new client: makes a folder in Google Drive and registers the client in the database. |
 | `move_transcript` | Move a transcript to a different client folder. Updates Drive, resets the record for reindexing, removes old vectors, and enqueues sync immediately. |
 | `import_all_transcripts` | Trigger a full import of all transcripts from TL;DV. Supports `limit` (default: 10) and `since` (ISO date) parameters. Idempotent. |
@@ -457,6 +440,15 @@ print('OK — collection ready')
 ---
 
 # Current Status
+
+Implemented (v0.14):
+
+- `add_fact` MCP tool — manually pin a fact to a specific transcript; stored as `user_fact` type in Qdrant
+- Pin logic in retrieval Stage 1 — documents with matching `user_facts` bypass the score threshold and are always included in results
+- `user_fact` vectors protected from deletion during reindex — `delete_old_versions` only removes `utterance`, `summary`, `fact` types
+- `user_facts` deleted on document removal from Drive
+- Speaker count decremented in `clients` collection on document deletion
+- Trashed Drive files now trigger deletion flow (same as 404) — previously, trashing a file without permanent deletion left stale vectors in Qdrant
 
 Implemented (v0.13):
 
@@ -533,6 +525,7 @@ Implemented (v0.10):
 - ~~v0.11 — TL;DV Connector~~ ✓
 - ~~v0.12 — MCP Management Tools~~ ✓
 - ~~v0.13 — Hybrid Search (BM25 + Semantic)~~ ✓
+- ~~v0.14 — Incremental Sync Optimizations + User Facts~~ ✓
 
 ---
 
