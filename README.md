@@ -299,7 +299,7 @@ TLBrain is designed so you don't pay for what a single-user scenario doesn't nee
 - One Gemini request per window (summary + facts together)
 - If a file hasn't changed, it's skipped — Gemini is never called again
 **Google Cloud (~$0/month):**
-- Cloud Run: scale to 0, pay only per request
+- Cloud Run: free tier covers all single-user traffic
 - Cloud Functions, Cloud Tasks, Cloud Scheduler: included in free tier
 - Firestore: free tier covers 50k reads and 20k writes per day — more than enough for single-user at 15 calls/week
 As long as you stay within the free tier limits, you only pay for syncing new transcripts — roughly $0.10 per call. Everything else is free. You can go on a six-month vacation, come back, and nothing will be lost and nothing will have cost you a penny while you were away.
