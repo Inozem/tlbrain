@@ -16,9 +16,10 @@ from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
-from core.google_drive.drive_client import create_client_folder, move_file_to_folder
+from core.google_drive.drive_client import list_client_folders, move_file_to_folder
 from core.google_drive.firestore import (
     create_client,
+    get_all_client_names,
     get_client_folder_id,
     get_sync_status,
     get_transcript_record,
@@ -484,7 +485,21 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     try:
         new_folder_id = get_client_folder_id(new_client_name)
         if not new_folder_id:
-            new_folder_id, _ = create_client_folder(new_client_name)
+            known_clients = get_all_client_names()
+            drive_folders = {f["name"] for f in list_client_folders()}
+            if new_client_name in drive_folders:
+                return build_jsonrpc_error(
+                    request_id=request.id,
+                    code=-32602,
+                    message=f"Client '{new_client_name}' exists in Google Drive but is not synced to Firestore yet.",
+                    details="Run sync_changes to synchronize, then retry.",
+                )
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Client '{new_client_name}' not found.",
+                details=f"Known clients: {known_clients}. Use create_client to add a new one.",
+            )
         move_file_to_folder(doc_id, new_folder_id)
 
         checker_url = os.environ.get("SYNC_CHECKER_URL", "")
