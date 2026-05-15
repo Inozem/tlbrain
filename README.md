@@ -1,5 +1,5 @@
-# 🧠 TLBrain
- 
+# 🧠 TLBrain `v1.0.0`
+
 Personal semantic memory for Claude — built on top of your client calls.
  
 TLBrain indexes meeting transcripts from TL;DV, stores everything in Google Drive, and lets Claude search through your conversations by meaning — without you having to paste anything manually.
@@ -146,7 +146,7 @@ TLDV_API_KEY=your-tldv-api-key      # only if using TL;DV connector
 **Optional (defaults shown):**
  
 ```env
-VERSION=latest  # or a specific tag, e.g. v0.14
+VERSION=1.0.0  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
