@@ -11,7 +11,7 @@ graph LR
     C -->|semantic retrieval| D[Claude]
 ```
  
-Works with **claude.ai** (web · desktop · mobile) · **Claude Desktop** · **Claude Cowork** · **Claude Code**
+Works with **claude.ai** (web) · **Claude Desktop** (Chat · Cowork · Code) · **Claude Mobile** (iOS · Android)
 Google Drive + Qdrant + Gemini · Single-user · Near-zero infrastructure cost · Deploy with one command
  
 ---
@@ -275,10 +275,10 @@ TLBrain works as a standard remote MCP server. That means Claude can use it dire
  
 Works with any Claude client that supports remote MCP:
  
-- **claude.ai** — web, desktop app, mobile
-- **Claude Desktop**
-- **Claude Cowork**
-- **Claude Code**
+- **claude.ai** — web
+- **Claude Desktop** — Chat, Cowork, Code (macOS, Windows)
+- **Claude Mobile** — iOS, Android
+
 Connect once, use everywhere. Configuration syncs automatically across clients.
  
 ---
