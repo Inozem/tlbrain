@@ -119,8 +119,6 @@ Then open [APIs & Services → Audience](https://console.cloud.google.com/auth/a
  
 > Without publishing, refresh tokens expire every 7 days (Testing mode limitation).
  
-> If `ALLOWED_EMAIL` is not set, the MCP endpoint works without OAuth — no sign-in required. This is convenient for local use, but if anyone gets the URL of your MCP server, they will have full access to all your transcripts. For any internet-facing deployment, always set `ALLOWED_EMAIL`.
- 
 ### 7. Get a Gemini API Key
 
 Open https://aistudio.google.com/apikey, create an API key, and save it — you'll need it as `GEMINI_API_KEY` in `.env`.
