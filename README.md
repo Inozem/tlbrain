@@ -95,10 +95,11 @@ Once the project is ready, go to **Firestore** in the left menu and click **Crea
  
 Open https://cloud.qdrant.io, create a free cluster:
  
+- Name: any (e.g. `tlbrain`)
 - Provider: **Google Cloud Platform**
-- Region: **Frankfurt (europe-west3)**
+- Region: **Frankfurt**
 - Tier: **Free** (1 node, 4 GiB disk, 1 GiB RAM)
-Copy the **Cluster URL** and **API Key** — you'll need them for `.env`.
+Once the cluster is created, copy the **Cluster URL** → `QDRANT_URL` and **API Key** → `QDRANT_API_KEY` — save them right away, you'll need them in `.env`.
  
 ### 5. Create a Root Folder in Google Drive
  
