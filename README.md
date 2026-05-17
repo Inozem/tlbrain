@@ -114,7 +114,7 @@ Client subfolders will be created automatically via MCP or manually in Google Dr
 3. Add to **Authorized redirect URIs**:
    - `https://claude.ai/api/mcp/auth_callback`
    - `http://localhost:8085`
-4. Copy **Client ID** and **Client Secret** into `.env`
+4. Copy **Client ID** → `GOOGLE_CLIENT_ID` and **Client Secret** → `GOOGLE_CLIENT_SECRET` into `.env`
 Then open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience) → **Publish App** → confirm.
  
 > Without publishing, refresh tokens expire every 7 days (Testing mode limitation).
