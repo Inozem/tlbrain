@@ -83,7 +83,9 @@ gcloud config set project YOUR_PROJECT_ID
  
 ### 3. Create a Firestore Database
  
-Open https://console.firebase.google.com/, connect your existing project, create Firestore:
+Open https://console.firebase.google.com/, on the "Create a project" page enter the project name (`tlbrain-prod`), then click the **"Add Firebase to Google Cloud project"** link at the bottom. In the dialog that opens, select your GCP project (`tlbrain-prod`). On the "Configure Google Analytics" step, disable **Google Analytics** — it is not needed for TLBrain.
+
+Once the project is ready, go to **Firestore** in the left menu and click **Create database** with these settings:
  
 - Edition: **Standard**
 - Mode: **Production**
