@@ -121,7 +121,11 @@ Then open [APIs & Services → Audience](https://console.cloud.google.com/auth/a
  
 > If `ALLOWED_EMAIL` is not set, the MCP endpoint works without OAuth — no sign-in required. This is convenient for local use, but if anyone gets the URL of your MCP server, they will have full access to all your transcripts. For any internet-facing deployment, always set `ALLOWED_EMAIL`.
  
-### 7. Fill in `.env`
+### 7. Get a Gemini API Key
+
+Open https://aistudio.google.com/apikey, create an API key, and save it — you'll need it as `GEMINI_API_KEY` in `.env`.
+
+### 8. Fill in `.env`
  
 ```bash
 cp .env.example .env
@@ -179,7 +183,7 @@ TLDV_RECONCILIATION_FUNCTION_NAME=tlbrain-tldv-reconciliation
 TLDV_RECONCILIATION_SCHEDULE="0 3 * * *"
 ```
  
-### 8. Deploy
+### 9. Deploy
  
 ```bash
 bash infra/deploy/deploy.sh
@@ -187,7 +191,7 @@ bash infra/deploy/deploy.sh
  
 Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker.
  
-### 9. Grant Google Drive Access
+### 10. Grant Google Drive Access
  
 ```bash
 gcloud run services describe tlbrain-vector-sync \
@@ -197,7 +201,7 @@ gcloud run services describe tlbrain-vector-sync \
  
 Share your root Drive folder with this email. Recommended permission: **Editor**.
  
-### 10. Connect TL;DV
+### 11. Connect TL;DV
  
 ```bash
 bash infra/deploy/connectors/deploy_tldv.sh
@@ -206,7 +210,7 @@ bash infra/deploy/connectors/deploy_tldv.sh
 After deploy, copy the webhook URL printed at the end and add it in TL;DV:
 **Settings → Integrations → Webhooks → Add** → event: `TranscriptReady`.
  
-### 11. Connect Claude
+### 12. Connect Claude
  
 1. Open any Claude client → **Settings → MCP Servers → Add**
 2. URL: `https://YOUR-MCP-URL.run.app/mcp`
@@ -214,7 +218,7 @@ After deploy, copy the webhook URL printed at the end and add it in TL;DV:
 4. Sign in with the same email as `ALLOWED_EMAIL`
 > After each redeploy, remove the MCP server and add it again — the session is tied to the Cloud Run instance.
  
-### 12. Verify
+### 13. Verify
  
 ```bash
 # Sync service logs
