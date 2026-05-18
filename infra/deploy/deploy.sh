@@ -189,7 +189,3 @@ echo "Internal:"
 echo "  Sync trigger:  POST ${VECTOR_SYNC_URL}/sync"
 echo "  Checker:       ${CHECKER_URL}"
 echo
-echo "Grant Drive access to sync service account:"
-gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
-  --region "${REGION}" \
-  --format='value(spec.template.spec.serviceAccountName)'
