@@ -110,7 +110,7 @@ Client subfolders will be created automatically via MCP or manually in Google Dr
 ### 6. Configure OAuth Client
  
 1. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
-2. **Create Credentials → OAuth 2.0 Client ID**, type: **Web application**, name: `TLBrain MCP`
+2. **Create Credentials → OAuth client ID**, type: **Web application**, name: `TLBrain MCP`
 3. Add to **Authorized redirect URIs**:
    - `https://claude.ai/api/mcp/auth_callback`
    - `http://localhost:8085`
