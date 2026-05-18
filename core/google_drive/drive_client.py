@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any
 
 import google.auth
@@ -20,15 +21,31 @@ def _build_http(credentials) -> google_auth_httplib2.AuthorizedHttp:
     return google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http(timeout=60))
 
 
+def _build_credentials(scopes: list[str]):
+    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
+    if refresh_token:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        creds = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            client_id=os.environ["GOOGLE_CLIENT_ID"],
+            client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+            token_uri="https://oauth2.googleapis.com/token",
+        )
+        creds.refresh(Request())
+        return creds
+    creds, _ = google.auth.default(scopes=scopes)
+    return creds
+
+
 def build_drive_service():
     logger.info("Building Google Drive service")
-    credentials, _ = google.auth.default(scopes=SCOPES_RO)
-    return build("drive", "v3", http=_build_http(credentials))
+    return build("drive", "v3", http=_build_http(_build_credentials(SCOPES_RO)))
 
 
 def build_drive_service_rw():
-    credentials, _ = google.auth.default(scopes=SCOPES_RW)
-    return build("drive", "v3", http=_build_http(credentials))
+    return build("drive", "v3", http=_build_http(_build_credentials(SCOPES_RW)))
 
 
 def list_client_folders() -> list[dict[str, str]]:
