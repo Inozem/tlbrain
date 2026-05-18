@@ -200,7 +200,9 @@ TLDV_RECONCILIATION_SCHEDULE="0 3 * * *"
 ```
  
 ### 10. Deploy
- 
+
+> Before deploying, make sure your `.env` has no comment lines (starting with `#`) — remove any that are there.
+
 ```bash
 bash infra/deploy/deploy.sh
 ```
