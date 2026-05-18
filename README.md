@@ -205,7 +205,11 @@ TLDV_RECONCILIATION_SCHEDULE="0 3 * * *"
 bash infra/deploy/deploy.sh
 ```
  
-Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker.
+A browser window will open for Google authorization:
+- If you see a "Google hasn't verified this app" warning — click **Advanced → Go to TLBrain MCP (unsafe)**
+- On the permissions screen, make sure all checkboxes are selected, then click **Continue**
+
+Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
  
 ### 11. Grant Google Drive Access
  
