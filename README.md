@@ -109,12 +109,13 @@ Client subfolders will be created automatically via MCP or manually in Google Dr
  
 ### 6. Configure OAuth Client
  
-1. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
-2. **Create Credentials → OAuth client ID**, type: **Web application**, name: `TLBrain MCP`
-3. Add to **Authorized redirect URIs**:
+1. Open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience), select **External**, click **Next** → **Create**
+2. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
+3. **Create Credentials → OAuth client ID**, type: **Web application**, name: `TLBrain MCP`
+4. On the same form, scroll down to **Authorized redirect URIs** and add:
    - `https://claude.ai/api/mcp/auth_callback`
    - `http://localhost:8085`
-4. Copy **Client ID** → `GOOGLE_CLIENT_ID` and **Client Secret** → `GOOGLE_CLIENT_SECRET` into `.env`
+5. Copy **Client ID** → `GOOGLE_CLIENT_ID` and **Client Secret** → `GOOGLE_CLIENT_SECRET` into `.env`
 Then open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience) → **Publish App** → confirm.
  
 > Without publishing, refresh tokens expire every 7 days (Testing mode limitation).
