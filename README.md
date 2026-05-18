@@ -67,12 +67,28 @@ You can ask Claude for a full list of clients and their sync status at any time.
 ## ⚡ Quick Start
  
 **Prerequisites:** Google Cloud project, TL;DV account, Qdrant Cloud (free tier), Gemini API key.
+
+Despite the one-command deployment, all third-party services (Google Cloud, Firebase, Qdrant, Google AI Studio) must be registered and configured manually — the steps below walk you through each one.
+
+> Stuck at any step? Share this section of the README and a screenshot of where you are with Claude — it will give you a hint right away.
  
-### 1. Create a Google Cloud Project
+### 1. Create `.env`
+
+```bash
+cp .env.example .env
+```
+
+### 2. Create a Google Cloud Project
  
-Open https://console.cloud.google.com/, create a new project. Recommended name: `tlbrain-prod`. Copy your `PROJECT_ID`.
- 
-### 2. Install Google Cloud CLI
+Open https://console.cloud.google.com/, create a new project. Recommended name: `tlbrain-prod`. Copy your **Project ID** (e.g. `tlbrain-prod-496610`).
+
+Add to `.env`:
+
+```env
+PROJECT_ID=your-project-id
+```
+
+### 3. Install Google Cloud CLI
  
 https://cloud.google.com/sdk/docs/install
  
@@ -80,71 +96,78 @@ https://cloud.google.com/sdk/docs/install
 gcloud auth login
 gcloud config set project YOUR_PROJECT_ID
 ```
+
+### 4. Create a Firestore Database
  
-### 3. Create a Firestore Database
- 
-Open https://console.firebase.google.com/, connect your existing project, create Firestore:
+Open https://console.firebase.google.com/, on the "Create a project" page enter the project name (`tlbrain-prod`), then click the **"Add Firebase to Google Cloud project"** link at the bottom. In the dialog that opens, select your GCP project (`tlbrain-prod`). On the "Configure Google Analytics" step, disable **Google Analytics** — it is not needed for TLBrain.
+
+Once the project is ready, go to **Firestore** in the left menu and click **Create database** with these settings:
  
 - Edition: **Standard**
 - Mode: **Production**
 - Region: **europe-west1**
 - Database ID: **(default)**
-### 4. Set Up Qdrant Cloud
+
+### 5. Set Up Qdrant Cloud
  
 Open https://cloud.qdrant.io, create a free cluster:
  
+- Name: any (e.g. `tlbrain`)
 - Provider: **Google Cloud Platform**
-- Region: **Frankfurt (europe-west3)**
+- Region: **Frankfurt**
 - Tier: **Free** (1 node, 4 GiB disk, 1 GiB RAM)
-Copy the **Cluster URL** and **API Key** — you'll need them for `.env`.
- 
-### 5. Create a Root Folder in Google Drive
- 
-Create a dedicated empty folder in Google Drive — this will be the root for all TLBrain transcripts. Don't use an existing folder with other files in it.
- 
-Client subfolders will be created automatically via MCP or manually in Google Drive. Copy the folder URL — you'll need it as `ROOT_FOLDER_URL` in `.env`.
- 
-### 6. Configure OAuth Client
- 
-1. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
-2. **Create Credentials → OAuth 2.0 Client ID**, type: **Web application**, name: `TLBrain MCP`
-3. Add to **Authorized redirect URIs**:
-   - `https://claude.ai/api/mcp/auth_callback`
-   - `http://localhost:8085`
-4. Copy **Client ID** and **Client Secret** into `.env`
-Then open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience) → **Publish App** → confirm.
- 
-> Without publishing, refresh tokens expire every 7 days (Testing mode limitation).
- 
-> If `ALLOWED_EMAIL` is not set, the MCP endpoint works without OAuth — no sign-in required. This is convenient for local use, but if anyone gets the URL of your MCP server, they will have full access to all your transcripts. For any internet-facing deployment, always set `ALLOWED_EMAIL`.
- 
-### 7. Fill in `.env`
- 
-```bash
-cp .env.example .env
-```
- 
-**Required:**
- 
+
+Add to `.env`:
+
 ```env
-PROJECT_ID=tlbrain-prod
- 
-ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
-GEMINI_API_KEY=your-gemini-api-key
- 
 QDRANT_URL=https://YOUR-CLUSTER-URL:6333
 QDRANT_API_KEY=your-qdrant-api-key
-QDRANT_COLLECTION=TLBrain
+```
+
+### 6. Create a Root Folder in Google Drive
  
+Create a dedicated empty folder in Google Drive — this will be the root for all TLBrain transcripts. Don't use an existing folder with other files in it.
+
+Client subfolders will be created automatically via MCP or manually in Google Drive.
+
+Add to `.env`:
+
+```env
+ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
+```
+
+### 7. Configure OAuth Client
+ 
+1. Open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience), select **External**, click **Next** → **Create**
+2. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
+3. **Create Credentials → OAuth client ID**, type: **Web application**, name: `TLBrain MCP`
+4. On the same form, scroll down to **Authorized redirect URIs** and add:
+   - `https://claude.ai/api/mcp/auth_callback`
+   - `http://localhost:8085`
+5. Open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience) → **Publish App** → confirm
+
+> Without publishing, refresh tokens expire every 7 days (Testing mode limitation).
+
+Add to `.env`:
+
+```env
 GOOGLE_CLIENT_ID=your-client-id
 GOOGLE_CLIENT_SECRET=your-client-secret
-ALLOWED_EMAIL=your-email@gmail.com  # leave empty to disable auth
- 
-TLDV_API_KEY=your-tldv-api-key      # only if using TL;DV connector
+ALLOWED_EMAIL=your-email@gmail.com  # leave empty to skip OAuth when connecting Claude — simpler setup, but anyone with the MCP URL gets full access to your transcripts
 ```
- 
-**Optional (defaults shown):**
- 
+
+### 8. Get a Gemini API Key
+
+Open https://aistudio.google.com/apikey, create an API key.
+
+Add to `.env`:
+
+```env
+GEMINI_API_KEY=your-gemini-api-key
+```
+
+### 9. Optional `.env` settings
+
 ```env
 VERSION=1.0.0  # or latest for the most recent build
  
@@ -176,53 +199,33 @@ TLDV_RECONCILIATION_FUNCTION_NAME=tlbrain-tldv-reconciliation
 TLDV_RECONCILIATION_SCHEDULE="0 3 * * *"
 ```
  
-### 8. Deploy
- 
+### 10. Deploy
+
+> Before deploying, make sure your `.env` has no comment lines (starting with `#`) — remove any that are there.
+
 ```bash
 bash infra/deploy/deploy.sh
 ```
  
-Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker.
+A browser window will open for Google authorization:
+- If you see a "Google hasn't verified this app" warning — click **Advanced → Go to TLBrain MCP (unsafe)**
+- On the permissions screen, make sure all checkboxes are selected, then click **Continue**
+
+Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
+
+When finished, the script prints the MCP URL and TL;DV webhook URL — copy them, you'll need them in the next steps.
  
-### 9. Grant Google Drive Access
+### 11. Connect TL;DV
+
+In TL;DV click your avatar in the bottom-left corner → **Settings → Integrations → Webhooks → Add**, paste the webhook URL from the deploy output → event: `TranscriptReady`.
  
-```bash
-gcloud run services describe tlbrain-vector-sync \
-  --region europe-west1 \
-  --format="value(spec.template.spec.serviceAccountName)"
-```
+### 12. Connect Claude
  
-Share your root Drive folder with this email. Recommended permission: **Editor**.
- 
-### 10. Connect TL;DV
- 
-```bash
-bash infra/deploy/connectors/deploy_tldv.sh
-```
- 
-After deploy, copy the webhook URL printed at the end and add it in TL;DV:
-**Settings → Integrations → Webhooks → Add** → event: `TranscriptReady`.
- 
-### 11. Connect Claude
- 
-1. Open any Claude client → **Settings → MCP Servers → Add**
+1. Open any Claude client → **Customize → MCP Servers → Add**
 2. URL: `https://YOUR-MCP-URL.run.app/mcp`
 3. Claude will detect OAuth automatically and prompt you to sign in with Google
 4. Sign in with the same email as `ALLOWED_EMAIL`
 > After each redeploy, remove the MCP server and add it again — the session is tied to the Cloud Run instance.
- 
-### 12. Verify
- 
-```bash
-# Sync service logs
-gcloud run services logs read tlbrain-sync --region europe-west1 --limit 50
- 
-# MCP service logs
-gcloud run services logs read tlbrain-mcp --region europe-west1 --limit 50
- 
-# Health check
-curl https://YOUR-SYNC-URL.run.app/
-```
  
 ---
  
