@@ -67,6 +67,10 @@ You can ask Claude for a full list of clients and their sync status at any time.
 ## ⚡ Quick Start
  
 **Prerequisites:** Google Cloud project, TL;DV account, Qdrant Cloud (free tier), Gemini API key.
+
+Despite the one-command deployment, all third-party services (Google Cloud, Firebase, Qdrant, Google AI Studio) must be registered and configured manually — the steps below walk you through each one.
+
+> Stuck at any step? Share this section of the README and a screenshot of where you are with Claude — it will give you a hint right away.
  
 ### 1. Create `.env`
 
@@ -149,7 +153,7 @@ Add to `.env`:
 ```env
 GOOGLE_CLIENT_ID=your-client-id
 GOOGLE_CLIENT_SECRET=your-client-secret
-ALLOWED_EMAIL=your-email@gmail.com  # leave empty to disable auth
+ALLOWED_EMAIL=your-email@gmail.com  # leave empty to skip OAuth when connecting Claude — simpler setup, but anyone with the MCP URL gets full access to your transcripts
 ```
 
 ### 8. Get a Gemini API Key
