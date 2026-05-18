@@ -68,11 +68,23 @@ You can ask Claude for a full list of clients and their sync status at any time.
  
 **Prerequisites:** Google Cloud project, TL;DV account, Qdrant Cloud (free tier), Gemini API key.
  
-### 1. Create a Google Cloud Project
+### 1. Create `.env`
+
+```bash
+cp .env.example .env
+```
+
+### 2. Create a Google Cloud Project
  
-Open https://console.cloud.google.com/, create a new project. Recommended name: `tlbrain-prod`. Copy your `PROJECT_ID`.
- 
-### 2. Install Google Cloud CLI
+Open https://console.cloud.google.com/, create a new project. Recommended name: `tlbrain-prod`. Copy your **Project ID** (e.g. `tlbrain-prod-496610`).
+
+Add to `.env`:
+
+```env
+PROJECT_ID=your-project-id
+```
+
+### 3. Install Google Cloud CLI
  
 https://cloud.google.com/sdk/docs/install
  
@@ -80,8 +92,8 @@ https://cloud.google.com/sdk/docs/install
 gcloud auth login
 gcloud config set project YOUR_PROJECT_ID
 ```
- 
-### 3. Create a Firestore Database
+
+### 4. Create a Firestore Database
  
 Open https://console.firebase.google.com/, on the "Create a project" page enter the project name (`tlbrain-prod`), then click the **"Add Firebase to Google Cloud project"** link at the bottom. In the dialog that opens, select your GCP project (`tlbrain-prod`). On the "Configure Google Analytics" step, disable **Google Analytics** — it is not needed for TLBrain.
 
@@ -91,7 +103,8 @@ Once the project is ready, go to **Firestore** in the left menu and click **Crea
 - Mode: **Production**
 - Region: **europe-west1**
 - Database ID: **(default)**
-### 4. Set Up Qdrant Cloud
+
+### 5. Set Up Qdrant Cloud
  
 Open https://cloud.qdrant.io, create a free cluster:
  
@@ -99,15 +112,27 @@ Open https://cloud.qdrant.io, create a free cluster:
 - Provider: **Google Cloud Platform**
 - Region: **Frankfurt**
 - Tier: **Free** (1 node, 4 GiB disk, 1 GiB RAM)
-Once the cluster is created, copy the **Cluster URL** → `QDRANT_URL` and **API Key** → `QDRANT_API_KEY` — save them right away, you'll need them in `.env`.
- 
-### 5. Create a Root Folder in Google Drive
+
+Add to `.env`:
+
+```env
+QDRANT_URL=https://YOUR-CLUSTER-URL:6333
+QDRANT_API_KEY=your-qdrant-api-key
+```
+
+### 6. Create a Root Folder in Google Drive
  
 Create a dedicated empty folder in Google Drive — this will be the root for all TLBrain transcripts. Don't use an existing folder with other files in it.
- 
-Client subfolders will be created automatically via MCP or manually in Google Drive. Copy the folder URL — you'll need it as `ROOT_FOLDER_URL` in `.env`.
- 
-### 6. Configure OAuth Client
+
+Client subfolders will be created automatically via MCP or manually in Google Drive.
+
+Add to `.env`:
+
+```env
+ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
+```
+
+### 7. Configure OAuth Client
  
 1. Open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience), select **External**, click **Next** → **Create**
 2. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
@@ -115,42 +140,30 @@ Client subfolders will be created automatically via MCP or manually in Google Dr
 4. On the same form, scroll down to **Authorized redirect URIs** and add:
    - `https://claude.ai/api/mcp/auth_callback`
    - `http://localhost:8085`
-5. Copy **Client ID** → `GOOGLE_CLIENT_ID` and **Client Secret** → `GOOGLE_CLIENT_SECRET` into `.env`
-Then open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience) → **Publish App** → confirm.
- 
+5. Open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience) → **Publish App** → confirm
+
 > Without publishing, refresh tokens expire every 7 days (Testing mode limitation).
- 
-### 7. Get a Gemini API Key
 
-Open https://aistudio.google.com/apikey, create an API key, and save it — you'll need it as `GEMINI_API_KEY` in `.env`.
+Add to `.env`:
 
-### 8. Fill in `.env`
- 
-```bash
-cp .env.example .env
-```
- 
-**Required:**
- 
 ```env
-PROJECT_ID=tlbrain-prod
- 
-ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
-GEMINI_API_KEY=your-gemini-api-key
- 
-QDRANT_URL=https://YOUR-CLUSTER-URL:6333
-QDRANT_API_KEY=your-qdrant-api-key
-QDRANT_COLLECTION=TLBrain
- 
 GOOGLE_CLIENT_ID=your-client-id
 GOOGLE_CLIENT_SECRET=your-client-secret
 ALLOWED_EMAIL=your-email@gmail.com  # leave empty to disable auth
- 
-TLDV_API_KEY=your-tldv-api-key      # only if using TL;DV connector
 ```
- 
-**Optional (defaults shown):**
- 
+
+### 8. Get a Gemini API Key
+
+Open https://aistudio.google.com/apikey, create an API key.
+
+Add to `.env`:
+
+```env
+GEMINI_API_KEY=your-gemini-api-key
+```
+
+### 9. Optional `.env` settings
+
 ```env
 VERSION=1.0.0  # or latest for the most recent build
  
@@ -182,7 +195,7 @@ TLDV_RECONCILIATION_FUNCTION_NAME=tlbrain-tldv-reconciliation
 TLDV_RECONCILIATION_SCHEDULE="0 3 * * *"
 ```
  
-### 9. Deploy
+### 10. Deploy
  
 ```bash
 bash infra/deploy/deploy.sh
@@ -190,7 +203,7 @@ bash infra/deploy/deploy.sh
  
 Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker.
  
-### 10. Grant Google Drive Access
+### 11. Grant Google Drive Access
  
 ```bash
 gcloud run services describe tlbrain-vector-sync \
@@ -200,7 +213,7 @@ gcloud run services describe tlbrain-vector-sync \
  
 Share your root Drive folder with this email. Recommended permission: **Editor**.
  
-### 11. Connect TL;DV
+### 12. Connect TL;DV
  
 ```bash
 bash infra/deploy/connectors/deploy_tldv.sh
@@ -209,7 +222,7 @@ bash infra/deploy/connectors/deploy_tldv.sh
 After deploy, copy the webhook URL printed at the end and add it in TL;DV:
 **Settings → Integrations → Webhooks → Add** → event: `TranscriptReady`.
  
-### 12. Connect Claude
+### 13. Connect Claude
  
 1. Open any Claude client → **Settings → MCP Servers → Add**
 2. URL: `https://YOUR-MCP-URL.run.app/mcp`
@@ -217,7 +230,7 @@ After deploy, copy the webhook URL printed at the end and add it in TL;DV:
 4. Sign in with the same email as `ALLOWED_EMAIL`
 > After each redeploy, remove the MCP server and add it again — the session is tied to the Cloud Run instance.
  
-### 13. Verify
+### 14. Verify
  
 ```bash
 # Sync service logs
