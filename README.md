@@ -215,55 +215,17 @@ Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker. The s
 
 When finished, the script prints the MCP URL and TL;DV webhook URL — copy them, you'll need them in the next steps.
  
-### 11. Grant Google Drive Access
- 
-```bash
-gcloud run services describe tlbrain-vector-sync \
-  --region europe-west1 \
-  --format="value(spec.template.spec.serviceAccountName)"
-```
- 
-Share your root Drive folder with this email. Recommended permission: **Editor**.
- 
-### 12. Connect TL;DV
+### 11. Connect TL;DV
 
-In TL;DV click your avatar in the bottom-left corner → **Settings → My Account → API keys → Generate new API key**.
-
-Add to `.env`:
-
-```env
-TLDV_API_KEY=your-tldv-api-key
-```
-
-Then deploy the connector:
-
-```bash
-bash infra/deploy/connectors/deploy_tldv.sh
-```
+In TL;DV click your avatar in the bottom-left corner → **Settings → Integrations → Webhooks → Add**, paste the webhook URL from the deploy output → event: `TranscriptReady`.
  
-After deploy, copy the webhook URL printed at the end and add it in TL;DV:
-**Settings → Integrations → Webhooks → Add** → event: `TranscriptReady`.
+### 12. Connect Claude
  
-### 13. Connect Claude
- 
-1. Open any Claude client → **Settings → MCP Servers → Add**
+1. Open any Claude client → **Customize → MCP Servers → Add**
 2. URL: `https://YOUR-MCP-URL.run.app/mcp`
 3. Claude will detect OAuth automatically and prompt you to sign in with Google
 4. Sign in with the same email as `ALLOWED_EMAIL`
 > After each redeploy, remove the MCP server and add it again — the session is tied to the Cloud Run instance.
- 
-### 14. Verify
- 
-```bash
-# Sync service logs
-gcloud run services logs read tlbrain-sync --region europe-west1 --limit 50
- 
-# MCP service logs
-gcloud run services logs read tlbrain-mcp --region europe-west1 --limit 50
- 
-# Health check
-curl https://YOUR-SYNC-URL.run.app/
-```
  
 ---
  
