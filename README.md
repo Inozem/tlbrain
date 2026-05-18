@@ -218,7 +218,17 @@ gcloud run services describe tlbrain-vector-sync \
 Share your root Drive folder with this email. Recommended permission: **Editor**.
  
 ### 12. Connect TL;DV
- 
+
+In TL;DV click your avatar in the bottom-left corner → **Settings → My Account → API keys → Generate new API key**.
+
+Add to `.env`:
+
+```env
+TLDV_API_KEY=your-tldv-api-key
+```
+
+Then deploy the connector:
+
 ```bash
 bash infra/deploy/connectors/deploy_tldv.sh
 ```
