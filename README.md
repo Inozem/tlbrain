@@ -210,6 +210,8 @@ A browser window will open for Google authorization:
 - On the permissions screen, make sure all checkboxes are selected, then click **Continue**
 
 Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
+
+When finished, the script prints the MCP URL and TL;DV webhook URL — copy them, you'll need them in the next steps.
  
 ### 11. Grant Google Drive Access
  
