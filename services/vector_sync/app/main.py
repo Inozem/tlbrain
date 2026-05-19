@@ -1,10 +1,12 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
 from core.google_drive.drive_client import get_file_parent_folder_id
-from core.google_drive.firestore import get_client_name_by_folder_id, update_client_speakers
+from core.google_drive.firestore import get_client_name_by_folder_id, mark_error, update_client_speakers
 from core.qdrant.setup import ensure_collection
 from core.qdrant.writer import delete_by_doc_id
 from core.utils.logging import configure_logging
@@ -12,6 +14,7 @@ from services.vector_sync.app.index_store import delete_index, load_index
 from services.vector_sync.app.processor import process_one
 
 configure_logging()
+logger = logging.getLogger(__name__)
 ensure_collection()
 
 app = FastAPI()
@@ -32,10 +35,13 @@ async def sync_doc_endpoint(doc_id: str):
     try:
         folder_id, is_trashed = get_file_parent_folder_id(doc_id)
         if is_trashed:
+            logger.warning("File is trashed in Drive, deleting: %s", doc_id)
             should_delete = True
     except HttpError as e:
         if e.resp.status == 404:
-            should_delete = True
+            logger.warning("File not found in Drive (404), marking error for retry: %s", doc_id)
+            mark_error(doc_id, "Drive file not found (404)")
+            return JSONResponse(content={"status": "ok", "result": "error_retry"})
         else:
             raise
 
@@ -45,7 +51,7 @@ async def sync_doc_endpoint(doc_id: str):
             speakers = existing.get("speakers", [])
             client_name_existing = existing.get("client_name", "")
             delete_by_doc_id(doc_id, root_folder_id)
-            if speakers and client_name_existing and client_name_existing != "_unassigned":
+            if speakers and client_name_existing:
                 update_client_speakers(client_name_existing, speakers, delta=-1)
             delete_index(doc_id)
         return JSONResponse(content={"status": "ok", "result": "deleted"})
