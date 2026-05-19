@@ -16,13 +16,14 @@ from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
-from core.google_drive.drive_client import list_client_folders, move_file_to_folder
+from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder
 from core.google_drive.firestore import (
     create_client,
     get_all_client_names,
     get_client_folder_id,
     get_sync_status,
     get_transcript_record,
+    move_transcript_record,
     update_client_speakers,
     get_unassigned,
 )
@@ -500,7 +501,17 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
                 message=f"Client '{new_client_name}' not found.",
                 details=f"Known clients: {known_clients}. Use create_client to add a new one.",
             )
+        existing = get_transcript_record(doc_id)
+        old_client_name = (existing or {}).get("client_name", "")
+        speakers = (existing or {}).get("speakers", [])
+
         move_file_to_folder(doc_id, new_folder_id)
+        move_transcript_record(doc_id, new_client_name, new_folder_id)
+
+        if speakers and old_client_name:
+            update_client_speakers(old_client_name, speakers, delta=-1)
+        if speakers and new_client_name != "_unassigned":
+            update_client_speakers(new_client_name, speakers)
 
         checker_url = os.environ.get("SYNC_CHECKER_URL", "")
         if checker_url:

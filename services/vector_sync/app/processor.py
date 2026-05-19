@@ -50,7 +50,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
         if client_name_changed:
             set_payload_client_name(doc_id, root_folder_id, client_name)
             stored_speakers = (existing or {}).get("speakers", [])
-            if stored_speakers and stored_client_name and stored_client_name != "_unassigned":
+            if stored_speakers and stored_client_name:
                 update_client_speakers(stored_client_name, stored_speakers, delta=-1)
             if stored_speakers and client_name != "_unassigned":
                 update_client_speakers(client_name, stored_speakers)
