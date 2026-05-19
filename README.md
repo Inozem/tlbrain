@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.0.0`
+# 🧠 TLBrain `v1.0.1`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -169,7 +169,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.0.0  # or latest for the most recent build
+VERSION=1.0.1  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1

@@ -94,7 +94,7 @@ def handle_initialize(request: JSONRPCRequest) -> dict:
             },
             "serverInfo": {
                 "name": "tlbrain",
-                "version": "1.0.0",
+                "version": os.environ.get("VERSION", "latest"),
             },
         },
     )
