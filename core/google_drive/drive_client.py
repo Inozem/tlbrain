@@ -24,6 +24,7 @@ def _build_http(credentials) -> google_auth_httplib2.AuthorizedHttp:
 def _build_credentials(scopes: list[str]):
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
     if refresh_token:
+        logger.info("Drive auth: using user OAuth (GOOGLE_REFRESH_TOKEN)")
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
         creds = Credentials(
@@ -35,6 +36,7 @@ def _build_credentials(scopes: list[str]):
         )
         creds.refresh(Request())
         return creds
+    logger.info("Drive auth: using ADC (no GOOGLE_REFRESH_TOKEN)")
     creds, _ = google.auth.default(scopes=scopes)
     return creds
 
