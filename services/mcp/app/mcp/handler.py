@@ -16,7 +16,7 @@ from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
-from core.google_drive.drive_client import list_client_folders, move_file_to_folder
+from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder
 from core.google_drive.firestore import (
     create_client,
     get_all_client_names,
