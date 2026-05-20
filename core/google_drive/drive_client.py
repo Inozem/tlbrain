@@ -145,6 +145,7 @@ def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool]:
     """
     service = build_drive_service()
     file = service.files().get(fileId=doc_id, fields="parents,trashed").execute()
+    logger.info("Drive file metadata for %s: trashed=%s, parents=%s", doc_id, file.get("trashed"), file.get("parents"))
     if file.get("trashed"):
         return None, True
     parents = file.get("parents", [])

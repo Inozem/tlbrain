@@ -42,6 +42,30 @@ def acquire_for_syncing(doc_id: str) -> bool:
     return result
 
 
+def ensure_imported(doc_id: str, client_name: str, folder_id: str) -> bool:
+    """Create transcript_index record with status=imported if it doesn't exist. Returns True if created."""
+    db = _get_db()
+    ref = db.collection(COLLECTION_NAME).document(doc_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        if ref.get(transaction=transaction).exists:
+            return False
+        transaction.set(ref, {
+            "doc_id": doc_id,
+            "client_name": client_name,
+            "drive_folder": folder_id,
+            "status": "imported",
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
+        })
+        return True
+
+    result = _txn(db.transaction())
+    if result:
+        logger.info("Created imported record from Drive: %s (client=%s)", doc_id, client_name)
+    return result
+
+
 def mark_synced(doc_id: str) -> None:
     _get_db().collection(COLLECTION_NAME).document(doc_id).update({
         "status": "synced",

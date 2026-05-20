@@ -24,7 +24,9 @@ from core.google_drive.firestore import (
 )
 from core.utils.tasks import enqueue_task
 
-logging.basicConfig(level=logging.INFO)
+from core.utils.logging import configure_logging
+
+configure_logging()
 logger = logging.getLogger(__name__)
 
 STALE_MINUTES = 15
