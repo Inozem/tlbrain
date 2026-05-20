@@ -297,6 +297,55 @@ def sync_clients_from_drive(folders: list[dict[str, str]]) -> int:
     return created
 
 
+def rebuild_client_speakers() -> int:
+    """Rebuild clients.speakers per client from scratch.
+    Counts all synced docs in Python, then writes the final map in a single atomic update.
+    Returns total number of unique speaker keys updated."""
+    db = _get_db()
+    updated = 0
+
+    for client_doc in db.collection(CLIENTS_COLLECTION).stream():
+        client_name = client_doc.id
+
+        docs = (
+            db.collection(COLLECTION_NAME)
+            .where(filter=firestore.FieldFilter("client_name", "==", client_name))
+            .where(filter=firestore.FieldFilter("status", "==", "synced"))
+            .stream()
+        )
+
+        speaker_counts: dict[str, int] = {}
+        for doc in docs:
+            for speaker in (doc.to_dict() or {}).get("speakers", []):
+                key = _speaker_key(speaker)
+                speaker_counts[key] = speaker_counts.get(key, 0) + 1
+
+        doc_ref = db.collection(CLIENTS_COLLECTION).document(client_name)
+        doc_data = doc_ref.get().to_dict() or {}
+
+        # New flat fields with computed counts
+        new_flat = {f"speakers.{key}": count for key, count in speaker_counts.items()}
+
+        # Delete stale flat fields (speakers no longer present in synced docs)
+        to_delete = {
+            k: firestore.DELETE_FIELD
+            for k in doc_data
+            if k.startswith("speakers.") and k not in new_flat
+        }
+        # Delete nested `speakers` map if it exists (left from wrong .update() calls)
+        if "speakers" in doc_data and isinstance(doc_data.get("speakers"), dict):
+            to_delete["speakers"] = firestore.DELETE_FIELD
+
+        final = {**to_delete, **new_flat}
+        if final:
+            doc_ref.set(final, merge=True)
+
+        logger.info("Rebuilt speakers for %s: %d unique speakers", client_name, len(speaker_counts))
+        updated += len(speaker_counts)
+
+    return updated
+
+
 def get_all_client_names() -> list[str]:
     """Return all known client names from the clients collection."""
     db = _get_db()

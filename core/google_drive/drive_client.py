@@ -87,13 +87,25 @@ def scan_root_folder() -> list[dict[str, Any]]:
             folder_id,
         )
 
-        files = service.files().list(
-            q=(
-                f"'{folder_id}' in parents "
-                f"and mimeType='application/vnd.google-apps.document'"
-            ),
-            fields="files(id,name,createdTime,modifiedTime)",
-        ).execute()["files"]
+        files = []
+        page_token = None
+        while True:
+            kwargs = dict(
+                q=(
+                    f"'{folder_id}' in parents "
+                    f"and mimeType='application/vnd.google-apps.document' "
+                    f"and trashed=false"
+                ),
+                fields="nextPageToken,files(id,name,createdTime,modifiedTime)",
+                pageSize=1000,
+            )
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = service.files().list(**kwargs).execute()
+            files.extend(response.get("files", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
 
         logger.info(
             "Files found in %s: %s",

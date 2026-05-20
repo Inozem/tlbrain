@@ -19,6 +19,7 @@ from core.google_drive.firestore import (
     get_drive_sync_token,
     get_error_docs,
     get_stale_syncing,
+    rebuild_client_speakers,
     set_drive_sync_token,
     sync_clients_from_drive,
 )
@@ -96,10 +97,11 @@ def checker(request):
 
 
 def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestore.Client) -> int:
-    """Full Drive scan: enqueue changed docs. Saves new page token."""
+    """Full Drive scan: enqueue changed docs and orphaned Firestore records. Saves new page token."""
     start_token = get_start_page_token()
 
     files = scan_root_folder()
+    drive_doc_ids = {file["doc_id"] for file in files}
     queued = 0
 
     for file in files:
@@ -117,6 +119,19 @@ def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestor
 
         if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}"):
             queued += 1
+
+    for doc in db.collection(COLLECTION_NAME).select(["status"]).stream():
+        if doc.id in drive_doc_ids:
+            continue
+        status = (doc.to_dict() or {}).get("status", "")
+        if status in ("queued", "downloading"):
+            continue
+        if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc.id}"):
+            queued += 1
+            logger.info("Enqueued orphan for deletion: %s (status=%s)", doc.id, status)
+
+    updated = rebuild_client_speakers()
+    logger.info("Rebuilt client speakers: %d entries", updated)
 
     set_drive_sync_token(start_token)
     return queued
