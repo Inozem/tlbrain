@@ -69,11 +69,7 @@ def iter_windows(
             logger.debug("skip existing summary_key=%s", summary_key)
             continue
 
-        try:
-            summary_text, facts_list = generate_summary_and_facts(window["utterances"])
-        except Exception:
-            logger.warning("llm failed for summary_key=%s, skipping window", summary_key, exc_info=True)
-            continue
+        summary_text, facts_list = generate_summary_and_facts(window["utterances"])
 
         summary = {
             "type": "summary",
