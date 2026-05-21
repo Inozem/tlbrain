@@ -100,6 +100,12 @@ def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestor
     """Full Drive scan: enqueue changed docs and orphaned Firestore records. Saves new page token."""
     start_token = get_start_page_token()
 
+    # Rebuild speaker counts BEFORE queuing new tasks — at this point all previously
+    # synced docs are in status=synced and will be counted correctly.
+    # Docs queued below will be handled incrementally by update_client_speakers when they sync.
+    updated = rebuild_client_speakers()
+    logger.info("Rebuilt client speakers: %d entries", updated)
+
     files = scan_root_folder()
     drive_doc_ids = {file["doc_id"] for file in files}
     queued = 0
@@ -129,9 +135,6 @@ def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestor
         if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc.id}"):
             queued += 1
             logger.info("Enqueued orphan for deletion: %s (status=%s)", doc.id, status)
-
-    updated = rebuild_client_speakers()
-    logger.info("Rebuilt client speakers: %d entries", updated)
 
     set_drive_sync_token(start_token)
     return queued
