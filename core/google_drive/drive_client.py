@@ -2,7 +2,6 @@ import logging
 import os
 from typing import Any
 
-import google.auth
 import google_auth_httplib2
 import httplib2
 from googleapiclient.discovery import build
