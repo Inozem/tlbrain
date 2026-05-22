@@ -36,9 +36,7 @@ def _build_credentials(scopes: list[str]):
         )
         creds.refresh(Request())
         return creds
-    logger.info("Drive auth: using ADC (no GOOGLE_REFRESH_TOKEN)")
-    creds, _ = google.auth.default(scopes=scopes)
-    return creds
+    raise RuntimeError("GOOGLE_REFRESH_TOKEN is not set — Drive access requires user OAuth credentials")
 
 
 def build_drive_service():
