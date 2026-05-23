@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.0.1`
+# 🧠 TLBrain `v1.0.2`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -160,6 +160,8 @@ ALLOWED_EMAIL=your-email@gmail.com  # leave empty to skip OAuth when connecting 
 
 Open https://aistudio.google.com/apikey, create an API key.
 
+> **Important:** Switch your Google AI Studio account from Free tier to **Tier 1 (pay-as-you-go)**. Free tier rate limits are too low to process transcripts and index them into the vector database. All other services in TLBrain remain on free tier.
+
 Add to `.env`:
 
 ```env
@@ -169,7 +171,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.0.1  # or latest for the most recent build
+VERSION=1.0.2  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -182,9 +184,13 @@ RETRIEVAL_SCORE_THRESHOLD=0.6
 # "*/5 * * * *" = every 5 min  |  "*/15 * * * *" = every 15 min  |  "0 4 * * *" = daily
 SYNC_CHECKER_SCHEDULE="*/15 * * * *"
  
+# Max instances (controls cost — Cloud Run scaling)
+VECTOR_SYNC_MAX_INSTANCES=2
+MCP_MAX_INSTANCES=1
+TLDV_IMPORT_MAX_INSTANCES=2
+
 # Cloud Tasks
 VECTOR_SYNC_QUEUE=tlbrain-vector-sync-queue
-CLOUD_TASKS_MAX_CONCURRENT=2
  
 # Infrastructure names (Cloud Run / Cloud Function)
 MCP_SERVICE_NAME=tlbrain-mcp
@@ -289,6 +295,8 @@ Connect once, use everywhere. Configuration syncs automatically across clients.
 ## 💰 Cost Breakdown
  
 TLBrain is designed so you don't pay for what a single-user scenario doesn't need.
+
+> **Note on initial sync costs:** If you're importing a large backlog of transcripts from TL;DV, expect noticeable Gemini charges during the first sync. Gemini (Tier 1) is billed per token — transcript processing and embedding generation are the main costs. Other services run on free tier, but heavy initial load may push them over their monthly limits and trigger billing. After the first month, free tier limits reset and the system returns to near-zero cost.
  
 **Qdrant Cloud (~$0/month):**
 - 1 GiB RAM, 4 GiB disk — free forever
