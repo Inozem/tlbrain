@@ -45,6 +45,7 @@ cp "${REPO_ROOT}/core/google_drive/drive_client.py" "${STAGE}/core/google_drive/
 cp "${REPO_ROOT}/core/google_drive/firestore.py" "${STAGE}/core/google_drive/"
 cp "${REPO_ROOT}/core/utils/__init__.py" "${STAGE}/core/utils/"
 cp "${REPO_ROOT}/core/utils/tasks.py" "${STAGE}/core/utils/"
+cp "${REPO_ROOT}/core/utils/logging.py" "${STAGE}/core/utils/"
 
 gcloud functions deploy "${SYNC_CHECKER_NAME}" \
   --gen2 \
@@ -54,7 +55,8 @@ gcloud functions deploy "${SYNC_CHECKER_NAME}" \
   --entry-point checker \
   --trigger-http \
   --allow-unauthenticated \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",VECTOR_SYNC_URL="${VECTOR_SYNC_URL}",VECTOR_SYNC_QUEUE="${VECTOR_SYNC_QUEUE}",TLDV_IMPORT_QUEUE="${TLDV_IMPORT_QUEUE}",TLDV_IMPORT_SERVICE_URL="${TLDV_IMPORT_SERVICE_URL}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
+  --max-instances=1 \
+  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",VECTOR_SYNC_URL="${VECTOR_SYNC_URL}",VECTOR_SYNC_QUEUE="${VECTOR_SYNC_QUEUE}",TLDV_IMPORT_QUEUE="${TLDV_IMPORT_QUEUE}",TLDV_IMPORT_SERVICE_URL="${TLDV_IMPORT_SERVICE_URL}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}",GOOGLE_REFRESH_TOKEN="${GOOGLE_REFRESH_TOKEN}",GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}",GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET}"
 
 CHECKER_URL=$(gcloud functions describe "${SYNC_CHECKER_NAME}" \
   --region "${REGION}" \

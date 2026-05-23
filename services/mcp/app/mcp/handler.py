@@ -27,7 +27,7 @@ from core.google_drive.firestore import (
     update_client_speakers,
     get_unassigned,
 )
-from core.qdrant.writer import upsert_user_facts
+from core.qdrant.writer import set_payload_client_name, upsert_user_facts
 
 logger = logging.getLogger(__name__)
 
@@ -505,8 +505,10 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
         old_client_name = (existing or {}).get("client_name", "")
         speakers = (existing or {}).get("speakers", [])
 
+        root_folder_id = get_root_folder_id()
         move_file_to_folder(doc_id, new_folder_id)
         move_transcript_record(doc_id, new_client_name, new_folder_id)
+        set_payload_client_name(doc_id, root_folder_id, new_client_name)
 
         if speakers and old_client_name:
             update_client_speakers(old_client_name, speakers, delta=-1)

@@ -14,6 +14,7 @@ REGION=${REGION:-europe-west1}
 TLDV_IMPORT_SERVICE_NAME=${TLDV_IMPORT_SERVICE_NAME:-tlbrain-tldv-import}
 TLDV_IMPORT_IMAGE="gcr.io/${PROJECT_ID}/${TLDV_IMPORT_SERVICE_NAME}"
 TLDV_IMPORT_QUEUE=${TLDV_IMPORT_QUEUE:-tlbrain-tldv-import-queue}
+TLDV_IMPORT_MAX_INSTANCES=${TLDV_IMPORT_MAX_INSTANCES:-2}
 TLDV_WEBHOOK_FUNCTION_NAME=${TLDV_WEBHOOK_FUNCTION_NAME:-tlbrain-tldv-webhook}
 TLDV_RECONCILIATION_FUNCTION_NAME=${TLDV_RECONCILIATION_FUNCTION_NAME:-tlbrain-tldv-reconciliation}
 GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
@@ -56,8 +57,11 @@ gcloud config set project "${PROJECT_ID}"
 echo "Creating Cloud Tasks queue ${TLDV_IMPORT_QUEUE}..."
 gcloud tasks queues create "${TLDV_IMPORT_QUEUE}" \
   --location="${REGION}" \
-  --max-concurrent-dispatches=2 \
-  2>/dev/null || echo "Queue already exists, skipping."
+  --max-concurrent-dispatches="${TLDV_IMPORT_MAX_INSTANCES}" \
+  2>/dev/null || \
+gcloud tasks queues update "${TLDV_IMPORT_QUEUE}" \
+  --location="${REGION}" \
+  --max-concurrent-dispatches="${TLDV_IMPORT_MAX_INSTANCES}"
 
 # =========================
 # Deploy components

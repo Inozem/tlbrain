@@ -2,7 +2,6 @@ import logging
 import os
 from typing import Any
 
-import google.auth
 import google_auth_httplib2
 import httplib2
 from googleapiclient.discovery import build
@@ -36,9 +35,7 @@ def _build_credentials(scopes: list[str]):
         )
         creds.refresh(Request())
         return creds
-    logger.info("Drive auth: using ADC (no GOOGLE_REFRESH_TOKEN)")
-    creds, _ = google.auth.default(scopes=scopes)
-    return creds
+    raise RuntimeError("GOOGLE_REFRESH_TOKEN is not set — Drive access requires user OAuth credentials")
 
 
 def build_drive_service():
@@ -87,13 +84,25 @@ def scan_root_folder() -> list[dict[str, Any]]:
             folder_id,
         )
 
-        files = service.files().list(
-            q=(
-                f"'{folder_id}' in parents "
-                f"and mimeType='application/vnd.google-apps.document'"
-            ),
-            fields="files(id,name,createdTime,modifiedTime)",
-        ).execute()["files"]
+        files = []
+        page_token = None
+        while True:
+            kwargs = dict(
+                q=(
+                    f"'{folder_id}' in parents "
+                    f"and mimeType='application/vnd.google-apps.document' "
+                    f"and trashed=false"
+                ),
+                fields="nextPageToken,files(id,name,createdTime,modifiedTime)",
+                pageSize=1000,
+            )
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = service.files().list(**kwargs).execute()
+            files.extend(response.get("files", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
 
         logger.info(
             "Files found in %s: %s",
@@ -145,6 +154,7 @@ def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool]:
     """
     service = build_drive_service()
     file = service.files().get(fileId=doc_id, fields="parents,trashed").execute()
+    logger.info("Drive file metadata for %s: trashed=%s, parents=%s", doc_id, file.get("trashed"), file.get("parents"))
     if file.get("trashed"):
         return None, True
     parents = file.get("parents", [])

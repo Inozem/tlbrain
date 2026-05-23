@@ -6,7 +6,7 @@ from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
 from core.google_drive.drive_client import get_file_parent_folder_id
-from core.google_drive.firestore import get_client_name_by_folder_id, mark_error, update_client_speakers
+from core.google_drive.firestore import ensure_imported, get_client_name_by_folder_id, update_client_speakers
 from core.qdrant.setup import ensure_collection
 from core.qdrant.writer import delete_by_doc_id
 from core.utils.logging import configure_logging
@@ -39,9 +39,8 @@ async def sync_doc_endpoint(doc_id: str):
             should_delete = True
     except HttpError as e:
         if e.resp.status == 404:
-            logger.warning("File not found in Drive (404), marking error for retry: %s", doc_id)
-            mark_error(doc_id, "Drive file not found (404)")
-            return JSONResponse(content={"status": "ok", "result": "error_retry"})
+            logger.warning("File not found in Drive (404), deleting: %s", doc_id)
+            should_delete = True
         else:
             raise
 
@@ -67,6 +66,8 @@ async def sync_doc_endpoint(doc_id: str):
             content={"status": "error", "details": "could not determine client for doc"},
             status_code=404,
         )
+
+    ensure_imported(doc_id, client_name, folder_id or "")
 
     try:
         result = process_one(doc_id, client_name, root_folder_id)
