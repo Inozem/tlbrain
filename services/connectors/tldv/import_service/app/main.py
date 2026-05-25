@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.gemini.llm import call_gemini_json
-from core.google_drive.firestore import CLIENTS_COLLECTION, COLLECTION_NAME, _speaker_key, delete_queued_placeholder, get_all_client_names, mark_downloading, update_client_speakers
+from core.google_drive.firestore import CLIENTS_COLLECTION, COLLECTION_NAME, _speaker_key, delete_queued_placeholder, get_all_client_names, mark_download_error, mark_downloading, update_client_speakers
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import tldv_get
@@ -310,7 +310,8 @@ async def import_meeting(request: Request):
         meeting = tldv_get(f"/meetings/{meeting_id}")
     except http_requests.exceptions.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 404:
-            logger.warning("Meeting not found in TL;DV API, skipping: %s", meeting_id)
+            logger.warning("Meeting not found in TL;DV API, deleting placeholder: %s", meeting_id)
+            delete_queued_placeholder(meeting_id)
             return {"ok": True, "skipped": True, "reason": "meeting_not_found"}
         raise
     logger.info("Meeting: %r", meeting.get("name"))
@@ -318,16 +319,19 @@ async def import_meeting(request: Request):
     try:
         transcript_resp = tldv_get(f"/meetings/{meeting_id}/transcript")
     except http_requests.exceptions.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 404:
-            logger.warning("Transcript not found for meeting_id=%s, skipping", meeting_id)
-            return {"ok": True, "skipped": True, "reason": "transcript_not_found"}
+        if exc.response is not None and exc.response.status_code in (403, 404):
+            status_code = exc.response.status_code
+            logger.warning("Transcript HTTP %s for meeting_id=%s, marking error", status_code, meeting_id)
+            mark_download_error(meeting_id, f"HTTP {status_code} fetching transcript")
+            return {"ok": True, "skipped": True, "reason": f"transcript_http_{status_code}"}
         raise
     utterances = transcript_resp.get("results", transcript_resp.get("data", []))
     logger.info("Utterances: %d", len(utterances))
 
     if not utterances:
-        logger.warning("No transcript yet for meeting_id=%s, skipping", meeting_id)
-        return {"ok": True, "skipped": True, "reason": "no_transcript"}
+        logger.warning("Empty transcript for meeting_id=%s, marking error", meeting_id)
+        mark_download_error(meeting_id, "empty transcript")
+        return {"ok": True, "skipped": True, "reason": "empty_transcript"}
 
     client_name = _detect_client_name(db, meeting, utterances)
     title = meeting.get("name") or f"TL;DV {meeting_id}"
