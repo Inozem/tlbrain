@@ -44,6 +44,21 @@ async def sync_doc_endpoint(doc_id: str):
         else:
             raise
 
+    client_name = None
+    if not should_delete:
+        client_name = get_client_name_by_folder_id(folder_id) if folder_id else None
+
+        if not client_name:
+            existing = load_index(doc_id)
+            if existing:
+                # File was in our system but folder is no longer a TLBrain client → moved out → delete
+                logger.warning("File moved outside TLBrain, deleting: %s", doc_id)
+                should_delete = True
+            else:
+                # No record, unknown folder → skip
+                logger.warning("Could not determine client for doc, skipping: %s", doc_id)
+                return JSONResponse(content={"status": "ok", "result": "skipped_no_client"})
+
     if should_delete:
         existing = load_index(doc_id)
         if existing:
@@ -54,18 +69,6 @@ async def sync_doc_endpoint(doc_id: str):
                 update_client_speakers(client_name_existing, speakers, delta=-1)
             delete_index(doc_id)
         return JSONResponse(content={"status": "ok", "result": "deleted"})
-
-    client_name = get_client_name_by_folder_id(folder_id) if folder_id else None
-
-    if not client_name:
-        existing = load_index(doc_id)
-        client_name = (existing or {}).get("client_name", "")
-
-    if not client_name:
-        return JSONResponse(
-            content={"status": "error", "details": "could not determine client for doc"},
-            status_code=404,
-        )
 
     ensure_imported(doc_id, client_name, folder_id or "")
 
