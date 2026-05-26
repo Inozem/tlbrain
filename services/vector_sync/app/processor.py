@@ -32,7 +32,7 @@ def _get_bm25_model() -> SparseTextEmbedding:
     return _bm25_model
 
 
-def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
+def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: str | None = None) -> str:
     """
     Full processing cycle for one document.
     Returns: "processed" | "skipped" | "not_acquired"
@@ -56,7 +56,8 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str) -> str:
                 update_client_speakers(client_name, stored_speakers)
             logger.info("Updated client_name in Qdrant: %s → %s (%s)", stored_client_name, client_name, doc_id)
 
-        raw_text = read_google_doc(doc_id)
+        if raw_text is None:
+            raw_text = read_google_doc(doc_id)
         content_hash = sha256_text(raw_text + client_name)
 
         if existing_utterance_hashes:

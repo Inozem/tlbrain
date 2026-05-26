@@ -1,5 +1,18 @@
 from typing import Any
 
+_REQUIRED_HEADER_FIELDS = {"date", "provider"}
+
+
+def is_valid_format(text: str) -> bool:
+    """Return True if text matches the canonical TLBrain transcript format."""
+    header_lines, body_lines = _split_header_body(text)
+    if not header_lines:
+        return False
+    metadata = _parse_header(header_lines)
+    if not _REQUIRED_HEADER_FIELDS.issubset(metadata.keys()):
+        return False
+    return len(_parse_utterances(body_lines)) > 0
+
 
 def parse_document(text: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
     header_lines, body_lines = _split_header_body(text)

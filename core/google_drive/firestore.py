@@ -231,8 +231,11 @@ def get_stale_syncing() -> list[str]:
     return recovered
 
 
+_NO_RETRY_STAGES = {"import", "invalid_format"}
+
+
 def get_error_docs() -> list[str]:
-    """Return doc IDs with error status, excluding import-stage errors (no Google Doc yet)."""
+    """Return doc IDs with error status, excluding stages that should not be auto-retried."""
     db = _get_db()
     error_docs = (
         db.collection(COLLECTION_NAME)
@@ -241,7 +244,7 @@ def get_error_docs() -> list[str]:
     )
     result = []
     for doc in error_docs:
-        if (doc.to_dict() or {}).get("error_stage") == "import":
+        if (doc.to_dict() or {}).get("error_stage") in _NO_RETRY_STAGES:
             continue
         result.append(doc.id)
         logger.info("Error doc detected: %s", doc.id)
