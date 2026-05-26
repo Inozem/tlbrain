@@ -86,13 +86,26 @@ def mark_error(doc_id: str, error: str, error_stage: str = "vector_sync") -> Non
 
 
 def write_queued(meeting_id: str) -> bool:
-    """Create a placeholder queued record for a meeting. Returns True if created, False if already existed."""
+    """Create a placeholder queued record for a meeting.
+
+    Returns True if created or reset from import error, False if already existed.
+    """
     db = _get_db()
     ref = db.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction) -> bool:
-        if ref.get(transaction=transaction).exists:
+        snapshot = ref.get(transaction=transaction)
+        if snapshot.exists:
+            data = snapshot.to_dict() or {}
+            if data.get("status") == "error" and data.get("error_stage") == "import":
+                transaction.update(ref, {
+                    "status": "queued",
+                    "error": None,
+                    "error_stage": None,
+                    "status_changed_at": firestore.SERVER_TIMESTAMP,
+                })
+                return True
             return False
         transaction.set(ref, {
             "meeting_id": meeting_id,
@@ -113,6 +126,16 @@ def mark_downloading(meeting_id: str) -> None:
         "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Marked downloading: %s", meeting_id)
+
+
+def mark_download_error(meeting_id: str, error: str) -> None:
+    _get_db().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
+        "status": "error",
+        "error": error,
+        "error_stage": "import",
+        "status_changed_at": firestore.SERVER_TIMESTAMP,
+    })
+    logger.info("Marked download error: %s — %s", meeting_id, error)
 
 
 def delete_queued_placeholder(meeting_id: str) -> None:
@@ -208,8 +231,11 @@ def get_stale_syncing() -> list[str]:
     return recovered
 
 
+_NO_RETRY_STAGES = {"import", "invalid_format"}
+
+
 def get_error_docs() -> list[str]:
-    """Return doc IDs with error status."""
+    """Return doc IDs with error status, excluding stages that should not be auto-retried."""
     db = _get_db()
     error_docs = (
         db.collection(COLLECTION_NAME)
@@ -218,6 +244,8 @@ def get_error_docs() -> list[str]:
     )
     result = []
     for doc in error_docs:
+        if (doc.to_dict() or {}).get("error_stage") in _NO_RETRY_STAGES:
+            continue
         result.append(doc.id)
         logger.info("Error doc detected: %s", doc.id)
     return result

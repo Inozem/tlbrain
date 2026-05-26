@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.0.2`
+# 🧠 TLBrain `v1.0.3`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -171,7 +171,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.0.2  # or latest for the most recent build
+VERSION=1.0.3  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -220,6 +220,8 @@ A browser window will open for Google authorization:
 Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
 
 When finished, the script prints the MCP URL and TL;DV webhook URL — copy them, you'll need them in the next steps.
+
+> The deploy takes ~7 minutes to complete.
  
 ### 11. Connect TL;DV
 
@@ -270,7 +272,7 @@ In TL;DV click your avatar in the bottom-left corner → **Settings → Integrat
 | Adding transcripts | Manual upload | Auto-sync from TL;DV |
 | Context limit | Hits ceiling fast | Semantic retrieval — only relevant fragments |
 | Structured memory | None | Facts, summaries, decisions extracted per call |
-| Cost at scale | Grows with context size | Fixed ~$0.10 per transcript indexed |
+| Cost at scale | Grows with context size | Fixed ~$0.20 per transcript indexed |
 | Search | Keyword / full-text | Hybrid semantic + BM25 |
 | Client organization | Manual | Auto-detected, correctable |
  
@@ -304,9 +306,9 @@ TLBrain is designed so you don't pay for what a single-user scenario doesn't nee
 - Embeddings only for summaries and facts → ~10–20% of utterance volume
 - Enough for most single-user scenarios
 
-**Gemini (~$0.10 per transcript):**
+**Gemini (~$0.20 per transcript):**
 - You only pay for Gemini when indexing new transcripts
-- ~$0.10 per transcript depending on conversation length
+- ~$0.20 per transcript — depends on conversation length, number of utterances, and content volume
 - `text-embedding-004`, `output_dimensionality=768` → 4× cheaper than 3072
 - One Gemini request per window (summary + facts together)
 - If a file hasn't changed, it's skipped — Gemini is never called again
@@ -316,7 +318,7 @@ TLBrain is designed so you don't pay for what a single-user scenario doesn't nee
 - Cloud Functions, Cloud Tasks, Cloud Scheduler: included in free tier
 - Firestore: free tier covers 50k reads and 20k writes per day — more than enough for single-user at 15 calls/week
 
-As long as you stay within the free tier limits, you only pay for syncing new transcripts — roughly $0.10 per call. Everything else is free. You can go on a six-month vacation, come back, and nothing will be lost and nothing will have cost you a penny while you were away.
+As long as you stay within the free tier limits, you only pay for syncing new transcripts — roughly $0.20 per call. Everything else is free. You can go on a six-month vacation, come back, and nothing will be lost and nothing will have cost you a penny while you were away.
  
 ---
  

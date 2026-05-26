@@ -35,11 +35,15 @@ def tldv_reconciliation(request):
     limit = body.get("limit")
 
     db = firestore.Client()
-    existing = {
-        doc.to_dict().get("meeting_id")
-        for doc in db.collection(COLLECTION_NAME).stream()
-        if doc.to_dict().get("meeting_id")
-    }
+    existing: set[str] = set()
+    for doc in db.collection(COLLECTION_NAME).stream():
+        data = doc.to_dict() or {}
+        mid = data.get("meeting_id")
+        if not mid:
+            continue
+        if data.get("status") == "error" and data.get("error_stage") == "import":
+            continue  # allow reconciliation to retry import errors
+        existing.add(mid)
 
     missing = []
     meetings_count = 0

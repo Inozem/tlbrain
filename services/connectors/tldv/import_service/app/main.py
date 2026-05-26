@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.gemini.llm import call_gemini_json
-from core.google_drive.firestore import CLIENTS_COLLECTION, COLLECTION_NAME, _speaker_key, delete_queued_placeholder, get_all_client_names, mark_downloading, update_client_speakers
+from core.google_drive.firestore import CLIENTS_COLLECTION, COLLECTION_NAME, _speaker_key, delete_queued_placeholder, get_all_client_names, mark_download_error, mark_downloading, update_client_speakers
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import tldv_get
@@ -231,6 +231,10 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
     if len(candidates) == 1:
         logger.info("Client detected via speakers: %s", candidates[0])
         return candidates[0]
+    elif len(candidates) >= 2:
+        logger.info("Stage 1: %d speaker candidates: %s", len(candidates), candidates)
+    else:
+        logger.info("Stage 1: no speaker candidates found")
 
     if not all_clients:
         all_clients = get_all_client_names()
@@ -240,6 +244,8 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
         return "_unassigned"
 
     clients_to_check = candidates if candidates else all_clients
+    if not candidates:
+        logger.info("Stage 1: falling back to all %d clients", len(clients_to_check))
     clients_str = ", ".join(clients_to_check)
 
     # Stage 2: Gemini by meeting name (restricted to candidates or all)
@@ -250,8 +256,9 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
         ))
         client_name = result.get("client_name")
         confidence = result.get("confidence", 0)
+        logger.info("Stage 2: Gemini returned client=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
         if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
-            logger.info("Client detected via meeting name: %s (confidence=%.2f)", client_name, confidence)
+            logger.info("Client detected via meeting name: %s", client_name)
             return client_name
     except Exception as exc:
         logger.warning("Stage 2 client detection failed: %s", exc)
@@ -270,8 +277,9 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
         ))
         client_name = result.get("client_name")
         confidence = result.get("confidence", 0)
+        logger.info("Stage 3: Gemini returned client=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
         if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
-            logger.info("Client detected via transcript: %s (confidence=%.2f)", client_name, confidence)
+            logger.info("Client detected via transcript: %s", client_name)
             return client_name
     except Exception as exc:
         logger.warning("Stage 3 client detection failed: %s", exc)
@@ -310,7 +318,8 @@ async def import_meeting(request: Request):
         meeting = tldv_get(f"/meetings/{meeting_id}")
     except http_requests.exceptions.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 404:
-            logger.warning("Meeting not found in TL;DV API, skipping: %s", meeting_id)
+            logger.warning("Meeting not found in TL;DV API, deleting placeholder: %s", meeting_id)
+            delete_queued_placeholder(meeting_id)
             return {"ok": True, "skipped": True, "reason": "meeting_not_found"}
         raise
     logger.info("Meeting: %r", meeting.get("name"))
@@ -318,16 +327,19 @@ async def import_meeting(request: Request):
     try:
         transcript_resp = tldv_get(f"/meetings/{meeting_id}/transcript")
     except http_requests.exceptions.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 404:
-            logger.warning("Transcript not found for meeting_id=%s, skipping", meeting_id)
-            return {"ok": True, "skipped": True, "reason": "transcript_not_found"}
+        if exc.response is not None and exc.response.status_code in (403, 404):
+            status_code = exc.response.status_code
+            logger.warning("Transcript HTTP %s for meeting_id=%s, marking error", status_code, meeting_id)
+            mark_download_error(meeting_id, f"HTTP {status_code} fetching transcript")
+            return {"ok": True, "skipped": True, "reason": f"transcript_http_{status_code}"}
         raise
     utterances = transcript_resp.get("results", transcript_resp.get("data", []))
     logger.info("Utterances: %d", len(utterances))
 
     if not utterances:
-        logger.warning("No transcript yet for meeting_id=%s, skipping", meeting_id)
-        return {"ok": True, "skipped": True, "reason": "no_transcript"}
+        logger.warning("Empty transcript for meeting_id=%s, marking error", meeting_id)
+        mark_download_error(meeting_id, "empty transcript")
+        return {"ok": True, "skipped": True, "reason": "empty_transcript"}
 
     client_name = _detect_client_name(db, meeting, utterances)
     title = meeting.get("name") or f"TL;DV {meeting_id}"

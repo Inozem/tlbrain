@@ -123,14 +123,24 @@ def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestor
         ):
             continue
 
+        if (
+            existing
+            and existing.get("error_stage") == "invalid_format"
+            and existing.get("modifiedTime") == file["modifiedTime"]
+        ):
+            continue
+
         if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}"):
             queued += 1
 
-    for doc in db.collection(COLLECTION_NAME).select(["status"]).stream():
+    for doc in db.collection(COLLECTION_NAME).select(["status", "error_stage"]).stream():
         if doc.id in drive_doc_ids:
             continue
-        status = (doc.to_dict() or {}).get("status", "")
+        data = doc.to_dict() or {}
+        status = data.get("status", "")
         if status in ("queued", "downloading"):
+            continue
+        if status == "error" and data.get("error_stage") == "import":
             continue
         if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc.id}"):
             queued += 1

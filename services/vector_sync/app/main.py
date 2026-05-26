@@ -5,8 +5,10 @@ from fastapi.responses import JSONResponse
 from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
+from core.google_drive.docs_reader import read_google_doc
 from core.google_drive.drive_client import get_file_parent_folder_id
-from core.google_drive.firestore import ensure_imported, get_client_name_by_folder_id, update_client_speakers
+from core.google_drive.firestore import ensure_imported, get_client_name_by_folder_id, mark_error, update_client_speakers
+from core.parsing.parser import is_valid_format
 from core.qdrant.setup import ensure_collection
 from core.qdrant.writer import delete_by_doc_id
 from core.utils.logging import configure_logging
@@ -44,6 +46,21 @@ async def sync_doc_endpoint(doc_id: str):
         else:
             raise
 
+    client_name = None
+    if not should_delete:
+        client_name = get_client_name_by_folder_id(folder_id) if folder_id else None
+
+        if not client_name:
+            existing = load_index(doc_id)
+            if existing:
+                # File was in our system but folder is no longer a TLBrain client → moved out → delete
+                logger.warning("File moved outside TLBrain, deleting: %s", doc_id)
+                should_delete = True
+            else:
+                # No record, unknown folder → skip
+                logger.warning("Could not determine client for doc, skipping: %s", doc_id)
+                return JSONResponse(content={"status": "ok", "result": "skipped_no_client"})
+
     if should_delete:
         existing = load_index(doc_id)
         if existing:
@@ -55,22 +72,17 @@ async def sync_doc_endpoint(doc_id: str):
             delete_index(doc_id)
         return JSONResponse(content={"status": "ok", "result": "deleted"})
 
-    client_name = get_client_name_by_folder_id(folder_id) if folder_id else None
-
-    if not client_name:
-        existing = load_index(doc_id)
-        client_name = (existing or {}).get("client_name", "")
-
-    if not client_name:
-        return JSONResponse(
-            content={"status": "error", "details": "could not determine client for doc"},
-            status_code=404,
-        )
+    raw_text = read_google_doc(doc_id)
+    if not is_valid_format(raw_text):
+        logger.warning("File does not match TLBrain format, skipping: %s", doc_id)
+        if load_index(doc_id):
+            mark_error(doc_id, "invalid TLBrain document format", error_stage="invalid_format")
+        return JSONResponse(content={"status": "ok", "result": "skipped_invalid_format"})
 
     ensure_imported(doc_id, client_name, folder_id or "")
 
     try:
-        result = process_one(doc_id, client_name, root_folder_id)
+        result = process_one(doc_id, client_name, root_folder_id, raw_text=raw_text)
         return JSONResponse(content={"status": "ok", "result": result})
     except Exception as e:
         return JSONResponse(
