@@ -231,6 +231,10 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
     if len(candidates) == 1:
         logger.info("Client detected via speakers: %s", candidates[0])
         return candidates[0]
+    elif len(candidates) >= 2:
+        logger.info("Stage 1: %d speaker candidates: %s", len(candidates), candidates)
+    else:
+        logger.info("Stage 1: no speaker candidates found")
 
     if not all_clients:
         all_clients = get_all_client_names()
@@ -240,6 +244,8 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
         return "_unassigned"
 
     clients_to_check = candidates if candidates else all_clients
+    if not candidates:
+        logger.info("Stage 1: falling back to all %d clients", len(clients_to_check))
     clients_str = ", ".join(clients_to_check)
 
     # Stage 2: Gemini by meeting name (restricted to candidates or all)
@@ -250,8 +256,9 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
         ))
         client_name = result.get("client_name")
         confidence = result.get("confidence", 0)
+        logger.info("Stage 2: Gemini returned client=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
         if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
-            logger.info("Client detected via meeting name: %s (confidence=%.2f)", client_name, confidence)
+            logger.info("Client detected via meeting name: %s", client_name)
             return client_name
     except Exception as exc:
         logger.warning("Stage 2 client detection failed: %s", exc)
@@ -270,8 +277,9 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
         ))
         client_name = result.get("client_name")
         confidence = result.get("confidence", 0)
+        logger.info("Stage 3: Gemini returned client=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
         if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
-            logger.info("Client detected via transcript: %s (confidence=%.2f)", client_name, confidence)
+            logger.info("Client detected via transcript: %s", client_name)
             return client_name
     except Exception as exc:
         logger.warning("Stage 3 client detection failed: %s", exc)
