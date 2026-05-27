@@ -52,10 +52,10 @@ _RESPONSE_SCHEMA = {
 _CLIENT_DETECTION_SCHEMA = {
     "type": "object",
     "properties": {
-        "client_name": {"type": "string", "nullable": True},
+        "folder_name": {"type": "string", "nullable": True},
         "confidence": {"type": "number"},
     },
-    "required": ["client_name", "confidence"],
+    "required": ["folder_name", "confidence"],
 }
 
 
