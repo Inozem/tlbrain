@@ -226,6 +226,7 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
 
     # Stage 1: speaker frequency analysis
     speakers = _get_speakers(utterances)
+    logger.info("Stage 1: speakers from TL;DV: %s", {s: _speaker_key(s) for s in speakers})
     candidates, all_clients = _get_clients_by_speakers(db, speakers)
 
     if len(candidates) == 1:
