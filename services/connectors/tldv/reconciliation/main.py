@@ -74,13 +74,13 @@ def tldv_reconciliation(request):
     queued = 0
     for meeting in batch:
         meeting_id = meeting["id"]
+        write_queued(meeting_id)
         if enqueue_task(
             queue_name=queue_name,
             task_id=f"tldv-import-{meeting_id}",
             url=f"{import_service_url}/import",
             body={"meeting_id": meeting_id},
         ):
-            write_queued(meeting_id)
             queued += 1
             logger.info("Task created for meeting_id=%s", meeting_id)
         else:
