@@ -147,36 +147,38 @@ def _create_google_doc(drive, folder_id: str, title: str, text: str, speaker_ran
 _CONFIDENCE_THRESHOLD = 0.8
 
 _DETECT_PROMPT_STAGE1 = """\
-You are classifying a business meeting to a known client.
+You are deciding where to save a meeting transcript in Google Drive.
 
 Meeting name: {meeting_name}
-Known clients: {clients}
+Available folders:
+{folders}
 
-Which client does this meeting belong to? Reply with valid JSON only:
-{{"client_name": "...", "confidence": 0.0}}
+In which folder should this transcript be saved? Reply with valid JSON only:
+{{"folder_name": "...", "confidence": 0.0}}
 
 Rules:
-- client_name must be exactly one of the known clients, or null if unsure
+- folder_name must be copied VERBATIM from the available folders list above, or null if unsure
 - confidence 0.0-1.0; only use >=0.8 when highly certain
-- If no known clients match or you are unsure, use null and low confidence
+- If no folder matches or you are unsure, use null and low confidence
 """
 
 _DETECT_PROMPT_STAGE2 = """\
-You are classifying a business meeting to a known client.
+You are deciding where to save a meeting transcript in Google Drive.
 
 Meeting name: {meeting_name}
 Transcript excerpt:
 {transcript}
 
-Known clients: {clients}
+Available folders:
+{folders}
 
-Which client does this meeting belong to? Reply with valid JSON only:
-{{"client_name": "...", "confidence": 0.0}}
+In which folder should this transcript be saved? Reply with valid JSON only:
+{{"folder_name": "...", "confidence": 0.0}}
 
 Rules:
-- client_name must be exactly one of the known clients, or null if unsure
+- folder_name must be copied VERBATIM from the available folders list above, or null if unsure
 - confidence 0.0-1.0; only use >=0.8 when highly certain
-- If no known clients match or you are unsure, use null and low confidence
+- If no folder matches or you are unsure, use null and low confidence
 """
 
 
@@ -247,17 +249,17 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
     clients_to_check = candidates if candidates else all_clients
     if not candidates:
         logger.info("Stage 1: falling back to all %d clients", len(clients_to_check))
-    clients_str = ", ".join(clients_to_check)
+    folders_str = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(clients_to_check))
 
     # Stage 2: Gemini by meeting name (restricted to candidates or all)
     try:
         result = call_gemini_json(_DETECT_PROMPT_STAGE1.format(
             meeting_name=meeting_name,
-            clients=clients_str,
+            folders=folders_str,
         ))
-        client_name = result.get("client_name")
+        client_name = result.get("folder_name")
         confidence = result.get("confidence", 0)
-        logger.info("Stage 2: Gemini returned client=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
+        logger.info("Stage 2: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
         if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
             logger.info("Client detected via meeting name: %s", client_name)
             return client_name
@@ -274,11 +276,11 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
         result = call_gemini_json(_DETECT_PROMPT_STAGE2.format(
             meeting_name=meeting_name,
             transcript=excerpt,
-            clients=clients_str,
+            folders=folders_str,
         ))
-        client_name = result.get("client_name")
+        client_name = result.get("folder_name")
         confidence = result.get("confidence", 0)
-        logger.info("Stage 3: Gemini returned client=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
+        logger.info("Stage 3: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
         if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
             logger.info("Client detected via transcript: %s", client_name)
             return client_name
