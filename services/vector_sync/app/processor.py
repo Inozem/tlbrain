@@ -5,9 +5,10 @@ from qdrant_client.models import SparseVector
 
 from core.gemini.embeddings import embed, make_client
 from core.google_drive.docs_reader import read_google_doc
-from core.google_drive.firestore import acquire_for_syncing, update_client_speakers, mark_error, mark_synced
+from core.google_drive.firestore import acquire_for_syncing, update_client_speakers, mark_error, mark_synced, update_skipped_utterances
 from core.parsing.parser import parse_document
 from core.parsing.processor import build_utterance_payloads, iter_windows
+from core.parsing.windowing import generate_windows
 from core.qdrant.writer import (
     delete_old_versions,
     delete_summaries_by_center_indexes,
@@ -122,9 +123,11 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: st
             embed_client = make_client()
             summaries_count = 0
             facts_count = 0
+            skipped = []
             for summary, facts in iter_windows(
                 utterances, doc_id, version, client_name, dialog_date, root_folder_id,
                 allowed_center_indexes=affected_centers,
+                skipped_utterances=skipped,
             ):
                 summary_vector = embed([summary["text"]], client=embed_client)[0]
                 upsert_summaries([summary], [summary_vector])
@@ -134,6 +137,15 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: st
                 summaries_count += 1
                 facts_count += len(facts)
 
+            reanalyzed = {
+                u["order_index"]
+                for w in generate_windows(utterances)
+                if w["center_index"] in affected_centers
+                for u in w["utterances"]
+            }
+            existing_skipped = [i for i in ((existing or {}).get("skipped_utterances") or [])
+                                if i not in reanalyzed]
+            update_skipped_utterances(doc_id, existing_skipped + skipped)
             update_index(doc_id, {"client_name": client_name, "content_hash": content_hash, "version": version})
             mark_synced(doc_id)
             update_index(doc_id, {"utterance_hashes": new_hashes})
@@ -184,8 +196,10 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: st
             embed_client = make_client()
             summaries_count = 0
             facts_count = 0
+            skipped = []
             for summary, facts in iter_windows(
-                utterances, doc_id, version, client_name, dialog_date, root_folder_id
+                utterances, doc_id, version, client_name, dialog_date, root_folder_id,
+                skipped_utterances=skipped,
             ):
                 summary_vector = embed([summary["text"]], client=embed_client)[0]
                 upsert_summaries([summary], [summary_vector])
@@ -196,6 +210,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: st
                 facts_count += len(facts)
 
             delete_old_versions(doc_id, version, root_folder_id)
+            update_skipped_utterances(doc_id, skipped)
             update_index(doc_id, {"client_name": client_name, "content_hash": content_hash, "version": version})
             mark_synced(doc_id)
 
