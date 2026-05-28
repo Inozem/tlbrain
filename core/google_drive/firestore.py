@@ -359,12 +359,10 @@ def rebuild_client_speakers() -> int:
         # New nested paths with computed counts
         new_updates = {f"speakers.{key}": count for key, count in speaker_counts.items()}
 
-        # Delete stale flat fields (top-level keys with dots, left from the buggy .set(merge=True))
-        to_delete = {
-            k: firestore.DELETE_FIELD
-            for k in doc_data
-            if k.startswith("speakers.") and k not in new_updates
-        }
+        # Delete stale entries from nested speakers map (speakers no longer in any synced doc)
+        existing_speaker_keys = set((doc_data.get("speakers") or {}).keys())
+        stale_keys = existing_speaker_keys - set(speaker_counts.keys())
+        to_delete = {f"speakers.{key}": firestore.DELETE_FIELD for key in stale_keys}
 
         final = {**to_delete, **new_updates}
         if final:
