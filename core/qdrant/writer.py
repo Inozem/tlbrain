@@ -144,5 +144,26 @@ def delete_summaries_by_center_indexes(
     )
 
 
+@with_retry
+def fetch_utterances_by_order_indexes(
+    doc_id: str, root_folder_id: str, order_indexes: list[int]
+) -> list[dict[str, Any]]:
+    if not order_indexes:
+        return []
+    results, _ = get_client().scroll(
+        collection_name=get_collection_name(),
+        scroll_filter=Filter(must=[
+            FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+            FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
+            FieldCondition(key="order_index", match=MatchAny(any=order_indexes)),
+            FieldCondition(key="type", match=MatchValue(value="utterance")),
+        ]),
+        with_payload=True,
+        with_vectors=False,
+        limit=len(order_indexes),
+    )
+    return sorted([r.payload for r in results], key=lambda u: u.get("order_index", 0))
+
+
 def _point_id(type_: str, doc_id: str, key: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"{type_}:{doc_id}:{key}"))

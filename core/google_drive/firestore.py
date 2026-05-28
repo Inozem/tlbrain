@@ -251,6 +251,28 @@ def get_error_docs() -> list[str]:
     return result
 
 
+def update_skipped_utterances(doc_id: str, skipped_utterances: list[int]) -> None:
+    _get_db().collection(COLLECTION_NAME).document(doc_id).update({
+        "skipped_utterances": sorted(set(skipped_utterances)),
+    })
+
+
+def get_docs_with_skipped_utterances() -> list[dict]:
+    docs = (
+        _get_db().collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("skipped_utterances_count", ">", 0))
+        .stream()
+    )
+    result = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        result.append({
+            "doc_id": doc.id,
+            "client_name": data.get("client_name", ""),
+            "skipped_utterances": data.get("skipped_utterances", []),
+        })
+    return result
+
 
 def _speaker_key(name: str) -> str:
     import hashlib

@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Generator
 
-from core.gemini.llm import generate_summary_and_facts
+from core.gemini.llm import GeminiEmptyResponseError, generate_summary_and_facts
 from core.parsing.windowing import generate_windows
 
 
@@ -50,6 +50,7 @@ def iter_windows(
     root_folder_id: str,
     existing_summary_keys: set[str] | None = None,
     allowed_center_indexes: set[int] | None = None,
+    skipped_utterances: list[int] | None = None,
 ) -> Generator[tuple[dict[str, Any], list[dict[str, Any]]], None, None]:
     """Generator: yield (summary_dict, facts_list) one window at a time."""
     if existing_summary_keys is None:
@@ -69,7 +70,13 @@ def iter_windows(
             logger.debug("skip existing summary_key=%s", summary_key)
             continue
 
-        summary_text, facts_list = generate_summary_and_facts(window["utterances"])
+        try:
+            summary_text, facts_list = generate_summary_and_facts(window["utterances"])
+        except GeminiEmptyResponseError:
+            logger.warning("Skipping window center_index=%d for %s: Gemini returned no content", center_index, doc_id)
+            if skipped_utterances is not None:
+                skipped_utterances.extend(u["order_index"] for u in window["utterances"])
+            continue
 
         summary = {
             "type": "summary",
