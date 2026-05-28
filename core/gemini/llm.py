@@ -10,6 +10,11 @@ from core.utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
+
+class GeminiEmptyResponseError(Exception):
+    """Raised when Gemini returns a response with no text content (e.g. safety filter)."""
+
+
 _LLM_MODEL = "gemini-2.5-flash"
 
 _PROMPT = """\
@@ -109,4 +114,10 @@ def _generate_structured(client: genai.Client, prompt: str, schema: dict = _RESP
             response_schema=schema,
         ),
     )
+    if response.text is None:
+        finish_reason = (
+            response.candidates[0].finish_reason if response.candidates else "unknown"
+        )
+        logger.warning("Gemini returned no text content (finish_reason=%s)", finish_reason)
+        raise GeminiEmptyResponseError(f"Gemini returned no text content (finish_reason={finish_reason})")
     return json.loads(response.text)
