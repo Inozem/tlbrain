@@ -263,7 +263,12 @@ def update_client_speakers(client_name: str, speakers: list[str], delta: int = 1
         return
     db = _get_db()
     updates = {f"speakers.{_speaker_key(s)}": firestore.Increment(delta) for s in speakers}
-    db.collection(CLIENTS_COLLECTION).document(client_name).set(updates, merge=True)
+    ref = db.collection(CLIENTS_COLLECTION).document(client_name)
+    try:
+        ref.update(updates)
+    except Exception:
+        ref.set({"speakers": {}}, merge=True)
+        ref.update(updates)
     logger.debug("Updated speakers for %s (delta=%d): %s", client_name, delta, speakers)
 
 
@@ -351,22 +356,17 @@ def rebuild_client_speakers() -> int:
         doc_ref = db.collection(CLIENTS_COLLECTION).document(client_name)
         doc_data = doc_ref.get().to_dict() or {}
 
-        # New flat fields with computed counts
-        new_flat = {f"speakers.{key}": count for key, count in speaker_counts.items()}
+        # New nested paths with computed counts
+        new_updates = {f"speakers.{key}": count for key, count in speaker_counts.items()}
 
-        # Delete stale flat fields (speakers no longer present in synced docs)
-        to_delete = {
-            k: firestore.DELETE_FIELD
-            for k in doc_data
-            if k.startswith("speakers.") and k not in new_flat
-        }
-        # Delete nested `speakers` map if it exists (left from wrong .update() calls)
-        if "speakers" in doc_data and isinstance(doc_data.get("speakers"), dict):
-            to_delete["speakers"] = firestore.DELETE_FIELD
+        # Delete stale entries from nested speakers map (speakers no longer in any synced doc)
+        existing_speaker_keys = set((doc_data.get("speakers") or {}).keys())
+        stale_keys = existing_speaker_keys - set(speaker_counts.keys())
+        to_delete = {f"speakers.{key}": firestore.DELETE_FIELD for key in stale_keys}
 
-        final = {**to_delete, **new_flat}
+        final = {**to_delete, **new_updates}
         if final:
-            doc_ref.set(final, merge=True)
+            doc_ref.update(final)
 
         logger.info("Rebuilt speakers for %s: %d unique speakers", client_name, len(speaker_counts))
         updated += len(speaker_counts)
