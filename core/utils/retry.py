@@ -38,6 +38,13 @@ def _is_transient(exc: Exception) -> bool:
             return True
     except ImportError:
         pass
+    try:
+        import requests.exceptions
+        if isinstance(exc, requests.exceptions.HTTPError):
+            if exc.response is not None and exc.response.status_code >= 500:
+                return True
+    except ImportError:
+        pass
     return False
 
 

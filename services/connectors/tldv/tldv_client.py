@@ -3,10 +3,13 @@ from datetime import datetime, timezone
 
 import requests
 
+from core.utils.retry import with_retry
+
 _BASE = "https://pasta.tldv.io/v1alpha1"
 _DATE_FMT = "%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)"
 
 
+@with_retry
 def tldv_get(path: str) -> dict:
     resp = requests.get(
         f"{_BASE}{path}",
