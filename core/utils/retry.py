@@ -34,7 +34,7 @@ def _is_transient(exc: Exception) -> bool:
         pass
     try:
         from google.genai.errors import ClientError
-        if isinstance(exc, ClientError) and exc.status_code == 429:
+        if isinstance(exc, ClientError) and getattr(exc, "code", None) == 429:
             return True
     except ImportError:
         pass
