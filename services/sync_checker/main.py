@@ -130,6 +130,9 @@ def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestor
         ):
             continue
 
+        if existing and existing.get("status") in ("queued", "downloading"):
+            continue
+
         if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}"):
             queued += 1
 

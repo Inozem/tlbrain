@@ -35,6 +35,7 @@ def tldv_reconciliation(request):
     limit = body.get("limit")
 
     db = firestore.Client()
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
     existing: set[str] = set()
     for doc in db.collection(COLLECTION_NAME).stream():
         data = doc.to_dict() or {}
@@ -43,6 +44,10 @@ def tldv_reconciliation(request):
             continue
         if data.get("status") == "error" and data.get("error_stage") == "import":
             continue  # allow reconciliation to retry import errors
+        if data.get("status") == "queued":
+            changed_at = data.get("status_changed_at")
+            if not changed_at or changed_at < stale_cutoff:
+                continue  # stale queued — allow reconciliation to re-enqueue
         existing.add(mid)
 
     missing = []
