@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 import google.auth
@@ -185,6 +186,15 @@ Rules:
 _SPEAKER_MIN_CLIENTS = 1
 _SPEAKER_MAX_CLIENTS = 4
 
+_PLACEHOLDER_SPEAKER_RE = re.compile(
+    r"^(speaker|спикер|participant|участник)\s*\d+$",
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_speaker(name: str) -> bool:
+    return bool(_PLACEHOLDER_SPEAKER_RE.match(name))
+
 
 def _get_speakers(utterances: list[dict]) -> list[str]:
     speakers = {
@@ -228,8 +238,12 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
 
     # Stage 1: speaker frequency analysis
     speakers = _get_speakers(utterances)
-    logger.info("Stage 1: speakers from TL;DV: %s", {s: _speaker_key(s) for s in speakers})
-    candidates, all_clients = _get_clients_by_speakers(db, speakers)
+    if all(_is_placeholder_speaker(s) for s in speakers):
+        logger.info("Stage 1: all speakers are placeholders (%s), skipping", speakers)
+        candidates, all_clients = [], []
+    else:
+        logger.info("Stage 1: speakers from TL;DV: %s", {s: _speaker_key(s) for s in speakers})
+        candidates, all_clients = _get_clients_by_speakers(db, speakers)
 
     if len(candidates) == 1:
         logger.info("Client detected via speakers: %s", candidates[0])
@@ -324,6 +338,10 @@ async def import_meeting(request: Request):
             logger.warning("Meeting not found in TL;DV API, deleting placeholder: %s", meeting_id)
             delete_queued_placeholder(meeting_id)
             return {"ok": True, "skipped": True, "reason": "meeting_not_found"}
+        if exc.response is not None and exc.response.status_code == 403:
+            logger.warning("Meeting forbidden in TL;DV API (403), marking error: %s", meeting_id)
+            mark_download_error(meeting_id, "HTTP 403 fetching meeting")
+            return {"ok": True, "skipped": True, "reason": "meeting_http_403"}
         raise
     logger.info("Meeting: %r", meeting.get("name"))
 

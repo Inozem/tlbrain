@@ -1,6 +1,5 @@
 import logging
 import os
-from datetime import datetime, timedelta, timezone
 
 import functions_framework
 from google.cloud import firestore
@@ -30,7 +29,6 @@ from core.utils.logging import configure_logging
 configure_logging()
 logger = logging.getLogger(__name__)
 
-STALE_MINUTES = 15
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 
 
@@ -39,9 +37,6 @@ def checker(request):
     root_folder_id = get_root_folder_id()
     sync_url = os.environ["VECTOR_SYNC_URL"]
     queue_name = os.environ.get("VECTOR_SYNC_QUEUE", "tlbrain-vector-sync-queue")
-    tldv_import_queue = os.environ.get("TLDV_IMPORT_QUEUE")
-    tldv_import_url = os.environ.get("TLDV_IMPORT_SERVICE_URL")
-
     db = firestore.Client()
 
     stale_syncing = get_stale_syncing()
@@ -55,10 +50,6 @@ def checker(request):
         enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
     if error_docs:
         logger.info("Re-enqueued error docs: %d doc(s)", len(error_docs))
-
-    recovered_downloading = _recover_stale_downloading(db, tldv_import_queue, tldv_import_url)
-    if recovered_downloading:
-        logger.info("Recovered stale downloading: %d doc(s)", len(recovered_downloading))
 
     folders = list_client_folders()
     clients_synced = sync_clients_from_drive(folders)
@@ -85,14 +76,13 @@ def checker(request):
         queued = _full_scan(root_folder_id, sync_url, queue_name, db)
 
     logger.info(
-        "Checker done — queued=%d stale_syncing=%d error_docs=%d recovered_downloading=%d",
-        queued, len(stale_syncing), len(error_docs), len(recovered_downloading),
+        "Checker done — queued=%d stale_syncing=%d error_docs=%d",
+        queued, len(stale_syncing), len(error_docs),
     )
     return {
         "queued": queued,
         "stale_syncing": len(stale_syncing),
         "error_docs": len(error_docs),
-        "recovered_downloading": len(recovered_downloading),
     }, 200
 
 
@@ -187,41 +177,3 @@ def _process_changes(changes: list[dict], sync_url: str, queue_name: str) -> int
             queued += 1
 
     return queued
-
-
-def _recover_stale_downloading(
-    db: firestore.Client,
-    tldv_import_queue: str | None,
-    tldv_import_url: str | None,
-) -> list[str]:
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
-    downloading_docs = (
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("status", "==", "downloading"))
-        .stream()
-    )
-    recovered = []
-    for doc in downloading_docs:
-        data = doc.to_dict()
-        changed_at = data.get("status_changed_at")
-        if not changed_at or changed_at >= cutoff:
-            continue
-
-        meeting_id = data.get("meeting_id")
-        provider = data.get("provider", "tldv")
-
-        if provider == "tldv" and meeting_id and tldv_import_queue and tldv_import_url:
-            enqueue_task(
-                queue_name=tldv_import_queue,
-                url=f"{tldv_import_url}/import",
-                body={"meeting_id": meeting_id},
-            )
-
-        db.collection(COLLECTION_NAME).document(doc.id).update({
-            "status": "queued",
-            "status_changed_at": firestore.SERVER_TIMESTAMP,
-        })
-        recovered.append(doc.id)
-        logger.info("Recovered stale downloading: %s (provider=%s)", doc.id, provider)
-
-    return recovered
