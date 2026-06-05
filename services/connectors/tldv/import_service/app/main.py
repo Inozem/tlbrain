@@ -324,6 +324,10 @@ async def import_meeting(request: Request):
             logger.warning("Meeting not found in TL;DV API, deleting placeholder: %s", meeting_id)
             delete_queued_placeholder(meeting_id)
             return {"ok": True, "skipped": True, "reason": "meeting_not_found"}
+        if exc.response is not None and exc.response.status_code == 403:
+            logger.warning("Meeting forbidden in TL;DV API (403), marking error: %s", meeting_id)
+            mark_download_error(meeting_id, "HTTP 403 fetching meeting")
+            return {"ok": True, "skipped": True, "reason": "meeting_http_403"}
         raise
     logger.info("Meeting: %r", meeting.get("name"))
 
