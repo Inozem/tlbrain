@@ -197,6 +197,48 @@ def get_unassigned() -> dict:
     return {"count": len(transcripts), "transcripts": transcripts}
 
 
+def list_transcripts(
+    client_name: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict:
+    """Return paginated list of transcripts sorted by dialog_date desc.
+
+    Skips placeholder records (queued / downloading).
+    Returns: {total, returned, offset, limit, has_more, transcripts}
+    Each transcript: {doc_id, client_name, title, dialog_date, status}
+    """
+    db = _get_db()
+    query = db.collection(COLLECTION_NAME)
+    if client_name is not None:
+        query = query.where(filter=firestore.FieldFilter("client_name", "==", client_name))
+
+    transcripts = []
+    for doc in query.stream():
+        data = doc.to_dict() or {}
+        if data.get("status") in ("queued", "downloading"):
+            continue
+        transcripts.append({
+            "doc_id": doc.id,
+            "client_name": data.get("client_name", ""),
+            "title": data.get("source_file", ""),
+            "dialog_date": data.get("dialog_date", ""),
+            "status": data.get("status", ""),
+        })
+
+    transcripts.sort(key=lambda x: x["dialog_date"], reverse=True)
+    total = len(transcripts)
+    page = transcripts[offset: offset + limit]
+    return {
+        "total": total,
+        "returned": len(page),
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < total,
+        "transcripts": page,
+    }
+
+
 def list_imported() -> list[dict]:
     """Return all docs with status=imported."""
     db = _get_db()
