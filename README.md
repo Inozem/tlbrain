@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.0.8`
+# 🧠 TLBrain `v1.0.9`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -171,7 +171,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.0.8  # or latest for the most recent build
+VERSION=1.0.9  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -450,7 +450,8 @@ Authentication: Google OAuth 2.0 Authorization Code Flow. Claude detects OAuth v
 |---|---|
 | `query` | Hybrid search (semantic + BM25) over transcripts. Filters: `client_name`, `date_from`, `date_to`. Documents with `user_facts` are always included in results. |
 | `get_transcript` | Full transcripts without semantic search. By `doc_id` or `client_name` + date range. |
-| `list_clients` | List of clients with dialog count and last dialog date. Unassigned transcripts are highlighted separately. |
+| `list_clients` | List of clients with dialog count and last dialog date. |
+| `list_recent_transcripts` | Flat list of transcripts sorted by date desc across all clients. Filters: `client_name`, `date_from`, `date_to`. Supports pagination. Use to answer "where did the last call go?" |
 | `add_fact` | Manually attach a fact to a transcript. Stored as `user_fact`, idempotent. |
 | `create_client` | Create a client: folder in Drive + record in Firestore. |
 | `move_transcript` | Move a transcript to another client. Updates Drive, resets for reindexing. |
