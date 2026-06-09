@@ -23,6 +23,7 @@ from core.google_drive.firestore import (
     get_client_folder_id,
     get_sync_status,
     get_transcript_record,
+    list_transcripts,
     move_transcript_record,
     update_client_speakers,
     get_unassigned,
@@ -238,6 +239,27 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     },
                 },
                 {
+                    "name": "list_recent_transcripts",
+                    "description": "List transcripts sorted by date descending across all clients. Use this to answer 'where did the last call go?' or 'what was recorded recently?' without knowing the client name in advance. Supports optional client_name filter and pagination.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "client_name": {
+                                "type": "string",
+                                "description": "Filter by client name (optional)",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Page size (default: 20)",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Pagination offset (default: 0)",
+                            },
+                        },
+                    },
+                },
+                {
                     "name": "create_client",
                     "description": "Create a new client: makes a folder in Google Drive and registers the client in the database. Returns an error if a client with this name already exists.",
                     "inputSchema": {
@@ -288,6 +310,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "add_fact":
         return _handle_add_fact(request, arguments)
+
+    if tool_name == "list_recent_transcripts":
+        return _handle_list_recent_transcripts(request, arguments)
 
     if tool_name == "create_client":
         return _handle_create_client(request, arguments)
@@ -676,6 +701,38 @@ def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
     )
 
     content = build_mcp_content({"status": "ok", "doc_id": doc_id})
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_list_recent_transcripts(request: JSONRPCRequest, arguments: dict) -> dict:
+    client_name = arguments.get("client_name") or None
+    limit = int(arguments.get("limit") or 20)
+    offset = int(arguments.get("offset") or 0)
+
+    t0 = time.monotonic()
+    try:
+        result = list_transcripts(client_name=client_name, limit=limit, offset=offset)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to list transcripts",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: list_recent_transcripts",
+        extra={
+            "tool": "list_recent_transcripts",
+            "client_name": client_name,
+            "total": result["total"],
+            "returned": result["returned"],
+            "latency_ms": latency_ms,
+        },
+    )
+
+    content = build_mcp_content(result)
     return build_jsonrpc_result(request.id, content)
 
 
