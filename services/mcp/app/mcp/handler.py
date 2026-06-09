@@ -444,8 +444,8 @@ def _handle_list_clients(request: JSONRPCRequest) -> dict:
     if unassigned and unassigned.get("dialog_count", 0) > 0:
         payload["suggestion"] = (
             f"{unassigned['dialog_count']} transcript(s) are unassigned. "
-            f"Ask the user to review and assign them to a client. "
-            f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
+            f"Call list_recent_transcripts(client_name='_unassigned') to see them, "
+            f"then move each one using move_transcript(doc_id='...', new_client_name='...')."
         )
     content = build_mcp_content(payload)
     return build_jsonrpc_result(request.id, content)
@@ -495,9 +495,9 @@ def _handle_sync_tldv_all(request: JSONRPCRequest, arguments: dict) -> dict:
     if queued > 0:
         payload["suggestion"] = (
             f"Import started for {queued} transcript(s). "
-            f"While they are downloading, check two things via list_clients: "
-            f"1. Transcripts in `_unassigned` — the system could not detect the client, assign them manually via move_transcript. "
-            f"2. Transcripts that were assigned automatically — verify they went to the correct client. "
+            f"While they are downloading, check two things: "
+            f"1. Call list_recent_transcripts(client_name='_unassigned') — transcripts the system could not assign to a client, move them manually via move_transcript. "
+            f"2. Call list_clients to verify transcripts that were assigned automatically went to the correct client. "
             f"The more accurately transcripts are assigned, the better the system will detect clients for future imports."
         )
     content = build_mcp_content(payload)
@@ -644,7 +644,8 @@ def _handle_sync_status(request: JSONRPCRequest) -> dict:
     if unassigned > 0:
         status["suggestion"] = (
             f"Assigning transcripts to the correct client improves search accuracy and helps the system detect clients automatically in future imports. "
-            f"{unassigned} transcript(s) are currently unassigned — ask the user to assign them via move_transcript."
+            f"{unassigned} transcript(s) are currently unassigned — call list_recent_transcripts(client_name='_unassigned') to see them, "
+            f"then move each one using move_transcript(doc_id='...', new_client_name='...')."
         )
 
     content = build_mcp_content(status)
