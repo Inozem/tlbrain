@@ -23,6 +23,7 @@ from core.google_drive.firestore import (
     get_client_folder_id,
     get_sync_status,
     get_transcript_record,
+    list_transcripts,
     move_transcript_record,
     update_client_speakers,
     get_unassigned,
@@ -238,6 +239,35 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     },
                 },
                 {
+                    "name": "list_recent_transcripts",
+                    "description": "List transcripts sorted by date descending across all clients. Use this to answer 'where did the last call go?' or 'what was recorded recently?' without knowing the client name in advance. Supports optional client_name and date range filters, and pagination.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "client_name": {
+                                "type": "string",
+                                "description": "Filter by client name (optional)",
+                            },
+                            "date_from": {
+                                "type": "string",
+                                "description": "ISO date, inclusive lower bound (optional)",
+                            },
+                            "date_to": {
+                                "type": "string",
+                                "description": "ISO date, inclusive upper bound (optional)",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Page size (default: 20)",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Pagination offset (default: 0)",
+                            },
+                        },
+                    },
+                },
+                {
                     "name": "create_client",
                     "description": "Create a new client: makes a folder in Google Drive and registers the client in the database. Returns an error if a client with this name already exists.",
                     "inputSchema": {
@@ -288,6 +318,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "add_fact":
         return _handle_add_fact(request, arguments)
+
+    if tool_name == "list_recent_transcripts":
+        return _handle_list_recent_transcripts(request, arguments)
 
     if tool_name == "create_client":
         return _handle_create_client(request, arguments)
@@ -411,8 +444,8 @@ def _handle_list_clients(request: JSONRPCRequest) -> dict:
     if unassigned and unassigned.get("dialog_count", 0) > 0:
         payload["suggestion"] = (
             f"{unassigned['dialog_count']} transcript(s) are unassigned. "
-            f"Ask the user to review and assign them to a client. "
-            f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
+            f"Call list_recent_transcripts(client_name='_unassigned') to see them, "
+            f"then move each one using move_transcript(doc_id='...', new_client_name='...')."
         )
     content = build_mcp_content(payload)
     return build_jsonrpc_result(request.id, content)
@@ -462,9 +495,9 @@ def _handle_sync_tldv_all(request: JSONRPCRequest, arguments: dict) -> dict:
     if queued > 0:
         payload["suggestion"] = (
             f"Import started for {queued} transcript(s). "
-            f"While they are downloading, check two things via list_clients: "
-            f"1. Transcripts in `_unassigned` — the system could not detect the client, assign them manually via move_transcript. "
-            f"2. Transcripts that were assigned automatically — verify they went to the correct client. "
+            f"While they are downloading, check two things: "
+            f"1. Call list_recent_transcripts(client_name='_unassigned') — transcripts the system could not assign to a client, move them manually via move_transcript. "
+            f"2. Call list_clients to verify transcripts that were assigned automatically went to the correct client. "
             f"The more accurately transcripts are assigned, the better the system will detect clients for future imports."
         )
     content = build_mcp_content(payload)
@@ -611,7 +644,8 @@ def _handle_sync_status(request: JSONRPCRequest) -> dict:
     if unassigned > 0:
         status["suggestion"] = (
             f"Assigning transcripts to the correct client improves search accuracy and helps the system detect clients automatically in future imports. "
-            f"{unassigned} transcript(s) are currently unassigned — ask the user to assign them via move_transcript."
+            f"{unassigned} transcript(s) are currently unassigned — call list_recent_transcripts(client_name='_unassigned') to see them, "
+            f"then move each one using move_transcript(doc_id='...', new_client_name='...')."
         )
 
     content = build_mcp_content(status)
@@ -676,6 +710,40 @@ def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
     )
 
     content = build_mcp_content({"status": "ok", "doc_id": doc_id})
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_list_recent_transcripts(request: JSONRPCRequest, arguments: dict) -> dict:
+    client_name = arguments.get("client_name") or None
+    date_from = arguments.get("date_from") or None
+    date_to = arguments.get("date_to") or None
+    limit = int(arguments.get("limit") or 20)
+    offset = int(arguments.get("offset") or 0)
+
+    t0 = time.monotonic()
+    try:
+        result = list_transcripts(client_name=client_name, date_from=date_from, date_to=date_to, limit=limit, offset=offset)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to list transcripts",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: list_recent_transcripts",
+        extra={
+            "tool": "list_recent_transcripts",
+            "client_name": client_name,
+            "total": result["total"],
+            "returned": result["returned"],
+            "latency_ms": latency_ms,
+        },
+    )
+
+    content = build_mcp_content(result)
     return build_jsonrpc_result(request.id, content)
 
 
