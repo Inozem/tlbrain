@@ -240,13 +240,21 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                 },
                 {
                     "name": "list_recent_transcripts",
-                    "description": "List transcripts sorted by date descending across all clients. Use this to answer 'where did the last call go?' or 'what was recorded recently?' without knowing the client name in advance. Supports optional client_name filter and pagination.",
+                    "description": "List transcripts sorted by date descending across all clients. Use this to answer 'where did the last call go?' or 'what was recorded recently?' without knowing the client name in advance. Supports optional client_name and date range filters, and pagination.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "client_name": {
                                 "type": "string",
                                 "description": "Filter by client name (optional)",
+                            },
+                            "date_from": {
+                                "type": "string",
+                                "description": "ISO date, inclusive lower bound (optional)",
+                            },
+                            "date_to": {
+                                "type": "string",
+                                "description": "ISO date, inclusive upper bound (optional)",
                             },
                             "limit": {
                                 "type": "integer",
@@ -706,12 +714,14 @@ def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
 
 def _handle_list_recent_transcripts(request: JSONRPCRequest, arguments: dict) -> dict:
     client_name = arguments.get("client_name") or None
+    date_from = arguments.get("date_from") or None
+    date_to = arguments.get("date_to") or None
     limit = int(arguments.get("limit") or 20)
     offset = int(arguments.get("offset") or 0)
 
     t0 = time.monotonic()
     try:
-        result = list_transcripts(client_name=client_name, limit=limit, offset=offset)
+        result = list_transcripts(client_name=client_name, date_from=date_from, date_to=date_to, limit=limit, offset=offset)
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,

@@ -199,6 +199,8 @@ def get_unassigned() -> dict:
 
 def list_transcripts(
     client_name: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     limit: int = 20,
     offset: int = 0,
 ) -> dict:
@@ -218,11 +220,16 @@ def list_transcripts(
         data = doc.to_dict() or {}
         if data.get("status") in ("queued", "downloading"):
             continue
+        dialog_date = data.get("dialog_date", "")
+        if date_from and dialog_date < date_from:
+            continue
+        if date_to and dialog_date > date_to:
+            continue
         transcripts.append({
             "doc_id": doc.id,
             "client_name": data.get("client_name", ""),
             "title": data.get("source_file", ""),
-            "dialog_date": data.get("dialog_date", ""),
+            "dialog_date": dialog_date,
             "status": data.get("status", ""),
         })
 
