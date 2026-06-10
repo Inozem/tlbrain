@@ -285,6 +285,24 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                         "required": ["client_name"],
                     },
                 },
+                {
+                    "name": "rename_client",
+                    "description": "Rename a client: updates the folder name in Google Drive, all transcript records in the database, and the search index. The '_unassigned' folder cannot be renamed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "old_client_name": {
+                                "type": "string",
+                                "description": "Current client name",
+                            },
+                            "new_client_name": {
+                                "type": "string",
+                                "description": "New client name",
+                            },
+                        },
+                        "required": ["old_client_name", "new_client_name"],
+                    },
+                },
             ]
         },
     )
@@ -324,6 +342,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "create_client":
         return _handle_create_client(request, arguments)
+
+    if tool_name == "rename_client":
+        return _handle_rename_client(request, arguments)
 
     return build_jsonrpc_error(
         request_id=request.id,
@@ -790,4 +811,49 @@ def _handle_create_client(request: JSONRPCRequest, arguments: dict) -> dict:
 
     status = "ok" if folder_created else "registered_from_drive"
     content = build_mcp_content({"status": status, "client_name": client_name})
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_rename_client(request: JSONRPCRequest, arguments: dict) -> dict:
+    old_client_name = arguments.get("old_client_name", "").strip()
+    new_client_name = arguments.get("new_client_name", "").strip()
+
+    if not old_client_name or not new_client_name:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="old_client_name and new_client_name are required",
+        )
+
+    if old_client_name == "_unassigned":
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="Cannot rename the '_unassigned' folder",
+        )
+
+    if new_client_name == "_unassigned":
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="Cannot rename a client to '_unassigned'",
+        )
+
+    if old_client_name == new_client_name:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="old_client_name and new_client_name are the same",
+        )
+
+    existing_folder_id = get_client_folder_id(new_client_name)
+    if existing_folder_id:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Client '{new_client_name}' already exists",
+        )
+
+    # stub — real logic added in subsequent commits
+    content = build_mcp_content({"status": "ok", "old_client_name": old_client_name, "new_client_name": new_client_name})
     return build_jsonrpc_result(request.id, content)
