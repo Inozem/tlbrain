@@ -29,7 +29,7 @@ from core.google_drive.firestore import (
     update_client_speakers,
     get_unassigned,
 )
-from core.qdrant.writer import set_payload_client_name, upsert_user_facts
+from core.qdrant.writer import set_payload_client_name, set_payload_client_name_bulk, upsert_user_facts
 
 logger = logging.getLogger(__name__)
 
@@ -873,7 +873,9 @@ def _handle_rename_client(request: JSONRPCRequest, arguments: dict) -> dict:
                 code=-32602,
                 message=f"Client '{old_client_name}' not found",
             )
+        root_folder_id = get_root_folder_id()
         rename_folder(folder_id, new_client_name)
+        set_payload_client_name_bulk(old_client_name, root_folder_id, new_client_name)
         rename_client_records(old_client_name, new_client_name, folder_id)
 
         checker_url = os.environ.get("SYNC_CHECKER_URL", "")
