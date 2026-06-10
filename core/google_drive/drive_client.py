@@ -175,6 +175,16 @@ def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
     logger.info("Moved file %s to folder %s", doc_id, new_folder_id)
 
 
+def rename_folder(folder_id: str, new_name: str) -> None:
+    service = build_drive_service_rw()
+    service.files().update(
+        fileId=folder_id,
+        body={"name": new_name},
+        fields="id",
+    ).execute()
+    logger.info("Renamed folder %s to '%s'", folder_id, new_name)
+
+
 def create_client_folder(client_name: str) -> tuple[str, bool]:
     """Ensure ROOT_FOLDER/{client_name}/ exists in Drive.
 

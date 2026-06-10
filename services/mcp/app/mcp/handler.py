@@ -16,7 +16,7 @@ from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
-from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder
+from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder, rename_folder
 from core.google_drive.firestore import (
     create_client,
     get_all_client_names,
@@ -854,6 +854,43 @@ def _handle_rename_client(request: JSONRPCRequest, arguments: dict) -> dict:
             message=f"Client '{new_client_name}' already exists",
         )
 
-    # stub — real logic added in subsequent commits
+    drive_folders = {f["name"] for f in list_client_folders()}
+    if new_client_name in drive_folders:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Client '{new_client_name}' already exists in Google Drive but is not synced yet.",
+            details="Run sync_changes to synchronize, then retry.",
+        )
+
+    t0 = time.monotonic()
+    try:
+        folder_id = get_client_folder_id(old_client_name)
+        if not folder_id:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Client '{old_client_name}' not found",
+            )
+        rename_folder(folder_id, new_client_name)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to rename client",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: rename_client",
+        extra={
+            "tool": "rename_client",
+            "old_client_name": old_client_name,
+            "new_client_name": new_client_name,
+            "latency_ms": latency_ms,
+        },
+    )
+
     content = build_mcp_content({"status": "ok", "old_client_name": old_client_name, "new_client_name": new_client_name})
     return build_jsonrpc_result(request.id, content)
