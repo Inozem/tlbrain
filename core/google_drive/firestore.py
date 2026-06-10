@@ -526,6 +526,51 @@ def get_transcript_record(doc_id: str) -> dict | None:
     return doc.to_dict()
 
 
+def rename_client_records(old_name: str, new_name: str, folder_id: str) -> int:
+    """Rename client in Firestore: copy clients record, delete old, update all transcript_index docs.
+
+    Clears modifiedTime and content_hash so the checker re-enqueues reindexing.
+    Returns count of updated transcript_index documents.
+    """
+    db = _get_db()
+
+    old_ref = db.collection(CLIENTS_COLLECTION).document(old_name)
+    new_ref = db.collection(CLIENTS_COLLECTION).document(new_name)
+
+    old_data = (old_ref.get().to_dict() or {}).copy()
+    old_data["folder_id"] = folder_id
+    new_ref.set(old_data)
+    old_ref.delete()
+    logger.info("Renamed client record: %s → %s", old_name, new_name)
+
+    docs = (
+        db.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("client_name", "==", old_name))
+        .stream()
+    )
+
+    updated = 0
+    batch = db.batch()
+    batch_size = 0
+    for doc in docs:
+        batch.update(db.collection(COLLECTION_NAME).document(doc.id), {
+            "client_name": new_name,
+            "modifiedTime": firestore.DELETE_FIELD,
+            "content_hash": firestore.DELETE_FIELD,
+        })
+        updated += 1
+        batch_size += 1
+        if batch_size == 500:
+            batch.commit()
+            batch = db.batch()
+            batch_size = 0
+    if batch_size:
+        batch.commit()
+
+    logger.info("Updated %d transcript_index docs: %s → %s", updated, old_name, new_name)
+    return updated
+
+
 def create_client(client_name: str, folder_id: str, description: str | None = None) -> bool:
     """Create clients/{client_name} record. Returns True if created, False if already existed."""
     db = _get_db()

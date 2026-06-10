@@ -25,6 +25,7 @@ from core.google_drive.firestore import (
     get_transcript_record,
     list_transcripts,
     move_transcript_record,
+    rename_client_records,
     update_client_speakers,
     get_unassigned,
 )
@@ -873,6 +874,12 @@ def _handle_rename_client(request: JSONRPCRequest, arguments: dict) -> dict:
                 message=f"Client '{old_client_name}' not found",
             )
         rename_folder(folder_id, new_client_name)
+        rename_client_records(old_client_name, new_client_name, folder_id)
+
+        checker_url = os.environ.get("SYNC_CHECKER_URL", "")
+        if checker_url:
+            import httpx
+            httpx.post(checker_url, timeout=300)
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
