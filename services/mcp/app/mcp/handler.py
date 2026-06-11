@@ -27,6 +27,7 @@ from core.google_drive.firestore import (
     move_transcript_record,
     rename_client_records,
     update_client_speakers,
+    update_transcript_source_file,
     get_unassigned,
 )
 from core.qdrant.writer import set_payload_client_name, set_payload_client_name_bulk, upsert_user_facts
@@ -948,11 +949,12 @@ def _handle_rename_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     t0 = time.monotonic()
     try:
         rename_file(doc_id, new_title)
+        update_transcript_source_file(doc_id, new_title)
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
             code=-32603,
-            message="Failed to rename file in Drive",
+            message="Failed to rename transcript",
             details=str(e),
         )
 
