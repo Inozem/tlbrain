@@ -81,7 +81,7 @@ def checker(request):
     if page_token:
         try:
             changes, new_token = get_drive_changes(page_token)
-            queued = _process_changes(changes, sync_url, queue_name)
+            queued = _process_changes(changes, sync_url, queue_name, db)
             set_drive_sync_token(new_token)
             logger.info("Incremental sync: %d change(s) processed", len(changes))
         except HttpError as e:
@@ -137,6 +137,10 @@ def _full_scan(
         snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
         existing = snapshot.to_dict() if snapshot.exists else None
 
+        if existing and file.get("name") and existing.get("source_file") != file["name"]:
+            db.collection(COLLECTION_NAME).document(doc_id).update({"source_file": file["name"]})
+            logger.info("Updated source_file for %s: %r → %r", doc_id, existing.get("source_file"), file["name"])
+
         if (
             existing
             and existing.get("modifiedTime") == file["modifiedTime"]
@@ -175,7 +179,7 @@ def _full_scan(
     return queued
 
 
-def _process_changes(changes: list[dict], sync_url: str, queue_name: str) -> int:
+def _process_changes(changes: list[dict], sync_url: str, queue_name: str, db: firestore.Client) -> int:
     """Enqueue tasks for incremental Drive changes. Returns count queued."""
     queued = 0
 
@@ -204,6 +208,14 @@ def _process_changes(changes: list[dict], sync_url: str, queue_name: str) -> int
 
         if not get_client_name_by_folder_id(parents[0]):
             continue
+
+        file_name = file.get("name")
+        if file_name:
+            snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
+            record = snapshot.to_dict() if snapshot.exists else None
+            if record and record.get("source_file") != file_name:
+                db.collection(COLLECTION_NAME).document(doc_id).update({"source_file": file_name})
+                logger.info("Updated source_file for %s: %r → %r", doc_id, record.get("source_file"), file_name)
 
         if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}"):
             queued += 1
