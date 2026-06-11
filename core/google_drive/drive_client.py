@@ -161,6 +161,17 @@ def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool]:
     return (parents[0] if parents else None), False
 
 
+def get_folder_name(folder_id: str) -> str | None:
+    """Return the current Drive name of a folder — source of truth for client_name.
+
+    Used to detect in-place folder renames: the clients collection may still hold
+    the old name, but Drive always has the current one.
+    """
+    service = build_drive_service()
+    folder = service.files().get(fileId=folder_id, fields="name").execute()
+    return folder.get("name")
+
+
 def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
     """Move a Drive file to new_folder_id, removing all current parents."""
     service = build_drive_service_rw()

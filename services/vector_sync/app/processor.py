@@ -33,7 +33,7 @@ def _get_bm25_model() -> SparseTextEmbedding:
     return _bm25_model
 
 
-def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: str | None = None) -> str:
+def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: str | None = None, raw_text: str | None = None) -> str:
     """
     Full processing cycle for one document.
     Returns: "processed" | "skipped" | "not_acquired"
@@ -46,16 +46,34 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: st
         existing = load_index(doc_id)
         existing_utterance_hashes = (existing or {}).get("utterance_hashes")
         stored_client_name = (existing or {}).get("client_name", "")
+        stored_drive_folder = (existing or {}).get("drive_folder")
 
         client_name_changed = bool(client_name and client_name != stored_client_name)
+        # In-place folder rename: same folder_id, new name. Speaker counts are migrated by
+        # the folder task (copy_client_record), so the per-doc path must NOT touch them.
+        # A move (different folder_id) keeps the normal speaker migration below.
+        is_rename = bool(
+            folder_id and stored_drive_folder
+            and folder_id == stored_drive_folder
+            and client_name_changed
+        )
         if client_name_changed:
             set_payload_client_name(doc_id, root_folder_id, client_name)
-            stored_speakers = (existing or {}).get("speakers", [])
-            if stored_speakers and stored_client_name:
-                update_client_speakers(stored_client_name, stored_speakers, delta=-1)
-            if stored_speakers and client_name != "_unassigned":
-                update_client_speakers(client_name, stored_speakers)
-            logger.info("Updated client_name in Qdrant: %s → %s (%s)", stored_client_name, client_name, doc_id)
+            if not is_rename:
+                stored_speakers = (existing or {}).get("speakers", [])
+                if stored_speakers and stored_client_name:
+                    update_client_speakers(stored_client_name, stored_speakers, delta=-1)
+                if stored_speakers and client_name != "_unassigned":
+                    update_client_speakers(client_name, stored_speakers)
+            logger.info(
+                "Updated client_name in Qdrant: %s → %s (%s, rename=%s)",
+                stored_client_name, client_name, doc_id, is_rename,
+            )
+
+        # Keep drive_folder fresh — manual Drive moves don't update it otherwise, which
+        # would later misclassify an in-place rename as a move (double-counting speakers).
+        if folder_id and folder_id != stored_drive_folder:
+            update_index(doc_id, {"drive_folder": folder_id})
 
         if raw_text is None:
             raw_text = read_google_doc(doc_id)

@@ -15,6 +15,7 @@ from core.google_drive.drive_client import (
 from core.google_drive.firestore import (
     COLLECTION_NAME,
     get_client_name_by_folder_id,
+    get_doc_ids_by_client,
     get_drive_sync_token,
     get_error_docs,
     get_stale_syncing,
@@ -52,9 +53,23 @@ def checker(request):
         logger.info("Re-enqueued error docs: %d doc(s)", len(error_docs))
 
     folders = list_client_folders()
-    clients_synced = sync_clients_from_drive(folders)
+    clients_synced, renames = sync_clients_from_drive(folders)
     if clients_synced:
         logger.info("Auto-registered %d client(s) from Drive", clients_synced)
+    for r in renames:
+        enqueue_task(
+            queue_name=queue_name,
+            url=f"{sync_url}/client/rename",
+            task_id=f"rename-{r['folder_id']}",
+            body={"old_client_name": r["old"], "new_client_name": r["new"], "folder_id": r["folder_id"]},
+        )
+        doc_ids = get_doc_ids_by_client(r["old"])
+        for doc_id in doc_ids:
+            enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
+        logger.info(
+            "Client rename %s → %s: folder task + %d file task(s)",
+            r["old"], r["new"], len(doc_ids),
+        )
 
     page_token = get_drive_sync_token()
     queued = 0
