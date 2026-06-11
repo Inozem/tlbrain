@@ -177,6 +177,11 @@ def update_transcript_client(
     logger.info("Updated transcript client: %s → %s", doc_id, new_client_name)
 
 
+def update_transcript_source_file(doc_id: str, source_file: str) -> None:
+    _get_db().collection(COLLECTION_NAME).document(doc_id).update({"source_file": source_file})
+    logger.info("Updated source_file for %s: %r", doc_id, source_file)
+
+
 def get_unassigned() -> dict:
     """Return count and list of unassigned transcripts (past the import stage).
 

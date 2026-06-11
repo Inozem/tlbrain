@@ -22,6 +22,7 @@ from core.google_drive.firestore import (
     rebuild_client_speakers,
     set_drive_sync_token,
     sync_clients_from_drive,
+    update_transcript_source_file,
 )
 from core.utils.tasks import enqueue_task
 
@@ -138,8 +139,7 @@ def _full_scan(
         existing = snapshot.to_dict() if snapshot.exists else None
 
         if existing and file.get("name") and existing.get("source_file") != file["name"]:
-            db.collection(COLLECTION_NAME).document(doc_id).update({"source_file": file["name"]})
-            logger.info("Updated source_file for %s: %r → %r", doc_id, existing.get("source_file"), file["name"])
+            update_transcript_source_file(doc_id, file["name"])
 
         if (
             existing
@@ -214,8 +214,7 @@ def _process_changes(changes: list[dict], sync_url: str, queue_name: str, db: fi
             snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
             record = snapshot.to_dict() if snapshot.exists else None
             if record and record.get("source_file") != file_name:
-                db.collection(COLLECTION_NAME).document(doc_id).update({"source_file": file_name})
-                logger.info("Updated source_file for %s: %r → %r", doc_id, record.get("source_file"), file_name)
+                update_transcript_source_file(doc_id, file_name)
 
         if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}"):
             queued += 1
