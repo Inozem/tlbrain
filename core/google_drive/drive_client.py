@@ -161,15 +161,16 @@ def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool]:
     return (parents[0] if parents else None), False
 
 
-def get_folder_name(folder_id: str) -> str | None:
-    """Return the current Drive name of a folder — source of truth for client_name.
+def get_folder_info(folder_id: str) -> tuple[str | None, str | None]:
+    """Return (name, parent_folder_id) of a Drive folder — source of truth for client_name.
 
-    Used to detect in-place folder renames: the clients collection may still hold
-    the old name, but Drive always has the current one.
+    The parent lets the sync path verify the folder is a direct child of ROOT (a valid
+    client folder) without consulting the clients collection, which can be stale mid-rename.
     """
     service = build_drive_service()
-    folder = service.files().get(fileId=folder_id, fields="name").execute()
-    return folder.get("name")
+    folder = service.files().get(fileId=folder_id, fields="name,parents").execute()
+    parents = folder.get("parents", [])
+    return folder.get("name"), (parents[0] if parents else None)
 
 
 def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:

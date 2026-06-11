@@ -6,8 +6,8 @@ from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
 from core.google_drive.docs_reader import read_google_doc
-from core.google_drive.drive_client import get_file_parent_folder_id, get_folder_name
-from core.google_drive.firestore import copy_client_record, ensure_imported, get_client_name_by_folder_id, mark_error, update_client_speakers
+from core.google_drive.drive_client import get_file_parent_folder_id, get_folder_info
+from core.google_drive.firestore import ensure_imported, mark_error, reconcile_client_record, update_client_speakers
 from core.parsing.parser import is_valid_format
 from core.qdrant.setup import ensure_collection
 from core.qdrant.writer import delete_by_doc_id
@@ -42,8 +42,8 @@ async def rename_client_endpoint(payload: dict):
             content={"status": "error", "details": "old_client_name, new_client_name and folder_id are required"},
             status_code=400,
         )
-    copied = copy_client_record(old, new, folder_id)
-    return JSONResponse(content={"status": "ok", "old": old, "new": new, "copied": copied})
+    reconcile_client_record(old, new, folder_id)
+    return JSONResponse(content={"status": "ok", "old": old, "new": new})
 
 
 @app.post("/sync/doc/{doc_id}")
@@ -68,13 +68,12 @@ async def sync_doc_endpoint(doc_id: str):
 
     client_name = None
     if not should_delete:
-        stored_drive_folder = (existing or {}).get("drive_folder")
-        if folder_id and folder_id == stored_drive_folder:
-            # Doc still lives in its known folder → the live Drive name is the truth.
-            # Handles in-place folder rename, where the clients mapping may be stale.
-            client_name = get_folder_name(folder_id)
-        elif folder_id:
-            client_name = get_client_name_by_folder_id(folder_id)
+        if folder_id:
+            # Live Drive folder is the single source of truth for client_name. Validity =
+            # the folder is a direct child of ROOT; never consult the (rename-stale) clients map.
+            folder_name, folder_parent = get_folder_info(folder_id)
+            if folder_parent == root_folder_id:
+                client_name = folder_name
 
         if not client_name:
             if existing:

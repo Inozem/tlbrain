@@ -584,35 +584,25 @@ def rename_client_records(old_name: str, new_name: str, folder_id: str) -> list[
     return doc_ids
 
 
-def copy_client_record(old_name: str, new_name: str, folder_id: str) -> bool:
-    """Folder-rename reconciliation (folder task): copy clients/{old_name} →
-    clients/{new_name} carrying speaker counts, set folder_id, delete the old record.
+def reconcile_client_record(old_name: str, new_name: str, folder_id: str) -> None:
+    """Folder-rename reconciliation (folder task): ensure clients/{new_name} carries the
+    folder mapping + metadata, and remove clients/{old_name}.
 
-    Transactional and idempotent — returns False if clients/{new_name} already exists.
-    Does NOT touch transcript_index; per-doc file tasks update client_name there.
+    Speaker counts are NOT copied — they self-assemble from per-doc increments, so a
+    merge-set is used to avoid clobbering counts already written by file tasks. Idempotent
+    and order-independent. Does NOT touch transcript_index (file tasks own client_name there).
     """
     db = _get_db()
     old_ref = db.collection(CLIENTS_COLLECTION).document(old_name)
     new_ref = db.collection(CLIENTS_COLLECTION).document(new_name)
 
-    @firestore.transactional
-    def _txn(transaction: firestore.Transaction) -> bool:
-        if new_ref.get(transaction=transaction).exists:
-            return False
-        old_snapshot = old_ref.get(transaction=transaction)
-        data = (old_snapshot.to_dict() or {}) if old_snapshot.exists else {}
-        data["folder_id"] = folder_id
-        transaction.set(new_ref, data)
-        if old_snapshot.exists:
-            transaction.delete(old_ref)
-        return True
-
-    result = _txn(db.transaction())
-    if result:
-        logger.info("Copied client record: %s → %s (%s)", old_name, new_name, folder_id)
-    else:
-        logger.info("Client record already exists, skip copy: %s", new_name)
-    return result
+    old_data = old_ref.get().to_dict() or {}
+    record: dict = {"folder_id": folder_id, "status": old_data.get("status", "active")}
+    if old_data.get("description"):
+        record["description"] = old_data["description"]
+    new_ref.set(record, merge=True)
+    old_ref.delete()
+    logger.info("Reconciled client record: %s → %s (%s)", old_name, new_name, folder_id)
 
 
 def get_doc_ids_by_client(client_name: str) -> list[str]:

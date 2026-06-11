@@ -5,7 +5,7 @@ from qdrant_client.models import SparseVector
 
 from core.gemini.embeddings import embed, make_client
 from core.google_drive.docs_reader import read_google_doc
-from core.google_drive.firestore import acquire_for_syncing, update_client_speakers, mark_error, mark_synced, update_skipped_utterances
+from core.google_drive.firestore import acquire_for_syncing, get_client_folder_id, update_client_speakers, mark_error, mark_synced, update_skipped_utterances
 from core.parsing.parser import parse_document
 from core.parsing.processor import build_utterance_payloads, iter_windows
 from core.parsing.windowing import generate_windows
@@ -49,29 +49,19 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
         stored_drive_folder = (existing or {}).get("drive_folder")
 
         client_name_changed = bool(client_name and client_name != stored_client_name)
-        # In-place folder rename: same folder_id, new name. Speaker counts are migrated by
-        # the folder task (copy_client_record), so the per-doc path must NOT touch them.
-        # A move (different folder_id) keeps the normal speaker migration below.
-        is_rename = bool(
-            folder_id and stored_drive_folder
-            and folder_id == stored_drive_folder
-            and client_name_changed
-        )
         if client_name_changed:
             set_payload_client_name(doc_id, root_folder_id, client_name)
-            if not is_rename:
-                stored_speakers = (existing or {}).get("speakers", [])
-                if stored_speakers and stored_client_name:
-                    update_client_speakers(stored_client_name, stored_speakers, delta=-1)
-                if stored_speakers and client_name != "_unassigned":
-                    update_client_speakers(client_name, stored_speakers)
-            logger.info(
-                "Updated client_name in Qdrant: %s → %s (%s, rename=%s)",
-                stored_client_name, client_name, doc_id, is_rename,
-            )
+            stored_speakers = (existing or {}).get("speakers", [])
+            # Decrement the previous client only if its record still exists: during a folder
+            # rename the old record is deleted, and a blind decrement would resurrect a
+            # phantom. Counts self-assemble from each doc's increment into the new client.
+            if stored_speakers and stored_client_name and get_client_folder_id(stored_client_name):
+                update_client_speakers(stored_client_name, stored_speakers, delta=-1)
+            if stored_speakers and client_name != "_unassigned":
+                update_client_speakers(client_name, stored_speakers)
+            logger.info("Updated client_name in Qdrant: %s → %s (%s)", stored_client_name, client_name, doc_id)
 
-        # Keep drive_folder fresh — manual Drive moves don't update it otherwise, which
-        # would later misclassify an in-place rename as a move (double-counting speakers).
+        # Keep drive_folder fresh — manual Drive moves don't update it otherwise.
         if folder_id and folder_id != stored_drive_folder:
             update_index(doc_id, {"drive_folder": folder_id})
 
