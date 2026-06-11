@@ -304,6 +304,24 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                         "required": ["old_client_name", "new_client_name"],
                     },
                 },
+                {
+                    "name": "rename_transcript",
+                    "description": "Rename a transcript: updates the file name in Google Drive and the title visible in list_recent_transcripts.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "doc_id": {
+                                "type": "string",
+                                "description": "Document ID to rename",
+                            },
+                            "new_title": {
+                                "type": "string",
+                                "description": "New title for the transcript",
+                            },
+                        },
+                        "required": ["doc_id", "new_title"],
+                    },
+                },
             ]
         },
     )
@@ -346,6 +364,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "rename_client":
         return _handle_rename_client(request, arguments)
+
+    if tool_name == "rename_transcript":
+        return _handle_rename_transcript(request, arguments)
 
     return build_jsonrpc_error(
         request_id=request.id,
@@ -902,4 +923,27 @@ def _handle_rename_client(request: JSONRPCRequest, arguments: dict) -> dict:
     )
 
     content = build_mcp_content({"status": "ok", "old_client_name": old_client_name, "new_client_name": new_client_name})
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_rename_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
+    doc_id = arguments.get("doc_id", "").strip()
+    new_title = arguments.get("new_title", "").strip()
+
+    if not doc_id or not new_title:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="doc_id and new_title are required",
+        )
+
+    record = get_transcript_record(doc_id)
+    if not record:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Document not found: {doc_id}",
+        )
+
+    content = build_mcp_content({"status": "ok", "doc_id": doc_id, "new_title": new_title})
     return build_jsonrpc_result(request.id, content)
