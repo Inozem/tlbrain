@@ -56,6 +56,8 @@ def checker(request):
     clients_synced, renames = sync_clients_from_drive(folders)
     if clients_synced:
         logger.info("Auto-registered %d client(s) from Drive", clients_synced)
+    rename_doc_ids: set[str] = set()
+    rename_docs_queued = 0
     for r in renames:
         enqueue_task(
             queue_name=queue_name,
@@ -66,6 +68,8 @@ def checker(request):
         doc_ids = get_doc_ids_by_client(r["old"])
         for doc_id in doc_ids:
             enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
+            rename_doc_ids.add(doc_id)
+        rename_docs_queued += len(doc_ids)
         logger.info(
             "Client rename %s → %s: folder task + %d file task(s)",
             r["old"], r["new"], len(doc_ids),
@@ -83,26 +87,37 @@ def checker(request):
         except HttpError as e:
             if e.resp.status == 400:
                 logger.warning("Drive page token expired, falling back to full scan")
-                queued = _full_scan(root_folder_id, sync_url, queue_name, db)
+                queued = _full_scan(root_folder_id, sync_url, queue_name, db, skip_doc_ids=rename_doc_ids)
             else:
                 raise
     else:
         logger.info("No page token found, running full scan")
-        queued = _full_scan(root_folder_id, sync_url, queue_name, db)
+        queued = _full_scan(root_folder_id, sync_url, queue_name, db, skip_doc_ids=rename_doc_ids)
 
     logger.info(
-        "Checker done — queued=%d stale_syncing=%d error_docs=%d",
-        queued, len(stale_syncing), len(error_docs),
+        "Checker done — queued=%d renamed_folders=%d rename_docs_queued=%d stale_syncing=%d error_docs=%d",
+        queued, len(renames), rename_docs_queued, len(stale_syncing), len(error_docs),
     )
     return {
         "queued": queued,
+        "renamed_folders": len(renames),
+        "rename_docs_queued": rename_docs_queued,
         "stale_syncing": len(stale_syncing),
         "error_docs": len(error_docs),
     }, 200
 
 
-def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestore.Client) -> int:
-    """Full Drive scan: enqueue changed docs and orphaned Firestore records. Saves new page token."""
+def _full_scan(
+    root_folder_id: str,
+    sync_url: str,
+    queue_name: str,
+    db: firestore.Client,
+    skip_doc_ids: set[str] | None = None,
+) -> int:
+    """Full Drive scan: enqueue changed docs and orphaned Firestore records. Saves new page token.
+
+    skip_doc_ids: docs already enqueued by the rename pass — skipped to avoid double-enqueue.
+    """
     start_token = get_start_page_token()
 
     # Rebuild speaker counts BEFORE queuing new tasks — at this point all previously
@@ -117,6 +132,8 @@ def _full_scan(root_folder_id: str, sync_url: str, queue_name: str, db: firestor
 
     for file in files:
         doc_id = file["doc_id"]
+        if skip_doc_ids and doc_id in skip_doc_ids:
+            continue
         snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
         existing = snapshot.to_dict() if snapshot.exists else None
 
