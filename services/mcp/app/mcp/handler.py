@@ -16,7 +16,7 @@ from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
-from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder, rename_folder
+from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder, rename_file, rename_folder
 from core.google_drive.firestore import (
     create_client,
     get_all_client_names,
@@ -944,6 +944,23 @@ def _handle_rename_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
             code=-32602,
             message=f"Document not found: {doc_id}",
         )
+
+    t0 = time.monotonic()
+    try:
+        rename_file(doc_id, new_title)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to rename file in Drive",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: rename_transcript",
+        extra={"tool": "rename_transcript", "doc_id": doc_id, "new_title": new_title, "latency_ms": latency_ms},
+    )
 
     content = build_mcp_content({"status": "ok", "doc_id": doc_id, "new_title": new_title})
     return build_jsonrpc_result(request.id, content)

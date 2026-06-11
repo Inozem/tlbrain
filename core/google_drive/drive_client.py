@@ -187,6 +187,16 @@ def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
     logger.info("Moved file %s to folder %s", doc_id, new_folder_id)
 
 
+def rename_file(file_id: str, new_name: str) -> None:
+    service = build_drive_service_rw()
+    service.files().update(
+        fileId=file_id,
+        body={"name": new_name},
+        fields="id",
+    ).execute()
+    logger.info("Renamed file %s to '%s'", file_id, new_name)
+
+
 def rename_folder(folder_id: str, new_name: str) -> None:
     service = build_drive_service_rw()
     service.files().update(
