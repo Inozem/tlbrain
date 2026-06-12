@@ -5,7 +5,7 @@ from qdrant_client.models import SparseVector
 
 from core.gemini.embeddings import embed, make_client
 from core.google_drive.docs_reader import read_google_doc
-from core.google_drive.firestore import acquire_for_syncing, update_client_speakers, mark_error, mark_synced, update_skipped_utterances
+from core.google_drive.firestore import acquire_for_syncing, get_client_folder_id, update_client_speakers, mark_error, mark_synced, update_skipped_utterances
 from core.parsing.parser import parse_document
 from core.parsing.processor import build_utterance_payloads, iter_windows
 from core.parsing.windowing import generate_windows
@@ -33,7 +33,7 @@ def _get_bm25_model() -> SparseTextEmbedding:
     return _bm25_model
 
 
-def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: str | None = None) -> str:
+def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: str | None = None, raw_text: str | None = None) -> str:
     """
     Full processing cycle for one document.
     Returns: "processed" | "skipped" | "not_acquired"
@@ -46,16 +46,24 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, raw_text: st
         existing = load_index(doc_id)
         existing_utterance_hashes = (existing or {}).get("utterance_hashes")
         stored_client_name = (existing or {}).get("client_name", "")
+        stored_drive_folder = (existing or {}).get("drive_folder")
 
         client_name_changed = bool(client_name and client_name != stored_client_name)
         if client_name_changed:
             set_payload_client_name(doc_id, root_folder_id, client_name)
             stored_speakers = (existing or {}).get("speakers", [])
-            if stored_speakers and stored_client_name:
+            # Decrement the previous client only if its record still exists: during a folder
+            # rename the old record is deleted, and a blind decrement would resurrect a
+            # phantom. Counts self-assemble from each doc's increment into the new client.
+            if stored_speakers and stored_client_name and get_client_folder_id(stored_client_name):
                 update_client_speakers(stored_client_name, stored_speakers, delta=-1)
             if stored_speakers and client_name != "_unassigned":
                 update_client_speakers(client_name, stored_speakers)
             logger.info("Updated client_name in Qdrant: %s → %s (%s)", stored_client_name, client_name, doc_id)
+
+        # Keep drive_folder fresh — manual Drive moves don't update it otherwise.
+        if folder_id and folder_id != stored_drive_folder:
+            update_index(doc_id, {"drive_folder": folder_id})
 
         if raw_text is None:
             raw_text = read_google_doc(doc_id)

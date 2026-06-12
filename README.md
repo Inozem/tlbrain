@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.0.9`
+# 🧠 TLBrain `v1.1.0`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -171,7 +171,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.0.9  # or latest for the most recent build
+VERSION=1.1.0  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -458,6 +458,8 @@ Authentication: Google OAuth 2.0 Authorization Code Flow. Claude detects OAuth v
 | `import_all_transcripts` | Import all missed transcripts from TL;DV. Supports `limit` and `since`. |
 | `sync_changes` | Trigger an immediate sync run without waiting for the schedule. |
 | `sync_status` | Sync status counts by stage + number of unassigned transcripts. |
+| `rename_client` | Rename a client: updates folder in Drive, all transcript records, and the search index. |
+| `rename_transcript` | Rename a transcript: updates file name in Drive and title in the transcript list. |
  
 ### Repository Structure
  

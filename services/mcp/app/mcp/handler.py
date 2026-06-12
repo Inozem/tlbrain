@@ -16,7 +16,7 @@ from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.clients import list_clients
-from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder
+from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder, rename_file, rename_folder
 from core.google_drive.firestore import (
     create_client,
     get_all_client_names,
@@ -25,10 +25,12 @@ from core.google_drive.firestore import (
     get_transcript_record,
     list_transcripts,
     move_transcript_record,
+    rename_client_records,
     update_client_speakers,
+    update_transcript_source_file,
     get_unassigned,
 )
-from core.qdrant.writer import set_payload_client_name, upsert_user_facts
+from core.qdrant.writer import set_payload_client_name, set_payload_client_name_bulk, upsert_user_facts
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +287,42 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                         "required": ["client_name"],
                     },
                 },
+                {
+                    "name": "rename_client",
+                    "description": "Rename a client: updates the folder name in Google Drive, all transcript records in the database, and the search index. The '_unassigned' folder cannot be renamed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "old_client_name": {
+                                "type": "string",
+                                "description": "Current client name",
+                            },
+                            "new_client_name": {
+                                "type": "string",
+                                "description": "New client name",
+                            },
+                        },
+                        "required": ["old_client_name", "new_client_name"],
+                    },
+                },
+                {
+                    "name": "rename_transcript",
+                    "description": "Rename a transcript: updates the file name in Google Drive and the title visible in list_recent_transcripts.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "doc_id": {
+                                "type": "string",
+                                "description": "Document ID to rename",
+                            },
+                            "new_title": {
+                                "type": "string",
+                                "description": "New title for the transcript",
+                            },
+                        },
+                        "required": ["doc_id", "new_title"],
+                    },
+                },
             ]
         },
     )
@@ -324,6 +362,12 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "create_client":
         return _handle_create_client(request, arguments)
+
+    if tool_name == "rename_client":
+        return _handle_rename_client(request, arguments)
+
+    if tool_name == "rename_transcript":
+        return _handle_rename_transcript(request, arguments)
 
     return build_jsonrpc_error(
         request_id=request.id,
@@ -790,4 +834,135 @@ def _handle_create_client(request: JSONRPCRequest, arguments: dict) -> dict:
 
     status = "ok" if folder_created else "registered_from_drive"
     content = build_mcp_content({"status": status, "client_name": client_name})
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_rename_client(request: JSONRPCRequest, arguments: dict) -> dict:
+    old_client_name = arguments.get("old_client_name", "").strip()
+    new_client_name = arguments.get("new_client_name", "").strip()
+
+    if not old_client_name or not new_client_name:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="old_client_name and new_client_name are required",
+        )
+
+    if old_client_name == "_unassigned":
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="Cannot rename the '_unassigned' folder",
+        )
+
+    if new_client_name == "_unassigned":
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="Cannot rename a client to '_unassigned'",
+        )
+
+    if old_client_name == new_client_name:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="old_client_name and new_client_name are the same",
+        )
+
+    existing_folder_id = get_client_folder_id(new_client_name)
+    if existing_folder_id:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Client '{new_client_name}' already exists",
+        )
+
+    drive_folders = {f["name"] for f in list_client_folders()}
+    if new_client_name in drive_folders:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Client '{new_client_name}' already exists in Google Drive but is not synced yet.",
+            details="Run sync_changes to synchronize, then retry.",
+        )
+
+    t0 = time.monotonic()
+    try:
+        folder_id = get_client_folder_id(old_client_name)
+        if not folder_id:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Client '{old_client_name}' not found",
+            )
+        root_folder_id = get_root_folder_id()
+        rename_folder(folder_id, new_client_name)
+        set_payload_client_name_bulk(old_client_name, root_folder_id, new_client_name)
+        rename_client_records(old_client_name, new_client_name, folder_id)
+
+        checker_url = os.environ.get("SYNC_CHECKER_URL", "")
+        if checker_url:
+            import httpx
+            httpx.post(checker_url, timeout=300)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to rename client",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: rename_client",
+        extra={
+            "tool": "rename_client",
+            "old_client_name": old_client_name,
+            "new_client_name": new_client_name,
+            "latency_ms": latency_ms,
+        },
+    )
+
+    content = build_mcp_content({"status": "ok", "old_client_name": old_client_name, "new_client_name": new_client_name})
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_rename_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
+    doc_id = arguments.get("doc_id", "").strip()
+    new_title = arguments.get("new_title", "").strip()
+
+    if not doc_id or not new_title:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="doc_id and new_title are required",
+        )
+
+    record = get_transcript_record(doc_id)
+    if not record:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Document not found: {doc_id}",
+        )
+
+    t0 = time.monotonic()
+    try:
+        rename_file(doc_id, new_title)
+        update_transcript_source_file(doc_id, new_title)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to rename transcript",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: rename_transcript",
+        extra={"tool": "rename_transcript", "doc_id": doc_id, "new_title": new_title, "latency_ms": latency_ms},
+    )
+
+    content = build_mcp_content({"status": "ok", "doc_id": doc_id, "new_title": new_title})
     return build_jsonrpc_result(request.id, content)

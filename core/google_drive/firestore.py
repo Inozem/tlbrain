@@ -177,6 +177,11 @@ def update_transcript_client(
     logger.info("Updated transcript client: %s → %s", doc_id, new_client_name)
 
 
+def update_transcript_source_file(doc_id: str, source_file: str) -> None:
+    _get_db().collection(COLLECTION_NAME).document(doc_id).update({"source_file": source_file})
+    logger.info("Updated source_file for %s: %r", doc_id, source_file)
+
+
 def get_unassigned() -> dict:
     """Return count and list of unassigned transcripts (past the import stage).
 
@@ -370,26 +375,39 @@ def migrate_speaker_index() -> int:
     return migrated
 
 
-def sync_clients_from_drive(folders: list[dict[str, str]]) -> int:
-    """Upsert clients/{name} for each Drive folder. Updates folder_id if changed. Returns count of new records.
+def sync_clients_from_drive(folders: list[dict[str, str]]) -> tuple[int, list[dict[str, str]]]:
+    """Upsert clients/{name} for each Drive folder. Updates folder_id if changed.
+
+    Detects in-place folder renames (folder_id already registered under a different
+    name) and returns them WITHOUT mutating — the checker dispatches a folder task
+    (clients copy) plus per-doc file tasks to reconcile Qdrant and transcript_index.
+    A renamed folder is NOT auto-registered, to avoid a duplicate folder_id mapping.
+
+    Returns (count of new records, renames=[{"old", "new", "folder_id"}]).
 
     Each folder dict must have: {name: str, id: str}
     """
     db = _get_db()
     created = 0
+    renames: list[dict[str, str]] = []
     for folder in folders:
         name = folder["name"]
         folder_id = folder["id"]
         ref = db.collection(CLIENTS_COLLECTION).document(name)
         snapshot = ref.get()
         if not snapshot.exists:
-            ref.set({
-                "status": "active",
-                "folder_id": folder_id,
-                "created_at": firestore.SERVER_TIMESTAMP,
-            })
-            logger.info("Auto-registered client from Drive: %s (%s)", name, folder_id)
-            created += 1
+            old_name = get_client_name_by_folder_id(folder_id)
+            if old_name and old_name != name:
+                renames.append({"old": old_name, "new": name, "folder_id": folder_id})
+                logger.info("Detected folder rename via Drive: %s → %s (%s)", old_name, name, folder_id)
+            else:
+                ref.set({
+                    "status": "active",
+                    "folder_id": folder_id,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                })
+                logger.info("Auto-registered client from Drive: %s (%s)", name, folder_id)
+                created += 1
         elif snapshot.to_dict().get("folder_id") != folder_id:
             ref.update({"folder_id": folder_id})
             logger.info("Updated folder_id for client: %s (%s)", name, folder_id)
@@ -398,7 +416,7 @@ def sync_clients_from_drive(folders: list[dict[str, str]]) -> int:
     if migrated:
         logger.info("Migrated speaker index for %d doc(s)", migrated)
 
-    return created
+    return created, renames
 
 
 def rebuild_client_speakers() -> int:
@@ -524,6 +542,84 @@ def get_transcript_record(doc_id: str) -> dict | None:
     if not doc.exists:
         return None
     return doc.to_dict()
+
+
+def rename_client_records(old_name: str, new_name: str, folder_id: str) -> list[str]:
+    """Rename client in Firestore: copy clients record, delete old, update all transcript_index docs.
+
+    Clears modifiedTime and content_hash so the checker re-enqueues reindexing.
+    Returns list of affected transcript doc_ids.
+    """
+    db = _get_db()
+
+    old_ref = db.collection(CLIENTS_COLLECTION).document(old_name)
+    new_ref = db.collection(CLIENTS_COLLECTION).document(new_name)
+
+    old_data = (old_ref.get().to_dict() or {}).copy()
+    old_data["folder_id"] = folder_id
+    new_ref.set(old_data)
+    old_ref.delete()
+    logger.info("Renamed client record: %s → %s", old_name, new_name)
+
+    docs = (
+        db.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("client_name", "==", old_name))
+        .stream()
+    )
+
+    doc_ids: list[str] = []
+    batch = db.batch()
+    batch_size = 0
+    for doc in docs:
+        batch.update(db.collection(COLLECTION_NAME).document(doc.id), {
+            "client_name": new_name,
+            "modifiedTime": firestore.DELETE_FIELD,
+            "content_hash": firestore.DELETE_FIELD,
+        })
+        doc_ids.append(doc.id)
+        batch_size += 1
+        if batch_size == 500:
+            batch.commit()
+            batch = db.batch()
+            batch_size = 0
+    if batch_size:
+        batch.commit()
+
+    logger.info("Updated %d transcript_index docs: %s → %s", len(doc_ids), old_name, new_name)
+    return doc_ids
+
+
+def reconcile_client_record(old_name: str, new_name: str, folder_id: str) -> None:
+    """Folder-rename reconciliation (folder task): ensure clients/{new_name} carries the
+    folder mapping + metadata, and remove clients/{old_name}.
+
+    Speaker counts are NOT copied — they self-assemble from per-doc increments, so a
+    merge-set is used to avoid clobbering counts already written by file tasks. Idempotent
+    and order-independent. Does NOT touch transcript_index (file tasks own client_name there).
+    """
+    db = _get_db()
+    old_ref = db.collection(CLIENTS_COLLECTION).document(old_name)
+    new_ref = db.collection(CLIENTS_COLLECTION).document(new_name)
+
+    old_data = old_ref.get().to_dict() or {}
+    record: dict = {"folder_id": folder_id, "status": old_data.get("status", "active")}
+    if old_data.get("description"):
+        record["description"] = old_data["description"]
+    new_ref.set(record, merge=True)
+    old_ref.delete()
+    logger.info("Reconciled client record: %s → %s (%s)", old_name, new_name, folder_id)
+
+
+def get_doc_ids_by_client(client_name: str) -> list[str]:
+    """Return all transcript_index doc IDs for a client."""
+    db = _get_db()
+    docs = (
+        db.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("client_name", "==", client_name))
+        .select([])
+        .stream()
+    )
+    return [doc.id for doc in docs]
 
 
 def create_client(client_name: str, folder_id: str, description: str | None = None) -> bool:

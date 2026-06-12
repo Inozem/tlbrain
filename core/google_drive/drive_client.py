@@ -161,6 +161,18 @@ def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool]:
     return (parents[0] if parents else None), False
 
 
+def get_folder_info(folder_id: str) -> tuple[str | None, str | None]:
+    """Return (name, parent_folder_id) of a Drive folder — source of truth for client_name.
+
+    The parent lets the sync path verify the folder is a direct child of ROOT (a valid
+    client folder) without consulting the clients collection, which can be stale mid-rename.
+    """
+    service = build_drive_service()
+    folder = service.files().get(fileId=folder_id, fields="name,parents").execute()
+    parents = folder.get("parents", [])
+    return folder.get("name"), (parents[0] if parents else None)
+
+
 def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
     """Move a Drive file to new_folder_id, removing all current parents."""
     service = build_drive_service_rw()
@@ -173,6 +185,26 @@ def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
         fields="id",
     ).execute()
     logger.info("Moved file %s to folder %s", doc_id, new_folder_id)
+
+
+def rename_file(file_id: str, new_name: str) -> None:
+    service = build_drive_service_rw()
+    service.files().update(
+        fileId=file_id,
+        body={"name": new_name},
+        fields="id",
+    ).execute()
+    logger.info("Renamed file %s to '%s'", file_id, new_name)
+
+
+def rename_folder(folder_id: str, new_name: str) -> None:
+    service = build_drive_service_rw()
+    service.files().update(
+        fileId=folder_id,
+        body={"name": new_name},
+        fields="id",
+    ).execute()
+    logger.info("Renamed folder %s to '%s'", folder_id, new_name)
 
 
 def create_client_folder(client_name: str) -> tuple[str, bool]:
