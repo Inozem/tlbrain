@@ -42,7 +42,7 @@ def acquire_for_syncing(doc_id: str) -> bool:
     return result
 
 
-def ensure_imported(doc_id: str, client_name: str, folder_id: str) -> bool:
+def ensure_imported(doc_id: str, client_name: str, folder_id: str, source_file: str = "") -> bool:
     """Create transcript_index record with status=imported if it doesn't exist. Returns True if created."""
     db = _get_db()
     ref = db.collection(COLLECTION_NAME).document(doc_id)
@@ -55,6 +55,7 @@ def ensure_imported(doc_id: str, client_name: str, folder_id: str) -> bool:
             "doc_id": doc_id,
             "client_name": client_name,
             "drive_folder": folder_id,
+            "source_file": source_file,
             "status": "imported",
             "status_changed_at": firestore.SERVER_TIMESTAMP,
         })

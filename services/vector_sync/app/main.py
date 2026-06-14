@@ -54,8 +54,9 @@ async def sync_doc_endpoint(doc_id: str):
     should_delete = False
     folder_id = None
 
+    file_name = None
     try:
-        folder_id, is_trashed = get_file_parent_folder_id(doc_id)
+        folder_id, is_trashed, file_name = get_file_parent_folder_id(doc_id)
         if is_trashed:
             logger.warning("File is trashed in Drive, deleting: %s", doc_id)
             should_delete = True
@@ -102,7 +103,7 @@ async def sync_doc_endpoint(doc_id: str):
             mark_error(doc_id, "invalid TLBrain document format", error_stage="invalid_format")
         return JSONResponse(content={"status": "ok", "result": "skipped_invalid_format"})
 
-    ensure_imported(doc_id, client_name, folder_id or "")
+    ensure_imported(doc_id, client_name, folder_id or "", source_file=file_name or "")
 
     try:
         result = process_one(doc_id, client_name, root_folder_id, folder_id=folder_id, raw_text=raw_text)

@@ -147,18 +147,18 @@ def get_drive_changes(page_token: str) -> tuple[list[dict], str]:
     return changes, response["newStartPageToken"]
 
 
-def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool]:
-    """Return (parent_folder_id, is_trashed) for a Drive file.
+def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool, str | None]:
+    """Return (parent_folder_id, is_trashed, file_name) for a Drive file.
 
     is_trashed=True means the file is in trash and should be treated as deleted.
     """
     service = build_drive_service()
-    file = service.files().get(fileId=doc_id, fields="parents,trashed").execute()
+    file = service.files().get(fileId=doc_id, fields="name,parents,trashed").execute()
     logger.info("Drive file metadata for %s: trashed=%s, parents=%s", doc_id, file.get("trashed"), file.get("parents"))
     if file.get("trashed"):
-        return None, True
+        return None, True, None
     parents = file.get("parents", [])
-    return (parents[0] if parents else None), False
+    return (parents[0] if parents else None), False, file.get("name")
 
 
 def get_folder_info(folder_id: str) -> tuple[str | None, str | None]:

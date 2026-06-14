@@ -171,7 +171,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.1.0  # or latest for the most recent build
+VERSION=1.1.1  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -508,7 +508,6 @@ Google Doc format:
 DATE: YYYY-MM-DD
 TIME: HH:MM
 PROVIDER: tldv | fireflies | manual
-SOURCE_FILE: original filename from the provider
 ---
 Speaker Name :: Utterance text.
  

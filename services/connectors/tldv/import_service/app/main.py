@@ -92,7 +92,6 @@ def _format_transcript(meeting: dict, utterances: list[dict]) -> tuple[str, list
         f"DATE: {dialog_date}",
         f"TIME: {dialog_time}",
         "PROVIDER: tldv",
-        f"SOURCE_FILE: {source_file}",
         "---",
     ]) + "\n"
 
