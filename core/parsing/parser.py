@@ -31,7 +31,7 @@ def _split_header_body(text: str) -> tuple[list[str], list[str]]:
 
 
 def _parse_header(lines: list[str]) -> dict[str, str]:
-    mapping = {"DATE": "date", "TIME": "time", "PROVIDER": "provider", "SOURCE_FILE": "source_file"}
+    mapping = {"DATE": "date", "TIME": "time", "PROVIDER": "provider"}
     result: dict[str, str] = {}
     for line in lines:
         if ":" not in line:
