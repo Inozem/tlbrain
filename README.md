@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.1.0`
+# 🧠 TLBrain `v1.1.1`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
