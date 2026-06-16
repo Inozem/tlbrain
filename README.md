@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.1.1`
+# 🧠 TLBrain `v1.2.0`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -171,7 +171,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.1.1  # or latest for the most recent build
+VERSION=1.2.0  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -456,7 +456,7 @@ Authentication: Google OAuth 2.0 Authorization Code Flow. Claude detects OAuth v
 | `create_client` | Create a client: folder in Drive + record in Firestore. |
 | `move_transcript` | Move a transcript to another client. Updates Drive, resets for reindexing. |
 | `import_all_transcripts` | Import all missed transcripts from TL;DV. Supports `limit` and `since`. |
-| `sync_changes` | Trigger an immediate sync run without waiting for the schedule. |
+| `sync_changes` | Trigger an immediate sync run without waiting for the schedule. Accepts optional `client_name` or `doc_id` for targeted resync of a specific client or document. |
 | `sync_status` | Sync status counts by stage + number of unassigned transcripts. |
 | `rename_client` | Rename a client: updates folder in Drive, all transcript records, and the search index. |
 | `rename_transcript` | Rename a transcript: updates file name in Drive and title in the transcript list. |
