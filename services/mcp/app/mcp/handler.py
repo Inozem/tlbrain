@@ -208,10 +208,19 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                 },
                 {
                     "name": "sync_changes",
-                    "description": "Trigger sync of transcripts from Google Drive. Use when you've made changes (moved a transcript, renamed a file) and don't want to wait for the next scheduled run.",
+                    "description": "Sync recent changes from Google Drive. Use client_name or doc_id only when a forced resync of a specific client or document is needed.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "client_name": {
+                                "type": "string",
+                                "description": "Resync all documents for this client only",
+                            },
+                            "doc_id": {
+                                "type": "string",
+                                "description": "Resync a specific document by ID",
+                            },
+                        },
                     },
                 },
                 {
@@ -349,7 +358,7 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
         return _handle_move_transcript(request, arguments)
 
     if tool_name == "sync_changes":
-        return _handle_sync_changes(request)
+        return _handle_sync_changes(request, arguments)
 
     if tool_name == "sync_status":
         return _handle_sync_status(request)
@@ -633,7 +642,7 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     return build_jsonrpc_result(request.id, content)
 
 
-def _handle_sync_changes(request: JSONRPCRequest) -> dict:
+def _handle_sync_changes(request: JSONRPCRequest, arguments: dict) -> dict:
     checker_url = os.environ.get("SYNC_CHECKER_URL", "")
     if not checker_url:
         return build_jsonrpc_error(
@@ -645,7 +654,12 @@ def _handle_sync_changes(request: JSONRPCRequest) -> dict:
     t0 = time.monotonic()
     try:
         import httpx
-        resp = httpx.post(checker_url, timeout=300)
+        body: dict = {}
+        if arguments.get("doc_id"):
+            body["doc_id"] = arguments["doc_id"].strip()
+        elif arguments.get("client_name"):
+            body["client_name"] = arguments["client_name"].strip()
+        resp = httpx.post(checker_url, json=body or None, timeout=300)
         resp.raise_for_status()
         result = resp.json()
     except Exception as e:
