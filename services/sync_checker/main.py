@@ -41,6 +41,22 @@ def checker(request):
     queue_name = os.environ.get("VECTOR_SYNC_QUEUE", "tlbrain-vector-sync-queue")
     db = firestore.Client()
 
+    body = request.get_json(silent=True) or {}
+    doc_id = body.get("doc_id")
+    client_name = body.get("client_name")
+
+    if doc_id:
+        enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
+        logger.info("Targeted resync: doc_id=%s", doc_id)
+        return {"mode": "doc", "doc_id": doc_id, "queued": 1}, 200
+
+    if client_name:
+        doc_ids = get_doc_ids_by_client(client_name)
+        for d in doc_ids:
+            enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{d}")
+        logger.info("Targeted resync: client_name=%s queued=%d", client_name, len(doc_ids))
+        return {"mode": "client", "client_name": client_name, "queued": len(doc_ids)}, 200
+
     stale_syncing = get_stale_syncing()
     for doc_id in stale_syncing:
         enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
