@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.2.0`
+# 🧠 TLBrain `v1.2.1`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -171,7 +171,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.2.0  # or latest for the most recent build
+VERSION=1.2.1  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -309,7 +309,7 @@ TLBrain is designed so you don't pay for what a single-user scenario doesn't nee
 **Gemini (~$0.20 per transcript):**
 - You only pay for Gemini when indexing new transcripts
 - ~$0.20 per transcript — depends on conversation length, number of utterances, and content volume
-- `text-embedding-004`, `output_dimensionality=768` → 4× cheaper than 3072
+- `gemini-embedding-2`, `output_dimensionality=768` → 4× cheaper than 3072
 - One Gemini request per window (summary + facts together)
 - If a file hasn't changed, it's skipped — Gemini is never called again
 

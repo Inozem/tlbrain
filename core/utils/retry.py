@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 RETRIES = 3
 BACKOFFS = [1, 2, 4]
+RATE_LIMIT_BACKOFFS = [30, 60, 120]
 
 F = TypeVar("F", bound=Callable)
 
@@ -33,16 +34,20 @@ def _is_transient(exc: Exception) -> bool:
     except ImportError:
         pass
     try:
-        from google.genai.errors import ClientError
-        if isinstance(exc, ClientError) and getattr(exc, "code", None) == 429:
-            return True
-    except ImportError:
-        pass
-    try:
         import requests.exceptions
         if isinstance(exc, requests.exceptions.HTTPError):
             if exc.response is not None and exc.response.status_code >= 500:
                 return True
+    except ImportError:
+        pass
+    return False
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    try:
+        from google.genai.errors import ClientError
+        if isinstance(exc, ClientError) and getattr(exc, "code", None) == 429:
+            return True
     except ImportError:
         pass
     return False
@@ -56,7 +61,11 @@ def with_retry(fn: F) -> F:
             try:
                 return fn(*args, **kwargs)
             except Exception as exc:
-                if not _is_transient(exc):
+                if _is_rate_limit(exc):
+                    backoffs = RATE_LIMIT_BACKOFFS
+                elif _is_transient(exc):
+                    backoffs = BACKOFFS
+                else:
                     raise
                 last_exc = exc
                 logger.warning(
@@ -64,7 +73,7 @@ def with_retry(fn: F) -> F:
                     attempt + 1, RETRIES, fn.__name__, exc,
                 )
                 if attempt < RETRIES - 1:
-                    time.sleep(BACKOFFS[attempt])
+                    time.sleep(backoffs[attempt])
         raise RuntimeError(
             f"{fn.__name__} failed after {RETRIES} attempts"
         ) from last_exc
