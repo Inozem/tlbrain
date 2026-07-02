@@ -23,7 +23,7 @@ def _get_bm25_model() -> SparseTextEmbedding:
 
 def search_summaries_and_facts(
     query: str,
-    client_name: str | None = None,
+    folder_ids: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     top_k: int = 15,
@@ -40,8 +40,8 @@ def search_summaries_and_facts(
         FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
     ]
 
-    if client_name is not None:
-        must.append(FieldCondition(key="client_name", match=MatchValue(value=client_name)))
+    if folder_ids is not None:
+        must.append(FieldCondition(key="parent_id", match=MatchAny(any=folder_ids)))
 
     date_range: dict[str, int] = {}
     if date_from is not None:
@@ -65,7 +65,7 @@ def search_summaries_and_facts(
         payload = point.payload or {}
         hits.append({
             "doc_id": payload.get("doc_id"),
-            "client_name": payload.get("client_name"),
+            "parent_id": payload.get("parent_id"),
             "type": payload.get("type"),
             "center_index": payload.get("center_index"),
             "covered_range": payload.get("covered_range"),
@@ -78,7 +78,7 @@ def search_summaries_and_facts(
 def search_user_facts(
     query: str,
     top_k: int = 10,
-    client_name: str | None = None,
+    folder_ids: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -90,8 +90,8 @@ def search_user_facts(
         FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
     ]
 
-    if client_name is not None:
-        must.append(FieldCondition(key="client_name", match=MatchValue(value=client_name)))
+    if folder_ids is not None:
+        must.append(FieldCondition(key="parent_id", match=MatchAny(any=folder_ids)))
 
     date_range: dict[str, int] = {}
     if date_from is not None:
@@ -144,7 +144,7 @@ def search_summaries_for_doc(
         payload = point.payload or {}
         hits.append({
             "doc_id": payload.get("doc_id"),
-            "client_name": payload.get("client_name"),
+            "parent_id": payload.get("parent_id"),
             "type": payload.get("type"),
             "center_index": payload.get("center_index"),
             "covered_range": payload.get("covered_range"),
@@ -156,13 +156,13 @@ def search_summaries_for_doc(
 def keyword_search_utterances(
     query: str,
     top_k: int = 10,
-    client_name: str | None = None,
+    folder_ids: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     BM25 keyword search over utterances in Qdrant.
-    Returns list of hits: doc_id, client_name, covered_range (window around hit), score.
+    Returns list of hits: doc_id, parent_id, covered_range (window around hit), score.
     Filters are applied before search; no fallback if results are empty.
     """
     embedding = next(iter(_get_bm25_model().embed([query])))
@@ -176,8 +176,8 @@ def keyword_search_utterances(
         FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
     ]
 
-    if client_name is not None:
-        must.append(FieldCondition(key="client_name", match=MatchValue(value=client_name)))
+    if folder_ids is not None:
+        must.append(FieldCondition(key="parent_id", match=MatchAny(any=folder_ids)))
 
     date_range: dict[str, int] = {}
     if date_from is not None:
@@ -202,7 +202,7 @@ def keyword_search_utterances(
         order_index = payload.get("order_index", 0)
         hits.append({
             "doc_id": payload.get("doc_id"),
-            "client_name": payload.get("client_name"),
+            "parent_id": payload.get("parent_id"),
             "covered_range": [max(0, order_index - _KEYWORD_HALF_WINDOW), order_index + _KEYWORD_HALF_WINDOW],
             "score": point.score,
         })

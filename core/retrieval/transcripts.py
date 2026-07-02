@@ -1,32 +1,46 @@
 from typing import Any
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
+from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, Range
 
 from core.config import get_root_folder_id
+from core.google_drive.firestore import expand_subtree, get_all_folders, resolve_folder_path
 from core.qdrant.client import get_client
 from core.qdrant.schema import get_collection_name
 from core.retrieval.pipeline import dedup_and_sort
-from core.retrieval.segments import build_segments
+from core.retrieval.segments import build_segments, make_folder_path_resolver
 
 
 def get_transcripts(
     doc_id: str | None = None,
-    client_name: str | None = None,
+    folder_path: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     limit: int = 1,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    resolve_path = None
     if doc_id is not None:
         utterances = _scroll_by_doc_id(doc_id)
-    elif client_name is not None:
-        utterances = _scroll_by_client(client_name, date_from, date_to)
+    elif folder_path is not None:
+        terminal_ids = resolve_folder_path(folder_path)
+        if not terminal_ids:
+            return [], {
+                "truncated": False,
+                "total_matches": 0,
+                "returned_segments": 0,
+                "limit_reason": "no_results",
+                "suggestion": f"Folder not found: {'/'.join(folder_path)}",
+            }
+        folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
+        all_folders = get_all_folders()
+        resolve_path = make_folder_path_resolver(all_folders)
+        utterances = _scroll_by_folder(folder_ids, date_from, date_to)
     else:
         return [], {
             "truncated": False,
             "total_matches": 0,
             "returned_segments": 0,
             "limit_reason": "no_results",
-            "suggestion": "Укажите doc_id или client_name",
+            "suggestion": "Provide doc_id or folder_path.",
         }
 
     if not utterances:
@@ -35,7 +49,7 @@ def get_transcripts(
             "total_matches": 0,
             "returned_segments": 0,
             "limit_reason": "no_results",
-            "suggestion": "Нет данных за выбранный период или клиента",
+            "suggestion": "No data found for the given period or folder.",
         }
 
     docs: dict[str, list[dict[str, Any]]] = {}
@@ -59,7 +73,7 @@ def get_transcripts(
             continue
         min_idx = sorted_utterances[0]["order_index"]
         max_idx = sorted_utterances[-1]["order_index"]
-        result_segments.append(build_segments(doc_id_key, [[min_idx, max_idx]], sorted_utterances))
+        result_segments.append(build_segments(doc_id_key, [[min_idx, max_idx]], sorted_utterances, resolve_path))
 
     meta: dict[str, Any] = {
         "truncated": truncated,
@@ -67,7 +81,7 @@ def get_transcripts(
         "returned_segments": len(result_segments),
     }
     if truncated:
-        meta["suggestion"] = "Используйте limit или уточните период для получения большего числа транскриптов"
+        meta["suggestion"] = "Use limit or narrow down the period to retrieve more transcripts."
 
     return result_segments, meta
 
@@ -80,14 +94,14 @@ def _scroll_by_doc_id(doc_id: str) -> list[dict[str, Any]]:
     ]))
 
 
-def _scroll_by_client(
-    client_name: str,
+def _scroll_by_folder(
+    folder_ids: list[str],
     date_from: str | None,
     date_to: str | None,
 ) -> list[dict[str, Any]]:
     must: list[FieldCondition] = [
         FieldCondition(key="type", match=MatchValue(value="utterance")),
-        FieldCondition(key="client_name", match=MatchValue(value=client_name)),
+        FieldCondition(key="parent_id", match=MatchAny(any=folder_ids)),
         FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
     ]
 
