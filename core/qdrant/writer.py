@@ -99,6 +99,21 @@ def delete_by_doc_id(doc_id: str, root_folder_id: str) -> None:
 
 
 @with_retry
+def set_payload_dialog_date(doc_id: str, root_folder_id: str, dialog_date: str, dialog_date_num: int | None) -> None:
+    payload: dict = {"dialog_date": dialog_date}
+    if dialog_date_num is not None:
+        payload["dialog_date_num"] = dialog_date_num
+    get_client().set_payload(
+        collection_name=get_collection_name(),
+        payload=payload,
+        points=Filter(must=[
+            FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+            FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
+        ]),
+    )
+
+
+@with_retry
 def set_payload_parent_id(doc_id: str, root_folder_id: str, new_parent_id: str) -> None:
     get_client().set_payload(
         collection_name=get_collection_name(),

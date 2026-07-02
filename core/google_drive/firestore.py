@@ -701,6 +701,12 @@ def expand_subtree(folder_id: str) -> list[str]:
     return result
 
 
+def delete_folder(folder_id: str) -> None:
+    """Remove a folder record from the folders collection."""
+    _get_db().collection(FOLDERS_COLLECTION).document(folder_id).delete()
+    logger.info("Deleted folder record: %s", folder_id)
+
+
 def resolve_folder_path(path: list[str]) -> list[str]:
     """Resolve a path like ["Clients - Active", "Acme Corp"] to matching folder_ids.
 
