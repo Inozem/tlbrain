@@ -15,6 +15,7 @@ _MAX_RESULT_DOCS = 3
 
 def run_retrieval(
     query: str,
+    keywords: str | None = None,
     folder_path: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
@@ -41,7 +42,7 @@ def run_retrieval(
         )
         keyword_future = executor.submit(
             keyword_search_utterances,
-            query=query,
+            query=keywords if keywords else query,
             folder_ids=folder_ids,
             date_from=date_from,
             date_to=date_to,

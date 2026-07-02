@@ -15,22 +15,22 @@ from core.config import get_root_folder_id
 from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
-from core.retrieval.clients import list_clients
-from core.google_drive.drive_client import create_client_folder, list_client_folders, move_file_to_folder, rename_file, rename_folder
+from core.retrieval.folders import list_folders
+from core.google_drive.drive_client import create_folder, move_file_to_folder, move_folder_in_drive, rename_file
 from core.google_drive.firestore import (
-    create_client,
-    get_all_client_names,
-    get_client_folder_id,
+    expand_subtree,
+    get_all_folders,
+    get_folder_by_id,
     get_sync_status,
     get_transcript_record,
+    get_unassigned,
     list_transcripts,
     move_transcript_record,
-    rename_client_records,
-    update_client_speakers,
+    resolve_folder_path,
     update_transcript_source_file,
-    get_unassigned,
+    upsert_folder,
 )
-from core.qdrant.writer import set_payload_client_name, set_payload_client_name_bulk, upsert_user_facts
+from core.qdrant.writer import set_payload_parent_id, upsert_user_facts
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +110,26 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
             "tools": [
                 {
                     "name": "query",
-                    "description": "Search through client conversation transcripts. Always translate the query to English before calling this tool — the index is stored in English and translation ensures the best retrieval quality.",
+                    "description": (
+                        "Search through conversation transcripts using semantic + keyword search. "
+                        "Translate 'query' to English — summaries and facts are indexed in English. "
+                        "Use 'keywords' for names, brands, or terms that must match exactly as spoken."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Search query in English",
+                                "description": "Search query in English (used for semantic search over summaries and facts)",
+                            },
+                            "keywords": {
+                                "type": "string",
+                                "description": "Optional exact-match terms in the original language of the conversation (used for BM25 keyword search over utterances). Use for names, brands, or specific terms.",
+                            },
+                            "folder_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional folder path from root, e.g. [\"Clients - Active\", \"Acme Corp\"]. Searches the entire subtree.",
                             },
                             "date_from": {
                                 "type": "string",
@@ -126,17 +139,13 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                                 "type": "string",
                                 "description": "ISO date, optional",
                             },
-                            "client_name": {
-                                "type": "string",
-                                "description": "Client name filter",
-                            },
                         },
                         "required": ["query"],
                     },
                 },
                 {
                     "name": "get_transcript",
-                    "description": "Retrieve full conversation transcripts without semantic search. Use when you need the complete text of a specific dialog or the most recent dialogs for a client.",
+                    "description": "Retrieve full conversation transcripts without semantic search. Use when you need the complete text of a specific dialog or the most recent dialogs in a folder.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -144,9 +153,10 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                                 "type": "string",
                                 "description": "Specific document ID. If provided, all other params are ignored.",
                             },
-                            "client_name": {
-                                "type": "string",
-                                "description": "Filter by client name",
+                            "folder_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Folder path from root, e.g. [\"Acme Corp\"]. Returns transcripts from the entire subtree.",
                             },
                             "date_from": {
                                 "type": "string",
@@ -164,8 +174,8 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     },
                 },
                 {
-                    "name": "list_clients",
-                    "description": "List all clients in the knowledge base with their dialog count and last dialog date. Call this first to discover available clients before querying. If the response contains a 'suggestion' field, present it to the user.",
+                    "name": "list_folders",
+                    "description": "List all folders in the knowledge base as a tree with dialog counts and last dialog dates. Call this first to discover the folder hierarchy before querying. If the response contains a 'suggestion' field, present it to the user.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -190,7 +200,7 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                 },
                 {
                     "name": "move_transcript",
-                    "description": "Move a transcript to a different client folder. Updates Google Drive, resets the record for reindexing, and removes old vectors from the search index.",
+                    "description": "Move a transcript to a different folder. Updates Google Drive, resets the record for reindexing, and removes old vectors from the search index.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -198,24 +208,60 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                                 "type": "string",
                                 "description": "Document ID to move",
                             },
-                            "new_client_name": {
-                                "type": "string",
-                                "description": "Target client name (folder will be created if it doesn't exist)",
+                            "folder_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Target folder path from root, e.g. [\"Clients - Active\", \"Acme Corp\"]",
                             },
                         },
-                        "required": ["doc_id", "new_client_name"],
+                        "required": ["doc_id", "folder_path"],
+                    },
+                },
+                {
+                    "name": "move_folder",
+                    "description": "Move a folder to a different location in the hierarchy. Updates Google Drive and the folder index. Documents inside are not reindexed — their parent_id remains stable.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "folder_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Path of the folder to move, e.g. [\"Clients - Active\", \"Acme Corp\"]",
+                            },
+                            "new_parent_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Path of the new parent folder, e.g. [\"Clients - Past\"]. Empty or omitted = move to root.",
+                            },
+                        },
+                        "required": ["folder_path"],
+                    },
+                },
+                {
+                    "name": "create_folder",
+                    "description": "Create a new folder in Google Drive and register it in the knowledge base.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Folder name",
+                            },
+                            "parent_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Parent folder path from root, e.g. [\"Clients - Active\"]. Empty or omitted = create at root level.",
+                            },
+                        },
+                        "required": ["name"],
                     },
                 },
                 {
                     "name": "sync_changes",
-                    "description": "Sync recent changes from Google Drive. Use client_name or doc_id only when a forced resync of a specific client or document is needed.",
+                    "description": "Sync recent changes from Google Drive. Use doc_id only when a forced resync of a specific document is needed.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "client_name": {
-                                "type": "string",
-                                "description": "Resync all documents for this client only",
-                            },
                             "doc_id": {
                                 "type": "string",
                                 "description": "Resync a specific document by ID",
@@ -251,13 +297,14 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                 },
                 {
                     "name": "list_recent_transcripts",
-                    "description": "List transcripts sorted by date descending across all clients. Use this to answer 'where did the last call go?' or 'what was recorded recently?' without knowing the client name in advance. Supports optional client_name and date range filters, and pagination.",
+                    "description": "List transcripts sorted by date descending. Use to find recent recordings without knowing the folder. Supports optional folder_path and date range filters, and pagination.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "client_name": {
-                                "type": "string",
-                                "description": "Filter by client name (optional)",
+                            "folder_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Filter by folder path, e.g. [\"Clients - Active\", \"Acme Corp\"] (optional)",
                             },
                             "date_from": {
                                 "type": "string",
@@ -276,42 +323,6 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                                 "description": "Pagination offset (default: 0)",
                             },
                         },
-                    },
-                },
-                {
-                    "name": "create_client",
-                    "description": "Create a new client: makes a folder in Google Drive and registers the client in the database. Returns an error if a client with this name already exists.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "client_name": {
-                                "type": "string",
-                                "description": "Client name (used as folder name in Drive)",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Optional description",
-                            },
-                        },
-                        "required": ["client_name"],
-                    },
-                },
-                {
-                    "name": "rename_client",
-                    "description": "Rename a client: updates the folder name in Google Drive, all transcript records in the database, and the search index. The '_unassigned' folder cannot be renamed.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "old_client_name": {
-                                "type": "string",
-                                "description": "Current client name",
-                            },
-                            "new_client_name": {
-                                "type": "string",
-                                "description": "New client name",
-                            },
-                        },
-                        "required": ["old_client_name", "new_client_name"],
                     },
                 },
                 {
@@ -348,14 +359,20 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
     if tool_name == "get_transcript":
         return _handle_get_transcript(request, arguments)
 
-    if tool_name == "list_clients":
-        return _handle_list_clients(request)
+    if tool_name == "list_folders":
+        return _handle_list_folders(request)
 
     if tool_name == "import_all_transcripts":
         return _handle_sync_tldv_all(request, arguments)
 
     if tool_name == "move_transcript":
         return _handle_move_transcript(request, arguments)
+
+    if tool_name == "move_folder":
+        return _handle_move_folder(request, arguments)
+
+    if tool_name == "create_folder":
+        return _handle_create_folder(request, arguments)
 
     if tool_name == "sync_changes":
         return _handle_sync_changes(request, arguments)
@@ -369,12 +386,6 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
     if tool_name == "list_recent_transcripts":
         return _handle_list_recent_transcripts(request, arguments)
 
-    if tool_name == "create_client":
-        return _handle_create_client(request, arguments)
-
-    if tool_name == "rename_client":
-        return _handle_rename_client(request, arguments)
-
     if tool_name == "rename_transcript":
         return _handle_rename_transcript(request, arguments)
 
@@ -387,7 +398,8 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
 def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
     query = arguments.get("query", "")
-    client_name = arguments.get("client_name") or None
+    keywords = arguments.get("keywords") or None
+    folder_path = arguments.get("folder_path") or None
     date_from = arguments.get("date_from") or None
     date_to = arguments.get("date_to") or None
 
@@ -395,7 +407,8 @@ def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
     try:
         segments, meta = run_retrieval(
             query=query,
-            client_name=client_name,
+            keywords=keywords,
+            folder_path=folder_path,
             date_from=date_from,
             date_to=date_to,
         )
@@ -414,7 +427,7 @@ def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
         extra={
             "tool": "query",
             "query": query,
-            "client_name": client_name,
+            "folder_path": folder_path,
             "hits_total": meta.get("total_matches", 0),
             "docs_returned": docs_returned,
             "segments_returned": meta.get("returned_segments", 0),
@@ -429,7 +442,7 @@ def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
 
 def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     doc_id = arguments.get("doc_id") or None
-    client_name = arguments.get("client_name") or None
+    folder_path = arguments.get("folder_path") or None
     date_from = arguments.get("date_from") or None
     date_to = arguments.get("date_to") or None
     limit = arguments.get("limit") or 1
@@ -438,7 +451,7 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     try:
         segments, meta = get_transcripts(
             doc_id=doc_id,
-            client_name=client_name,
+            folder_path=folder_path,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
@@ -457,7 +470,7 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
         "tool call: get_transcript",
         extra={
             "tool": "get_transcript",
-            "client_name": client_name,
+            "folder_path": folder_path,
             "hits_total": meta.get("total_matches", 0),
             "docs_returned": docs_returned,
             "segments_returned": meta.get("returned_segments", 0),
@@ -470,38 +483,28 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     return build_jsonrpc_result(request.id, content)
 
 
-def _handle_list_clients(request: JSONRPCRequest) -> dict:
+def _handle_list_folders(request: JSONRPCRequest) -> dict:
     t0 = time.monotonic()
     try:
-        clients = list_clients()
+        result = list_folders()
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
             code=-32603,
-            message="Failed to list clients",
+            message="Failed to list folders",
             details=str(e),
         )
 
     latency_ms = int((time.monotonic() - t0) * 1000)
     logger.info(
-        "tool call: list_clients",
-        extra={
-            "tool": "list_clients",
-            "docs_returned": len(clients),
-            "latency_ms": latency_ms,
-        },
+        "tool call: list_folders",
+        extra={"tool": "list_folders", "folders": len(result.get("folders", [])), "latency_ms": latency_ms},
     )
 
-    payload: dict = {"clients": clients}
-    unassigned = next((c for c in clients if c["client_name"] == "_unassigned"), None)
-    if unassigned and unassigned.get("dialog_count", 0) > 0:
-        payload["suggestion"] = (
-            f"{unassigned['dialog_count']} transcript(s) are unassigned. "
-            f"Call list_recent_transcripts(client_name='_unassigned') to see them, "
-            f"then move each one using move_transcript(doc_id='...', new_client_name='...')."
-        )
-    content = build_mcp_content(payload)
+    content = build_mcp_content(result)
     return build_jsonrpc_result(request.id, content)
+
+
 
 
 def _handle_sync_tldv_all(request: JSONRPCRequest, arguments: dict) -> dict:
@@ -549,9 +552,9 @@ def _handle_sync_tldv_all(request: JSONRPCRequest, arguments: dict) -> dict:
         payload["suggestion"] = (
             f"Import started for {queued} transcript(s). "
             f"While they are downloading, check two things: "
-            f"1. Call list_recent_transcripts(client_name='_unassigned') — transcripts the system could not assign to a client, move them manually via move_transcript. "
-            f"2. Call list_clients to verify transcripts that were assigned automatically went to the correct client. "
-            f"The more accurately transcripts are assigned, the better the system will detect clients for future imports."
+            f"1. Call list_recent_transcripts(folder_path=[\"_unassigned\"]) — transcripts the system could not assign, move them manually via move_transcript. "
+            f"2. Call list_folders to verify transcripts that were assigned automatically went to the correct folder. "
+            f"The more accurately transcripts are assigned, the better the system will detect folders for future imports."
         )
     content = build_mcp_content(payload)
     return build_jsonrpc_result(request.id, content)
@@ -559,52 +562,38 @@ def _handle_sync_tldv_all(request: JSONRPCRequest, arguments: dict) -> dict:
 
 def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     doc_id = arguments.get("doc_id", "").strip()
-    new_client_name = arguments.get("new_client_name", "").strip()
+    folder_path = arguments.get("folder_path") or []
 
-    if not doc_id or not new_client_name:
+    if not doc_id or not folder_path:
         return build_jsonrpc_error(
             request_id=request.id,
             code=-32602,
-            message="doc_id and new_client_name are required",
+            message="doc_id and folder_path are required",
         )
 
     t0 = time.monotonic()
     try:
-        new_folder_id = get_client_folder_id(new_client_name)
-        if not new_folder_id:
-            known_clients = get_all_client_names()
-            drive_folders = {f["name"] for f in list_client_folders()}
-            if new_client_name in drive_folders:
-                return build_jsonrpc_error(
-                    request_id=request.id,
-                    code=-32602,
-                    message=f"Client '{new_client_name}' exists in Google Drive but is not synced to Firestore yet.",
-                    details="Run sync_changes to synchronize, then retry.",
-                )
+        terminal_ids = resolve_folder_path(folder_path)
+        if not terminal_ids:
             return build_jsonrpc_error(
                 request_id=request.id,
                 code=-32602,
-                message=f"Client '{new_client_name}' not found.",
-                details=f"Known clients: {known_clients}. Use create_client to add a new one.",
+                message=f"Folder not found: {'/'.join(folder_path)}",
+                details="Use list_folders to see available folders.",
             )
-        existing = get_transcript_record(doc_id)
-        old_client_name = (existing or {}).get("client_name", "")
-        speakers = (existing or {}).get("speakers", [])
+        if len(terminal_ids) > 1:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Ambiguous folder path: {'/'.join(folder_path)} matches {len(terminal_ids)} folders.",
+                details="Use a more specific path.",
+            )
+        new_folder_id = terminal_ids[0]
 
         root_folder_id = get_root_folder_id()
         move_file_to_folder(doc_id, new_folder_id)
-        move_transcript_record(doc_id, new_client_name, new_folder_id)
-        set_payload_client_name(doc_id, root_folder_id, new_client_name)
-
-        if speakers and old_client_name:
-            update_client_speakers(old_client_name, speakers, delta=-1)
-        if speakers and new_client_name != "_unassigned":
-            update_client_speakers(new_client_name, speakers)
-
-        checker_url = os.environ.get("SYNC_CHECKER_URL", "")
-        if checker_url:
-            import httpx
-            httpx.post(checker_url, timeout=300)
+        move_transcript_record(doc_id, new_folder_id)
+        set_payload_parent_id(doc_id, root_folder_id, new_folder_id)
 
         unassigned = get_unassigned()
     except Exception as e:
@@ -618,27 +607,149 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     latency_ms = int((time.monotonic() - t0) * 1000)
     logger.info(
         "tool call: move_transcript",
-        extra={
-            "tool": "move_transcript",
-            "doc_id": doc_id,
-            "new_client_name": new_client_name,
-            "latency_ms": latency_ms,
-        },
+        extra={"tool": "move_transcript", "doc_id": doc_id, "folder_path": folder_path, "latency_ms": latency_ms},
     )
 
     payload: dict = {
         "status": "ok",
         "doc_id": doc_id,
-        "new_client_name": new_client_name,
+        "folder_path": folder_path,
         "unassigned_remaining": unassigned["count"],
     }
     if unassigned["count"] > 0:
         payload["unassigned_transcripts"] = unassigned["transcripts"]
         payload["suggestion"] = (
             f"{unassigned['count']} transcript(s) are still unassigned. "
-            f"Show each one using get_transcript(doc_id='...') and move it using move_transcript(doc_id='...', new_client_name='...')."
+            f"Show each one using get_transcript(doc_id='...') and move it using move_transcript."
         )
     content = build_mcp_content(payload)
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_move_folder(request: JSONRPCRequest, arguments: dict) -> dict:
+    folder_path = arguments.get("folder_path") or []
+    new_parent_path = arguments.get("new_parent_path") or []
+
+    if not folder_path:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="folder_path is required",
+        )
+
+    t0 = time.monotonic()
+    try:
+        terminal_ids = resolve_folder_path(folder_path)
+        if not terminal_ids:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Folder not found: {'/'.join(folder_path)}",
+            )
+        if len(terminal_ids) > 1:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Ambiguous path: {'/'.join(folder_path)} matches {len(terminal_ids)} folders. Provide a more specific path.",
+            )
+        folder_id = terminal_ids[0]
+
+        if new_parent_path:
+            parent_ids = resolve_folder_path(new_parent_path)
+            if not parent_ids:
+                return build_jsonrpc_error(
+                    request_id=request.id,
+                    code=-32602,
+                    message=f"Parent folder not found: {'/'.join(new_parent_path)}",
+                )
+            if len(parent_ids) > 1:
+                return build_jsonrpc_error(
+                    request_id=request.id,
+                    code=-32602,
+                    message=f"Ambiguous parent path: {'/'.join(new_parent_path)} matches {len(parent_ids)} folders.",
+                )
+            new_parent_id = parent_ids[0]
+        else:
+            new_parent_id = get_root_folder_id()
+
+        # Cycle check: new_parent must not be in the subtree of folder_id
+        subtree = expand_subtree(folder_id)
+        if new_parent_id in subtree:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message="Cannot move a folder into its own subtree.",
+            )
+
+        folder_data = get_folder_by_id(folder_id) or {}
+        move_folder_in_drive(folder_id, new_parent_id)
+        upsert_folder(folder_id, folder_data.get("name", ""), new_parent_id)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to move folder",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: move_folder",
+        extra={"tool": "move_folder", "folder_path": folder_path, "new_parent_path": new_parent_path, "latency_ms": latency_ms},
+    )
+
+    content = build_mcp_content({"status": "ok", "folder_id": folder_id, "new_parent_id": new_parent_id})
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_create_folder(request: JSONRPCRequest, arguments: dict) -> dict:
+    name = arguments.get("name", "").strip()
+    parent_path = arguments.get("parent_path") or []
+
+    if not name:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="name is required",
+        )
+
+    t0 = time.monotonic()
+    try:
+        if parent_path:
+            parent_ids = resolve_folder_path(parent_path)
+            if not parent_ids:
+                return build_jsonrpc_error(
+                    request_id=request.id,
+                    code=-32602,
+                    message=f"Parent folder not found: {'/'.join(parent_path)}",
+                )
+            if len(parent_ids) > 1:
+                return build_jsonrpc_error(
+                    request_id=request.id,
+                    code=-32602,
+                    message=f"Ambiguous parent path: {'/'.join(parent_path)} matches {len(parent_ids)} folders.",
+                )
+            parent_id = parent_ids[0]
+        else:
+            parent_id = get_root_folder_id()
+
+        folder_id = create_folder(name, parent_id)
+        upsert_folder(folder_id, name, parent_id)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to create folder",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: create_folder",
+        extra={"tool": "create_folder", "name": name, "parent_path": parent_path, "latency_ms": latency_ms},
+    )
+
+    content = build_mcp_content({"status": "ok", "folder_id": folder_id, "name": name})
     return build_jsonrpc_result(request.id, content)
 
 
@@ -657,8 +768,6 @@ def _handle_sync_changes(request: JSONRPCRequest, arguments: dict) -> dict:
         body: dict = {}
         if arguments.get("doc_id"):
             body["doc_id"] = arguments["doc_id"].strip()
-        elif arguments.get("client_name"):
-            body["client_name"] = arguments["client_name"].strip()
         resp = httpx.post(checker_url, json=body or None, timeout=300)
         resp.raise_for_status()
         result = resp.json()
@@ -701,9 +810,9 @@ def _handle_sync_status(request: JSONRPCRequest) -> dict:
     unassigned = status.pop("_unassigned_count", 0)
     if unassigned > 0:
         status["suggestion"] = (
-            f"Assigning transcripts to the correct client improves search accuracy and helps the system detect clients automatically in future imports. "
-            f"{unassigned} transcript(s) are currently unassigned — call list_recent_transcripts(client_name='_unassigned') to see them, "
-            f"then move each one using move_transcript(doc_id='...', new_client_name='...')."
+            f"Assigning transcripts to the correct folder improves search accuracy. "
+            f"{unassigned} transcript(s) are currently unassigned — call list_recent_transcripts(folder_path=[\"_unassigned\"]) to see them, "
+            f"then move each one using move_transcript(doc_id='...', folder_path=[...])."
         )
 
     content = build_mcp_content(status)
@@ -738,7 +847,7 @@ def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
             )
 
         dialog_date = record.get("dialog_date", "")
-        client_name = record.get("client_name", "")
+        parent_id = record.get("parent_id", "")
         root_folder_id = get_root_folder_id()
 
         payload = {
@@ -746,7 +855,7 @@ def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
             "doc_id": doc_id,
             "text": text,
             "root_folder_id": root_folder_id,
-            "client_name": client_name,
+            "parent_id": parent_id,
             "dialog_date": dialog_date,
             "dialog_date_num": int(dialog_date.replace("-", "")) if dialog_date else 0,
         }
@@ -772,15 +881,21 @@ def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
 
 
 def _handle_list_recent_transcripts(request: JSONRPCRequest, arguments: dict) -> dict:
-    client_name = arguments.get("client_name") or None
+    folder_path = arguments.get("folder_path") or None
     date_from = arguments.get("date_from") or None
     date_to = arguments.get("date_to") or None
     limit = int(arguments.get("limit") or 20)
     offset = int(arguments.get("offset") or 0)
 
+    folder_ids = None
+    if folder_path:
+        terminal_ids = resolve_folder_path(folder_path)
+        if terminal_ids:
+            folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
+
     t0 = time.monotonic()
     try:
-        result = list_transcripts(client_name=client_name, date_from=date_from, date_to=date_to, limit=limit, offset=offset)
+        result = list_transcripts(folder_ids=folder_ids, date_from=date_from, date_to=date_to, limit=limit, offset=offset)
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -794,7 +909,7 @@ def _handle_list_recent_transcripts(request: JSONRPCRequest, arguments: dict) ->
         "tool call: list_recent_transcripts",
         extra={
             "tool": "list_recent_transcripts",
-            "client_name": client_name,
+            "folder_path": folder_path,
             "total": result["total"],
             "returned": result["returned"],
             "latency_ms": latency_ms,
@@ -802,142 +917,6 @@ def _handle_list_recent_transcripts(request: JSONRPCRequest, arguments: dict) ->
     )
 
     content = build_mcp_content(result)
-    return build_jsonrpc_result(request.id, content)
-
-
-def _handle_create_client(request: JSONRPCRequest, arguments: dict) -> dict:
-    client_name = arguments.get("client_name", "").strip()
-    description = arguments.get("description") or None
-
-    if not client_name:
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message="client_name is required",
-        )
-
-    t0 = time.monotonic()
-    try:
-        folder_id, folder_created = create_client_folder(client_name)
-        registered = create_client(client_name, folder_id, description)
-    except Exception as e:
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32603,
-            message="Failed to create client",
-            details=str(e),
-        )
-
-    if not registered:
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message=f"Client already exists: {client_name}",
-        )
-
-    latency_ms = int((time.monotonic() - t0) * 1000)
-    logger.info(
-        "tool call: create_client",
-        extra={
-            "tool": "create_client",
-            "client_name": client_name,
-            "folder_created": folder_created,
-            "latency_ms": latency_ms,
-        },
-    )
-
-    status = "ok" if folder_created else "registered_from_drive"
-    content = build_mcp_content({"status": status, "client_name": client_name})
-    return build_jsonrpc_result(request.id, content)
-
-
-def _handle_rename_client(request: JSONRPCRequest, arguments: dict) -> dict:
-    old_client_name = arguments.get("old_client_name", "").strip()
-    new_client_name = arguments.get("new_client_name", "").strip()
-
-    if not old_client_name or not new_client_name:
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message="old_client_name and new_client_name are required",
-        )
-
-    if old_client_name == "_unassigned":
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message="Cannot rename the '_unassigned' folder",
-        )
-
-    if new_client_name == "_unassigned":
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message="Cannot rename a client to '_unassigned'",
-        )
-
-    if old_client_name == new_client_name:
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message="old_client_name and new_client_name are the same",
-        )
-
-    existing_folder_id = get_client_folder_id(new_client_name)
-    if existing_folder_id:
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message=f"Client '{new_client_name}' already exists",
-        )
-
-    drive_folders = {f["name"] for f in list_client_folders()}
-    if new_client_name in drive_folders:
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32602,
-            message=f"Client '{new_client_name}' already exists in Google Drive but is not synced yet.",
-            details="Run sync_changes to synchronize, then retry.",
-        )
-
-    t0 = time.monotonic()
-    try:
-        folder_id = get_client_folder_id(old_client_name)
-        if not folder_id:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Client '{old_client_name}' not found",
-            )
-        root_folder_id = get_root_folder_id()
-        rename_folder(folder_id, new_client_name)
-        set_payload_client_name_bulk(old_client_name, root_folder_id, new_client_name)
-        rename_client_records(old_client_name, new_client_name, folder_id)
-
-        checker_url = os.environ.get("SYNC_CHECKER_URL", "")
-        if checker_url:
-            import httpx
-            httpx.post(checker_url, timeout=300)
-    except Exception as e:
-        return build_jsonrpc_error(
-            request_id=request.id,
-            code=-32603,
-            message="Failed to rename client",
-            details=str(e),
-        )
-
-    latency_ms = int((time.monotonic() - t0) * 1000)
-    logger.info(
-        "tool call: rename_client",
-        extra={
-            "tool": "rename_client",
-            "old_client_name": old_client_name,
-            "new_client_name": new_client_name,
-            "latency_ms": latency_ms,
-        },
-    )
-
-    content = build_mcp_content({"status": "ok", "old_client_name": old_client_name, "new_client_name": new_client_name})
     return build_jsonrpc_result(request.id, content)
 
 

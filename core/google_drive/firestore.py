@@ -171,27 +171,31 @@ def update_transcript_source_file(doc_id: str, source_file: str) -> None:
 
 
 def get_unassigned() -> dict:
-    """Return count and list of unassigned transcripts (past the import stage).
-
-    Returns: {"count": int, "transcripts": [{"doc_id": str, "dialog_date": str}]}
-    """
+    """Return count and list of unassigned transcripts (in _unassigned folder)."""
     db = _get_db()
-    docs = (
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("client_name", "==", "_unassigned"))
-        .stream()
-    )
-    transcripts = [
-        {"doc_id": d.id, "dialog_date": d.to_dict().get("dialog_date", "")}
-        for d in docs
-        if d.to_dict().get("status") not in ("queued", "downloading")
-    ]
+    unassigned_folder_id = None
+    for doc in db.collection(FOLDERS_COLLECTION).where(
+        filter=firestore.FieldFilter("name", "==", "_unassigned")
+    ).stream():
+        unassigned_folder_id = doc.id
+        break
+
+    if not unassigned_folder_id:
+        return {"count": 0, "transcripts": []}
+
+    transcripts = []
+    for d in db.collection(COLLECTION_NAME).where(
+        filter=firestore.FieldFilter("parent_id", "==", unassigned_folder_id)
+    ).stream():
+        data = d.to_dict() or {}
+        if data.get("status") not in ("queued", "downloading"):
+            transcripts.append({"doc_id": d.id, "dialog_date": data.get("dialog_date", "")})
     transcripts.sort(key=lambda x: x["dialog_date"], reverse=True)
     return {"count": len(transcripts), "transcripts": transcripts}
 
 
 def list_transcripts(
-    client_name: str | None = None,
+    folder_ids: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     limit: int = 20,
@@ -201,17 +205,15 @@ def list_transcripts(
 
     Skips placeholder records (queued / downloading).
     Returns: {total, returned, offset, limit, has_more, transcripts}
-    Each transcript: {doc_id, client_name, title, dialog_date, status}
+    Each transcript: {doc_id, parent_id, title, dialog_date, status}
     """
     db = _get_db()
-    query = db.collection(COLLECTION_NAME)
-    if client_name is not None:
-        query = query.where(filter=firestore.FieldFilter("client_name", "==", client_name))
-
     transcripts = []
-    for doc in query.stream():
+    for doc in db.collection(COLLECTION_NAME).stream():
         data = doc.to_dict() or {}
         if data.get("status") in ("queued", "downloading"):
+            continue
+        if folder_ids is not None and data.get("parent_id") not in folder_ids:
             continue
         dialog_date = data.get("dialog_date", "")
         if date_from and dialog_date < date_from:
@@ -220,7 +222,7 @@ def list_transcripts(
             continue
         transcripts.append({
             "doc_id": doc.id,
-            "client_name": data.get("client_name", ""),
+            "parent_id": data.get("parent_id"),
             "title": data.get("source_file", ""),
             "dialog_date": dialog_date,
             "status": data.get("status", ""),
@@ -678,6 +680,26 @@ def get_all_folders() -> dict[str, dict]:
     """Return {folder_id: data} for all registered folders."""
     db = _get_db()
     return {doc.id: (doc.to_dict() or {}) for doc in db.collection(FOLDERS_COLLECTION).stream()}
+
+
+def aggregate_transcripts_by_folder() -> dict[str, dict]:
+    """Return {parent_id: {count, last_date, last_doc_id}} for all synced transcripts."""
+    db = _get_db()
+    agg: dict[str, dict] = {}
+    for doc in db.collection(COLLECTION_NAME).where(
+        filter=firestore.FieldFilter("status", "==", "synced")
+    ).stream():
+        data = doc.to_dict() or {}
+        parent_id = data.get("parent_id")
+        if not parent_id:
+            continue
+        dialog_date = data.get("dialog_date", "")
+        entry = agg.setdefault(parent_id, {"count": 0, "last_date": None, "last_doc_id": None})
+        entry["count"] += 1
+        if not entry["last_date"] or dialog_date > entry["last_date"]:
+            entry["last_date"] = dialog_date
+            entry["last_doc_id"] = doc.id
+    return agg
 
 
 def expand_subtree(folder_id: str) -> list[str]:

@@ -217,6 +217,35 @@ def rename_folder(folder_id: str, new_name: str) -> None:
     logger.info("Renamed folder %s to '%s'", folder_id, new_name)
 
 
+def create_folder(name: str, parent_id: str) -> str:
+    """Create a new folder in Drive under parent_id. Returns the new folder_id."""
+    service = build_drive_service_rw()
+    folder = service.files().create(
+        body={
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        },
+        fields="id",
+    ).execute()
+    logger.info("Created folder %r under %s: %s", name, parent_id, folder["id"])
+    return folder["id"]
+
+
+def move_folder_in_drive(folder_id: str, new_parent_id: str) -> None:
+    """Move folder_id to new_parent_id in Drive."""
+    service = build_drive_service_rw()
+    file = service.files().get(fileId=folder_id, fields="parents").execute()
+    old_parents = ",".join(file.get("parents", []))
+    service.files().update(
+        fileId=folder_id,
+        addParents=new_parent_id,
+        removeParents=old_parents,
+        fields="id,parents",
+    ).execute()
+    logger.info("Moved folder %s → parent %s", folder_id, new_parent_id)
+
+
 def create_client_folder(client_name: str) -> tuple[str, bool]:
     """Ensure ROOT_FOLDER/{client_name}/ exists in Drive.
 
