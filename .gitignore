@@ -208,3 +208,11 @@ __marimo__/
 
 # Claude
 .claude
+CLAUDE.md
+docs/
+# Added by code-review-graph
+.code-review-graph/
+
+# Graphify
+graphify-out
+.mcp.json
