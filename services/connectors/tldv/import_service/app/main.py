@@ -12,7 +12,7 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.gemini.llm import call_gemini_json
-from core.google_drive.firestore import CLIENTS_COLLECTION, COLLECTION_NAME, _speaker_key, delete_queued_placeholder, get_all_client_names, mark_download_error, mark_downloading, update_client_speakers
+from core.google_drive.firestore import COLLECTION_NAME, FOLDERS_COLLECTION, _speaker_key, delete_queued_placeholder, get_all_folders, mark_download_error, mark_downloading, upsert_folder
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
 from tldv_client import tldv_get
@@ -205,64 +205,86 @@ def _get_speakers(utterances: list[dict]) -> list[str]:
     return sorted(speakers)
 
 
-def _get_clients_by_speakers(db: firestore.Client, speakers: list[str]) -> tuple[list[str], list[str]]:
-    """Query clients collection by speaker index.
+def _get_folders_by_speakers(db: firestore.Client, speakers: list[str]) -> tuple[list[str], list[str]]:
+    """Query folders collection by speaker index.
 
-    Returns (candidates, all_clients):
-    - candidates: clients where at least one speaker appears in 1-4 unique clients
-    - all_clients: all unique clients seen across all speaker queries (fallback for Gemini)
+    Returns (candidates, all_folder_ids):
+    - candidates: folder_ids where at least one speaker appears in 1-4 unique folders
+    - all_folder_ids: all unique folder_ids seen across all speaker queries (fallback for Gemini)
     """
-    all_clients: set[str] = set()
+    all_folder_ids: set[str] = set()
     candidates: set[str] = set()
 
     for speaker in speakers:
-        client_names: set[str] = set()
-        docs = db.collection(CLIENTS_COLLECTION) \
+        folder_ids: set[str] = set()
+        docs = db.collection(FOLDERS_COLLECTION) \
             .where(filter=firestore.FieldFilter(f"speakers.{_speaker_key(speaker)}", ">", 0)) \
             .stream()
         for doc in docs:
-            if doc.id != "_unassigned":
-                client_names.add(doc.id)
-            if len(client_names) >= 5:
+            data = doc.to_dict() or {}
+            if data.get("name") != "_unassigned":
+                folder_ids.add(doc.id)
+            if len(folder_ids) >= 5:
                 break
-        all_clients.update(client_names)
-        if _SPEAKER_MIN_CLIENTS <= len(client_names) <= _SPEAKER_MAX_CLIENTS:
-            candidates.update(client_names)
+        all_folder_ids.update(folder_ids)
+        if _SPEAKER_MIN_CLIENTS <= len(folder_ids) <= _SPEAKER_MAX_CLIENTS:
+            candidates.update(folder_ids)
 
-    return sorted(candidates), sorted(all_clients)
+    return sorted(candidates), sorted(all_folder_ids)
 
 
-def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[dict]) -> str:
+def _get_unassigned_folder_id(drive, root_folder_id: str) -> str:
+    """Get or create _unassigned folder in Drive, ensure it's registered in folders/."""
+    all_folders = get_all_folders()
+    for fid, data in all_folders.items():
+        if data.get("name") == "_unassigned" and data.get("parent_id") == root_folder_id:
+            return fid
+    folder_id = _get_or_create_folder(drive, root_folder_id, "_unassigned")
+    upsert_folder(folder_id, "_unassigned", root_folder_id)
+    return folder_id
+
+
+def _detect_target_folder_id(db: firestore.Client, meeting: dict, utterances: list[dict], drive, root_folder_id: str) -> str:
+    """Detect target folder_id for the transcript. Returns folder_id from folders/ collection."""
     meeting_name = meeting.get("name", "")
+    all_folders = get_all_folders()  # {folder_id: {name, parent_id, speakers, ...}}
 
     # Stage 1: speaker frequency analysis
     speakers = _get_speakers(utterances)
     if all(_is_placeholder_speaker(s) for s in speakers):
         logger.info("Stage 1: all speakers are placeholders (%s), skipping", speakers)
-        candidates, all_clients = [], []
+        candidates, all_candidates = [], []
     else:
         logger.info("Stage 1: speakers from TL;DV: %s", {s: _speaker_key(s) for s in speakers})
-        candidates, all_clients = _get_clients_by_speakers(db, speakers)
+        candidates, all_candidates = _get_folders_by_speakers(db, speakers)
 
     if len(candidates) == 1:
-        logger.info("Client detected via speakers: %s", candidates[0])
+        logger.info("Folder detected via speakers: %s", candidates[0])
         return candidates[0]
     elif len(candidates) >= 2:
         logger.info("Stage 1: %d speaker candidates: %s", len(candidates), candidates)
     else:
         logger.info("Stage 1: no speaker candidates found")
 
-    if not all_clients:
-        all_clients = get_all_client_names()
+    if not all_candidates:
+        all_candidates = [
+            fid for fid, data in all_folders.items()
+            if data.get("name") != "_unassigned"
+        ]
 
-    if not all_clients:
-        logger.info("No known clients, falling back to _unassigned")
-        return "_unassigned"
+    if not all_candidates:
+        logger.info("No known folders, falling back to _unassigned")
+        return _get_unassigned_folder_id(drive, root_folder_id)
 
-    clients_to_check = candidates if candidates else all_clients
+    ids_to_check = candidates if candidates else all_candidates
     if not candidates:
-        logger.info("Stage 1: falling back to all %d clients", len(clients_to_check))
-    folders_str = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(clients_to_check))
+        logger.info("Stage 1: falling back to all %d folders", len(ids_to_check))
+
+    folder_names = [all_folders.get(fid, {}).get("name", fid) for fid in ids_to_check]
+    folders_str = "\n".join(f"{i + 1}. {n}" for i, n in enumerate(folder_names))
+    name_to_ids: dict[str, list[str]] = {}
+    for fid, name in zip(ids_to_check, folder_names):
+        name_to_ids.setdefault(name, []).append(fid)
 
     # Stage 2: Gemini by meeting name (restricted to candidates or all)
     try:
@@ -270,14 +292,15 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
             meeting_name=meeting_name,
             folders=folders_str,
         ))
-        client_name = result.get("folder_name")
+        folder_name = result.get("folder_name")
         confidence = result.get("confidence", 0)
-        logger.info("Stage 2: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
-        if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
-            logger.info("Client detected via meeting name: %s", client_name)
-            return client_name
+        logger.info("Stage 2: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)", folder_name, confidence, _CONFIDENCE_THRESHOLD)
+        if folder_name and folder_name in name_to_ids and confidence >= _CONFIDENCE_THRESHOLD:
+            folder_id = name_to_ids[folder_name][0]
+            logger.info("Folder detected via meeting name: %s (%s)", folder_name, folder_id)
+            return folder_id
     except Exception as exc:
-        logger.warning("Stage 2 client detection failed: %s", exc)
+        logger.warning("Stage 2 folder detection failed: %s", exc)
 
     # Stage 3: Gemini by first 15 utterances (restricted to candidates or all)
     excerpt = "\n".join(
@@ -291,17 +314,18 @@ def _detect_client_name(db: firestore.Client, meeting: dict, utterances: list[di
             transcript=excerpt,
             folders=folders_str,
         ))
-        client_name = result.get("folder_name")
+        folder_name = result.get("folder_name")
         confidence = result.get("confidence", 0)
-        logger.info("Stage 3: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)", client_name, confidence, _CONFIDENCE_THRESHOLD)
-        if client_name and client_name in clients_to_check and confidence >= _CONFIDENCE_THRESHOLD:
-            logger.info("Client detected via transcript: %s", client_name)
-            return client_name
+        logger.info("Stage 3: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)", folder_name, confidence, _CONFIDENCE_THRESHOLD)
+        if folder_name and folder_name in name_to_ids and confidence >= _CONFIDENCE_THRESHOLD:
+            folder_id = name_to_ids[folder_name][0]
+            logger.info("Folder detected via transcript: %s (%s)", folder_name, folder_id)
+            return folder_id
     except Exception as exc:
-        logger.warning("Stage 3 client detection failed: %s", exc)
+        logger.warning("Stage 3 folder detection failed: %s", exc)
 
-    logger.info("Client not detected, falling back to _unassigned")
-    return "_unassigned"
+    logger.info("Folder not detected, falling back to _unassigned")
+    return _get_unassigned_folder_id(drive, root_folder_id)
 
 
 @app.get("/")
@@ -361,37 +385,37 @@ async def import_meeting(request: Request):
         mark_download_error(meeting_id, "empty transcript")
         return {"ok": True, "skipped": True, "reason": "empty_transcript"}
 
-    client_name = _detect_client_name(db, meeting, utterances)
     title = meeting.get("name") or f"TL;DV {meeting_id}"
     text, speaker_ranges = _format_transcript(meeting, utterances)
     dialog_date, _ = _parse_happened_at(meeting.get("happenedAt", ""))
 
     root_folder_id = get_root_folder_id()
     drive = _build_drive()
-    client_folder_id = _get_or_create_folder(drive, root_folder_id, client_name)
+    target_folder_id = _detect_target_folder_id(db, meeting, utterances, drive, root_folder_id)
 
-    doc_id, modified_time = _create_google_doc(drive, client_folder_id, title, text, speaker_ranges)
+    doc_id, modified_time = _create_google_doc(drive, target_folder_id, title, text, speaker_ranges)
     logger.info("Created Google Doc: doc_id=%s title=%r", doc_id, title)
 
     speakers = _get_speakers(utterances)
     db.collection(COLLECTION_NAME).document(doc_id).set({
         "doc_id": doc_id,
-        "root_folder_id": root_folder_id,
-        "client_name": client_name,
-        "drive_folder": client_folder_id,
+        "parent_id": target_folder_id,
         "dialog_date": dialog_date,
         "provider": "tldv",
         "source_file": title,
         "meeting_id": meeting_id,
         "speakers": speakers,
-        "speakers_indexed": True,
         "modifiedTime": modified_time,
         "status": "imported",
         "error": None,
         "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Saved to Firestore: doc_id=%s", doc_id)
-    update_client_speakers(client_name, speakers)
+
+    if speakers:
+        speaker_updates = {f"speakers.{_speaker_key(s)}": firestore.Increment(1) for s in speakers}
+        db.collection(FOLDERS_COLLECTION).document(target_folder_id).update(speaker_updates)
+
     delete_queued_placeholder(meeting_id)
 
     vector_sync_url = os.environ.get("VECTOR_SYNC_URL", "")
