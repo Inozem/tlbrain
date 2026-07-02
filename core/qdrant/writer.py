@@ -99,24 +99,12 @@ def delete_by_doc_id(doc_id: str, root_folder_id: str) -> None:
 
 
 @with_retry
-def set_payload_client_name(doc_id: str, root_folder_id: str, new_client_name: str) -> None:
+def set_payload_parent_id(doc_id: str, root_folder_id: str, new_parent_id: str) -> None:
     get_client().set_payload(
         collection_name=get_collection_name(),
-        payload={"client_name": new_client_name},
+        payload={"parent_id": new_parent_id},
         points=Filter(must=[
             FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
-            FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
-        ]),
-    )
-
-
-@with_retry
-def set_payload_client_name_bulk(old_client_name: str, root_folder_id: str, new_client_name: str) -> None:
-    get_client().set_payload(
-        collection_name=get_collection_name(),
-        payload={"client_name": new_client_name},
-        points=Filter(must=[
-            FieldCondition(key="client_name", match=MatchValue(value=old_client_name)),
             FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
         ]),
     )
