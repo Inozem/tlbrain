@@ -20,6 +20,8 @@ from core.google_drive.firestore import (
     get_folder_by_id,
     get_stale_syncing,
     move_transcript_record,
+    orphan_folder_children,
+    orphan_transcript_children,
     set_drive_sync_token,
     update_transcript_source_file,
     upsert_folder,
@@ -185,6 +187,8 @@ def _process_changes(
         if change.get("removed"):
             # No mimeType available — check folders/ to distinguish folder vs doc
             if get_folder_by_id(file_id):
+                orphan_folder_children(file_id)
+                orphan_transcript_children(file_id)
                 delete_folder(file_id)
             else:
                 if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{file_id}"):
@@ -194,6 +198,8 @@ def _process_changes(
         file = change.get("file", {})
         if file.get("trashed"):
             if file.get("mimeType") == GOOGLE_FOLDER_MIME:
+                orphan_folder_children(file_id)
+                orphan_transcript_children(file_id)
                 delete_folder(file_id)
             else:
                 if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{file_id}"):

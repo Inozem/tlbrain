@@ -639,7 +639,7 @@ def create_client(client_name: str, folder_id: str, description: str | None = No
 # folders/ collection (v2)
 # ---------------------------------------------------------------------------
 
-def upsert_folder(folder_id: str, name: str, parent_id: str) -> None:
+def upsert_folder(folder_id: str, name: str, parent_id: str | None) -> None:
     """Register or update a folder in folders/{folder_id}."""
     db = _get_db()
     ref = db.collection(FOLDERS_COLLECTION).document(folder_id)
@@ -699,6 +699,30 @@ def expand_subtree(folder_id: str) -> list[str]:
         result.append(fid)
         queue.extend(children.get(fid, []))
     return result
+
+
+def orphan_folder_children(folder_id: str) -> int:
+    """Clear parent_id for all subfolders that are direct children of folder_id."""
+    db = _get_db()
+    count = 0
+    for doc in db.collection(FOLDERS_COLLECTION).where("parent_id", "==", folder_id).stream():
+        doc.reference.update({"parent_id": None})
+        count += 1
+    if count:
+        logger.info("Orphaned %d subfolder(s) of %s", count, folder_id)
+    return count
+
+
+def orphan_transcript_children(folder_id: str) -> int:
+    """Clear parent_id for all transcript_index docs that are direct children of folder_id."""
+    db = _get_db()
+    count = 0
+    for doc in db.collection(COLLECTION_NAME).where("parent_id", "==", folder_id).stream():
+        doc.reference.update({"parent_id": None})
+        count += 1
+    if count:
+        logger.info("Orphaned %d transcript(s) of %s", count, folder_id)
+    return count
 
 
 def delete_folder(folder_id: str) -> None:
