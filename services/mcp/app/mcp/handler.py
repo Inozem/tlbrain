@@ -746,7 +746,7 @@ def _handle_create_folder(request: JSONRPCRequest, arguments: dict) -> dict:
     latency_ms = int((time.monotonic() - t0) * 1000)
     logger.info(
         "tool call: create_folder",
-        extra={"tool": "create_folder", "name": name, "parent_path": parent_path, "latency_ms": latency_ms},
+        extra={"tool": "create_folder", "folder_name": name, "parent_path": parent_path, "latency_ms": latency_ms},
     )
 
     content = build_mcp_content({"status": "ok", "folder_id": folder_id, "name": name})
