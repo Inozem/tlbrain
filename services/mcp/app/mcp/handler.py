@@ -19,6 +19,7 @@ from core.retrieval.folders import list_folders
 from core.google_drive.drive_client import create_folder, move_file_to_folder, move_folder_in_drive, rename_file
 from core.google_drive.firestore import (
     expand_subtree,
+    folder_name_exists,
     get_all_folders,
     get_folder_by_id,
     get_sync_status,
@@ -732,6 +733,14 @@ def _handle_create_folder(request: JSONRPCRequest, arguments: dict) -> dict:
             parent_id = parent_ids[0]
         else:
             parent_id = get_root_folder_id()
+
+        if folder_name_exists(name, parent_id):
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Folder '{name}' already exists in this location.",
+                details="Use list_folders to see the existing folder hierarchy.",
+            )
 
         folder_id = create_folder(name, parent_id)
         upsert_folder(folder_id, name, parent_id)

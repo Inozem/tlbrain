@@ -682,6 +682,19 @@ def get_all_folders() -> dict[str, dict]:
     return {doc.id: (doc.to_dict() or {}) for doc in db.collection(FOLDERS_COLLECTION).stream()}
 
 
+def folder_name_exists(name: str, parent_id: str) -> bool:
+    """Return True if a folder with this name already exists under parent_id."""
+    db = _get_db()
+    docs = (
+        db.collection(FOLDERS_COLLECTION)
+        .where("name", "==", name)
+        .where("parent_id", "==", parent_id)
+        .limit(1)
+        .stream()
+    )
+    return any(True for _ in docs)
+
+
 def aggregate_transcripts_by_folder() -> dict[str, dict]:
     """Return {parent_id: {count, last_date, last_doc_id}} for all synced transcripts."""
     db = _get_db()
