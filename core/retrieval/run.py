@@ -25,8 +25,9 @@ def run_retrieval(
     all_folders = get_all_folders()
     if folder_path:
         terminal_ids = _resolve_path(folder_path)
-        if terminal_ids:
-            folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
+        if not terminal_ids:
+            raise ValueError(f"Folder not found: {'/'.join(folder_path)}")
+        folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
 
     resolve_path = make_folder_path_resolver(all_folders)
 

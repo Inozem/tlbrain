@@ -980,8 +980,14 @@ def _handle_list_recent_transcripts(request: JSONRPCRequest, arguments: dict) ->
     folder_ids = None
     if folder_path:
         terminal_ids = resolve_folder_path(folder_path)
-        if terminal_ids:
-            folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
+        if not terminal_ids:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Folder not found: {'/'.join(folder_path)}",
+                details="Use list_folders to see available folders.",
+            )
+        folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
 
     t0 = time.monotonic()
     try:
