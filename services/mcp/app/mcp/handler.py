@@ -16,7 +16,7 @@ from core.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.folders import list_folders
-from core.google_drive.drive_client import create_folder, move_file_to_folder, move_folder_in_drive, rename_file
+from core.google_drive.drive_client import create_folder, move_file_to_folder, move_folder_in_drive, rename_file, rename_folder
 from core.google_drive.firestore import (
     expand_subtree,
     folder_name_exists,
@@ -258,6 +258,25 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     },
                 },
                 {
+                    "name": "rename_folder",
+                    "description": "Rename a folder in the knowledge base. Updates Google Drive and the folder index. Documents inside are not reindexed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "folder_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Path of the folder to rename, e.g. [\"Clients - Active\", \"Old Name\"]",
+                            },
+                            "new_name": {
+                                "type": "string",
+                                "description": "New name for the folder",
+                            },
+                        },
+                        "required": ["folder_path", "new_name"],
+                    },
+                },
+                {
                     "name": "sync_changes",
                     "description": "Sync recent changes from Google Drive. Use doc_id only when a forced resync of a specific document is needed.",
                     "inputSchema": {
@@ -374,6 +393,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
 
     if tool_name == "create_folder":
         return _handle_create_folder(request, arguments)
+
+    if tool_name == "rename_folder":
+        return _handle_rename_folder(request, arguments)
 
     if tool_name == "sync_changes":
         return _handle_sync_changes(request, arguments)
@@ -759,6 +781,65 @@ def _handle_create_folder(request: JSONRPCRequest, arguments: dict) -> dict:
     )
 
     content = build_mcp_content({"status": "ok", "folder_id": folder_id, "name": name})
+    return build_jsonrpc_result(request.id, content)
+
+
+def _handle_rename_folder(request: JSONRPCRequest, arguments: dict) -> dict:
+    folder_path = arguments.get("folder_path") or []
+    new_name = arguments.get("new_name", "").strip()
+
+    if not folder_path or not new_name:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="folder_path and new_name are required",
+        )
+
+    t0 = time.monotonic()
+    try:
+        terminal_ids = resolve_folder_path(folder_path)
+        if not terminal_ids:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Folder not found: {'/'.join(folder_path)}",
+            )
+        if len(terminal_ids) > 1:
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Ambiguous path: {'/'.join(folder_path)} matches {len(terminal_ids)} folders.",
+            )
+        folder_id = terminal_ids[0]
+
+        folder_data = get_folder_by_id(folder_id) or {}
+        parent_id = folder_data.get("parent_id", "")
+
+        if folder_name_exists(new_name, parent_id):
+            return build_jsonrpc_error(
+                request_id=request.id,
+                code=-32602,
+                message=f"Folder '{new_name}' already exists in this location.",
+                details="Use list_folders to see the existing folder hierarchy.",
+            )
+
+        rename_folder(folder_id, new_name)
+        upsert_folder(folder_id, new_name, parent_id)
+    except Exception as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to rename folder",
+            details=str(e),
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "tool call: rename_folder",
+        extra={"tool": "rename_folder", "folder_path": folder_path, "new_name": new_name, "latency_ms": latency_ms},
+    )
+
+    content = build_mcp_content({"status": "ok", "folder_id": folder_id, "new_name": new_name})
     return build_jsonrpc_result(request.id, content)
 
 
