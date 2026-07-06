@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v1.2.1`
+# 🧠 TLBrain `v2.0.0`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -22,6 +22,7 @@ Google Drive + Qdrant + Gemini · Single-user · Near-zero infrastructure cost �
 - [Example queries](#-example-queries)
 - [How it works in practice](#-how-it-works-in-practice)
 - [Quick Start](#-quick-start)
+- [Upgrading from v1 to v2](#-upgrading-from-v1-to-v2)
 - [Why TLBrain](#-why-tlbrain)
 - [Why not just use Claude Projects?](#-why-not-just-use-claude-projects)
 - [Why MCP?](#-why-mcp)
@@ -50,17 +51,17 @@ Claude retrieves the most relevant transcript fragments automatically. Saves tok
  
 ## 🔑 How it works in practice
  
-Transcripts are automatically organized into client folders in Google Drive. If the client wasn't detected correctly — ask Claude to move it, or drag the file to the right folder manually. Either way, TLBrain picks up the change automatically.
+Transcripts are automatically organized into folders in Google Drive. The hierarchy is arbitrary — any depth. If a transcript landed in the wrong folder — ask Claude to move it, or drag the file manually. Either way, TLBrain picks up the change automatically.
  
-Transcripts that couldn't be assigned to any client land in a special `_unassigned` folder. Claude will notify you and suggest reviewing — just move them to the right folder and they'll be re-synced automatically.
+Transcripts that couldn't be assigned to any folder land in a special `_unassigned` folder. Claude will notify you and suggest reviewing — just move them to the right folder and they'll be re-synced automatically.
  
 Noticed errors in a transcript? Fix them directly in Google Drive — TLBrain will re-sync within 15 minutes. Or ask Claude to trigger a sync immediately.
  
 If Claude couldn't find the right transcript — share the Google Drive link and tell Claude what the document is about. TLBrain will remember that hint and use it in future searches.
  
-Already using TL;DV? You can import your entire existing history. Best to do it in small batches — TLBrain may not recognize the client on the very first transcript, but as you correct it, it learns the pattern. Usually only the first transcript per client needs a fix.
+Already using TL;DV? You can import your entire existing history. Best to do it in small batches — TLBrain may not recognize the client on the very first transcript, but as you correct it, it learns the pattern. Usually only the first transcript per folder needs a fix.
  
-You can ask Claude for a full list of clients and their sync status at any time.
+You can ask Claude for a full list of folders and their sync status at any time.
  
 ---
  
@@ -128,7 +129,7 @@ QDRANT_API_KEY=your-qdrant-api-key
  
 Create a dedicated empty folder in Google Drive — this will be the root for all TLBrain transcripts. Don't use an existing folder with other files in it.
 
-Client subfolders will be created automatically via MCP or manually in Google Drive.
+Subfolders can be created via MCP (`create_folder`) or manually in Google Drive — TLBrain picks them up automatically.
 
 Add to `.env`:
 
@@ -171,7 +172,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=1.2.1  # or latest for the most recent build
+VERSION=2.0.0  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -236,7 +237,30 @@ In TL;DV click your avatar in the bottom-left corner → **Settings → Integrat
 > After each redeploy, remove the MCP server and add it again — the session is tied to the Cloud Run instance.
  
 ---
- 
+
+## 🔄 Upgrading from v1 to v2
+
+If you're already using TLBrain, **do not just redeploy** — the v2 code is incompatible with v1 data. A simple redeploy will break folder search: transcripts will lose their folder association and become unreachable by path.
+
+v2 changes the core data model: folders are now tracked by Drive folder ID instead of a flat `client_name` string. This enables arbitrary nesting depth and makes folder renames and moves work automatically. To convert your existing data, run the one-time migration **before** redeploying.
+
+The migration runs in four steps:
+
+1. **Build `folders/`** — scans the Drive hierarchy under `ROOT_FOLDER` and populates the new `folders/` Firestore collection.
+2. **Update `transcript_index`** — replaces `client_name` with `parent_id` (Drive folder ID) in every transcript record.
+3. **Update Qdrant** — replaces `client_name` with `parent_id` in vector payloads (no re-embedding needed).
+4. **Delete `clients/`** — removes the old Firestore collection.
+
+```bash
+python -m migrations.v1_to_v2.migrate --dry-run  # preview changes without writing
+python -m migrations.v1_to_v2.migrate            # apply
+python -m migrations.v1_to_v2.verify             # post-migration check
+```
+
+After the migration completes successfully, redeploy all services.
+
+---
+
 ## ✅ Why TLBrain
  
 | Feature | TLBrain | Typical RAG |
@@ -251,11 +275,11 @@ In TL;DV click your avatar in the bottom-left corner → **Settings → Integrat
  
 **Cheap semantic memory.** Embeddings are generated only for summaries and facts — not for every utterance. Utterances are stored with BM25 sparse vectors and retrieved by range. This drastically reduces cost and vector storage size.
  
-**Works with Google Drive.** Transcripts are stored as native Google Docs — no proprietary formats. Folder = client. If something goes wrong, the data is always directly accessible.
+**Works with Google Drive.** Transcripts are stored as native Google Docs — no proprietary formats. Folders mirror your real hierarchy — unlimited nesting depth. If something goes wrong, the data is always directly accessible.
  
 **MCP-native.** Claude connects like a standard MCP server. No plugins, no custom integrations — just the protocol.
  
-**Incremental sync.** One file changed — only that file gets reindexed. SHA-256 hash of content + client_name tracks both edits and moves between clients.
+**Incremental sync.** One file changed — only that file gets reindexed. SHA-256 hash of file content tracks edits; folder moves are detected separately via Drive Changes API.
  
 **Conversation-aware retrieval.** Retrieval works with utterance windows, not arbitrary chunks. Summaries cover overlapping ranges; facts are anchored to specific dialogue segments.
  
@@ -327,12 +351,11 @@ As long as you stay within the free tier limits, you only pay for syncing new tr
 - **Single-user only** — the architecture does not support multi-tenant
 - **TL;DV as the primary source** — other providers require writing a connector
 - **Polling sync** — changes are picked up with a delay up to `SYNC_CHECKER_SCHEDULE` (default: 15 min)
-- **Drive folder depth** — only 1 level: `ROOT_FOLDER/{client_name}/`
 - **Native Google Docs only** — other file formats are ignored
 - **No cross-transcript aggregation yet** — a single query returns fragments from the most relevant transcript, not a summary across multiple calls. Workaround: ask Claude to search by client + date range, then ask it to read the full transcript from the results if needed
 
 ---
- 
+
 ## 🏗️ Technical Architecture
  
 ### Services
@@ -396,7 +419,7 @@ Utterances are always saved. A failure in summary/facts generation does not bloc
  
 **Sync Checker** (Cloud Function, runs on schedule):
 1. Fetches changes via Drive Changes API (incremental, not full scan)
-2. For each changed file, computes `content_hash = sha256(file_content + client_name)`
+2. For each changed file, computes `content_hash = sha256(file_content)`
 3. If hash matches → skip; if different → enqueue reindex
 4. Runs recovery: resets stale `syncing` and `downloading` records
 
@@ -442,23 +465,23 @@ Authentication: Google OAuth 2.0 Authorization Code Flow. Claude detects OAuth v
 **Firestore — 3 collections:**
  
 - `transcript_index/{doc_id}` — sync status, hashes, metadata
-- `clients/{client_name}` — client registry, speaker frequencies
+- `folders/{folder_id}` — folder registry (id, name, parent_id)
 - `config/vector_sync` — service keys (Drive page token)
 ### MCP Tools
  
 | Tool | Description |
 |---|---|
-| `query` | Hybrid search (semantic + BM25) over transcripts. Filters: `client_name`, `date_from`, `date_to`. Documents with `user_facts` are always included in results. |
-| `get_transcript` | Full transcripts without semantic search. By `doc_id` or `client_name` + date range. |
-| `list_clients` | List of clients with dialog count and last dialog date. |
-| `list_recent_transcripts` | Flat list of transcripts sorted by date desc across all clients. Filters: `client_name`, `date_from`, `date_to`. Supports pagination. Use to answer "where did the last call go?" |
+| `query` | Hybrid search (semantic + BM25) over transcripts. Filters: `folder_path`, `date_from`, `date_to`. Searches recursively through nested folders. Documents with `user_facts` are always included. |
+| `get_transcript` | Full transcript without semantic search. By `doc_id` or `folder_path` + date range. |
+| `list_folders` | List the folder hierarchy. Pass `folder_path` to list subfolders of a specific folder. |
+| `list_recent_transcripts` | Flat list of transcripts sorted by date desc. Filters: `folder_path` (recursive), `date_from`, `date_to`. Supports pagination. |
 | `add_fact` | Manually attach a fact to a transcript. Stored as `user_fact`, idempotent. |
-| `create_client` | Create a client: folder in Drive + record in Firestore. |
-| `move_transcript` | Move a transcript to another client. Updates Drive, resets for reindexing. |
+| `create_folder` | Create a folder: Drive subfolder + Firestore record. Pass `folder_path` to nest under an existing folder. |
+| `rename_folder` | Rename a folder: updates Drive, Firestore. Pass `folder_path` to identify the folder. |
+| `move_transcript` | Move a transcript to another folder. Updates Drive, resets for reindexing. |
 | `import_all_transcripts` | Import all missed transcripts from TL;DV. Supports `limit` and `since`. |
-| `sync_changes` | Trigger an immediate sync run without waiting for the schedule. Accepts optional `client_name` or `doc_id` for targeted resync of a specific client or document. |
+| `sync_changes` | Trigger an immediate sync run without waiting for the schedule. Accepts optional `folder_path` or `doc_id` for targeted resync. |
 | `sync_status` | Sync status counts by stage + number of unassigned transcripts. |
-| `rename_client` | Rename a client: updates folder in Drive, all transcript records, and the search index. |
 | `rename_transcript` | Rename a transcript: updates file name in Drive and title in the transcript list. |
  
 ### Repository Structure
@@ -485,24 +508,12 @@ tlbrain/
 ├── infra/
 │   ├── docker/
 │   └── deploy/
+├── migrations/
+│   └── v1_to_v2/            # One-time migration from v1 to v2
 └── .env.example
 ```
  
-### Data Structure in Google Drive
- 
-```
-ROOT_FOLDER/
-├── _unassigned/
-│   └── Some Call Title          ← Google Doc
-├── Client_A/
-│   └── Meeting with Acme        ← Google Doc
-├── Client_B/
-│   └── Demo Call Mar 1          ← Google Doc
-```
- 
-Each subfolder = `client_name`. `_unassigned/` is a system folder for transcripts without an identified client.
- 
-Google Doc format:
+### Google Doc format:
  
 ```
 DATE: YYYY-MM-DD
