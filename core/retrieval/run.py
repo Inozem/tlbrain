@@ -3,9 +3,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from core.config import get_retrieval_score_threshold, get_retrieval_top_k
+from core.google_drive.firestore import expand_subtree, get_all_folders, resolve_folder_path as _resolve_path
 from core.retrieval.pipeline import dedup_and_sort, fetch_utterances, merge_ranges
 from core.retrieval.search import keyword_search_utterances, search_summaries_and_facts, search_summaries_for_doc, search_user_facts
-from core.retrieval.segments import build_segments
+from core.retrieval.segments import build_segments, make_folder_path_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -14,24 +15,36 @@ _MAX_RESULT_DOCS = 3
 
 def run_retrieval(
     query: str,
-    client_name: str | None = None,
+    keywords: str | None = None,
+    folder_path: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    # Resolve folder_path → subtree-expanded folder_ids; load folders for path display
+    folder_ids: list[str] | None = None
+    all_folders = get_all_folders()
+    if folder_path:
+        terminal_ids = _resolve_path(folder_path)
+        if not terminal_ids:
+            raise ValueError(f"Folder not found: {'/'.join(folder_path)}")
+        folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
+
+    resolve_path = make_folder_path_resolver(all_folders)
+
     # Stage 1: parallel semantic + keyword search
     with ThreadPoolExecutor(max_workers=2) as executor:
         semantic_future = executor.submit(
             search_summaries_and_facts,
             query=query,
-            client_name=client_name,
+            folder_ids=folder_ids,
             date_from=date_from,
             date_to=date_to,
             top_k=get_retrieval_top_k(),
         )
         keyword_future = executor.submit(
             keyword_search_utterances,
-            query=query,
-            client_name=client_name,
+            query=keywords if keywords else query,
+            folder_ids=folder_ids,
             date_from=date_from,
             date_to=date_to,
         )
@@ -41,7 +54,7 @@ def run_retrieval(
 
     # Pin: documents with user_facts matching the query bypass the score threshold
     pinned_hits: list[dict[str, Any]] = []
-    user_fact_hits = search_user_facts(query, client_name=client_name, date_from=date_from, date_to=date_to)
+    user_fact_hits = search_user_facts(query, folder_ids=folder_ids, date_from=date_from, date_to=date_to)
     if user_fact_hits:
         hits_by_doc: dict[str, int] = {}
         for h in user_fact_hits:
@@ -70,23 +83,23 @@ def run_retrieval(
             "total_matches": 0,
             "returned_segments": 0,
             "limit_reason": "no_results",
-            "suggestion": "Нет данных за выбранный период или клиента",
+            "suggestion": "No data found for the given period or folder.",
         }
 
     # Pick top _MAX_RESULT_DOCS documents by best semantic score;
     # keyword-only docs get score 0 and fill remaining slots if any.
     doc_best_score: dict[str, float] = {}
-    doc_client: dict[str, str] = {}
+    doc_parent_id: dict[str, str] = {}
     for hit in semantic_hits:
         doc_id = hit["doc_id"]
         if hit["score"] > doc_best_score.get(doc_id, -1):
             doc_best_score[doc_id] = hit["score"]
-            doc_client[doc_id] = hit["client_name"] or ""
+            doc_parent_id[doc_id] = hit.get("parent_id") or ""
     for hit in keyword_hits:
         doc_id = hit["doc_id"]
         if doc_id not in doc_best_score:
             doc_best_score[doc_id] = 0.0
-            doc_client[doc_id] = hit.get("client_name") or ""
+            doc_parent_id[doc_id] = hit.get("parent_id") or ""
 
     sorted_docs = sorted(doc_best_score.items(), key=lambda x: x[1], reverse=True)
     top_doc_ids = {doc_id for doc_id, _ in sorted_docs[:_MAX_RESULT_DOCS]}
@@ -99,7 +112,7 @@ def run_retrieval(
     result_segments = []
     for doc_id, doc_ranges in merged_by_doc.items():
         utterances = dedup_and_sort(fetch_utterances(doc_id, doc_ranges))
-        result_segments.append(build_segments(doc_id, doc_ranges, utterances))
+        result_segments.append(build_segments(doc_id, doc_ranges, utterances, resolve_path))
 
     meta: dict[str, Any] = {
         "truncated": len(other_docs) > 0,
@@ -108,9 +121,9 @@ def run_retrieval(
     }
     if other_docs:
         meta["other_matches"] = [
-            {"doc_id": doc_id, "client_name": doc_client[doc_id], "score": round(score, 4)}
+            {"doc_id": doc_id, "parent_id": doc_parent_id[doc_id], "score": round(score, 4)}
             for doc_id, score in other_docs
         ]
-        meta["suggestion"] = "Уточните период или клиента для более точного поиска"
+        meta["suggestion"] = "Narrow down by period or folder for more precise results."
 
     return result_segments, meta

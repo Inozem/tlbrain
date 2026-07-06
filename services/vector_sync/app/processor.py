@@ -5,7 +5,7 @@ from qdrant_client.models import SparseVector
 
 from core.gemini.embeddings import embed, make_client
 from core.google_drive.docs_reader import read_google_doc
-from core.google_drive.firestore import acquire_for_syncing, get_client_folder_id, update_client_speakers, mark_error, mark_synced, update_skipped_utterances
+from core.google_drive.firestore import acquire_for_syncing, mark_error, mark_synced, update_skipped_utterances
 from core.parsing.parser import parse_document
 from core.parsing.processor import build_utterance_payloads, iter_windows
 from core.parsing.windowing import generate_windows
@@ -13,7 +13,8 @@ from core.qdrant.writer import (
     delete_old_versions,
     delete_summaries_by_center_indexes,
     delete_utterances_by_order_indexes,
-    set_payload_client_name,
+    set_payload_dialog_date,
+    set_payload_parent_id,
     upsert_facts,
     upsert_summaries,
     upsert_utterances,
@@ -33,7 +34,7 @@ def _get_bm25_model() -> SparseTextEmbedding:
     return _bm25_model
 
 
-def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: str | None = None, raw_text: str | None = None) -> str:
+def process_one(doc_id: str, parent_id: str, root_folder_id: str, raw_text: str | None = None) -> str:
     """
     Full processing cycle for one document.
     Returns: "processed" | "skipped" | "not_acquired"
@@ -45,29 +46,38 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
     try:
         existing = load_index(doc_id)
         existing_utterance_hashes = (existing or {}).get("utterance_hashes")
-        stored_client_name = (existing or {}).get("client_name", "")
-        stored_drive_folder = (existing or {}).get("drive_folder")
-
-        client_name_changed = bool(client_name and client_name != stored_client_name)
-        if client_name_changed:
-            set_payload_client_name(doc_id, root_folder_id, client_name)
-            stored_speakers = (existing or {}).get("speakers", [])
-            # Decrement the previous client only if its record still exists: during a folder
-            # rename the old record is deleted, and a blind decrement would resurrect a
-            # phantom. Counts self-assemble from each doc's increment into the new client.
-            if stored_speakers and stored_client_name and get_client_folder_id(stored_client_name):
-                update_client_speakers(stored_client_name, stored_speakers, delta=-1)
-            if stored_speakers and client_name != "_unassigned":
-                update_client_speakers(client_name, stored_speakers)
-            logger.info("Updated client_name in Qdrant: %s → %s (%s)", stored_client_name, client_name, doc_id)
-
-        # Keep drive_folder fresh — manual Drive moves don't update it otherwise.
-        if folder_id and folder_id != stored_drive_folder:
-            update_index(doc_id, {"drive_folder": folder_id})
 
         if raw_text is None:
             raw_text = read_google_doc(doc_id)
-        content_hash = sha256_text(raw_text + client_name)
+
+        # content_hash covers text; parent_id_hash tracks what parent_id is in Qdrant.
+        # parent_id_hash is updated only after a successful Qdrant write, so it reliably
+        # reflects Qdrant state even when transcript_index.parent_id was pre-updated
+        # by move_transcript_record.
+        content_hash = sha256_text(raw_text)
+        parent_id_hash = sha256_text(parent_id)
+
+        text_in_sync = existing.get("content_hash") == content_hash if existing else False
+        parent_in_sync = existing.get("parent_id_hash") == parent_id_hash if existing else False
+
+        # Qdrant is fully in sync.
+        if existing_utterance_hashes and text_in_sync and parent_in_sync:
+            mark_synced(doc_id)
+            logger.info("Skipped (in sync): %s", doc_id)
+            return "skipped"
+
+        # Only parent_id changed — update payload without re-embedding.
+        if existing_utterance_hashes and text_in_sync and not parent_in_sync:
+            set_payload_parent_id(doc_id, root_folder_id, parent_id)
+            update_index(doc_id, {"parent_id": parent_id, "parent_id_hash": parent_id_hash})
+            mark_synced(doc_id)
+            logger.info("Skipped (parent_id updated): %s", doc_id)
+            return "skipped"
+
+        # Text changed. If parent_id also changed, update Qdrant payload on all existing
+        # points now so unchanged utterances/summaries don't keep the stale value.
+        if existing_utterance_hashes and not parent_in_sync:
+            set_payload_parent_id(doc_id, root_folder_id, parent_id)
 
         if existing_utterance_hashes:
             # --- Incremental path ---
@@ -91,9 +101,15 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
             changed_indexes = [int(k) for k in changed_str_keys]
 
             if not changed_indexes:
-                update_index(doc_id, {"client_name": client_name, "content_hash": content_hash, "version": version})
+                if dialog_date != (existing or {}).get("dialog_date", ""):
+                    try:
+                        dialog_date_num = int(dialog_date.replace("-", "")) if dialog_date else None
+                    except (ValueError, AttributeError):
+                        dialog_date_num = None
+                    set_payload_dialog_date(doc_id, root_folder_id, dialog_date, dialog_date_num)
+                update_index(doc_id, {"parent_id": parent_id, "parent_id_hash": parent_id_hash, "content_hash": content_hash, "version": version, "dialog_date": dialog_date, "provider": provider})
                 mark_synced(doc_id)
-                logger.info("Incremental skip (no changes): %s", doc_id)
+                logger.info("Incremental skip (no utterance changes): %s", doc_id)
                 return "skipped"
 
             update_index(doc_id, {
@@ -113,7 +129,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
             new_changed_keys = changed_str_keys & new_keys
             changed_utterances = [u for u in utterances if str(u["order_index"]) in new_changed_keys]
             utterance_payloads = build_utterance_payloads(
-                changed_utterances, doc_id, version, client_name, dialog_date, root_folder_id
+                changed_utterances, doc_id, version, parent_id, dialog_date, root_folder_id
             )
             if utterance_payloads:
                 bm25_embeddings = list(_get_bm25_model().embed([u["text"] for u in utterance_payloads]))
@@ -131,7 +147,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
             facts_count = 0
             skipped = []
             for summary, facts in iter_windows(
-                utterances, doc_id, version, client_name, dialog_date, root_folder_id,
+                utterances, doc_id, version, parent_id, dialog_date, root_folder_id,
                 allowed_center_indexes=affected_centers,
                 skipped_utterances=skipped,
             ):
@@ -152,16 +168,12 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
             existing_skipped = [i for i in ((existing or {}).get("skipped_utterances") or [])
                                 if i not in reanalyzed]
             update_skipped_utterances(doc_id, existing_skipped + skipped)
-            update_index(doc_id, {"client_name": client_name, "content_hash": content_hash, "version": version})
+            update_index(doc_id, {"parent_id": parent_id, "parent_id_hash": parent_id_hash, "content_hash": content_hash, "version": version})
             mark_synced(doc_id)
             update_index(doc_id, {"utterance_hashes": new_hashes})
 
             speakers = sorted({u["speaker"] for u in utterances if u.get("speaker")})
-            prev_speakers = set((existing or {}).get("speakers", []))
-            new_speakers = [s for s in speakers if s not in prev_speakers]
-            update_index(doc_id, {"speakers": speakers, "speakers_indexed": True})
-            if new_speakers and client_name != "_unassigned":
-                update_client_speakers(client_name, new_speakers)
+            update_index(doc_id, {"speakers": speakers})
 
             logger.info(
                 "Incremental sync: %s | changed=%d summaries=%d facts=%d",
@@ -171,7 +183,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
 
         else:
             # --- Full reindex path ---
-            if existing and existing.get("content_hash") == content_hash:
+            if existing and text_in_sync and parent_in_sync:
                 mark_synced(doc_id)
                 logger.info("Skipped unchanged: %s", doc_id)
                 return "skipped"
@@ -188,7 +200,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
             })
 
             utterance_payloads = build_utterance_payloads(
-                utterances, doc_id, version, client_name, dialog_date, root_folder_id
+                utterances, doc_id, version, parent_id, dialog_date, root_folder_id
             )
             bm25_embeddings = list(_get_bm25_model().embed([u["text"] for u in utterance_payloads]))
             sparse_vectors = [
@@ -202,7 +214,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
             facts_count = 0
             skipped = []
             for summary, facts in iter_windows(
-                utterances, doc_id, version, client_name, dialog_date, root_folder_id,
+                utterances, doc_id, version, parent_id, dialog_date, root_folder_id,
                 skipped_utterances=skipped,
             ):
                 summary_vector = embed([summary["text"]], client=embed_client)[0]
@@ -215,7 +227,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
 
             delete_old_versions(doc_id, version, root_folder_id)
             update_skipped_utterances(doc_id, skipped)
-            update_index(doc_id, {"client_name": client_name, "content_hash": content_hash, "version": version})
+            update_index(doc_id, {"parent_id": parent_id, "parent_id_hash": parent_id_hash, "content_hash": content_hash, "version": version})
             mark_synced(doc_id)
 
             utterance_hashes = {
@@ -225,11 +237,7 @@ def process_one(doc_id: str, client_name: str, root_folder_id: str, folder_id: s
             update_index(doc_id, {"utterance_hashes": utterance_hashes})
 
             speakers = sorted({u["speaker"] for u in utterances if u.get("speaker")})
-            prev_speakers = set((existing or {}).get("speakers", []))
-            new_speakers = [s for s in speakers if s not in prev_speakers]
-            update_index(doc_id, {"speakers": speakers, "speakers_indexed": True})
-            if new_speakers and client_name != "_unassigned":
-                update_client_speakers(client_name, new_speakers)
+            update_index(doc_id, {"speakers": speakers})
 
             logger.info(
                 "Processed: %s | utterances=%d summaries=%d facts=%d",

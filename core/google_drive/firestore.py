@@ -3,10 +3,13 @@ from datetime import datetime, timezone, timedelta
 
 from google.cloud import firestore
 
+from core.config import get_root_folder_id
+
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "transcript_index"
 CLIENTS_COLLECTION = "clients"
+FOLDERS_COLLECTION = "folders"
 STALE_SYNCING_MINUTES = 15
 
 
@@ -42,7 +45,7 @@ def acquire_for_syncing(doc_id: str) -> bool:
     return result
 
 
-def ensure_imported(doc_id: str, client_name: str, folder_id: str, source_file: str = "") -> bool:
+def ensure_imported(doc_id: str, parent_id: str, source_file: str = "") -> bool:
     """Create transcript_index record with status=imported if it doesn't exist. Returns True if created."""
     db = _get_db()
     ref = db.collection(COLLECTION_NAME).document(doc_id)
@@ -53,8 +56,7 @@ def ensure_imported(doc_id: str, client_name: str, folder_id: str, source_file: 
             return False
         transaction.set(ref, {
             "doc_id": doc_id,
-            "client_name": client_name,
-            "drive_folder": folder_id,
+            "parent_id": parent_id,
             "source_file": source_file,
             "status": "imported",
             "status_changed_at": firestore.SERVER_TIMESTAMP,
@@ -63,7 +65,7 @@ def ensure_imported(doc_id: str, client_name: str, folder_id: str, source_file: 
 
     result = _txn(db.transaction())
     if result:
-        logger.info("Created imported record from Drive: %s (client=%s)", doc_id, client_name)
+        logger.info("Created imported record: %s (parent=%s)", doc_id, parent_id)
     return result
 
 
@@ -144,15 +146,14 @@ def delete_queued_placeholder(meeting_id: str) -> None:
     logger.info("Deleted queued placeholder: %s", meeting_id)
 
 
-def move_transcript_record(doc_id: str, new_client_name: str, new_drive_folder: str) -> None:
-    """Update client_name and drive_folder, reset status to imported for reindexing.
+def move_transcript_record(doc_id: str, new_parent_id: str) -> None:
+    """Update parent_id, reset status to imported for reindexing.
 
     modifiedTime is deleted so the checker detects a change and re-enqueues sync,
     even though moving a file in Drive does not update its modifiedTime.
     """
     _get_db().collection(COLLECTION_NAME).document(doc_id).update({
-        "client_name": new_client_name,
-        "drive_folder": new_drive_folder,
+        "parent_id": new_parent_id,
         "status": "imported",
         "modifiedTime": firestore.DELETE_FIELD,
         "content_hash": firestore.DELETE_FIELD,
@@ -160,22 +161,8 @@ def move_transcript_record(doc_id: str, new_client_name: str, new_drive_folder: 
         "error": None,
         "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
-    logger.info("Moved transcript record: %s → %s", doc_id, new_client_name)
+    logger.info("Moved transcript record: %s → parent=%s", doc_id, new_parent_id)
 
-
-def update_transcript_client(
-    doc_id: str,
-    new_client_name: str,
-    new_drive_folder: str,
-    new_content_hash: str,
-) -> None:
-    """Update client_name, drive_folder and content_hash without resetting status or utterance_hashes."""
-    _get_db().collection(COLLECTION_NAME).document(doc_id).update({
-        "client_name": new_client_name,
-        "drive_folder": new_drive_folder,
-        "content_hash": new_content_hash,
-    })
-    logger.info("Updated transcript client: %s → %s", doc_id, new_client_name)
 
 
 def update_transcript_source_file(doc_id: str, source_file: str) -> None:
@@ -184,27 +171,31 @@ def update_transcript_source_file(doc_id: str, source_file: str) -> None:
 
 
 def get_unassigned() -> dict:
-    """Return count and list of unassigned transcripts (past the import stage).
-
-    Returns: {"count": int, "transcripts": [{"doc_id": str, "dialog_date": str}]}
-    """
+    """Return count and list of unassigned transcripts (in _unassigned folder)."""
     db = _get_db()
-    docs = (
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("client_name", "==", "_unassigned"))
-        .stream()
-    )
-    transcripts = [
-        {"doc_id": d.id, "dialog_date": d.to_dict().get("dialog_date", "")}
-        for d in docs
-        if d.to_dict().get("status") not in ("queued", "downloading")
-    ]
+    unassigned_folder_id = None
+    for doc in db.collection(FOLDERS_COLLECTION).where(
+        filter=firestore.FieldFilter("name", "==", "_unassigned")
+    ).stream():
+        unassigned_folder_id = doc.id
+        break
+
+    if not unassigned_folder_id:
+        return {"count": 0, "transcripts": []}
+
+    transcripts = []
+    for d in db.collection(COLLECTION_NAME).where(
+        filter=firestore.FieldFilter("parent_id", "==", unassigned_folder_id)
+    ).stream():
+        data = d.to_dict() or {}
+        if data.get("status") not in ("queued", "downloading"):
+            transcripts.append({"doc_id": d.id, "dialog_date": data.get("dialog_date", "")})
     transcripts.sort(key=lambda x: x["dialog_date"], reverse=True)
     return {"count": len(transcripts), "transcripts": transcripts}
 
 
 def list_transcripts(
-    client_name: str | None = None,
+    folder_ids: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     limit: int = 20,
@@ -214,17 +205,15 @@ def list_transcripts(
 
     Skips placeholder records (queued / downloading).
     Returns: {total, returned, offset, limit, has_more, transcripts}
-    Each transcript: {doc_id, client_name, title, dialog_date, status}
+    Each transcript: {doc_id, parent_id, title, dialog_date, status}
     """
     db = _get_db()
-    query = db.collection(COLLECTION_NAME)
-    if client_name is not None:
-        query = query.where(filter=firestore.FieldFilter("client_name", "==", client_name))
-
     transcripts = []
-    for doc in query.stream():
+    for doc in db.collection(COLLECTION_NAME).stream():
         data = doc.to_dict() or {}
         if data.get("status") in ("queued", "downloading"):
+            continue
+        if folder_ids is not None and data.get("parent_id") not in folder_ids:
             continue
         dialog_date = data.get("dialog_date", "")
         if date_from and dialog_date < date_from:
@@ -233,7 +222,7 @@ def list_transcripts(
             continue
         transcripts.append({
             "doc_id": doc.id,
-            "client_name": data.get("client_name", ""),
+            "parent_id": data.get("parent_id"),
             "title": data.get("source_file", ""),
             "dialog_date": dialog_date,
             "status": data.get("status", ""),
@@ -646,3 +635,164 @@ def create_client(client_name: str, folder_id: str, description: str | None = No
     if result:
         logger.info("Created client: %s (%s)", client_name, folder_id)
     return result
+
+
+# ---------------------------------------------------------------------------
+# folders/ collection (v2)
+# ---------------------------------------------------------------------------
+
+def upsert_folder(folder_id: str, name: str, parent_id: str | None) -> None:
+    """Register or update a folder in folders/{folder_id}."""
+    db = _get_db()
+    ref = db.collection(FOLDERS_COLLECTION).document(folder_id)
+    snapshot = ref.get()
+    if snapshot.exists:
+        data = snapshot.to_dict() or {}
+        updates: dict = {}
+        if data.get("name") != name:
+            updates["name"] = name
+        if data.get("parent_id") != parent_id:
+            updates["parent_id"] = parent_id
+        if updates:
+            ref.update(updates)
+            logger.info("Updated folder %s: %s", folder_id, updates)
+    else:
+        ref.set({
+            "folder_id": folder_id,
+            "name": name,
+            "parent_id": parent_id,
+            "speakers": {},
+            "description": None,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+        logger.info("Registered folder: %s name=%r parent=%s", folder_id, name, parent_id)
+
+
+def get_folder_by_id(folder_id: str) -> dict | None:
+    """Return folders/{folder_id} data, or None if not found."""
+    doc = _get_db().collection(FOLDERS_COLLECTION).document(folder_id).get()
+    if not doc.exists:
+        return None
+    return doc.to_dict()
+
+
+def get_all_folders() -> dict[str, dict]:
+    """Return {folder_id: data} for all registered folders."""
+    db = _get_db()
+    return {doc.id: (doc.to_dict() or {}) for doc in db.collection(FOLDERS_COLLECTION).stream()}
+
+
+def folder_name_exists(name: str, parent_id: str) -> bool:
+    """Return True if a folder with this name already exists under parent_id."""
+    db = _get_db()
+    docs = (
+        db.collection(FOLDERS_COLLECTION)
+        .where("name", "==", name)
+        .where("parent_id", "==", parent_id)
+        .limit(1)
+        .stream()
+    )
+    return any(True for _ in docs)
+
+
+def aggregate_transcripts_by_folder() -> dict[str, dict]:
+    """Return {parent_id: {count, last_date, last_doc_id}} for all synced transcripts."""
+    db = _get_db()
+    agg: dict[str, dict] = {}
+    for doc in db.collection(COLLECTION_NAME).where(
+        filter=firestore.FieldFilter("status", "==", "synced")
+    ).stream():
+        data = doc.to_dict() or {}
+        parent_id = data.get("parent_id")
+        if not parent_id:
+            continue
+        dialog_date = data.get("dialog_date", "")
+        entry = agg.setdefault(parent_id, {"count": 0, "last_date": None, "last_doc_id": None})
+        entry["count"] += 1
+        if not entry["last_date"] or dialog_date > entry["last_date"]:
+            entry["last_date"] = dialog_date
+            entry["last_doc_id"] = doc.id
+    return agg
+
+
+def expand_subtree(folder_id: str) -> list[str]:
+    """Return folder_id plus all its descendants from the folders collection.
+
+    BFS over Firestore data — no Drive calls. Includes the root folder_id itself.
+    """
+    all_folders = get_all_folders()
+    children: dict[str, list[str]] = {}
+    for fid, data in all_folders.items():
+        pid = data.get("parent_id")
+        if pid:
+            children.setdefault(pid, []).append(fid)
+
+    result: list[str] = []
+    queue = [folder_id]
+    while queue:
+        fid = queue.pop(0)
+        result.append(fid)
+        queue.extend(children.get(fid, []))
+    return result
+
+
+def orphan_folder_children(folder_id: str) -> int:
+    """Clear parent_id for all subfolders that are direct children of folder_id."""
+    db = _get_db()
+    count = 0
+    for doc in db.collection(FOLDERS_COLLECTION).where("parent_id", "==", folder_id).stream():
+        doc.reference.update({"parent_id": None})
+        count += 1
+    if count:
+        logger.info("Orphaned %d subfolder(s) of %s", count, folder_id)
+    return count
+
+
+def orphan_transcript_children(folder_id: str) -> int:
+    """Clear parent_id for all transcript_index docs that are direct children of folder_id."""
+    db = _get_db()
+    count = 0
+    for doc in db.collection(COLLECTION_NAME).where("parent_id", "==", folder_id).stream():
+        doc.reference.update({"parent_id": None})
+        count += 1
+    if count:
+        logger.info("Orphaned %d transcript(s) of %s", count, folder_id)
+    return count
+
+
+def delete_folder(folder_id: str) -> None:
+    """Remove a folder record from the folders collection."""
+    _get_db().collection(FOLDERS_COLLECTION).document(folder_id).delete()
+    logger.info("Deleted folder record: %s", folder_id)
+
+
+def resolve_folder_path(path: list[str]) -> list[str]:
+    """Resolve a path like ["Clients - Active", "Acme Corp"] to matching folder_ids.
+
+    Handles duplicate folder names: collects all candidates at each segment.
+    Returns folder_ids of the last path segment (not expanded to subtree).
+    Returns empty list if path is empty or no match found.
+    """
+    if not path:
+        return []
+
+    root_folder_id = get_root_folder_id()
+    all_folders = get_all_folders()
+
+    children: dict[str, list[tuple[str, str]]] = {}
+    for fid, data in all_folders.items():
+        pid = data.get("parent_id")
+        if pid:
+            children.setdefault(pid, []).append((fid, data.get("name", "")))
+
+    current: list[str] = [root_folder_id]
+    for segment in path:
+        next_candidates: list[str] = []
+        for parent_id in current:
+            for fid, name in children.get(parent_id, []):
+                if name == segment:
+                    next_candidates.append(fid)
+        if not next_candidates:
+            return []
+        current = next_candidates
+    return current
