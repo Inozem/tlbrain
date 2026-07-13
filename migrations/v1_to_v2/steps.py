@@ -90,8 +90,15 @@ def step_update_transcript_index(dry_run: bool = False) -> dict:
 
 def step_migrate_qdrant(dry_run: bool = False) -> dict:
     """Replace client_name with parent_id in Qdrant payload (no re-embed)."""
+    import os
+    from qdrant_client import QdrantClient
+
     db = _get_db()
-    qdrant = get_qdrant_client()
+    qdrant = QdrantClient(
+        url=os.environ["QDRANT_URL"],
+        api_key=os.environ["QDRANT_API_KEY"],
+        timeout=60,
+    )
     collection = get_collection_name()
 
     client_to_folder: dict[str, str] = {}
