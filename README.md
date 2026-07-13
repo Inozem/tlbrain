@@ -252,6 +252,9 @@ The migration runs in four steps:
 4. **Delete `clients/`** — removes the old Firestore collection.
 
 ```bash
+pip install google-cloud-firestore google-api-python-client google-auth qdrant-client
+gcloud auth application-default login
+
 python -m migrations.v1_to_v2.migrate --dry-run  # preview changes without writing
 python -m migrations.v1_to_v2.migrate            # apply
 python -m migrations.v1_to_v2.verify             # post-migration check
