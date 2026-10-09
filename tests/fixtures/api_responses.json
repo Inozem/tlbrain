@@ -1,0 +1,95 @@
+{
+  "description": "Small invented examples of external API payload shapes consumed by the application; not frozen service contracts.",
+  "providers": {
+    "tldv": {
+      "meeting_detail": {
+        "id": "synthetic-meeting-main",
+        "name": "Synthetic Sample Review",
+        "happenedAt": "2026-01-12T09:00:00Z"
+      },
+      "transcript_results": {
+        "results": [
+          {"speaker": "Fixture Speaker A", "text": "We will review the sample schedule."},
+          {"speaker": "Fixture Speaker B", "text": "The draft has three sections."}
+        ]
+      },
+      "transcript_data_fallback": {
+        "data": [
+          {"speakerName": "Fixture Speaker A", "transcript": "This invented line uses the data fallback."}
+        ]
+      },
+      "transcript_empty": {"results": []},
+      "meeting_pages": {
+        "page_one": {
+          "results": [
+            {"id": "synthetic-meeting-main", "name": "Synthetic Sample Review", "happenedAt": "Mon Jan 12 2026 09:00:00 GMT+0000 (Coordinated Universal Time)"}
+          ],
+          "pages": 2
+        },
+        "page_two": {
+          "results": [],
+          "pages": 2
+        }
+      }
+    },
+    "drive": {
+      "file": {
+        "id": "synthetic-doc-main",
+        "name": "Synthetic Sample Review",
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": ["synthetic-folder-ops"],
+        "modifiedTime": "2026-01-12T09:30:00Z"
+      },
+      "folder": {
+        "id": "synthetic-folder-ops",
+        "name": "Operations",
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": ["synthetic-folder-team"],
+        "modifiedTime": "2026-01-12T09:31:00Z"
+      },
+      "list_response": {
+        "files": [
+          {"id": "synthetic-doc-main", "name": "Synthetic Sample Review", "mimeType": "application/vnd.google-apps.document", "parents": ["synthetic-folder-ops"], "modifiedTime": "2026-01-12T09:30:00Z"},
+          {"id": "synthetic-folder-ops", "name": "Operations", "mimeType": "application/vnd.google-apps.folder", "parents": ["synthetic-folder-team"], "modifiedTime": "2026-01-12T09:31:00Z"}
+        ]
+      },
+      "list_response_with_duplicate": {
+        "files": [
+          {"id": "synthetic-doc-main", "name": "Synthetic Sample Review", "mimeType": "application/vnd.google-apps.document", "parents": ["synthetic-folder-ops"], "modifiedTime": "2026-01-12T09:30:00Z"},
+          {"id": "synthetic-doc-no-time", "name": "Synthetic Transcript Without Time", "mimeType": "application/vnd.google-apps.document", "parents": ["synthetic-folder-ops"], "modifiedTime": "2026-01-13T09:30:00Z"},
+          {"id": "synthetic-doc-main", "name": "Synthetic Sample Review", "mimeType": "application/vnd.google-apps.document", "parents": ["synthetic-folder-ops"], "modifiedTime": "2026-01-12T09:30:00Z"}
+        ]
+      },
+      "empty_list_response": {"files": []}
+    },
+    "google_docs": {
+      "main_transcript": {
+        "body": {
+          "content": [
+            {"paragraph": {"elements": [{"textRun": {"content": "DATE: 2026-01-12\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "TIME: 09:00\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "PROVIDER: tldv\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "---\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker A :: We will review the sample schedule.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker B :: The draft has three sections.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker A :: Each section needs a clear owner.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker B :: We can track changes in a small table.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker A :: The first review is on Tuesday.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker B :: Notes should include the decision.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker A :: A second pass can check the wording.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker B :: We will keep the example data invented.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker A :: The final copy can stay brief.\n"}}]}},
+            {"paragraph": {"elements": [{"textRun": {"content": "Fixture Speaker B :: We will record the next step.\n"}}]}}
+          ]
+        }
+      },
+      "empty_document": {"body": {"content": []}}
+    },
+    "gemini": {
+      "summary_and_facts_success": {"summary": "The sample schedule has three sections with assigned owners.", "facts": ["The first review is on Tuesday."]},
+      "summary_and_facts_empty": {"summary": "", "facts": []},
+      "folder_match": {"folder_name": "Operations", "confidence": 0.91},
+      "folder_unknown": {"folder_name": null, "confidence": 0.2}
+    }
+  }
+}

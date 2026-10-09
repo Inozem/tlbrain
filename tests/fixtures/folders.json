@@ -1,0 +1,122 @@
+{
+  "description": "Small invented Firestore-style folder snapshots for empty, nested, unassigned, and duplicate-name cases.",
+  "cases": {
+    "empty_snapshot": {
+      "root_folder_id": "synthetic-empty-root",
+      "folders": {}
+    },
+    "nested_tree_with_unassigned": {
+      "root_folder_id": "synthetic-root",
+      "folders": {
+        "synthetic-root": {
+          "folder_id": "synthetic-root",
+          "name": "Synthetic Root",
+          "parent_id": null,
+          "speakers": {},
+          "description": "Invented root folder."
+        },
+        "synthetic-folder-project": {
+          "folder_id": "synthetic-folder-project",
+          "name": "Sample Project",
+          "parent_id": "synthetic-root",
+          "speakers": {"Fixture Speaker A": 1},
+          "description": "Invented first-level folder."
+        },
+        "synthetic-folder-team": {
+          "folder_id": "synthetic-folder-team",
+          "name": "Sample Team",
+          "parent_id": "synthetic-folder-project",
+          "speakers": {"Fixture Speaker B": 2},
+          "description": "Invented second-level folder."
+        },
+        "synthetic-folder-ops": {
+          "folder_id": "synthetic-folder-ops",
+          "name": "Operations",
+          "parent_id": "synthetic-folder-team",
+          "speakers": {"Fixture Speaker A": 1, "Fixture Speaker B": 1},
+          "description": "Invented third-level folder and transcript parent."
+        },
+        "synthetic-folder-unassigned": {
+          "folder_id": "synthetic-folder-unassigned",
+          "name": "_unassigned",
+          "parent_id": "synthetic-root",
+          "speakers": {},
+          "description": "Invented fallback folder directly under the root."
+        }
+      }
+    },
+    "same_name_different_parents": {
+      "root_folder_id": "synthetic-duplicate-root",
+      "folders": {
+        "synthetic-duplicate-root": {
+          "folder_id": "synthetic-duplicate-root",
+          "name": "Synthetic Root",
+          "parent_id": null,
+          "speakers": {},
+          "description": "Invented root for distinct-parent duplicate names."
+        },
+        "synthetic-duplicate-parent-a": {
+          "folder_id": "synthetic-duplicate-parent-a",
+          "name": "Group A",
+          "parent_id": "synthetic-duplicate-root",
+          "speakers": {},
+          "description": "Invented parent A."
+        },
+        "synthetic-duplicate-parent-b": {
+          "folder_id": "synthetic-duplicate-parent-b",
+          "name": "Group B",
+          "parent_id": "synthetic-duplicate-root",
+          "speakers": {},
+          "description": "Invented parent B."
+        },
+        "synthetic-duplicate-child-a": {
+          "folder_id": "synthetic-duplicate-child-a",
+          "name": "Shared Display Name",
+          "parent_id": "synthetic-duplicate-parent-a",
+          "speakers": {},
+          "description": "Same display name under a different parent."
+        },
+        "synthetic-duplicate-child-b": {
+          "folder_id": "synthetic-duplicate-child-b",
+          "name": "Shared Display Name",
+          "parent_id": "synthetic-duplicate-parent-b",
+          "speakers": {},
+          "description": "Same display name under a different parent."
+        }
+      }
+    },
+    "ambiguous_sibling_names": {
+      "root_folder_id": "synthetic-ambiguous-root",
+      "folders": {
+        "synthetic-ambiguous-root": {
+          "folder_id": "synthetic-ambiguous-root",
+          "name": "Synthetic Root",
+          "parent_id": null,
+          "speakers": {},
+          "description": "Invented root for deliberately ambiguous existing data."
+        },
+        "synthetic-ambiguous-parent": {
+          "folder_id": "synthetic-ambiguous-parent",
+          "name": "Existing Group",
+          "parent_id": "synthetic-ambiguous-root",
+          "speakers": {},
+          "description": "Invented parent of duplicate sibling names."
+        },
+        "synthetic-ambiguous-child-a": {
+          "folder_id": "synthetic-ambiguous-child-a",
+          "name": "Repeated Name",
+          "parent_id": "synthetic-ambiguous-parent",
+          "speakers": {},
+          "description": "Deliberately ambiguous pre-existing sibling."
+        },
+        "synthetic-ambiguous-child-b": {
+          "folder_id": "synthetic-ambiguous-child-b",
+          "name": "Repeated Name",
+          "parent_id": "synthetic-ambiguous-parent",
+          "speakers": {},
+          "description": "Deliberately ambiguous pre-existing sibling."
+        }
+      }
+    }
+  }
+}
