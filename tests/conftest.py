@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from google.cloud import firestore
+from google.cloud import firestore_v1
+from google.cloud.firestore_v1 import client as firestore_client_module
+
+from tests.fixtures.firestore_fake import FakeFirestoreClient, firestore_fake as _firestore_fake
 
 
 _SYNTHETIC_ENV = {
@@ -25,6 +30,7 @@ _SYNTHETIC_ENV = {
 _ENV_PREFIXES = ("GOOGLE_", "GCP_", "GEMINI_", "QDRANT_", "TLDV_", "TL_DV_")
 _saved_environment: dict[str, str] | None = None
 _saved_socket_methods: dict[str, Any] | None = None
+_saved_firestore_constructors: dict[str, Any] | None = None
 
 
 def _is_loopback(address: object) -> bool:
@@ -76,7 +82,7 @@ def _guard_python_sockets() -> None:
 
 
 def _restore_test_boundaries() -> None:
-    global _saved_environment, _saved_socket_methods
+    global _saved_environment, _saved_socket_methods, _saved_firestore_constructors
 
     if _saved_environment is not None:
         for name in tuple(os.environ):
@@ -90,12 +96,22 @@ def _restore_test_boundaries() -> None:
             setattr(socket.socket, name, method)
         _saved_socket_methods = None
 
+    if _saved_firestore_constructors is not None:
+        firestore.Client = _saved_firestore_constructors["firestore.Client"]
+        firestore_v1.Client = _saved_firestore_constructors["firestore_v1.Client"]
+        firestore_client_module.Client = _saved_firestore_constructors["client.Client"]
+        _saved_firestore_constructors = None
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Protect collection imports and test execution before pytest collects tests."""
-    global _saved_environment, _saved_socket_methods
+    global _saved_environment, _saved_socket_methods, _saved_firestore_constructors
 
-    if _saved_environment is not None or _saved_socket_methods is not None:
+    if (
+        _saved_environment is not None
+        or _saved_socket_methods is not None
+        or _saved_firestore_constructors is not None
+    ):
         _restore_test_boundaries()
     _saved_environment = {
         name: value
@@ -107,9 +123,17 @@ def pytest_configure(config: pytest.Config) -> None:
         "connect_ex": socket.socket.connect_ex,
         "sendto": socket.socket.sendto,
     }
+    _saved_firestore_constructors = {
+        "firestore.Client": firestore.Client,
+        "firestore_v1.Client": firestore_v1.Client,
+        "client.Client": firestore_client_module.Client,
+    }
     try:
         _apply_synthetic_environment()
         _guard_python_sockets()
+        firestore.Client = FakeFirestoreClient
+        firestore_v1.Client = FakeFirestoreClient
+        firestore_client_module.Client = FakeFirestoreClient
     except BaseException:
         _restore_test_boundaries()
         raise
@@ -141,3 +165,11 @@ def synthetic_environment(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
 def _offline_test_boundaries(synthetic_environment: dict[str, str]) -> None:
     """Reset synthetic environment for every test; socket guard spans collection."""
     del synthetic_environment
+    _firestore_fake.reset()
+
+
+@pytest.fixture
+def firestore_fake() -> Any:
+    """Return isolated per-test Firestore fake state and its control API."""
+    _firestore_fake.reset()
+    return _firestore_fake
