@@ -96,7 +96,12 @@ async def token(request: Request):
 @app.get("/authorize")
 async def authorize(request: Request):
     params = dict(request.query_params)
-    logger.info("authorize request", extra={"params": params})
+    safe_params = {
+        key: params[key]
+        for key in ("client_id", "scope", "response_type", "code_challenge_method")
+        if key in params
+    }
+    logger.info("authorize request", extra={"params": safe_params})
     if "scope" not in params:
         params["scope"] = "openid email profile"
     query = "&".join(f"{k}={v}" for k, v in params.items())

@@ -61,3 +61,62 @@ def test_json_records_preserve_stage_result_and_document_or_meeting_id(
     assert event["stage"] == stage
     assert event["result"] == result
     assert event[identifier_key] == identifier
+
+
+def test_json_records_preserve_safe_correlation_and_status_fields(capsys):
+    configure_logging()
+    logger = logging.getLogger("logging.safe_extras")
+    secret = "synthetic-secret-marker"
+
+    logger.warning(
+        "stage completed",
+        extra={
+            "stage": "index",
+            "result": "success",
+            "doc_id": "synthetic-doc-safe",
+            "meeting_id": "synthetic-meeting-safe",
+            "request_id": "synthetic-request-safe",
+            "response_status": 207,
+            "token_count": 4,
+            "processing_state": "complete",
+            "access_token": secret,
+            "client_secret": secret,
+        },
+    )
+
+    [event] = _read_json_lines(capsys.readouterr().err)
+    assert event["stage"] == "index"
+    assert event["result"] == "success"
+    assert event["doc_id"] == "synthetic-doc-safe"
+    assert event["meeting_id"] == "synthetic-meeting-safe"
+    assert event["request_id"] == "synthetic-request-safe"
+    assert event["response_status"] == 207
+    assert event["token_count"] == 4
+    assert event["processing_state"] == "complete"
+    assert "access_token" not in event
+    assert "client_secret" not in event
+    assert secret not in json.dumps(event)
+
+
+def test_nested_sensitive_extra_key_is_omitted_and_safe_siblings_survive(capsys):
+    configure_logging()
+    logger = logging.getLogger("logging.nested_extras")
+    secret = "synthetic-opaque-nested-secret"
+    request_id = "synthetic-nested-request"
+
+    logger.error(
+        "proxy request failed",
+        extra={
+            "proxy": {
+                "access_token": secret,
+                "request_id": request_id,
+                "status": 502,
+            }
+        },
+    )
+
+    [event] = _read_json_lines(capsys.readouterr().err)
+    assert secret not in json.dumps(event)
+    assert "access_token" not in event["proxy"]
+    assert event["proxy"]["request_id"] == request_id
+    assert event["proxy"]["status"] == 502

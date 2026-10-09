@@ -103,3 +103,15 @@ def test_nested_proxy_exception_markers_are_absent_from_serialized_logs(capsys):
     assert "exception" in event
     leaked = [marker for marker in (nested_marker, exception_marker) if marker in serialized]
     assert leaked == []
+
+
+def test_quoted_json_secret_in_log_message_is_redacted(capsys):
+    configure_logging()
+    logger = logging.getLogger("services.mcp.logging.json_secret")
+    marker = "synthetic-opaque-value-73"
+
+    logger.error(f'proxy response: {{"access_token": "{marker}"}}')
+
+    [event] = _json_events(capsys.readouterr().err)
+    assert marker not in event["message"]
+    assert event["message"] == 'proxy response: {"access_token": "[REDACTED]"}'
