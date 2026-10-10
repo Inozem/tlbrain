@@ -8,6 +8,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 from pathlib import Path, PurePosixPath
@@ -23,6 +24,13 @@ EXCLUDED_PARTS = {
     ".tox", ".venv", "venv", "tests", "test", "fixtures", "fixture",
     "dist", "build", "cache", ".cache",
 }
+
+_REQUIREMENT_INCLUDE = re.compile(
+    r"^(?P<prefix>\s*)(?P<option>-r|--requirement|-c|--constraint)"
+    r"(?P<space>\s+)(?P<target>[^\s#]+)(?P<suffix>.*)$"
+)
+_LOCAL_PATH = re.compile(r"^(?:[./\\]|[A-Za-z]:[\\/]|[A-Za-z0-9_.-]+[\\/])")
+_LOCAL_ARCHIVE = re.compile(r"(?i)(?:\.whl|\.egg|\.zip|\.tar(?:\.(?:gz|bz2|xz|zst))?|\.tgz|\.gz|\.bz2|\.xz)$")
 
 
 def _safe_relative(value: str, *, label: str) -> PurePosixPath:
@@ -418,6 +426,183 @@ class Assembler:
             return target_path.as_posix()
         raise AssemblyError(f"service {self.service_name}: remap maps {source_rel!r} to the output root")
 
+    def requirements_graph(self) -> tuple[str, dict[str, str], dict[str, Path]]:
+        """Resolve requirement roots and return the top-level file and staged graph."""
+        staged: dict[str, str] = {}
+        resources: dict[str, Path] = {}
+        active: list[Path] = []
+        visited: set[Path] = set()
+
+        def checked_path(declaring: Path, value: str, label: str) -> Path:
+            if not value or "\x00" in value:
+                raise AssemblyError(f"service {self.service_name}: invalid {label} path {value!r}")
+            raw = Path(value.replace("\\", "/"))
+            normalized_value = value.replace("\\", "/")
+            if raw.is_absolute() or normalized_value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+                raise AssemblyError(f"service {self.service_name}: unsafe {label} path {value!r}")
+            candidate = declaring.parent / raw
+            try:
+                # Non-strict resolution still normalizes existing symlinked
+                # components, while avoiding Windows access-denied failures
+                # from strict resolution on readable paths.
+                resolved = candidate.resolve()
+                if not candidate.exists():
+                    raise FileNotFoundError(value)
+            except (OSError, RuntimeError) as exc:
+                raise AssemblyError(
+                    f"service {self.service_name}: {declaring.relative_to(self.root).as_posix()}: "
+                    f"cannot resolve {label} {value!r}: {exc}"
+                ) from exc
+            if not resolved.is_relative_to(self.root) or _excluded(resolved, self.root):
+                raise AssemblyError(
+                    f"service {self.service_name}: unsafe {label} path {value!r} "
+                    f"from {declaring.relative_to(self.root).as_posix()}"
+                )
+            return resolved
+
+        def staged_name(path: Path) -> str:
+            return ".requirements/" + path.relative_to(self.root).as_posix()
+
+        def is_local_target(target: str, declaring: Path) -> bool:
+            # URLs and VCS references belong to pip's network resolver. Keep
+            # them intact even when their final component resembles an archive.
+            if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", target):
+                return False
+            if target in (".", "..") or _LOCAL_PATH.match(target):
+                return True
+            if _LOCAL_ARCHIVE.search(target):
+                return True
+            if "/" not in target and "\\" not in target:
+                try:
+                    return (declaring.parent / target).exists()
+                except OSError:
+                    return False
+            return False
+
+        def rewrite_reference(text: str, source_file: Path, staged_file: str, token: str, start: int, end: int) -> str:
+            resource = checked_path(source_file, token, "local requirement resource")
+            if not resource.is_file() and not resource.is_dir():
+                raise AssemblyError(
+                    f"service {self.service_name}: local requirement resource {token!r} "
+                    f"from {source_file.relative_to(self.root).as_posix()} is not a file or directory"
+                )
+            dest = staged_name(resource)
+            if resource.is_dir():
+                for base, dirs, files in os.walk(resource):
+                    base_path = Path(base)
+                    kept_dirs: list[str] = []
+                    for dirname in dirs:
+                        directory = base_path / dirname
+                        if dirname in EXCLUDED_PARTS or dirname.startswith(".env"):
+                            continue
+                        if directory.is_symlink():
+                            raise AssemblyError(
+                                f"service {self.service_name}: unsafe symlink in local requirement resource "
+                                f"{directory.relative_to(self.root).as_posix()}"
+                            )
+                        kept_dirs.append(dirname)
+                    dirs[:] = kept_dirs
+                    for filename in files:
+                        candidate = base_path / filename
+                        if candidate.is_symlink():
+                            raise AssemblyError(
+                                f"service {self.service_name}: unsafe symlink in local requirement resource "
+                                f"{candidate.relative_to(self.root).as_posix()}"
+                            )
+                        if not _excluded(candidate, self.root):
+                            resources[staged_name(candidate)] = candidate
+            else:
+                resources[dest] = resource
+            staged_parent = Path(staged_file).parent
+            relative_dest = os.path.relpath(dest, staged_parent.as_posix()).replace("\\", "/")
+            return text[:start] + relative_dest + text[end:]
+
+        def process_file(path: Path) -> None:
+            if path in active:
+                cycle = " -> ".join(p.relative_to(self.root).as_posix() for p in active + [path])
+                raise AssemblyError(f"service {self.service_name}: requirements include cycle: {cycle}")
+            if path in visited:
+                return
+            active.append(path)
+            try:
+                try:
+                    contents = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as exc:
+                    raise AssemblyError(f"service {self.service_name}: cannot read requirements file {path}: {exc}") from exc
+                out_lines: list[str] = []
+                staged_file = staged_name(path)
+                for line in contents.splitlines(keepends=True):
+                    body = line.rstrip("\r\n")
+                    ending = line[len(body):]
+                    match = _REQUIREMENT_INCLUDE.match(body)
+                    if match:
+                        target = match.group("target")
+                        included = checked_path(path, target, "requirements include")
+                        if not included.is_file():
+                            raise AssemblyError(
+                                f"service {self.service_name}: requirements include {target!r} "
+                                f"from {path.relative_to(self.root).as_posix()} is not a file"
+                            )
+                        target_staged = staged_name(included)
+                        relative_target = os.path.relpath(target_staged, Path(staged_file).parent.as_posix()).replace("\\", "/")
+                        rewritten = body[:match.start("target")] + relative_target + body[match.end("target"):]
+                        out_lines.append(rewritten + ending)
+                        process_file(included)
+                        continue
+
+                    # Local path requirements are either a path-only declaration,
+                    # an editable argument, or a direct-reference URL after `@`.
+                    spans: list[tuple[int, int]] = []
+                    try:
+                        tokens = shlex.shlex(body, posix=True, punctuation_chars="@")
+                        tokens.whitespace_split = True
+                        tokens.commenters = "#"
+                        parsed = list(tokens)
+                    except ValueError:
+                        parsed = []
+                    if parsed:
+                        stripped = body.lstrip()
+                        offset = len(body) - len(stripped)
+                        first = parsed[0]
+                        if first in ("-e", "--editable") and len(parsed) > 1:
+                            target = parsed[1]
+                            pos = body.find(target, offset + len(first))
+                            if is_local_target(target, path):
+                                spans.append((pos, pos + len(target)))
+                        elif is_local_target(first, path):
+                            pos = body.find(first, offset)
+                            spans.append((pos, pos + len(first)))
+                        else:
+                            for i, token in enumerate(parsed[:-1]):
+                                if token == "@" and is_local_target(parsed[i + 1], path):
+                                    target = parsed[i + 1]
+                                    pos = body.find(target, body.find("@") + 1)
+                                    spans.append((pos, pos + len(target)))
+                                    break
+                    for start, end in reversed(spans):
+                        body = rewrite_reference(body, path, staged_file, body[start:end], start, end)
+                    out_lines.append(body + ending)
+                staged[staged_file] = "".join(out_lines)
+            finally:
+                active.pop()
+            visited.add(path)
+
+        roots: list[str] = []
+        for root_value in self.config.get("requirements_roots", []):
+            if not isinstance(root_value, str):
+                raise AssemblyError(f"service {self.service_name}: requirements root must be a path string")
+            root = checked_path(self.root / "_requirements_root", root_value, "requirements root")
+            if not root.is_file():
+                raise AssemblyError(f"service {self.service_name}: requirements root {root_value!r} is not a file")
+            roots.append(staged_name(root))
+            process_file(root)
+
+        top_lines = []
+        for root in roots:
+            relative = os.path.relpath(root, ".").replace("\\", "/")
+            top_lines.append(f"-r {relative}\n")
+        return "".join(top_lines), staged, resources
+
 
 def assemble(service_name: str, output: Path, source_root: Path) -> None:
     source_root = source_root.resolve()
@@ -431,6 +616,7 @@ def assemble(service_name: str, output: Path, source_root: Path) -> None:
         raise AssemblyError(f"unknown service {service_name!r} in {config_path}")
     assembler = Assembler(source_root, service_name, service)
     sources = assembler.build()
+    requirements_root, requirements_files, requirements_resources = assembler.requirements_graph()
     output = output.resolve()
     if output == source_root or output.is_relative_to(source_root):
         raise AssemblyError("output directory must be outside the source root")
@@ -452,6 +638,19 @@ def assemble(service_name: str, output: Path, source_root: Path) -> None:
             "runtime_path": runtime_rel,
             "import_edges": source_edges,
         })
+    (output / "requirements.txt").write_text(requirements_root, encoding="utf-8")
+    for relative, source in requirements_resources.items():
+        destination = (output / Path(*PurePosixPath(relative).parts)).resolve()
+        if not destination.is_relative_to(output):
+            raise AssemblyError(f"service {service_name}: requirements resource destination escapes output root: {relative}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    for relative, contents in requirements_files.items():
+        destination = (output / Path(*PurePosixPath(relative).parts)).resolve()
+        if not destination.is_relative_to(output):
+            raise AssemblyError(f"service {service_name}: requirements destination escapes output root: {relative}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(contents, encoding="utf-8")
     report = {
         "schema_version": int(manifest.get("schema_version", 1)),
         "service": service_name,
