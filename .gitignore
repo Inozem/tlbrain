@@ -216,3 +216,6 @@ docs/
 # Graphify
 graphify-out
 .mcp.json
+
+# Declarative service assembly inputs are source; other build/ directories stay ignored.
+!infra/build/
