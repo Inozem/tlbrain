@@ -39,6 +39,14 @@ _RUNTIME_TARGETS = {
     "tldv_webhook": "main:tldv_webhook",
     "tldv_reconciliation": "main:tldv_reconciliation",
 }
+_ASSEMBLED_RUNTIME_TARGETS = {
+    "mcp": "services.mcp.app.main:app",
+    "vector_sync": "services.vector_sync.app.main:app",
+    "tldv_import": "app.main:app",
+    "sync_checker": "checker",
+    "tldv_webhook": "tldv_webhook",
+    "tldv_reconciliation": "tldv_reconciliation",
+}
 _RUNTIME_KINDS = {
     "mcp": "asgi",
     "vector_sync": "asgi",
@@ -56,10 +64,18 @@ def _artifact(
     *,
     extra_sources: dict[str, str] | None = None,
     requirements: str = "",
+    assembled_report: bool = False,
 ) -> Path:
     """Create a minimal assembled artifact and schema-v1 assembly report."""
     artifact = tmp_path / f"artifact-{service}"
-    sources = {_ENTRY_PATHS[service]: entry_source, **(extra_sources or {})}
+    entry_path = _ENTRY_PATHS[service]
+    if assembled_report:
+        runtime_target = _ASSEMBLED_RUNTIME_TARGETS[service]
+        module_name = (
+            runtime_target.split(":", 1)[0] if ":" in runtime_target else "main"
+        )
+        entry_path = module_name.replace(".", "/") + ".py"
+    sources = {entry_path: entry_source, **(extra_sources or {})}
     (artifact / ".requirements").mkdir(parents=True)
     (artifact / "requirements.txt").write_text(requirements, encoding="utf-8")
 
@@ -79,12 +95,15 @@ def _artifact(
     report = {
         "schema_version": 1,
         "service": service,
-        "runtime": {
-            "target": _RUNTIME_TARGETS[service],
-            "kind": _RUNTIME_KINDS[service],
-        },
         "source_files": source_records,
     }
+    if assembled_report:
+        report["runtime_target"] = _ASSEMBLED_RUNTIME_TARGETS[service]
+    else:
+        report["runtime"] = {
+            "target": _RUNTIME_TARGETS[service],
+            "kind": _RUNTIME_KINDS[service],
+        }
     (artifact / "assembly-report.json").write_text(
         json.dumps(report), encoding="utf-8"
     )
@@ -109,6 +128,24 @@ def _external_smoke_support(tmp_path: Path) -> Path:
     smoke_support = validation_dir / "smoke_support.py"
     shutil.copyfile(SMOKE_SUPPORT, smoke_support)
     return smoke_support.resolve()
+
+
+def test_smoke_support_rejects_missing_sdk_boundary() -> None:
+    """A fake must not create an SDK symbol that the installed SDK lacks."""
+    import importlib.util
+    from types import SimpleNamespace
+
+    spec = importlib.util.spec_from_file_location(
+        "smoke_support_under_test", SMOKE_SUPPORT
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with pytest.raises(RuntimeError, match="Required SDK boundary sample_sdk.Client"):
+        module._replace_boundary(
+            SimpleNamespace(__name__="sample_sdk"), "Client", lambda: None
+        )
 
 
 def _success_entry_source(service: str) -> str:
@@ -326,8 +363,9 @@ def test_validator_fails_for_missing_sdk_or_application_import(
 
 
 @pytest.mark.parametrize("service", tuple(_ENTRY_PATHS))
+@pytest.mark.parametrize("report_shape", ("nested", "assembled"))
 def test_smoke_support_runs_offline_startup_and_benign_route(
-    tmp_path: Path, service: str
+    tmp_path: Path, service: str, report_shape: str
 ) -> None:
     """Exercise component smokes separately via ``-k smoke_support``."""
     marker = (tmp_path / f"{service}-route-ran.txt").resolve()
@@ -336,6 +374,8 @@ def test_smoke_support_runs_offline_startup_and_benign_route(
         entry_source = (
             "from qdrant_client import QdrantClient\n"
             "assert getattr(QdrantClient, '__tlbrain_external_fake__', False) is True\n"
+            "import os\n"
+            "assert os.environ['QDRANT_COLLECTION'] == 'offline-smoke-collection'\n"
             "client = QdrantClient()\n"
             + entry_source
         )
@@ -350,6 +390,7 @@ def test_smoke_support_runs_offline_startup_and_benign_route(
         service,
         entry_source,
         extra_sources={"app_internal.py": "VALUE = 4\n"},
+        assembled_report=report_shape == "assembled",
     )
     smoke_support = _external_smoke_support(tmp_path)
     # run_smoke owns startup and benign-route behavior; its return shape is
