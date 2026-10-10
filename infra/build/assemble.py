@@ -58,24 +58,110 @@ def _module_for_path(path: Path, root: Path) -> str:
     return ".".join(parts)
 
 
-def _registry_prefixes(source_root: Path) -> set[str]:
+def _provider_registry(source_root: Path) -> dict[str, Any]:
     registry_path = source_root / "infra" / "build" / "dependency-providers.json"
     if not registry_path.is_file():
-        return set()
+        return {"providers": [], "optional_imports": []}
     try:
         data = json.loads(registry_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AssemblyError(f"cannot read dependency provider registry: {exc}") from exc
+    if not isinstance(data, dict):
+        raise AssemblyError("dependency provider registry must contain an object")
+    return data
+
+
+def _registry_prefixes(data: dict[str, Any]) -> set[str]:
     prefixes: set[str] = set()
     for provider in data.get("providers", []):
+        if not isinstance(provider, dict):
+            continue
         for prefix in provider.get("import_prefixes", []):
             if isinstance(prefix, str):
                 prefixes.add(prefix)
     for optional in data.get("optional_imports", []):
+        if not isinstance(optional, dict):
+            continue
         prefix = optional.get("import_prefix")
         if isinstance(prefix, str):
             prefixes.add(prefix)
     return prefixes
+
+
+def _is_import_prefix(module: str, prefix: str) -> bool:
+    return module == prefix or module.startswith(prefix + ".")
+
+
+def _guard_catches_import_error(handler: ast.ExceptHandler) -> bool:
+    def catches(node: ast.AST | None) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in {"ImportError", "ModuleNotFoundError"}
+        if isinstance(node, ast.Tuple):
+            return any(catches(item) for item in node.elts)
+        return False
+
+    return catches(handler.type)
+
+
+def _is_type_checking_test(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "TYPE_CHECKING"
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "TYPE_CHECKING"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "typing"
+    )
+
+
+class _GuardedImportCollector(ast.NodeVisitor):
+    """Collect imports with the narrow guard contexts surrounding each node."""
+
+    def __init__(self) -> None:
+        self.guards: set[str] = set()
+        self.imports: list[tuple[ast.Import | ast.ImportFrom, frozenset[str]]] = []
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.imports.append((node, frozenset(self.guards)))
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.imports.append((node, frozenset(self.guards)))
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        if _is_type_checking_test(node.test):
+            self.guards.add("TYPE_CHECKING")
+        for child in node.body:
+            self.visit(child)
+        if _is_type_checking_test(node.test):
+            self.guards.remove("TYPE_CHECKING")
+        for child in node.orelse:
+            self.visit(child)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        catches_import_error = any(_guard_catches_import_error(handler) for handler in node.handlers)
+        if catches_import_error:
+            self.guards.add("ImportError")
+        for child in node.body:
+            self.visit(child)
+        if catches_import_error:
+            self.guards.remove("ImportError")
+        for handler in node.handlers:
+            self.visit(handler)
+        for child in node.orelse:
+            self.visit(child)
+        for child in node.finalbody:
+            self.visit(child)
+
+
+def _imported_modules(node: ast.Import | ast.ImportFrom) -> set[str]:
+    if isinstance(node, ast.Import):
+        return {alias.name for alias in node.names}
+    if node.level or not node.module:
+        return set()
+    if any(alias.name == "*" for alias in node.names):
+        return {node.module}
+    return {f"{node.module}.{alias.name}" for alias in node.names}
 
 
 class Assembler:
@@ -85,7 +171,8 @@ class Assembler:
         self.config = config
         self.aliases = config.get("module_aliases", {})
         self.remaps = config.get("path_remaps", {})
-        self.provider_prefixes = _registry_prefixes(self.root)
+        self.provider_registry = _provider_registry(self.root)
+        self.provider_prefixes = _registry_prefixes(self.provider_registry)
         self.sources: dict[Path, dict[str, Any]] = {}
         self.edges: list[dict[str, Any]] = []
         self.external: dict[tuple[str, str], dict[str, Any]] = {}
@@ -158,6 +245,73 @@ class Assembler:
             or ("." in module and prefix.startswith(module + "."))
             for prefix in self.provider_prefixes
         )
+
+    def _selected_provider_requirements(self) -> list[str]:
+        """Return requirement files for longest-prefix required provider imports."""
+        providers = self.provider_registry.get("providers", [])
+        optional_imports = self.provider_registry.get("optional_imports", [])
+        # Older source-graph fixtures used empty objects for these collections.
+        # Treat that empty legacy shape as no declarations.
+        providers = providers if isinstance(providers, list) else []
+        optional_imports = optional_imports if isinstance(optional_imports, list) else []
+
+        optional_by_source: dict[str, list[tuple[str, str]]] = {}
+        for optional in optional_imports:
+            if not isinstance(optional, dict):
+                continue
+            source_file = optional.get("source_file")
+            prefix = optional.get("import_prefix")
+            guard = optional.get("guard_context", optional.get("guard"))
+            if isinstance(source_file, str) and isinstance(prefix, str) and isinstance(guard, str):
+                optional_by_source.setdefault(source_file.replace("\\", "/"), []).append((prefix, guard))
+
+        required_prefixes: set[str] = set()
+        for source, info in self.sources.items():
+            source_rel = source.relative_to(self.root).as_posix()
+            collector = _GuardedImportCollector()
+            collector.visit(info["tree"])
+            declared_optional = optional_by_source.get(source_rel, [])
+            for node, guards in collector.imports:
+                for imported in _imported_modules(node):
+                    is_optional = any(
+                        guard in guards and _is_import_prefix(imported, prefix)
+                        for prefix, guard in declared_optional
+                    )
+                    if is_optional:
+                        continue
+                    matching_prefixes = [
+                        prefix
+                        for provider in providers
+                        if isinstance(provider, dict)
+                        for prefix in provider.get("import_prefixes", [])
+                        if isinstance(prefix, str) and _is_import_prefix(imported, prefix)
+                    ]
+                    if matching_prefixes:
+                        required_prefixes.add(max(matching_prefixes, key=len))
+
+        selected: list[str] = []
+        for imported_prefix in sorted(required_prefixes):
+            matches = [
+                (len(prefix), provider)
+                for provider in providers
+                if isinstance(provider, dict)
+                for prefix in provider.get("import_prefixes", [])
+                if isinstance(prefix, str) and prefix == imported_prefix
+            ]
+            if not matches:
+                continue
+            # A qualified prefix belongs to the provider(s) that declare that
+            # exact longest match; broader bundles do not activate alongside it.
+            for _length, provider in matches:
+                files = provider.get("requirements_files", [])
+                if not isinstance(files, list):
+                    raise AssemblyError(f"provider {imported_prefix!r} requirements_files must be a list")
+                for requirement_file in files:
+                    if not isinstance(requirement_file, str):
+                        raise AssemblyError(f"provider {imported_prefix!r} requirement file must be a path string")
+                    if requirement_file not in selected:
+                        selected.append(requirement_file)
+        return selected
 
     def _is_external(self, module: str) -> bool:
         if self._is_stdlib(module) or self._is_qualified_provider(module):
@@ -588,13 +742,16 @@ class Assembler:
             visited.add(path)
 
         roots: list[str] = []
-        for root_value in self.config.get("requirements_roots", []):
+        root_values = list(self.config.get("requirements_roots", []))
+        root_values.extend(self._selected_provider_requirements())
+        for root_value in root_values:
             if not isinstance(root_value, str):
                 raise AssemblyError(f"service {self.service_name}: requirements root must be a path string")
             root = checked_path(self.root / "_requirements_root", root_value, "requirements root")
             if not root.is_file():
                 raise AssemblyError(f"service {self.service_name}: requirements root {root_value!r} is not a file")
-            roots.append(staged_name(root))
+            if staged_name(root) not in roots:
+                roots.append(staged_name(root))
             process_file(root)
 
         top_lines = []
