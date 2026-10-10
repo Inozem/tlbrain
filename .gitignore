@@ -219,3 +219,4 @@ graphify-out
 
 # Declarative service assembly inputs are source; other build/ directories stay ignored.
 !infra/build/
+.build/

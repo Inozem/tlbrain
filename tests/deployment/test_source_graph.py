@@ -7,6 +7,7 @@ application's installed packages and never imports the synthetic source.
 from __future__ import annotations
 
 import json
+import importlib.util
 import re
 import subprocess
 import sys
@@ -63,7 +64,7 @@ def _project(
     (build_root / "dependency-providers.json").write_text(
         json.dumps(registry), encoding="utf-8"
     )
-    output = tmp_path / "assembled"
+    output = source_root / ".build" / "assembled"
     return source_root, output
 
 
@@ -84,6 +85,13 @@ def _run(source_root: Path, output: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+def _set_resources(source_root: Path, resources: list[dict[str, str]]) -> None:
+    path = source_root / "infra" / "build" / "service-manifests.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["services"]["mcp"]["resources"] = resources
+    path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def _assert_success(source_root: Path, output: Path) -> dict[str, object]:
@@ -342,3 +350,151 @@ def test_analysis_does_not_execute_synthetic_source(tmp_path: Path) -> None:
 
     assert "dependency.py" in _source_paths(report)
     assert not marker.exists()
+
+
+def test_resources_are_staged_and_reported_with_hashes(tmp_path: Path) -> None:
+    source_root, output = _project(tmp_path, {"main.py": "VALUE = 1\n", "assets/model.bin": "model bytes"})
+    _set_resources(source_root, [{"source_path": "assets/model.bin", "runtime_path": "data/model.bin"}])
+
+    report = _assert_success(source_root, output)
+
+    assert (output / "data" / "model.bin").read_bytes() == b"model bytes"
+    assert report["resources"] == [{
+        "source_path": "assets/model.bin",
+        "runtime_path": "data/model.bin",
+        "sha256": __import__("hashlib").sha256(b"model bytes").hexdigest(),
+    }]
+
+
+def test_resource_directory_inventory_excludes_build_and_test_material(tmp_path: Path) -> None:
+    source_root, output = _project(
+        tmp_path,
+        {
+            "main.py": "VALUE = 1\n",
+            "assets/keep.bin": "keep",
+            "assets/.env.local": "secret",
+            "assets/tests/test_data.bin": "test data",
+            "assets/.build/stale.bin": "stale build",
+        },
+    )
+    _set_resources(source_root, [{"source_path": "assets", "runtime_path": "data"}])
+
+    report = _assert_success(source_root, output)
+
+    assert (output / "data" / "keep.bin").read_bytes() == b"keep"
+    assert not (output / "data" / ".env.local").exists()
+    assert not (output / "data" / "tests").exists()
+    assert not (output / "data" / ".build").exists()
+    assert [item["runtime_path"] for item in report["resources"]] == ["data/keep.bin"]
+
+
+def test_resource_walk_error_fails_with_declared_resource_and_no_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root, output = _project(
+        tmp_path,
+        {"main.py": "VALUE = 1\n", "assets/subdir/file.bin": "asset"},
+    )
+    _set_resources(source_root, [{"source_path": "assets", "runtime_path": "data"}])
+    spec = importlib.util.spec_from_file_location("assemble_under_test", ASSEMBLER)
+    assert spec is not None and spec.loader is not None
+    assembler_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(assembler_module)
+    original_walk = assembler_module.os.walk
+    resource_root = source_root / "assets"
+
+    def walk_with_resource_error(top: object, *args: object, **kwargs: object):
+        onerror = kwargs.get("onerror")
+        if Path(top) == resource_root and onerror is not None:
+            onerror(PermissionError("synthetic traversal failure"))
+        yield from original_walk(top, *args, **kwargs)
+
+    monkeypatch.setattr(assembler_module.os, "walk", walk_with_resource_error)
+
+    with pytest.raises(assembler_module.AssemblyError, match="cannot enumerate resource 'assets'"):
+        assembler_module.assemble("mcp", output, source_root)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("source_path", ["../outside.txt", ".env.local", "missing.bin"])
+def test_missing_traversing_or_excluded_resources_fail_without_publish(tmp_path: Path, source_path: str) -> None:
+    source_root, output = _project(tmp_path, {"main.py": "VALUE = 1\n", ".env.local": "secret"})
+    _set_resources(source_root, [{"source_path": source_path, "runtime_path": "asset.bin"}])
+
+    result = _run(source_root, output)
+
+    assert result.returncode != 0
+    assert not output.exists()
+
+
+def test_remap_resource_and_portable_case_collisions_fail_before_publish(tmp_path: Path) -> None:
+    source_root, output = _project(
+        tmp_path,
+        {"main.py": "import src.dep\n", "src/dep.py": "VALUE = 1\n", "assets/file": "x"},
+        path_remaps={"src/dep.py": "DATA/item.py"},
+    )
+    _set_resources(source_root, [{"source_path": "assets/file", "runtime_path": "data/ITEM.py"}])
+
+    result = _run(source_root, output)
+
+    assert result.returncode != 0
+    assert "collision" in (result.stdout + result.stderr).lower()
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("path_remaps", "resource_runtime"),
+    [
+        ({"src/dep.py": "Tests/dep.py"}, None),
+        ({}, ".ENV.private/data.bin"),
+    ],
+)
+def test_excluded_runtime_destinations_fail_for_sources_and_resources(
+    tmp_path: Path,
+    path_remaps: dict[str, str],
+    resource_runtime: str | None,
+) -> None:
+    files = {"main.py": "import src.dep\n", "src/dep.py": "VALUE = 1\n", "assets/file.bin": "asset"}
+    source_root, output = _project(tmp_path, files, path_remaps=path_remaps)
+    if resource_runtime is not None:
+        _set_resources(source_root, [{"source_path": "assets/file.bin", "runtime_path": resource_runtime}])
+
+    result = _run(source_root, output)
+
+    assert result.returncode != 0
+    assert "excluded" in (result.stdout + result.stderr).lower()
+    assert not output.exists()
+
+
+def test_output_must_be_inside_source_build_and_failed_rebuild_preserves_output(tmp_path: Path) -> None:
+    source_root, output = _project(tmp_path, {"main.py": "VALUE = 1\n"})
+    assert _run(source_root, output).returncode == 0
+    before = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+
+    unsafe = _run(source_root, tmp_path / "outside")
+    assert unsafe.returncode != 0
+    assert "strict descendant" in (unsafe.stdout + unsafe.stderr)
+
+    _set_resources(source_root, [{"source_path": "main.py", "runtime_path": "main.py"}])
+    failed_rebuild = _run(source_root, output)
+
+    assert failed_rebuild.returncode != 0
+    after = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    assert after == before
+    assert not list(output.parent.glob(".assemble-stage-*"))
+    assert not list(output.parent.glob(".assemble-backup-*"))
+
+
+def test_report_and_output_bytes_are_deterministic_and_replacement_is_complete(tmp_path: Path) -> None:
+    source_root, output = _project(tmp_path, {"main.py": "import dependency\n", "dependency.py": "VALUE = 2\n"})
+    assert _run(source_root, output).returncode == 0
+    first = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    # Include the generated artifact in the next source analysis; .build remains excluded.
+    assert _run(source_root, output).returncode == 0
+    second = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    assert first == second
+    report = json.loads((output / "assembly-report.json").read_text(encoding="utf-8"))
+    assert report["config_hashes"]["service_manifest_sha256"]
+    assert all(entry["sha256"] for entry in report["source_files"])
+    assert "runtime_target" in report
+    assert not any(".build" in path for path in _source_paths(report))

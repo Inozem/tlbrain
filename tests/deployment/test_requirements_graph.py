@@ -61,7 +61,7 @@ def _project(
     (build_root / "dependency-providers.json").write_text(
         json.dumps(registry), encoding="utf-8"
     )
-    return source_root, tmp_path / "assembled"
+    return source_root, source_root / ".build" / "assembled"
 
 
 def _run(source_root: Path, output: Path) -> subprocess.CompletedProcess[str]:
@@ -145,6 +145,41 @@ def test_nested_includes_resolve_from_declaring_file_and_are_rewritten(
         for line in staged_file.read_text(encoding="utf-8").splitlines():
             if re.match(r"^\s*-[rc]\s+", line):
                 assert _include_target(staged_file, line).is_file()
+
+    result = _run(source_root, output)
+    assert result.returncode == 0, result.stderr or result.stdout
+    report = json.loads((output / "assembly-report.json").read_text(encoding="utf-8"))
+    graph = report["requirements_graph"]
+    assert len(graph["roots"]) == 1
+    assert len(graph["files"]) == 4
+    assert all(item["sha256"] for item in graph["files"])
+
+
+def test_selected_requirements_destination_collision_fails_without_replacing_output(tmp_path: Path) -> None:
+    source_root, output = _project(
+        tmp_path,
+        {
+            "main.py": "VALUE = 1\n",
+            "requirements/base.txt": "sample-sdk>=1\n",
+            "assets/duplicate": "resource",
+        },
+        requirements_roots=["requirements/base.txt"],
+    )
+    assert _run(source_root, output).returncode == 0
+    previous = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    manifest_path = source_root / "infra" / "build" / "service-manifests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["services"]["mcp"]["resources"] = [{
+        "source_path": "assets/duplicate",
+        "runtime_path": ".requirements/requirements/base.txt",
+    }]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = _run(source_root, output)
+
+    assert result.returncode != 0
+    assert "collision" in (result.stdout + result.stderr).lower()
+    assert {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()} == previous
 
 
 def test_leaf_syntax_and_local_resources_are_preserved_and_staged(

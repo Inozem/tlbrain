@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -42,12 +44,77 @@ def _safe_relative(value: str, *, label: str) -> PurePosixPath:
     return path
 
 
+def _runtime_path_excluded(path: str) -> bool:
+    """Apply source-tree exclusions to artifact destinations portably."""
+    excluded = {part.casefold() for part in EXCLUDED_PARTS} | {".build"}
+    return any(part.casefold() in excluded or part.casefold().startswith(".env") for part in PurePosixPath(path).parts)
+
+
 def _excluded(path: Path, source_root: Path) -> bool:
     try:
         parts = path.relative_to(source_root).parts
     except ValueError:
         return True
-    return any(part in EXCLUDED_PARTS or part.startswith(".env") for part in parts)
+    return any(part in EXCLUDED_PARTS or part == ".build" or part.startswith(".env") for part in parts)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_output(output: Path, source_root: Path) -> tuple[Path, Path]:
+    """Return the verified .build parent and output path without following symlinks."""
+    build_root = source_root / ".build"
+    if build_root.is_symlink():
+        raise AssemblyError("source-root .build directory must not be a symlink")
+    try:
+        build_root.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise AssemblyError(f"cannot create verified .build directory: {exc}") from exc
+    if not build_root.is_dir():
+        raise AssemblyError("source-root .build path must be a directory")
+    requested = output if output.is_absolute() else Path.cwd() / output
+    # Check every existing component from .build to the requested leaf before
+    # resolving, so a symlink cannot redirect publishing or cleanup elsewhere.
+    try:
+        relative = requested.absolute().relative_to(build_root.absolute())
+    except ValueError as exc:
+        raise AssemblyError("output directory must be a strict descendant of <source-root>/.build") from exc
+    if not relative.parts or any(part in (".", "..") for part in relative.parts):
+        raise AssemblyError("output directory must be a strict descendant of <source-root>/.build")
+    cursor = build_root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise AssemblyError("output path must not contain symlinks")
+    resolved_build = build_root.resolve()
+    resolved_output = requested.resolve()
+    if resolved_output == resolved_build or not resolved_output.is_relative_to(resolved_build):
+        raise AssemblyError("output directory must be a strict descendant of <source-root>/.build")
+    if resolved_output.exists() and not resolved_output.is_dir():
+        raise AssemblyError("output path exists and is not a directory")
+    return resolved_build, resolved_output
+
+
+def _check_destinations(paths: list[str], service_name: str) -> None:
+    """Reject duplicate, portable-case, and file/directory destination conflicts."""
+    seen: dict[str, str] = {}
+    folded = [(PurePosixPath(path).as_posix(), PurePosixPath(path).as_posix().casefold()) for path in paths]
+    for original, key in folded:
+        if key in seen:
+            raise AssemblyError(f"service {service_name}: output path collision: {original!r} and {seen[key]!r}")
+        seen[key] = original
+    keys = sorted(seen)
+    for key in keys:
+        pieces = key.split("/")
+        for i in range(1, len(pieces)):
+            parent = "/".join(pieces[:i])
+            if parent in seen:
+                raise AssemblyError(f"service {service_name}: file/directory output collision: {seen[parent]!r} and {seen[key]!r}")
 
 
 def _module_for_path(path: Path, root: Path) -> str:
@@ -774,52 +841,172 @@ def assemble(service_name: str, output: Path, source_root: Path) -> None:
     assembler = Assembler(source_root, service_name, service)
     sources = assembler.build()
     requirements_root, requirements_files, requirements_resources = assembler.requirements_graph()
-    output = output.resolve()
-    if output == source_root or output.is_relative_to(source_root):
-        raise AssemblyError("output directory must be outside the source root")
-    output.mkdir(parents=True, exist_ok=True)
+    build_root, output = _validate_output(output, source_root)
+
+    payloads: dict[str, tuple[Path | None, bytes]] = {}
+    destination_paths: list[str] = []
     entries: list[dict[str, str]] = []
     for source, _chain in sources:
         source_rel = source.relative_to(source_root).as_posix()
         runtime_rel = assembler.runtime_path(source)
-        destination = (output / Path(*PurePosixPath(runtime_rel).parts)).resolve()
-        if not destination.is_relative_to(output):
-            raise AssemblyError(f"service {service_name}: destination escapes output root: {runtime_rel}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        if _runtime_path_excluded(runtime_rel):
+            raise AssemblyError(f"service {service_name}: runtime destination is excluded: {runtime_rel!r}")
+        destination_paths.append(runtime_rel)
+        payloads[runtime_rel] = (source, b"")
         source_edges = [
             edge for edge in assembler.edges if edge["source_path"] == source_rel
         ]
         entries.append({
             "source_path": source_rel,
             "runtime_path": runtime_rel,
+            "sha256": _sha256(source),
             "import_edges": source_edges,
         })
-    (output / "requirements.txt").write_text(requirements_root, encoding="utf-8")
+
+    resource_records: list[dict[str, str]] = []
+    raw_resources = service.get("resources", [])
+    if not isinstance(raw_resources, list):
+        raise AssemblyError(f"service {service_name}: resources must be a list")
+    for item in raw_resources:
+        if not isinstance(item, dict) or not isinstance(item.get("source_path"), str) or not isinstance(item.get("runtime_path"), str):
+            raise AssemblyError(f"service {service_name}: each resource must declare source_path and runtime_path")
+        source_rel = _safe_relative(item["source_path"], label="resource source").as_posix()
+        runtime_rel = _safe_relative(item["runtime_path"], label="resource runtime path").as_posix()
+        if _runtime_path_excluded(runtime_rel):
+            raise AssemblyError(f"service {service_name}: resource runtime destination is excluded: {runtime_rel!r}")
+        source_path = source_root.joinpath(*PurePosixPath(source_rel).parts)
+        cursor = source_root
+        unsafe_link = False
+        for part in PurePosixPath(source_rel).parts:
+            cursor = cursor / part
+            unsafe_link |= cursor.is_symlink()
+        try:
+            resolved_resource = source_path.resolve()
+            if not source_path.exists():
+                raise FileNotFoundError(source_rel)
+        except (OSError, RuntimeError) as exc:
+            raise AssemblyError(f"service {service_name}: missing resource {source_rel!r}: {exc}") from exc
+        if unsafe_link or not resolved_resource.is_relative_to(source_root) or _excluded(resolved_resource, source_root):
+            raise AssemblyError(f"service {service_name}: unsafe or excluded resource {source_rel!r}")
+        if not resolved_resource.is_file() and not resolved_resource.is_dir():
+            raise AssemblyError(f"service {service_name}: resource {source_rel!r} must be a file")
+        resource_files: list[Path] = []
+        if resolved_resource.is_file():
+            resource_files.append(resolved_resource)
+        else:
+            def fail_resource_walk(error: OSError) -> None:
+                raise AssemblyError(
+                    f"service {service_name}: cannot enumerate resource {source_rel!r}: {error}"
+                ) from error
+
+            for base, dirs, files in os.walk(resolved_resource, onerror=fail_resource_walk):
+                base_path = Path(base)
+                if any((base_path / dirname).is_symlink() for dirname in dirs):
+                    raise AssemblyError(f"service {service_name}: unsafe symlink in resource {source_rel!r}")
+                dirs[:] = sorted(
+                    dirname for dirname in dirs
+                    if dirname not in EXCLUDED_PARTS and dirname != ".build" and not dirname.startswith(".env")
+                )
+                for filename in sorted(files):
+                    candidate = base_path / filename
+                    if candidate.is_symlink():
+                        raise AssemblyError(f"service {service_name}: unsafe symlink in resource {source_rel!r}")
+                    if not _excluded(candidate, source_root):
+                        resource_files.append(candidate)
+        for resource_file in sorted(resource_files, key=lambda path: path.relative_to(source_root).as_posix()):
+            relative_from_resource = resource_file.relative_to(resolved_resource).as_posix() if resolved_resource.is_dir() else ""
+            resource_runtime = "/".join(part for part in (runtime_rel, relative_from_resource) if part)
+            destination_paths.append(resource_runtime)
+            payloads[resource_runtime] = (resource_file, b"")
+            resource_records.append({
+                "source_path": resource_file.relative_to(source_root).as_posix(),
+                "runtime_path": resource_runtime,
+                "sha256": _sha256(resource_file),
+            })
+
+    reserved = ["requirements.txt", "assembly-report.json"]
+    req_resource_records: list[dict[str, str]] = []
     for relative, source in requirements_resources.items():
-        destination = (output / Path(*PurePosixPath(relative).parts)).resolve()
-        if not destination.is_relative_to(output):
-            raise AssemblyError(f"service {service_name}: requirements resource destination escapes output root: {relative}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        destination_paths.append(relative)
+        payloads[relative] = (source, b"")
+        req_resource_records.append({"runtime_path": relative, "source_path": source.relative_to(source_root).as_posix(), "sha256": _sha256(source)})
     for relative, contents in requirements_files.items():
-        destination = (output / Path(*PurePosixPath(relative).parts)).resolve()
-        if not destination.is_relative_to(output):
-            raise AssemblyError(f"service {service_name}: requirements destination escapes output root: {relative}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(contents, encoding="utf-8")
+        destination_paths.append(relative)
+        payloads[relative] = (None, contents.encode("utf-8"))
+    _check_destinations([*destination_paths, *reserved], service_name)
+
+    edges = sorted(assembler.edges, key=lambda edge: (edge["source_path"], edge["line"], edge["import"], edge["resolved_module"]))
+    for entry in entries:
+        entry["import_edges"] = [edge for edge in edges if edge["source_path"] == entry["source_path"]]
     report = {
         "schema_version": int(manifest.get("schema_version", 1)),
         "service": service_name,
+        "config_hashes": {
+            "service_manifest_sha256": _sha256(config_path),
+            "dependency_provider_registry_sha256": _sha256(source_root / "infra" / "build" / "dependency-providers.json")
+            if (source_root / "infra" / "build" / "dependency-providers.json").is_file() else None,
+        },
         "source_files": entries,
-        "import_edges": assembler.edges,
+        "import_edges": edges,
         "required_external_imports": sorted(
             assembler.external.values(),
             key=lambda item: (item["name"], item["source_path"], item["line"]),
         ),
+        "provider_roots": assembler._selected_provider_requirements(),
+        "requirements_graph": {
+            "roots": [line[len("-r "):].strip() for line in requirements_root.splitlines() if line.startswith("-r ")],
+            "files": [
+                {"runtime_path": path, "sha256": hashlib.sha256(contents.encode("utf-8")).hexdigest()}
+                for path, contents in sorted(requirements_files.items())
+            ],
+            "resources": sorted(req_resource_records, key=lambda item: (item["runtime_path"], item["source_path"])),
+        },
+        "resources": sorted(resource_records, key=lambda item: (item["source_path"], item["runtime_path"])),
+        "runtime_target": service.get("runtime", {}).get("target") if isinstance(service.get("runtime", {}), dict) else None,
     }
-    report_path = output / "assembly-report.json"
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_bytes = (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+    # Stage beside the output so the final directory rename stays on one volume.
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix=".assemble-stage-", dir=output.parent))
+    except OSError as exc:
+        raise AssemblyError(f"service {service_name}: cannot create output staging directory: {exc}") from exc
+    backup: Path | None = None
+    try:
+        for relative, (source, contents) in payloads.items():
+            destination = stage.joinpath(*PurePosixPath(relative).parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source is None:
+                destination.write_bytes(contents)
+            else:
+                shutil.copy2(source, destination)
+        (stage / "requirements.txt").write_text(requirements_root, encoding="utf-8")
+        (stage / "assembly-report.json").write_bytes(report_bytes)
+        if output.exists():
+            backup = Path(tempfile.mkdtemp(prefix=".assemble-backup-", dir=output.parent))
+            backup.rmdir()
+            os.replace(output, backup)
+        try:
+            os.replace(stage, output)
+        except OSError:
+            if backup is not None and backup.exists():
+                os.replace(backup, output)
+                backup = None
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
+            backup = None
+    except OSError as exc:
+        raise AssemblyError(f"service {service_name}: could not publish assembly output: {exc}") from exc
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+        if backup is not None and backup.exists():
+            # A backup is removed only after the old output has been restored or
+            # a successful new output is in place.
+            if output.exists():
+                shutil.rmtree(backup)
 
 
 def main(argv: list[str] | None = None) -> int:
