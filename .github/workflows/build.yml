@@ -1,19 +1,140 @@
 name: Build and push Docker images
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "core/**"
+      - "services/**"
+      - "infra/**"
+      - "tests/**"
+      - "migrations/**"
+      - "requirements*.txt"
+      - "**/requirements*.txt"
+      - "pytest.ini"
+      - ".github/workflows/**"
   push:
     branches:
       - main
     paths:
       - "core/**"
       - "services/**"
-      - "requirements-common.txt"
-      - "infra/docker/**"
+      - "infra/**"
+      - "tests/**"
+      - "migrations/**"
+      - "requirements*.txt"
+      - "**/requirements*.txt"
+      - "pytest.ini"
+      - ".github/workflows/**"
     tags:
       - "v*"
 
 jobs:
+  offline-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install declared development requirements
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Run offline regression suite
+        run: python -m pytest -q
+
+  source-validation:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - mcp
+          - vector_sync
+          - tldv_import
+          - sync_checker
+          - tldv_webhook
+          - tldv_reconciliation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate assembled source artifact
+        run: >-
+          bash infra/build/preflight.sh
+          --service "${{ matrix.service }}"
+          --source-root "$GITHUB_WORKSPACE"
+          --output "$GITHUB_WORKSPACE/.build/ci/source-${{ matrix.service }}"
+
+  image-validation:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: mcp
+            dockerfile: infra/docker/Dockerfile.mcp
+          - service: vector_sync
+            dockerfile: infra/docker/Dockerfile.vector_sync
+          - service: tldv_import
+            dockerfile: infra/docker/Dockerfile.tldv_import
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build final Linux amd64 image
+        run: docker build --platform linux/amd64 --file "${{ matrix.dockerfile }}" --tag "tlbrain-gated:${{ matrix.service }}" .
+      - name: Validate actual final image
+        run: >-
+          bash infra/build/preflight.sh --image-mode
+          --image "tlbrain-gated:${{ matrix.service }}"
+          --service "${{ matrix.service }}"
+          --platform linux/amd64
+      - name: Save gated image
+        run: docker save "tlbrain-gated:${{ matrix.service }}" --output "${{ runner.temp }}/${{ matrix.service }}.tar"
+      - name: Upload gated image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gated-image-${{ matrix.service }}
+          path: ${{ runner.temp }}/${{ matrix.service }}.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  native-bootstrap-smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install smoke test runner
+        run: python -m pip install --disable-pip-version-check "pytest>=8.0"
+      - name: Exercise synthetic refresh-token gcloud fallback
+        run: >-
+          python -m pytest -q --confcutdir=tests/deployment
+          tests/deployment/test_runner_bootstrap.py
+          -k "discovery_fallback_uses_only_gcloud_python_location or discovery_refresh_token_uses_gcloud_fallback_without_setup_and_preserves_inputs"
+      - name: Validate a lightweight Function on the prepared host
+        shell: bash
+        run: >-
+          bash infra/build/preflight.sh
+          --service sync_checker
+          --source-root "$GITHUB_WORKSPACE"
+          --output "$GITHUB_WORKSPACE/.build/ci/native-${{ matrix.os }}-sync-checker"
+
   build-mcp:
+    needs:
+      - offline-regression
+      - source-validation
+      - image-validation
+      - native-bootstrap-smoke
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,15 +155,29 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - name: Download gated image
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          file: infra/docker/Dockerfile.mcp
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          name: gated-image-mcp
+          path: ${{ runner.temp }}/gated-image
+      - name: Load, tag, and push gated image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          docker load --input "${{ runner.temp }}/gated-image/mcp.tar"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag "tlbrain-gated:mcp" "$tag"
+            docker push "$tag"
+          done <<< "$TAGS"
 
   build-tldv-import:
+    needs:
+      - offline-regression
+      - source-validation
+      - image-validation
+      - native-bootstrap-smoke
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,15 +198,29 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - name: Download gated image
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          file: infra/docker/Dockerfile.tldv_import
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          name: gated-image-tldv_import
+          path: ${{ runner.temp }}/gated-image
+      - name: Load, tag, and push gated image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          docker load --input "${{ runner.temp }}/gated-image/tldv_import.tar"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag "tlbrain-gated:tldv_import" "$tag"
+            docker push "$tag"
+          done <<< "$TAGS"
 
   build-vector-sync:
+    needs:
+      - offline-regression
+      - source-validation
+      - image-validation
+      - native-bootstrap-smoke
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -92,10 +241,18 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - name: Download gated image
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          file: infra/docker/Dockerfile.vector_sync
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          name: gated-image-vector_sync
+          path: ${{ runner.temp }}/gated-image
+      - name: Load, tag, and push gated image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          docker load --input "${{ runner.temp }}/gated-image/vector_sync.tar"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag "tlbrain-gated:vector_sync" "$tag"
+            docker push "$tag"
+          done <<< "$TAGS"
