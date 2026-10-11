@@ -21,30 +21,17 @@ VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
   --format='value(status.url)')
 
-STAGE=$(mktemp -d)
-trap "rm -rf ${STAGE}" EXIT
-
-cp "${REPO_ROOT}/services/sync_checker/main.py" "${STAGE}/"
-cat "${REPO_ROOT}/services/sync_checker/requirements.txt" \
-    "${REPO_ROOT}/core/google_drive/requirements.txt" \
-    "${REPO_ROOT}/core/utils/requirements.txt" > "${STAGE}/requirements.txt"
-
-mkdir -p "${STAGE}/core/google_drive"
-mkdir -p "${STAGE}/core/utils"
-cp "${REPO_ROOT}/core/__init__.py" "${STAGE}/core/"
-cp "${REPO_ROOT}/core/config.py" "${STAGE}/core/"
-cp "${REPO_ROOT}/core/google_drive/__init__.py" "${STAGE}/core/google_drive/"
-cp "${REPO_ROOT}/core/google_drive/drive_client.py" "${STAGE}/core/google_drive/"
-cp "${REPO_ROOT}/core/google_drive/firestore.py" "${STAGE}/core/google_drive/"
-cp "${REPO_ROOT}/core/utils/__init__.py" "${STAGE}/core/utils/"
-cp "${REPO_ROOT}/core/utils/tasks.py" "${STAGE}/core/utils/"
-cp "${REPO_ROOT}/core/utils/logging.py" "${STAGE}/core/utils/"
+ARTIFACT="${REPO_ROOT}/.build/sync_checker"
+"${REPO_ROOT}/infra/build/preflight.sh" \
+  --service sync_checker \
+  --source-root "${REPO_ROOT}" \
+  --output "${ARTIFACT}"
 
 gcloud functions deploy "${SYNC_CHECKER_NAME}" \
   --gen2 \
   --runtime python312 \
   --region "${REGION}" \
-  --source "${STAGE}" \
+  --source "${ARTIFACT}" \
   --entry-point checker \
   --trigger-http \
   --allow-unauthenticated \

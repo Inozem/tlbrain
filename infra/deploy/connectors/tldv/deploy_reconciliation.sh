@@ -23,31 +23,17 @@ IMPORT_SERVICE_URL=$(gcloud run services describe "${TLDV_IMPORT_SERVICE_NAME}" 
   --region "${REGION}" \
   --format='value(status.url)')
 
-STAGE=$(mktemp -d)
-trap "rm -rf ${STAGE}" EXIT
-
-cp "${REPO_ROOT}/services/connectors/tldv/reconciliation/main.py" "${STAGE}/"
-cp "${REPO_ROOT}/services/connectors/tldv/tldv_client.py" "${STAGE}/"
-cat "${REPO_ROOT}/services/connectors/tldv/reconciliation/requirements.txt" \
-    "${REPO_ROOT}/core/utils/requirements.txt" \
-    "${REPO_ROOT}/core/google_drive/requirements.txt" > "${STAGE}/requirements.txt"
-
-mkdir -p "${STAGE}/core/utils"
-mkdir -p "${STAGE}/core/google_drive"
-cp "${REPO_ROOT}/core/__init__.py" "${STAGE}/core/"
-cp "${REPO_ROOT}/core/config.py" "${STAGE}/core/"
-cp "${REPO_ROOT}/core/utils/__init__.py" "${STAGE}/core/utils/"
-cp "${REPO_ROOT}/core/utils/tasks.py" "${STAGE}/core/utils/"
-cp "${REPO_ROOT}/core/utils/logging.py" "${STAGE}/core/utils/"
-cp "${REPO_ROOT}/core/utils/retry.py" "${STAGE}/core/utils/"
-cp "${REPO_ROOT}/core/google_drive/__init__.py" "${STAGE}/core/google_drive/"
-cp "${REPO_ROOT}/core/google_drive/firestore.py" "${STAGE}/core/google_drive/"
+ARTIFACT="${REPO_ROOT}/.build/tldv_reconciliation"
+"${REPO_ROOT}/infra/build/preflight.sh" \
+  --service tldv_reconciliation \
+  --source-root "${REPO_ROOT}" \
+  --output "${ARTIFACT}"
 
 gcloud functions deploy "${TLDV_RECONCILIATION_FUNCTION_NAME}" \
   --gen2 \
   --runtime python312 \
   --region "${REGION}" \
-  --source "${STAGE}" \
+  --source "${ARTIFACT}" \
   --entry-point tldv_reconciliation \
   --trigger-http \
   --allow-unauthenticated \
