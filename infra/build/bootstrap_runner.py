@@ -208,6 +208,11 @@ def _version(value: str) -> tuple[int, int, int]:
     return int(match[1]), int(match[2]), int(match[3] or 0)
 
 
+def _normalize_windows_version(value: str) -> str:
+    """Make major-only Windows releases parseable as numeric OS versions."""
+    return f"{value}.0" if re.fullmatch(r"\d+", value) else value
+
+
 def _safe_relative(value: str, *, label: str) -> PurePosixPath:
     if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
         raise ValueError(f"unsafe {label} path")
@@ -294,7 +299,7 @@ def _current_platform() -> dict[str, str]:
     system = sys.platform
     if system.startswith("win"):
         name, libc = "windows", "none"
-        os_version = host_platform.win32_ver()[0]
+        os_version = _normalize_windows_version(host_platform.win32_ver()[0])
         libc_version = ""
     elif system == "darwin":
         name, libc = "macos", "none"
@@ -335,7 +340,10 @@ def _probe_interpreter(path: Path) -> dict[str, Any]:
     if result.returncode:
         raise RuntimeError(f"interpreter probe failed: {result.stderr.strip()}")
     try:
-        return json.loads(result.stdout.strip().splitlines()[-1])
+        facts = json.loads(result.stdout.strip().splitlines()[-1])
+        if facts.get("os") == "windows" and isinstance(facts.get("os_version"), str):
+            facts["os_version"] = _normalize_windows_version(facts["os_version"])
+        return facts
     except (ValueError, IndexError) as exc:
         raise RuntimeError("interpreter probe returned invalid data") from exc
 

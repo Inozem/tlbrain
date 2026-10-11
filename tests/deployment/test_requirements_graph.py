@@ -320,6 +320,10 @@ def test_optional_only_qualified_provider_is_excluded(tmp_path: Path) -> None:
 
     _assert_success(source_root, output)
     assert "optional-sdk-dist" not in _selected_requirements(output)
+    report = json.loads((output / "assembly-report.json").read_text(encoding="utf-8"))
+    assert "acme.optional_sdk.client" not in {
+        item["name"] for item in report["required_external_imports"]
+    }
 
 
 def test_same_prefix_required_elsewhere_selects_explicit_provider_file(
@@ -351,6 +355,12 @@ def test_same_prefix_required_elsewhere_selects_explicit_provider_file(
     selected = _selected_requirements(output)
     assert "mapped-distribution>=7" in selected
     assert "acme.optional_sdk" not in selected
+    report = json.loads((output / "assembly-report.json").read_text(encoding="utf-8"))
+    required_imports = {
+        item["name"] for item in report["required_external_imports"]
+    }
+    assert "acme.optional_sdk.client" not in required_imports
+    assert "acme.optional_sdk.required_api" in required_imports
 
 
 def test_optional_type_checking_import_is_excluded_by_qualified_context(

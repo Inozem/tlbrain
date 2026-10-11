@@ -289,6 +289,17 @@ _SERVICE_CMDS = {
 }
 
 
+def _bm25_cache_probe_code() -> str:
+    """Return an offline probe that validates a usable sparse BM25 vector."""
+    return (
+        "from fastembed import SparseTextEmbedding; "
+        "vectors=SparseTextEmbedding(model_name='Qdrant/bm25').embed(['offline cache probe']); "
+        "vector=next(iter(vectors), None); "
+        "assert vector is not None; "
+        "assert len(vector.indices) > 0 and len(vector.indices) == len(vector.values)"
+    )
+
+
 def _validate_service_runtime(config: dict[str, Any], service: str) -> None:
     container = config.get("config")
     if not isinstance(container, dict) or container.get("Cmd") != _SERVICE_CMDS[service]:
@@ -369,13 +380,7 @@ def _run_image_runtime_validation(
         if validation.get("status") != "passed" or validation.get("service") != service or validation.get("target") != target:
             raise RuntimeError("image revalidation did not pass for the reported target")
         if service in {"mcp", "vector_sync"}:
-            cache_code = (
-                "from fastembed import SparseTextEmbedding; "
-                "vectors=SparseTextEmbedding(model_name='Qdrant/bm25').embed(['offline cache probe']); "
-                "vector=next(iter(vectors), None); "
-                "assert vector is not None and len(vector) > 0"
-            )
-            cache = docker.run(image_id, ["python", "-I", "-c", cache_code], [])
+            cache = docker.run(image_id, ["python", "-I", "-c", _bm25_cache_probe_code()], [])
             if cache.returncode:
                 raise RuntimeError("image BM25 cache is missing or unusable offline")
 
@@ -436,13 +441,7 @@ def run_image_preflight(
         if validation.get("status") != "passed" or validation.get("service") != service or validation.get("target") != target:
             raise RuntimeError("image validation did not pass for the reported target")
         if service in {"mcp", "vector_sync"}:
-            cache_code = (
-                "from fastembed import SparseTextEmbedding; "
-                "vectors=SparseTextEmbedding(model_name='Qdrant/bm25').embed(['offline cache probe']); "
-                "vector=next(iter(vectors), None); "
-                "assert vector is not None and len(vector) > 0"
-            )
-            cache = docker.run(image_id, ["python", "-I", "-c", cache_code], [])
+            cache = docker.run(image_id, ["python", "-I", "-c", _bm25_cache_probe_code()], [])
             if cache.returncode:
                 raise RuntimeError("image BM25 cache is missing or unusable offline")
     checks = ["compile", "imports", "startup"]

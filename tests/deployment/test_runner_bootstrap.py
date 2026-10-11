@@ -183,6 +183,48 @@ def _platform() -> dict[str, str]:
     }
 
 
+@pytest.mark.parametrize(
+    ("release", "expected"),
+    [("11", "11.0"), ("8.1", "8.1"), ("10.0.22631", "10.0.22631")],
+)
+def test_current_windows_platform_normalizes_major_only_release(
+    monkeypatch: pytest.MonkeyPatch, release: str, expected: str,
+) -> None:
+    runner = _runner()
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setattr(runner.host_platform, "win32_ver", lambda: (release, "", "", ""))
+
+    facts = runner._current_platform()
+
+    assert facts["os_version"] == expected
+    assert runner._at_least(facts["os_version"], "8.1", "OS version")
+
+
+@pytest.mark.parametrize(
+    ("release", "expected"),
+    [("11", "11.0"), ("8.1", "8.1"), ("10.0.22631", "10.0.22631")],
+)
+def test_candidate_probe_normalizes_windows_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, release: str, expected: str,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+    raw_facts = {
+        "version": "3.12.13", "ssl": True, "venv": True, "pip": True,
+        "os": "windows", "architecture": "AMD64", "libc": "none",
+        "libc_version": "", "os_version": release,
+    }
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(raw_facts), stderr=""),
+    )
+
+    facts = runner._probe_interpreter(candidate)
+
+    assert facts["os_version"] == expected
+    assert runner._at_least(facts["os_version"], "8.1", "OS version")
+
+
 def _fixture_probe(_path: Path) -> dict[str, object]:
     """Describe the synthetic archive executable without launching it."""
     return {

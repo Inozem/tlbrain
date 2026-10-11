@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +23,47 @@ VALIDATION_LABEL = "org.tlbrain.validation"
 # For this synthetic MCP target, evidence covers import, startup, and cache
 # checks in addition to compile; source-only smoke evidence is not sufficient.
 REQUIRED_CHECKS = ["compile", "imports", "startup", "cache"]
+
+
+@pytest.mark.parametrize(
+    "indices,values",
+    [([1], [0.5]), ([1, 2], [0.5, 0.25])],
+)
+def test_bm25_cache_probe_accepts_nonempty_consistent_sparse_vectors(
+    monkeypatch: pytest.MonkeyPatch, indices: list[int], values: list[float]
+) -> None:
+    metadata = importlib.import_module("infra.build.image_metadata")
+
+    class FakeSparseTextEmbedding:
+        def __init__(self, *, model_name: str) -> None:
+            assert model_name == "Qdrant/bm25"
+
+        def embed(self, _texts: list[str]) -> list[Any]:
+            return [SimpleNamespace(indices=indices, values=values)]
+
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(SparseTextEmbedding=FakeSparseTextEmbedding))
+    exec(metadata._bm25_cache_probe_code(), {})
+
+
+@pytest.mark.parametrize(
+    "indices,values",
+    [([], []), ([1, 2], [0.5])],
+)
+def test_bm25_cache_probe_rejects_empty_or_inconsistent_sparse_vectors(
+    monkeypatch: pytest.MonkeyPatch, indices: list[int], values: list[float]
+) -> None:
+    metadata = importlib.import_module("infra.build.image_metadata")
+
+    class FakeSparseTextEmbedding:
+        def __init__(self, *, model_name: str) -> None:
+            assert model_name == "Qdrant/bm25"
+
+        def embed(self, _texts: list[str]) -> list[Any]:
+            return [SimpleNamespace(indices=indices, values=values)]
+
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(SparseTextEmbedding=FakeSparseTextEmbedding))
+    with pytest.raises(AssertionError):
+        exec(metadata._bm25_cache_probe_code(), {})
 
 
 class FakeRegistry:

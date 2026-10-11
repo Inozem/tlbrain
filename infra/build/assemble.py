@@ -380,6 +380,39 @@ class Assembler:
                         selected.append(requirement_file)
         return selected
 
+    def _optional_external_import_keys(self) -> set[tuple[str, str, int]]:
+        """Return report entries covered by a matching optional import declaration."""
+        optional_imports = self.provider_registry.get("optional_imports", [])
+        if not isinstance(optional_imports, list):
+            return set()
+
+        optional_by_source: dict[str, list[tuple[str, str]]] = {}
+        for optional in optional_imports:
+            if not isinstance(optional, dict):
+                continue
+            source_file = optional.get("source_file")
+            prefix = optional.get("import_prefix")
+            guard = optional.get("guard_context", optional.get("guard"))
+            if isinstance(source_file, str) and isinstance(prefix, str) and isinstance(guard, str):
+                optional_by_source.setdefault(source_file.replace("\\", "/"), []).append((prefix, guard))
+
+        optional_keys: set[tuple[str, str, int]] = set()
+        for source, info in self.sources.items():
+            source_rel = source.relative_to(self.root).as_posix()
+            declared_optional = optional_by_source.get(source_rel, [])
+            if not declared_optional:
+                continue
+            collector = _GuardedImportCollector()
+            collector.visit(info["tree"])
+            for node, guards in collector.imports:
+                for imported in _imported_modules(node):
+                    if any(
+                        guard in guards and _is_import_prefix(imported, prefix)
+                        for prefix, guard in declared_optional
+                    ):
+                        optional_keys.add((imported, source_rel, getattr(node, "lineno", 1)))
+        return optional_keys
+
     def _is_external(self, module: str) -> bool:
         if self._is_stdlib(module) or self._is_qualified_provider(module):
             return True
@@ -938,6 +971,7 @@ def assemble(service_name: str, output: Path, source_root: Path) -> None:
     edges = sorted(assembler.edges, key=lambda edge: (edge["source_path"], edge["line"], edge["import"], edge["resolved_module"]))
     for entry in entries:
         entry["import_edges"] = [edge for edge in edges if edge["source_path"] == entry["source_path"]]
+    optional_external_imports = assembler._optional_external_import_keys()
     report = {
         "schema_version": int(manifest.get("schema_version", 1)),
         "service": service_name,
@@ -949,7 +983,10 @@ def assemble(service_name: str, output: Path, source_root: Path) -> None:
         "source_files": entries,
         "import_edges": edges,
         "required_external_imports": sorted(
-            assembler.external.values(),
+            (
+                item for item in assembler.external.values()
+                if (item["name"], item["source_path"], item["line"]) not in optional_external_imports
+            ),
             key=lambda item: (item["name"], item["source_path"], item["line"]),
         ),
         "provider_roots": assembler._selected_provider_requirements(),
