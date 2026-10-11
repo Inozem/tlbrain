@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -175,7 +177,21 @@ class _Downloader:
 
 
 def _platform() -> dict[str, str]:
-    return {"os": "windows", "architecture": "x86_64", "libc": "none"}
+    return {
+        "os": "windows", "architecture": "x86_64", "libc": "none",
+        "os_version": "10.0", "libc_version": "",
+    }
+
+
+def _fixture_probe(_path: Path) -> dict[str, object]:
+    """Describe the synthetic archive executable without launching it."""
+    return {
+        "version": "3.12.99",
+        "ssl": True,
+        "venv": True,
+        "pip": True,
+        **_platform(),
+    }
 
 
 def test_lock_schema_accepts_v1_and_selects_keyed_platform(tmp_path: Path) -> None:
@@ -245,16 +261,19 @@ def test_portable_runner_cold_then_warm_cache_uses_verified_archive(tmp_path: Pa
     downloader = _Downloader(archive)
     cache = tmp_path / "private-cache"
     first = runner.ensure_runtime(
-        lock_path, cache, _platform(), downloader=downloader
+        lock_path, cache, _platform(), downloader=downloader,
+        interpreter_probe=_fixture_probe,
     )
     assert Path(first).is_file()
     assert downloader.calls == ["https://example.invalid/fixture/cpython.tar.gz"]
     assert not list(cache.rglob("*.partial"))
     second = runner.ensure_runtime(
-        lock_path, cache, _platform(), downloader=downloader
+        lock_path, cache, _platform(), downloader=downloader,
+        interpreter_probe=_fixture_probe,
     )
     assert Path(second) == Path(first)
     assert len(downloader.calls) == 1
+    assert Path(first).parent.parent.parent.parent.name == "generations"
 
 
 def test_portable_runner_repairs_corrupt_cache_without_exposing_partial_activation(
@@ -266,14 +285,152 @@ def test_portable_runner_repairs_corrupt_cache_without_exposing_partial_activati
     downloader = _Downloader(archive)
     cache = tmp_path / "private-cache"
     cache.mkdir()
-    (cache / "active").mkdir()
-    (cache / "active" / "python.exe").write_text("corrupt", encoding="utf-8")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    generation = cache / "generations" / f"windows-x86_64-none-{digest}"
+    executable = generation / "python" / "bin" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("corrupt", encoding="utf-8")
     executable = runner.ensure_runtime(
-        lock_path, cache, _platform(), downloader=downloader
+        lock_path, cache, _platform(), downloader=downloader,
+        interpreter_probe=_fixture_probe,
     )
     assert Path(executable).is_file()
     assert len(downloader.calls) == 1
     assert not list(cache.glob("*.partial"))
+
+
+def test_portable_runner_repairs_generation_when_cached_mode_changes_without_probing_it(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    archive = _fixture_archive("valid-toolchain.tar.gz")
+    downloader = _Downloader(archive)
+    cache = tmp_path / "private-cache"
+    lock_path = _write_lock(tmp_path)
+    probed: list[Path] = []
+
+    def probe(path: Path) -> dict[str, object]:
+        probed.append(path)
+        return _fixture_probe(path)
+
+    runtime = runner.ensure_runtime(
+        lock_path, cache, _platform(), downloader=downloader, interpreter_probe=probe,
+    )
+    damaged = Path(runtime)
+    os.chmod(damaged, 0o444)
+    probed.clear()
+    repaired = runner.ensure_runtime(
+        lock_path, cache, _platform(), downloader=downloader, interpreter_probe=probe,
+    )
+    assert Path(repaired) == damaged
+    assert os.stat(repaired).st_mode & 0o222
+    assert len(downloader.calls) == 2
+    assert probed and all("runner-" in str(path) for path in probed)
+
+
+def test_portable_runner_publish_failure_keeps_prior_generation_available(tmp_path: Path) -> None:
+    runner = _runner()
+    original_archive = _fixture_archive("valid-toolchain.tar.gz")
+    lock_path = _write_lock(tmp_path, _lock_document(original_archive))
+    cache = tmp_path / "private-cache"
+    original = runner.ensure_runtime(
+        lock_path, cache, _platform(), downloader=_Downloader(original_archive),
+        interpreter_probe=_fixture_probe,
+    )
+    original_generation = Path(original).parents[2]
+
+    replacement_archive = tmp_path / "replacement.tar.gz"
+    _write_tar(replacement_archive, [("python/bin/python.exe", b"replacement", "file", 0o755)])
+    lock_path.write_text(json.dumps(_lock_document(replacement_archive)), encoding="utf-8")
+
+    def fail_publish(_staged: Path, target: Path) -> None:
+        assert target != original_generation
+        raise RuntimeError("synthetic publish failure")
+
+    with pytest.raises(RuntimeError, match="synthetic publish failure"):
+        runner.ensure_runtime(
+            lock_path, cache, _platform(), downloader=_Downloader(replacement_archive),
+            interpreter_probe=_fixture_probe, publisher=fail_publish,
+        )
+    assert original_generation.is_dir()
+    assert Path(original).is_file()
+    assert runner.check_runtime(original)["python_minor"] == "3.12"
+
+
+def test_check_runtime_fails_closed_for_managed_generation_with_bad_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    runtime = runner.ensure_runtime(
+        _write_lock(tmp_path), tmp_path / "cache", _platform(),
+        downloader=_Downloader(_fixture_archive("valid-toolchain.tar.gz")),
+        interpreter_probe=_fixture_probe,
+    )
+    marker = Path(runtime).parents[2] / ".bootstrap-runtime.json"
+    marker.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(runner, "_probe_interpreter", lambda _path: pytest.fail("managed runtime was executed"))
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity|marker)"):
+        runner.check_runtime(runtime)
+
+
+@pytest.mark.parametrize("bound", ["os_version_min", "libc_version_min"])
+def test_portable_runner_enforces_platform_minimum_boundaries(
+    tmp_path: Path, bound: str,
+) -> None:
+    runner = _runner()
+    archive = _fixture_archive("valid-toolchain.tar.gz")
+    document = _lock_document(archive)
+    entry = document["entries"]["windows-x86_64-none"]
+    at_minimum = "10.0" if bound == "os_version_min" else "2.17"
+    below_minimum = "9.9" if bound == "os_version_min" else "2.16"
+    entry[bound] = at_minimum
+    platform_facts = dict(_platform())
+    if bound == "libc_version_min":
+        del document["entries"]["windows-x86_64-none"]
+        entry.update(os="linux", libc="glibc")
+        document["entries"]["linux-x86_64-glibc"] = entry
+        platform_facts.update(os="linux", libc="glibc", os_version="", libc_version=at_minimum)
+
+    def probe(path: Path) -> dict[str, object]:
+        version_facts = dict(platform_facts)
+        if path.name == "native-python":
+            version_facts["os_version" if bound == "os_version_min" else "libc_version"] = below_minimum
+        return {
+            "version": "3.12.7", "ssl": True, "venv": True, "pip": True,
+            **version_facts,
+        }
+
+    lock_path = _write_lock(tmp_path, document)
+    with pytest.raises(RuntimeError, match="(?i)(minimum|version)"):
+        runner.ensure_runtime(
+            lock_path, tmp_path / "below-host", {
+                **platform_facts,
+                "os_version" if bound == "os_version_min" else "libc_version": below_minimum,
+            },
+            downloader=_Downloader(archive), interpreter_probe=probe,
+        )
+
+    def downloaded_below(_path: Path) -> dict[str, object]:
+        facts = dict(platform_facts)
+        facts["os_version" if bound == "os_version_min" else "libc_version"] = below_minimum
+        return {"version": "3.12.7", "ssl": True, "venv": True, "pip": True, **facts}
+
+    with pytest.raises(RuntimeError, match="(?i)(minimum|version)"):
+        runner.ensure_runtime(
+            lock_path, tmp_path / "below-runtime", platform_facts,
+            downloader=_Downloader(archive), interpreter_probe=downloaded_below,
+        )
+
+    native = tmp_path / "native-python"
+    native.write_text("synthetic native Python", encoding="utf-8")
+    downloader = _Downloader(archive)
+    runtime = runner.ensure_runtime(
+        lock_path, tmp_path / "at-bound", platform_facts,
+        native_interpreter=native,
+        downloader=downloader, interpreter_probe=probe,
+    )
+    assert Path(runtime).is_file()
+    assert len(downloader.calls) == 1
 
 
 def test_portable_runner_checksum_failure_precedes_extraction_and_publish(tmp_path: Path) -> None:
@@ -320,6 +477,34 @@ def test_portable_runner_downloader_failure_precedes_activation_and_cleans_parti
     assert not cache.exists() or list(cache.rglob("*")) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory symlink behavior")
+def test_portable_runner_rejects_symlinked_generations_directory_before_touching_target(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    cache = tmp_path / "private-cache"
+    outside = tmp_path / "outside"
+    cache.mkdir()
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    try:
+        (cache / "generations").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+    with pytest.raises(RuntimeError, match="(?i)(symlink|reparse|generations)"):
+        runner.ensure_runtime(
+            _write_lock(tmp_path), cache, _platform(), downloader=downloader,
+            interpreter_probe=_fixture_probe,
+        )
+
+    assert downloader.calls == []
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in outside.iterdir()) == ["keep.txt"]
+
+
 @pytest.mark.parametrize("archive_name", ["traversal-toolchain.tar.gz", "link-escape-toolchain.tar.gz"])
 def test_portable_runner_rejects_archive_path_escape_before_activation(
     tmp_path: Path, archive_name: str
@@ -340,6 +525,62 @@ def test_portable_runner_rejects_archive_path_escape_before_activation(
     assert activated == []
 
 
+def _write_tar(path: Path, members: list[tuple[str, bytes, str, int]]) -> None:
+    with tarfile.open(path, "w:gz") as archive:
+        for name, content, kind, mode in members:
+            info = tarfile.TarInfo(name)
+            info.mode = mode
+            if kind == "file":
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+            elif kind == "dir":
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            elif kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = content.decode()
+                archive.addfile(info)
+            elif kind == "fifo":
+                info.type = tarfile.FIFOTYPE
+                archive.addfile(info)
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        [("python/file", b"one", "file", 0o644), ("python/file", b"two", "file", 0o644)],
+        [("python/run.exe", b"one", "file", 0o755), ("python/run.exe/child", b"two", "file", 0o644)],
+        [("python/run.exe", b"", "fifo", 0o644)],
+        [("python/link", b"../outside", "symlink", 0o777), ("python/link/child", b"x", "file", 0o644)],
+    ],
+    ids=("duplicate", "file-directory-collision", "special-entry", "symlink-parent"),
+)
+def test_portable_runner_rejects_colliding_special_and_link_parent_entries(
+    tmp_path: Path, members: list[tuple[str, bytes, str, int]]
+) -> None:
+    runner = _runner()
+    archive = tmp_path / "unsafe.tar.gz"
+    _write_tar(archive, members)
+    with pytest.raises((ValueError, RuntimeError), match="(?i)(archive|duplicate|collid|special|directory|link|unsafe|path)"):
+        runner._extract_safe(archive, tmp_path / "extract")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not represented by Windows")
+def test_portable_runner_preserves_regular_file_permissions(tmp_path: Path) -> None:
+    runner = _runner()
+    archive = tmp_path / "permissions.tar.gz"
+    _write_tar(archive, [
+        ("python/bin/tool", b"synthetic", "file", 0o751),
+        ("python/bin/tool-link", b"tool", "symlink", 0o777),
+    ])
+    destination = tmp_path / "extract"
+    runner._extract_safe(archive, destination)
+    tool = destination / "python" / "bin" / "tool"
+    assert tool.stat().st_mode & 0o777 == 0o751
+    assert (tool.parent / "tool-link").is_symlink()
+    assert (tool.parent / "tool-link").read_bytes() == b"synthetic"
+
+
 @pytest.mark.parametrize("host_minor", ["3.10", "3.14"])
 def test_portable_runner_never_treats_host_python_as_service_runtime(
     tmp_path: Path, host_minor: str
@@ -352,6 +593,7 @@ def test_portable_runner_never_treats_host_python_as_service_runtime(
         _platform(),
         host_python_version=f"{host_minor}.8",
         downloader=_Downloader(_fixture_archive("valid-toolchain.tar.gz")),
+        interpreter_probe=_fixture_probe,
     )
     check = runner.check_runtime(runtime)
     assert check["python_minor"] == "3.12"
@@ -363,16 +605,46 @@ def test_portable_runner_reuses_acceptable_native_cpython312(tmp_path: Path) -> 
     native = tmp_path / "native-python"
     native.write_text("synthetic native Python 3.12 probe", encoding="utf-8")
     downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+
     runtime = runner.ensure_runtime(
         _write_lock(tmp_path),
         tmp_path / "cache",
         _platform(),
         native_interpreter=native,
-        interpreter_probe=lambda _path: {"version": "3.12.7", "ssl": True, "venv": True, "pip": True},
+        interpreter_probe=lambda _path: {
+            "version": "3.12.7", "ssl": True, "venv": True, "pip": True,
+            **_platform(),
+        },
         downloader=downloader,
     )
     assert Path(runtime) == native
     assert downloader.calls == []
+
+
+def test_portable_runner_rejects_native_cpython312_for_another_platform(tmp_path: Path) -> None:
+    runner = _runner()
+    native = tmp_path / "native-python"
+    native.write_text("synthetic native Python 3.12 probe", encoding="utf-8")
+    downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+
+    def probe(path: Path) -> dict[str, object]:
+        if path == native:
+            return {
+                "version": "3.12.7", "ssl": True, "venv": True, "pip": True,
+                "os": "linux", "architecture": "x86_64", "libc": "glibc",
+            }
+        return _fixture_probe(path)
+
+    runtime = runner.ensure_runtime(
+        _write_lock(tmp_path),
+        tmp_path / "cache",
+        _platform(),
+        native_interpreter=native,
+        interpreter_probe=probe,
+        downloader=downloader,
+    )
+    assert Path(runtime) != native
+    assert len(downloader.calls) == 1
 
 
 @pytest.mark.parametrize("failed_check", ["ssl", "venv", "pip"])
