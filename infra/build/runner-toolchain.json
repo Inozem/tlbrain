@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "python_minor": "3.12",
+  "entries": {
+    "windows-x86_64-none": {
+      "os": "windows",
+      "architecture": "x86_64",
+      "libc": "none",
+      "python_patch": "3.12.14",
+      "release": "3.12.14+20260901",
+      "target_triple": "x86_64-pc-windows-msvc",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-pc-windows-msvc-install_only.tar.gz",
+      "sha256": "e90c1b6419da3bd812dd73bb3de40287a21abf153438147639ec5e20375ea93f",
+      "archive_format": "tar.gz",
+      "executable": "python/python.exe",
+      "host_python_min": "3.10",
+      "host_python_max": "3.14",
+      "os_version_min": "8.1"
+    },
+    "macos-x86_64-none": {
+      "os": "macos",
+      "architecture": "x86_64",
+      "libc": "none",
+      "python_patch": "3.12.14",
+      "release": "3.12.14+20260901",
+      "target_triple": "x86_64-apple-darwin",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-apple-darwin-install_only.tar.gz",
+      "sha256": "2e31b23f3f1319f707d0e620b48847a0046577541d357276821f9f1b5492e0ba",
+      "archive_format": "tar.gz",
+      "executable": "python/bin/python3.12",
+      "host_python_min": "3.10",
+      "host_python_max": "3.14",
+      "os_version_min": "10.15"
+    },
+    "linux-x86_64-glibc": {
+      "os": "linux",
+      "architecture": "x86_64",
+      "libc": "glibc",
+      "python_patch": "3.12.14",
+      "release": "3.12.14+20260901",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-install_only.tar.gz",
+      "sha256": "936c246dfdbbfa7cb22dd01814a21f582a892689fae96b06071a5e433baffa22",
+      "archive_format": "tar.gz",
+      "executable": "python/bin/python3.12",
+      "host_python_min": "3.10",
+      "host_python_max": "3.14",
+      "libc_version_min": "2.17"
+    }
+  }
+}

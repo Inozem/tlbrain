@@ -29,6 +29,94 @@ LOCK = BUILD_DIR / "runner-toolchain.json"
 FIXTURES = Path(__file__).parent / "fixtures" / "toolchain"
 
 
+PINNED_TOOLCHAINS = {
+    "windows-x86_64-none": {
+        "os": "windows",
+        "libc": "none",
+        "target_triple": "x86_64-pc-windows-msvc",
+        "executable": "python/python.exe",
+        "minimum_key": "os_version_min",
+        "minimum_version": "8.1",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-pc-windows-msvc-install_only.tar.gz",
+        "sha256": "e90c1b6419da3bd812dd73bb3de40287a21abf153438147639ec5e20375ea93f",
+    },
+    "macos-x86_64-none": {
+        "os": "macos",
+        "libc": "none",
+        "target_triple": "x86_64-apple-darwin",
+        "executable": "python/bin/python3.12",
+        "minimum_key": "os_version_min",
+        "minimum_version": "10.15",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-apple-darwin-install_only.tar.gz",
+        "sha256": "2e31b23f3f1319f707d0e620b48847a0046577541d357276821f9f1b5492e0ba",
+    },
+    "linux-x86_64-glibc": {
+        "os": "linux",
+        "libc": "glibc",
+        "target_triple": "x86_64-unknown-linux-gnu",
+        "executable": "python/bin/python3.12",
+        "minimum_key": "libc_version_min",
+        "minimum_version": "2.17",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-install_only.tar.gz",
+        "sha256": "936c246dfdbbfa7cb22dd01814a21f582a892689fae96b06071a5e433baffa22",
+    },
+}
+
+
+def _pinned_toolchain_lock() -> dict[str, Any]:
+    """Read the checked-in public build-toolchain pins without loading a runner."""
+    return json.loads(LOCK.read_text(encoding="utf-8"))
+
+
+def test_pinned_toolchain_schema_covers_only_supported_baselines() -> None:
+    lock = _pinned_toolchain_lock()
+    assert lock["schema_version"] == 1
+    assert lock["python_minor"] == "3.12"
+    assert set(lock["entries"]) == set(PINNED_TOOLCHAINS)
+
+
+@pytest.mark.parametrize("key", sorted(PINNED_TOOLCHAINS))
+def test_pinned_toolchain_identity_and_reviewed_asset(key: str) -> None:
+    entry = _pinned_toolchain_lock()["entries"][key]
+    expected = PINNED_TOOLCHAINS[key]
+    assert entry["os"] == expected["os"]
+    assert entry["architecture"] == "x86_64"
+    assert entry["libc"] == expected["libc"]
+    assert entry["python_patch"] == "3.12.14"
+    assert entry["release"] == "3.12.14+20260901"
+    assert entry["target_triple"] == expected["target_triple"]
+    assert entry["url"] == expected["url"]
+    assert entry["url"].endswith(f"{entry['target_triple']}-install_only.tar.gz")
+    assert entry["sha256"] == expected["sha256"]
+    assert len(entry["sha256"]) == 64
+    assert all(character in "0123456789abcdef" for character in entry["sha256"])
+    assert entry["archive_format"] == "tar.gz"
+    assert entry["executable"] == expected["executable"]
+    executable = Path(entry["executable"])
+    assert not executable.is_absolute()
+    assert ".." not in executable.parts
+
+
+@pytest.mark.parametrize("key", sorted(PINNED_TOOLCHAINS))
+def test_pinned_toolchain_host_and_platform_bounds(key: str) -> None:
+    entry = _pinned_toolchain_lock()["entries"][key]
+    expected = PINNED_TOOLCHAINS[key]
+    assert entry["host_python_min"] == "3.10"
+    assert entry["host_python_max"] == "3.14"
+    assert entry[expected["minimum_key"]] == expected["minimum_version"]
+    bound_keys = {"os_version_min", "libc_version_min"}
+    assert {name for name in bound_keys if name in entry} == {expected["minimum_key"]}
+
+
+def test_pinned_toolchain_excludes_mutable_or_incompatible_targets() -> None:
+    lock_text = LOCK.read_text(encoding="utf-8").lower()
+    assert "latest" not in lock_text
+    assert "musl" not in lock_text
+    assert "x86_64_v2" not in lock_text
+    assert "x86_64_v3" not in lock_text
+    assert all("aarch64" not in entry["target_triple"] for entry in _pinned_toolchain_lock()["entries"].values())
+
+
 def _runner() -> Any:
     """Load the future runner by absolute path, without import-time collection."""
     if not RUNNER.is_file():
