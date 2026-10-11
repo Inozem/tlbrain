@@ -359,6 +359,45 @@ def test_fingerprint_is_stable_and_covers_rootfs_and_execution_config() -> None:
     assert metadata.runtime_fingerprint(label_only) == baseline
 
 
+def test_registry_reader_rejects_empty_required_checks_before_tag_resolution() -> None:
+    metadata = _metadata()
+    fixture, registry, _ = _registry_image(metadata)
+
+    with pytest.raises(ValueError):
+        _read(registry, fixture, required_checks=[])
+
+    assert registry.resolutions == 0
+    assert registry.tag_queries == []
+
+
+def test_http_registry_rejects_insecure_remote_urls_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _metadata()
+    calls: list[Any] = []
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        calls.append((args, kwargs))
+        raise AssertionError("URL policy checks must happen before network access")
+
+    monkeypatch.setattr(metadata, "urlopen", forbidden)
+    with pytest.raises(ValueError):
+        metadata.HTTPRegistry("http://registry.example.invalid")
+
+    registry = metadata.HTTPRegistry("https://registry.example.invalid")
+    with pytest.raises(RuntimeError, match="authentication challenge is invalid"):
+        registry._fetch_bearer_token(
+            'realm="http://auth.example.invalid/token",service="registry"'
+        )
+    assert calls == []
+
+
+def test_http_registry_allows_loopback_http_without_network() -> None:
+    metadata = _metadata()
+    registry = metadata.HTTPRegistry("http://127.0.0.1:5000")
+    assert registry.base == "http://127.0.0.1:5000"
+
+
 def test_finalizer_writes_compact_record_without_changing_runtime_image(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
