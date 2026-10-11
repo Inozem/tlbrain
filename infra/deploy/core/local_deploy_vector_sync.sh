@@ -19,7 +19,11 @@ VECTOR_SYNC_MAX_INSTANCES=${VECTOR_SYNC_MAX_INSTANCES:-2}
 SYNC_IMAGE="gcr.io/${PROJECT_ID}/${VECTOR_SYNC_SERVICE_NAME}"
 
 echo "--- Building Vector Sync image ---"
-docker build -f "${REPO_ROOT}/infra/docker/Dockerfile.vector_sync" -t "${SYNC_IMAGE}" "${REPO_ROOT}"
+docker build --platform linux/amd64 -f "${REPO_ROOT}/infra/docker/Dockerfile.vector_sync" -t "${SYNC_IMAGE}" "${REPO_ROOT}"
+bash "${REPO_ROOT}/infra/build/preflight.sh" --image-mode \
+  --image "${SYNC_IMAGE}" \
+  --service vector_sync \
+  --platform linux/amd64
 docker push "${SYNC_IMAGE}"
 
 echo "--- Deploying Vector Sync Service ---"

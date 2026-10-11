@@ -23,7 +23,11 @@ SYNC_CHECKER_NAME=${SYNC_CHECKER_NAME:-tlbrain-sync-checker}
 MCP_MAX_INSTANCES=${MCP_MAX_INSTANCES:-1}
 
 echo "--- Building MCP image ---"
-docker build -f "${REPO_ROOT}/infra/docker/Dockerfile.mcp" -t "${MCP_IMAGE}" "${REPO_ROOT}"
+docker build --platform linux/amd64 -f "${REPO_ROOT}/infra/docker/Dockerfile.mcp" -t "${MCP_IMAGE}" "${REPO_ROOT}"
+bash "${REPO_ROOT}/infra/build/preflight.sh" --image-mode \
+  --image "${MCP_IMAGE}" \
+  --service mcp \
+  --platform linux/amd64
 docker push "${MCP_IMAGE}"
 
 echo "--- Deploying MCP Service ---"
