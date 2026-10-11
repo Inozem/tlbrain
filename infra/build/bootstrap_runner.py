@@ -6,6 +6,7 @@ download, unpacking, and activation work inside the caller's cache directory.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import ntpath
@@ -671,4 +672,163 @@ def ensure_runtime(
         return result
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _artifact_fingerprint(artifact: Path) -> str:
+    """Fingerprint files without opening forbidden environment files."""
+    digest = hashlib.sha256()
+    files = sorted((item for item in artifact.rglob("*") if item.is_file()), key=lambda p: p.relative_to(artifact).as_posix())
+    for path in files:
+        digest.update(path.relative_to(artifact).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        if path.name.lower().startswith(".env"):
+            digest.update(b"forbidden-environment-file-content-omitted")
+        else:
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _is_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_preflight_paths(source_root: Path, output: Path) -> tuple[Path, Path]:
+    if not source_root.is_absolute() or not output.is_absolute():
+        raise ValueError("--source-root and --output must be absolute paths")
+    source_root = Path(os.path.abspath(source_root))
+    if not source_root.is_dir():
+        raise ValueError("--source-root must be a directory")
+    build_root = source_root / ".build"
+    if build_root.is_symlink():
+        raise ValueError("source-root .build directory must not be a symlink")
+    requested = Path(os.path.abspath(output))
+    try:
+        relative = requested.relative_to(build_root)
+    except ValueError as exc:
+        raise ValueError("--output must be a strict descendant of <source-root>/.build") from exc
+    if not relative.parts or any(part in (".", "..") for part in relative.parts):
+        raise ValueError("--output must be a strict descendant of <source-root>/.build")
+    cursor = build_root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError("--output path must not contain symlinks")
+    resolved_build = Path(os.path.abspath(build_root))
+    resolved_output = Path(os.path.abspath(requested))
+    if resolved_output == resolved_build or not _is_inside(resolved_output, resolved_build):
+        raise ValueError("--output must be a strict descendant of <source-root>/.build")
+    toolchain_root = resolved_build / "toolchain"
+    if _is_inside(resolved_output, toolchain_root) or _is_inside(toolchain_root, resolved_output):
+        raise ValueError("--output must not overlap the private toolchain cache")
+    return source_root, resolved_output
+
+
+def _native_os_name() -> str:
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def _native_architecture() -> str:
+    return host_platform.machine()
+
+
+def run_preflight(service: str, source_root: os.PathLike[str] | str, output: os.PathLike[str] | str) -> int:
+    """Assemble once, check dependencies, and validate without publishing."""
+    supported = {"mcp", "vector_sync", "tldv_import", "sync_checker", "tldv_webhook", "tldv_reconciliation"}
+    if service not in supported:
+        raise ValueError(f"unsupported service: {service}")
+    root, artifact = _validate_preflight_paths(Path(source_root), Path(output))
+    build_tools = Path(__file__).resolve().parent
+    runtime = ensure_runtime(
+        build_tools / "runner-toolchain.json", root / ".build" / "toolchain",
+        native_interpreter=Path(sys.executable) if sys.version_info[:2] == (3, 12) else None,
+    )
+
+    # Invoke the chosen checkout's assembler exactly once.
+    assembler = root / "infra" / "build" / "assemble.py"
+    completed = subprocess.run(
+        [sys.executable, "-I", str(assembler), "--service", service, "--source-root", str(root), "--output", str(artifact)],
+        cwd=str(root), check=False,
+    )
+    if completed.returncode:
+        return completed.returncode
+    if not artifact.is_dir():
+        raise RuntimeError("assembler completed without creating the requested artifact")
+    if any(path.is_file() and path.name.lower().startswith(".env") for path in artifact.rglob("*")):
+        raise RuntimeError("assembled artifact contains a forbidden environment file")
+    before = _artifact_fingerprint(artifact)
+    report = json.loads((artifact / "assembly-report.json").read_text(encoding="utf-8"))
+    artifact_target = report.get("runtime_target") or "unspecified"
+
+    external_parent = next((parent for parent in root.parents if parent.name == ".tmp" and parent.is_dir() and not parent.is_symlink()), None)
+    with tempfile.TemporaryDirectory(prefix="tlbrain-preflight-", dir=external_parent) as temporary:
+        external = Path(os.path.abspath(temporary))
+        harness = external / "validation"
+        harness.mkdir()
+        shutil.copy2(build_tools / "validate.py", harness / "validate.py")
+        shutil.copy2(build_tools / "smoke_support.py", harness / "smoke_support.py")
+        result_path = external / "validation-result.json"
+        environment = external / "runtime-venv"
+        created = subprocess.run([str(runtime), "-I", "-m", "venv", str(environment)], cwd=str(external), check=False)
+        if created.returncode:
+            return created.returncode
+        venv_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if not venv_python.is_file():
+            raise RuntimeError("verified runtime did not create its runtime-only virtual environment")
+        requirements = artifact / "requirements.txt"
+        if requirements.is_file() and requirements.read_text(encoding="utf-8").strip():
+            installed = subprocess.run(
+                [str(venv_python), "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "-r", str(requirements)],
+                cwd=str(external), check=False,
+            )
+            if installed.returncode:
+                return installed.returncode
+        checked = subprocess.run([str(venv_python), "-I", "-m", "pip", "check"], cwd=str(external), check=False)
+        if checked.returncode:
+            return checked.returncode
+        validation = subprocess.run(
+            [str(venv_python), "-I", str((harness / "validate.py").resolve()), "--service", service,
+             "--artifact", str(Path(os.path.abspath(artifact))), "--offline", "--result", str(result_path)],
+            cwd=str(external), check=False,
+        )
+        if validation.returncode:
+            return validation.returncode
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        after = _artifact_fingerprint(artifact)
+        if result.get("status") != "passed" or result.get("artifact_fingerprint") != before or after != before:
+            raise RuntimeError("artifact fingerprint changed or validation did not pass; it cannot be handed to upload")
+        print(f"Preflight passed for {service}")
+        print(f"Native OS: {_native_os_name()}")
+        print(f"Native architecture: {_native_architecture()}")
+        print("Artifact deployment target OS: linux")
+        print(f"Artifact runtime target: {artifact_target}")
+        print(f"Artifact fingerprint: {before}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Prepare and validate one service artifact without publishing it.")
+    parser.add_argument("--service", required=True)
+    parser.add_argument("--source-root", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args(argv)
+    try:
+        return run_preflight(args.service, args.source_root, args.output)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"preflight: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
