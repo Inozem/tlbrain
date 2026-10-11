@@ -209,3 +209,292 @@ def test_shell_entrypoint_exposes_requested_options() -> None:
     assert "WindowsApps" in contents
     assert "for candidate_name in python3; do" in contents
     assert "candidate_name in python3 python" not in contents
+    assert '"${1:-}" == "--image-mode"' in contents
+    assert '"$image_metadata" image-preflight' in contents
+
+
+def test_image_preflight_runs_runtime_checks_before_finalizing(monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = importlib.import_module("infra.build.image_metadata")
+    report = {
+        "service": "mcp",
+        "runtime_target": "services.mcp.app.main:app",
+        "source_files": [{"runtime_path": "services/mcp/app/main.py", "source_path": "services/mcp/app/main.py", "sha256": "a" * 64}],
+        "resources": [{"runtime_path": "models/config.json", "source_path": "models/config.json", "sha256": "0123456789abcdef" * 4}],
+        "requirements_graph": {"roots": ["requirements.txt"], "files": [{"runtime_path": "requirements.txt", "sha256": "def"}]},
+    }
+
+    class FakeDocker:
+        def __init__(self, fail_at: str | None = None) -> None:
+            self.fail_at = fail_at
+            self.config = {
+                "image_id": "sha256:immutable-image", "os": "linux", "architecture": "amd64",
+                "rootfs": {"diff_ids": ["sha256:layer"]},
+                "config": {"Entrypoint": None, "Cmd": metadata._SERVICE_CMDS["mcp"], "WorkingDir": "/app", "User": None, "Env": ["PORT=8080"], "Labels": {}},
+            }
+            self.events: list[str] = []
+
+        def inspect_image(self, _image: str) -> dict[str, Any]:
+            return json.loads(json.dumps(self.config))
+
+        def run(self, _image: str, command: list[str], mounts: list[tuple[Path, str, bool]]) -> Any:
+            assert _image == "sha256:immutable-image"
+            if "-c" in command and "assembly-report.json" in command[-1]:
+                self.events.append("report")
+                return SimpleNamespace(returncode=0, stdout=json.dumps(report), stderr="")
+            if any(item.endswith("validate.py") for item in command):
+                self.events.append("runtime")
+                if self.fail_at == "runtime":
+                    return SimpleNamespace(returncode=12, stdout="", stderr="")
+                result_path = next(host for host, destination, _readonly in mounts if destination == "/tlbrain-validation-result") / "result.json"
+                result_path.write_text(json.dumps({"status": "passed", "service": "mcp", "target": report["runtime_target"]}), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            self.events.append("cache")
+            if self.fail_at == "cache":
+                return SimpleNamespace(returncode=13, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def attach_label(self, _image: str, key: str, value: str) -> None:
+            self.events.append("finalize")
+            self.config["config"]["Labels"][key] = value
+
+    workflow = {"repository": "owner/repo", "run_id": "42", "attempt": "1"}
+    docker = FakeDocker()
+    result = metadata.run_image_preflight(docker, "mcp:local", "mcp", workflow, build_tools=BUILD_TOOLS)
+    assert docker.events == ["report", "runtime", "cache", "finalize"]
+    evidence = json.loads(result["config"]["Labels"][metadata.VALIDATION_LABEL])
+    assert evidence["checks"] == ["compile", "imports", "startup", "cache"]
+    assert evidence["target"] == report["runtime_target"]
+    assert evidence["workflow"] == workflow
+    assert evidence["source_fingerprint"] == metadata._fingerprint_report_section({"source_files": report["source_files"], "resources": report["resources"]})
+    assert evidence["requirements_fingerprint"] == metadata._fingerprint_report_section(report["requirements_graph"])
+
+
+def test_image_preflight_revalidates_runtime_changed_by_label_attachment() -> None:
+    metadata = importlib.import_module("infra.build.image_metadata")
+    report = {
+        "service": "mcp", "runtime_target": "main:app",
+        "source_files": [{"runtime_path": "main.py", "source_path": "main.py", "sha256": "a" * 64}],
+        "resources": [], "requirements_graph": {"files": []},
+    }
+
+    class ChangingRuntimeDocker:
+        def __init__(self) -> None:
+            self.config = {
+                "image_id": "sha256:original", "os": "linux", "architecture": "amd64",
+                "rootfs": {"diff_ids": ["sha256:layer-one"]},
+                "config": {"Entrypoint": None, "Cmd": metadata._SERVICE_CMDS["mcp"], "WorkingDir": "/app", "User": None, "Env": ["PORT=8080"], "Labels": {}},
+            }
+            self.events: list[str] = []
+            self.runtime_runs = 0
+            self.attachments = 0
+            self.pinned_images: list[str] = []
+
+        def inspect_image(self, _image: str) -> dict[str, Any]:
+            return json.loads(json.dumps(self.config))
+
+        def run(self, image: str, command: list[str], mounts: list[tuple[Path, str, bool]]) -> Any:
+            self.pinned_images.append(image)
+            if "assembly-report.json" in command[-1]:
+                self.events.append("report")
+                return SimpleNamespace(returncode=0, stdout=json.dumps(report), stderr="")
+            if any(item.endswith("validate.py") for item in command):
+                self.events.append("runtime")
+                self.runtime_runs += 1
+                result_path = next(host for host, destination, _readonly in mounts if destination == "/tlbrain-validation-result") / "result.json"
+                result_path.write_text(json.dumps({"status": "passed", "service": "mcp", "target": "main:app"}), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            self.events.append("cache")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def attach_label(self, _image: str, key: str, value: str) -> None:
+            self.events.append("finalize")
+            self.attachments += 1
+            self.config["config"]["Labels"][key] = value
+            if self.attachments == 1:
+                self.config["rootfs"]["diff_ids"] = ["sha256:layer-two"]
+                self.config["image_id"] = "sha256:changed-runtime"
+
+    docker = ChangingRuntimeDocker()
+    result = metadata.run_image_preflight(
+        docker, "mcp:local", "mcp", {"repository": "o/r", "run_id": "1", "attempt": "1"}, build_tools=BUILD_TOOLS
+    )
+    label = result["config"]["Labels"][metadata.VALIDATION_LABEL]
+    evidence = json.loads(label)
+    assert docker.events == ["report", "runtime", "cache", "finalize", "report", "runtime", "cache", "finalize"]
+    assert docker.runtime_runs == 2
+    assert evidence["runtime_fingerprint"] == metadata.runtime_fingerprint(result)
+    assert evidence["source_fingerprint"] == metadata._fingerprint_report_section({"source_files": report["source_files"], "resources": report["resources"]})
+    assert evidence["requirements_fingerprint"] == metadata._fingerprint_report_section(report["requirements_graph"])
+    assert "sha256:changed-runtime" in docker.pinned_images
+
+
+@pytest.mark.parametrize("failure", ["runtime", "second_change"])
+def test_image_preflight_blocks_failed_or_unstable_runtime_revalidation(failure: str) -> None:
+    metadata = importlib.import_module("infra.build.image_metadata")
+    report = {
+        "service": "mcp", "runtime_target": "main:app",
+        "source_files": [{"runtime_path": "main.py", "source_path": "main.py", "sha256": "a" * 64}],
+        "resources": [], "requirements_graph": {"files": []},
+    }
+
+    class UnstableRuntimeDocker:
+        def __init__(self) -> None:
+            self.config = {
+                "image_id": "sha256:original", "os": "linux", "architecture": "amd64",
+                "rootfs": {"diff_ids": ["sha256:layer-one"]},
+                "config": {"Entrypoint": None, "Cmd": metadata._SERVICE_CMDS["mcp"], "WorkingDir": "/app", "User": None, "Env": ["PORT=8080"], "Labels": {}},
+            }
+            self.runtime_runs = 0
+            self.attachments = 0
+
+        def inspect_image(self, _image: str) -> dict[str, Any]:
+            return json.loads(json.dumps(self.config))
+
+        def run(self, _image: str, command: list[str], mounts: list[tuple[Path, str, bool]]) -> Any:
+            if "assembly-report.json" in command[-1]:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(report), stderr="")
+            if any(item.endswith("validate.py") for item in command):
+                self.runtime_runs += 1
+                if failure == "runtime" and self.runtime_runs == 2:
+                    return SimpleNamespace(returncode=7, stdout="", stderr="")
+                result_path = next(host for host, destination, _readonly in mounts if destination == "/tlbrain-validation-result") / "result.json"
+                result_path.write_text(json.dumps({"status": "passed", "service": "mcp", "target": "main:app"}), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def attach_label(self, _image: str, key: str, value: str) -> None:
+            self.attachments += 1
+            self.config["config"]["Labels"][key] = value
+            if self.attachments < 3:
+                self.config["rootfs"]["diff_ids"] = [f"sha256:layer-{self.attachments + 1}"]
+                self.config["image_id"] = f"sha256:changed-{self.attachments}"
+
+    docker = UnstableRuntimeDocker()
+    with pytest.raises(RuntimeError):
+        metadata.run_image_preflight(
+            docker, "mcp:local", "mcp", {"repository": "o/r", "run_id": "1", "attempt": "1"}, build_tools=BUILD_TOOLS
+        )
+    assert docker.attachments == (1 if failure == "runtime" else 2)
+    assert docker.runtime_runs == 2
+
+
+@pytest.mark.parametrize("fail_at", ["runtime", "cache"])
+def test_image_preflight_fails_before_finalization(
+    monkeypatch: pytest.MonkeyPatch, fail_at: str
+) -> None:
+    metadata = importlib.import_module("infra.build.image_metadata")
+    report = {
+        "service": "mcp", "runtime_target": "main:app",
+        "source_files": [{"runtime_path": "main.py", "source_path": "main.py", "sha256": "a" * 64}],
+        "resources": [],
+        "requirements_graph": {"files": []},
+    }
+
+    class FakeDocker:
+        def __init__(self) -> None:
+            self.config = {
+                "image_id": "sha256:immutable-image", "os": "linux", "architecture": "amd64", "rootfs": {"diff_ids": ["sha256:layer"]},
+                "config": {"Entrypoint": None, "Cmd": metadata._SERVICE_CMDS["mcp"], "WorkingDir": "/app", "User": None, "Env": ["PORT=8080"], "Labels": {}},
+            }
+            self.events: list[str] = []
+
+        def inspect_image(self, _image: str) -> dict[str, Any]:
+            return json.loads(json.dumps(self.config))
+
+        def run(self, _image: str, command: list[str], mounts: list[tuple[Path, str, bool]]) -> Any:
+            assert _image == "sha256:immutable-image"
+            if "-c" in command and "assembly-report.json" in command[-1]:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(report), stderr="")
+            stage = "runtime" if any(item.endswith("validate.py") for item in command) else "cache"
+            self.events.append(stage)
+            if stage == fail_at:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if stage == "runtime":
+                result = next(host for host, destination, _readonly in mounts if destination == "/tlbrain-validation-result") / "result.json"
+                result.write_text(json.dumps({"status": "passed", "service": "mcp", "target": report["runtime_target"]}), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def attach_label(self, *_args: Any) -> None:
+            self.events.append("finalize")
+
+    docker = FakeDocker()
+    with pytest.raises(RuntimeError):
+        metadata.run_image_preflight(docker, "mcp:local", "mcp", {"repository": "o/r", "run_id": "1", "attempt": "1"}, build_tools=BUILD_TOOLS)
+    assert "finalize" not in docker.events
+
+
+def test_image_preflight_pins_checks_to_image_id_and_rejects_tag_movement() -> None:
+    metadata = importlib.import_module("infra.build.image_metadata")
+    report = {
+        "service": "mcp", "runtime_target": "main:app",
+        "source_files": [{"runtime_path": "main.py", "source_path": "main.py", "sha256": "a" * 64}],
+        "resources": [], "requirements_graph": {"files": []},
+    }
+
+    class MovingTagDocker:
+        def __init__(self) -> None:
+            self.image = {
+                "image_id": "sha256:checked-image", "os": "linux", "architecture": "amd64",
+                "rootfs": {"diff_ids": ["sha256:checked-layer"]},
+                "config": {"Entrypoint": None, "Cmd": metadata._SERVICE_CMDS["mcp"], "WorkingDir": "/app", "User": None, "Env": ["PORT=8080"], "Labels": {}},
+            }
+            self.moved = False
+            self.run_images: list[str] = []
+            self.attached = False
+
+        def inspect_image(self, image: str) -> dict[str, Any]:
+            if image == "mcp:local" and self.moved:
+                changed = json.loads(json.dumps(self.image))
+                changed["image_id"] = "sha256:different-image"
+                changed["rootfs"]["diff_ids"] = ["sha256:different-layer"]
+                return changed
+            return json.loads(json.dumps(self.image))
+
+        def run(self, image: str, command: list[str], mounts: list[tuple[Path, str, bool]]) -> Any:
+            self.run_images.append(image)
+            assert image == "sha256:checked-image"
+            if "assembly-report.json" in command[-1]:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(report), stderr="")
+            if any(item.endswith("validate.py") for item in command):
+                result_path = next(host for host, destination, _readonly in mounts if destination == "/tlbrain-validation-result") / "result.json"
+                result_path.write_text(json.dumps({"status": "passed", "service": "mcp", "target": report["runtime_target"]}), encoding="utf-8")
+                self.moved = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def attach_label(self, *_args: Any) -> None:
+            self.attached = True
+
+    docker = MovingTagDocker()
+    with pytest.raises(RuntimeError, match="tag moved"):
+        metadata.run_image_preflight(docker, "mcp:local", "mcp", {"repository": "o/r", "run_id": "1", "attempt": "1"}, build_tools=BUILD_TOOLS)
+    assert docker.run_images == ["sha256:checked-image", "sha256:checked-image", "sha256:checked-image"]
+    assert not docker.attached
+
+
+@pytest.mark.parametrize("bad_runtime", ["command", "port"])
+def test_image_preflight_rejects_service_runtime_mismatch_before_checks(bad_runtime: str) -> None:
+    metadata = importlib.import_module("infra.build.image_metadata")
+
+    class BadRuntimeDocker:
+        def __init__(self) -> None:
+            self.image = {
+                "image_id": "sha256:checked-image", "os": "linux", "architecture": "amd64",
+                "rootfs": {"diff_ids": ["sha256:checked-layer"]},
+                "config": {"Entrypoint": None, "Cmd": metadata._SERVICE_CMDS["mcp"].copy(), "WorkingDir": "/app", "User": None, "Env": ["PORT=8080"], "Labels": {}},
+            }
+            self.runs = 0
+
+        def inspect_image(self, _image: str) -> dict[str, Any]:
+            return json.loads(json.dumps(self.image))
+
+        def run(self, *_args: Any) -> Any:
+            self.runs += 1
+            raise AssertionError("runtime checks must not run for an invalid image config")
+
+    docker = BadRuntimeDocker()
+    if bad_runtime == "command":
+        docker.image["config"]["Cmd"] = ["python", "app.py"]
+    else:
+        docker.image["config"]["Env"] = ["PORT=9090"]
+    with pytest.raises(ValueError, match="image (command|runtime)"):
+        metadata.run_image_preflight(docker, "mcp:local", "mcp", {"repository": "o/r", "run_id": "1", "attempt": "1"}, build_tools=BUILD_TOOLS)
+    assert docker.runs == 0

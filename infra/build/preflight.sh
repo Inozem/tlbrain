@@ -3,6 +3,12 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 runner="$script_dir/bootstrap_runner.py"
+image_metadata="$script_dir/image_metadata.py"
+image_mode=false
+if [[ "${1:-}" == "--image-mode" ]]; then
+    image_mode=true
+    shift
+fi
 
 is_store_alias() {
     case "${1//\\/\/}" in
@@ -15,6 +21,9 @@ for candidate_name in python3; do
     if command -v "$candidate_name" >/dev/null 2>&1; then
         candidate="$(command -v "$candidate_name")"
         if ! is_store_alias "$candidate"; then
+            if [[ "$image_mode" == true ]]; then
+                exec "$candidate" "$image_metadata" image-preflight "$@"
+            fi
             exec "$candidate" "$runner" "$@"
         fi
     fi
@@ -27,6 +36,9 @@ if command -v powershell.exe >/dev/null 2>&1; then
             candidate="$(cygpath -u "$candidate")"
         fi
         if ! is_store_alias "$candidate"; then
+            if [[ "$image_mode" == true ]]; then
+                exec "$candidate" "$image_metadata" image-preflight "$@"
+            fi
             exec "$candidate" "$runner" "$@"
         fi
     fi
@@ -40,6 +52,9 @@ if command -v gcloud >/dev/null 2>&1; then
             candidate="$(cygpath -u "$candidate")"
         fi
         if ! is_store_alias "$candidate"; then
+            if [[ "$image_mode" == true ]]; then
+                exec "$candidate" "$image_metadata" image-preflight "$@"
+            fi
             exec "$candidate" "$runner" "$@"
         fi
     fi

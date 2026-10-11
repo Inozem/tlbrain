@@ -475,3 +475,19 @@ def test_finalizer_writes_compact_record_without_changing_runtime_image(
 
     with pytest.raises((ValueError, RuntimeError)):
         metadata.finalize_image(FakeDocker(config, alter_cmd=True), image_digest, evidence)
+
+    invalid_records = []
+    missing_field = dict(evidence)
+    missing_field.pop("workflow")
+    invalid_records.append(missing_field)
+    bad_source = dict(evidence, source_fingerprint="not-a-digest")
+    invalid_records.append(bad_source)
+    missing_cache = dict(evidence, checks=["compile", "imports", "startup"])
+    invalid_records.append(missing_cache)
+    bad_workflow = dict(evidence, workflow={"repository": "repo", "run_id": "", "attempt": "1"})
+    invalid_records.append(bad_workflow)
+    for invalid in invalid_records:
+        docker = FakeDocker(config)
+        with pytest.raises(ValueError):
+            metadata.finalize_image(docker, image_digest, invalid)
+        assert docker.attachments == []
