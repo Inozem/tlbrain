@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import platform as host_platform
 import re
@@ -28,6 +29,151 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORMS = {"windows", "macos", "linux"}
 _ARCHITECTURES = {"x86_64"}
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def normalize_windows_path(path: os.PathLike[str] | str, root: os.PathLike[str] | str | None = None) -> str:
+    """Normalize a Windows path lexically, without consulting the host filesystem."""
+    value = os.fspath(path)
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("invalid Windows path")
+    normalized = ntpath.normpath(value.replace("/", "\\"))
+    if root is not None:
+        root_value = os.fspath(root)
+        if not isinstance(root_value, str) or not root_value or "\x00" in root_value:
+            raise ValueError("invalid Windows root path")
+        normalized_root = ntpath.normpath(root_value.replace("/", "\\"))
+        try:
+            common = ntpath.commonpath((normalized, normalized_root))
+        except ValueError as exc:
+            raise ValueError(f"path is outside root: {value}") from exc
+        if ntpath.normcase(common) != ntpath.normcase(normalized_root):
+            raise ValueError(f"path escapes root: {value}")
+    return normalized
+
+
+def _platform_name(value: Mapping[str, str] | str | None) -> tuple[str, str]:
+    """Return the host OS and architecture used for bootstrap tool discovery."""
+    if value is None:
+        facts = _current_platform()
+        return facts["os"], facts["architecture"]
+    if isinstance(value, str):
+        facts = _current_platform()
+        name = value.lower()
+        if name.startswith("win"):
+            name = "windows"
+        elif name in {"darwin", "osx", "mac"}:
+            name = "macos"
+        elif name.startswith("linux"):
+            name = "linux"
+        return name, facts["architecture"]
+    facts = _current_platform()
+    name = str(value.get("os", facts["os"])).lower()
+    if name.startswith("win"):
+        name = "windows"
+    elif name in {"darwin", "osx", "mac"}:
+        name = "macos"
+    elif name.startswith("linux"):
+        name = "linux"
+    architecture = str(value.get("architecture", facts["architecture"])).lower()
+    return name, architecture
+
+
+def discover_bootstrap_interpreter(
+    process_runner: Callable[..., Any],
+    env: Mapping[str, str],
+    platform: Mapping[str, str] | str | None,
+    candidates: list[os.PathLike[str] | str] | tuple[os.PathLike[str] | str, ...],
+    gcloud_available: bool = False,
+    project_root: os.PathLike[str] | str | None = None,
+) -> str:
+    """Find an already supplied bootstrap Python or ask gcloud for its Python.
+
+    Candidate paths are treated as results of the caller's existing discovery
+    process. Only the platform's approved bootstrap command is executed here.
+    """
+    # Do not use or modify env/project_root. They remain in the signature for
+    # the caller's discovery boundary and for backwards-compatible call sites.
+    del env, project_root
+    os_name, _architecture = _platform_name(platform)
+    approved_command = "powershell.exe" if os_name == "windows" else "python3" if os_name in {"linux", "macos"} else None
+
+    def is_store_alias(value: str) -> bool:
+        folded = value.replace("/", "\\").casefold()
+        return "\\windowsapps\\" in folded or folded.endswith("\\windowsapps")
+
+    for raw_candidate in candidates:
+        candidate = os.fspath(raw_candidate)
+        basename = ntpath.basename(candidate.replace("/", "\\")).lower()
+        if is_store_alias(candidate):
+            continue
+        # A path supplied by the caller is already an available interpreter;
+        # return it verbatim so native spelling and spaces are preserved.
+        looks_like_path = ntpath.isabs(candidate) or "/" in candidate or "\\" in candidate
+        if looks_like_path and basename in {"python.exe", "python3.exe", "python", "python3", "python3.12"}:
+            return candidate
+        if approved_command is None or basename != approved_command.lower():
+            continue
+        if os_name == "windows":
+            # Resolve only an Application entry. The WindowsApps filter avoids
+            # launching the Microsoft Store execution alias.
+            command = (
+                "$command = Get-Command -Name python.exe -CommandType Application "
+                "-ErrorAction SilentlyContinue | Where-Object { $_.Source -notmatch "
+                "'(?i)\\\\WindowsApps\\\\' } | Select-Object -First 1; "
+                "if ($command) { [Console]::Out.WriteLine($command.Source) }"
+            )
+            argv = [candidate, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+        else:
+            argv = [candidate, "-I", "-c", "import sys; print(sys.executable)"]
+        try:
+            result = process_runner(argv, capture_output=True, text=True, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if getattr(result, "returncode", 1) == 0:
+            found = str(getattr(result, "stdout", "")).strip()
+            if found and not is_store_alias(found):
+                return found
+
+    if gcloud_available:
+        try:
+            result = process_runner(
+                ["gcloud", "info", "--format=value(basic.python_location)"],
+                capture_output=True, text=True, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"gcloud could not report its bootstrap Python location: {exc}") from exc
+        if getattr(result, "returncode", 1) != 0:
+            detail = str(getattr(result, "stderr", "")).strip()
+            raise RuntimeError(f"gcloud bootstrap interpreter discovery failed ({result.returncode}): {detail}")
+        found = str(getattr(result, "stdout", "")).strip()
+        if found:
+            if os_name == "windows" and is_store_alias(found):
+                raise RuntimeError("gcloud reported a Microsoft Store Python alias; provide an installed Python executable")
+            return found
+        raise RuntimeError("gcloud returned an empty bootstrap Python location")
+    raise RuntimeError("no bootstrap interpreter found; provide Python or make gcloud available")
+
+
+def invoke_powershell_adapter(
+    adapter_path: os.PathLike[str] | str,
+    args: list[os.PathLike[str] | str] | tuple[os.PathLike[str] | str, ...],
+    process_runner: Callable[..., Any],
+) -> Any:
+    """Invoke the PowerShell adapter using an argv vector and report failures."""
+    argv = [
+        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass", "-File", os.fspath(adapter_path), "--",
+        *(os.fspath(argument) for argument in args),
+    ]
+    try:
+        result = process_runner(argv, capture_output=True, text=True, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"PowerShell bootstrap adapter could not start: {exc}") from exc
+    if getattr(result, "returncode", 1) != 0:
+        detail = str(getattr(result, "stderr", "")).strip() or str(getattr(result, "stdout", "")).strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"PowerShell bootstrap adapter failed with exit code {result.returncode}{suffix}")
+    return result
 
 
 def _is_reparse_point(path: Path) -> bool:

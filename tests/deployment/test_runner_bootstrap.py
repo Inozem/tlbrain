@@ -797,6 +797,27 @@ def test_discovery_does_not_require_docker_or_windows_tools_on_gcloud_route() ->
     assert "powershell" not in flat
 
 
+def test_discovery_rejects_windows_store_python_alias_before_launching_it() -> None:
+    runner = _runner()
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        calls.append(list(argv))
+        assert argv[0] == "gcloud"
+        return SimpleNamespace(returncode=0, stdout=r"C:\Build Area\Python\python.exe", stderr="")
+
+    found = runner.discover_bootstrap_interpreter(
+        process_runner=run,
+        env={"PATH": "synthetic"},
+        platform="windows",
+        candidates=[r"C:\Users\synthetic\AppData\Local\Microsoft\WindowsApps\python.exe"],
+        gcloud_available=True,
+    )
+
+    assert found == r"C:\Build Area\Python\python.exe"
+    assert calls == [["gcloud", "info", "--format=value(basic.python_location)"]]
+
+
 @pytest.mark.parametrize(
     ("input_path", "expected"),
     [
