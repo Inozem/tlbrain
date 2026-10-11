@@ -26,6 +26,17 @@ TLDV_IMPORT_MAX_INSTANCES=${TLDV_IMPORT_MAX_INSTANCES:-2}
 
 echo "--- Deploying TL;DV Import Service ---"
 
+TLDV_IMPORT_DIGEST=$(bash "${REPO_ROOT}/infra/build/preflight.sh" --verify-mode \
+  --repository "inozem/tlbrain-tldv-import" \
+  --version "${VERSION}" \
+  --service tldv_import \
+  --target "app.main:app" \
+  --platform linux/amd64 \
+  --required-check compile \
+  --required-check imports \
+  --required-check startup)
+TLDV_IMPORT_IMAGE="inozem/tlbrain-tldv-import@${TLDV_IMPORT_DIGEST}"
+
 VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
   --format='value(status.url)')
