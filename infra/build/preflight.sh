@@ -5,8 +5,12 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 runner="$script_dir/bootstrap_runner.py"
 image_metadata="$script_dir/image_metadata.py"
 image_mode=false
+verify_mode=false
 if [[ "${1:-}" == "--image-mode" ]]; then
     image_mode=true
+    shift
+elif [[ "${1:-}" == "--verify-mode" ]]; then
+    verify_mode=true
     shift
 fi
 
@@ -24,6 +28,9 @@ for candidate_name in python3; do
             if [[ "$image_mode" == true ]]; then
                 exec "$candidate" "$image_metadata" image-preflight "$@"
             fi
+            if [[ "$verify_mode" == true ]]; then
+                exec "$candidate" "$image_metadata" verify "$@"
+            fi
             exec "$candidate" "$runner" "$@"
         fi
     fi
@@ -38,6 +45,9 @@ if command -v powershell.exe >/dev/null 2>&1; then
         if ! is_store_alias "$candidate"; then
             if [[ "$image_mode" == true ]]; then
                 exec "$candidate" "$image_metadata" image-preflight "$@"
+            fi
+            if [[ "$verify_mode" == true ]]; then
+                exec "$candidate" "$image_metadata" verify "$@"
             fi
             exec "$candidate" "$runner" "$@"
         fi
@@ -54,6 +64,9 @@ if command -v gcloud >/dev/null 2>&1; then
         if ! is_store_alias "$candidate"; then
             if [[ "$image_mode" == true ]]; then
                 exec "$candidate" "$image_metadata" image-preflight "$@"
+            fi
+            if [[ "$verify_mode" == true ]]; then
+                exec "$candidate" "$image_metadata" verify "$@"
             fi
             exec "$candidate" "$runner" "$@"
         fi
