@@ -152,15 +152,25 @@ def _success_entry_source(service: str) -> str:
     source = "import app_internal.qualified\nfrom app_internal import VALUE\n"
     if service == "vector_sync":
         source = "from qdrant_client import QdrantClient\nclient = QdrantClient()\n" + source
-    return (
-        source
-        + "def deferred_import():\n"
+    source += (
+        "def deferred_import():\n"
         "    from app_internal import deferred\n"
         "    return deferred.VALUE\n"
         "assert VALUE == 4\n"
         "assert app_internal.qualified.VALUE == 3\n"
         "assert deferred_import() == 2\n"
     )
+    if service in {"mcp", "vector_sync", "tldv_import"}:
+        source += (
+            "async def app(scope, receive, send):\n"
+            "    await receive()\n"
+            "    await send({'type': 'http.response.start', 'status': 200, 'headers': [(b'content-type', b'application/json')]})\n"
+            "    await send({'type': 'http.response.body', 'body': b'{\"status\":\"ok\"}', 'more_body': False})\n"
+        )
+    else:
+        target = _RUNTIME_TARGETS[service].split(":", 1)[1]
+        source += f"def {target}(request):\n    return ({'{}'!r}, 200)\n"
+    return source
 
 
 def _run_validator(
@@ -271,7 +281,11 @@ def test_validator_ignores_poisoned_host_paths_and_writes_result_outside_artifac
     artifact = _artifact(
         tmp_path,
         "mcp",
-        "import harmless_poison\nfrom app_internal import VALUE\nassert VALUE == 7\n",
+        "import harmless_poison\nfrom app_internal import VALUE\nassert VALUE == 7\n"
+        "async def app(scope, receive, send):\n"
+        "    await receive()\n"
+        "    await send({'type': 'http.response.start', 'status': 200, 'headers': [(b'content-type', b'application/json')]})\n"
+        "    await send({'type': 'http.response.body', 'body': b'{\"status\":\"ok\"}', 'more_body': False})\n",
         extra_sources={
             "harmless_poison.py": "VALUE = 'artifact source wins'\n",
             "app_internal.py": "VALUE = 7\n",
@@ -306,6 +320,114 @@ def test_validator_ignores_poisoned_host_paths_and_writes_result_outside_artifac
     _assert_success_result(completed, result_path, "mcp", artifact)
     assert result_path.is_relative_to(tmp_path.resolve())
     assert not result_path.is_relative_to(artifact)
+
+
+def test_validator_resolves_qualified_external_module_and_symbol(
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact(
+        tmp_path,
+        "mcp",
+        _success_entry_source("mcp"),
+        extra_sources={
+            "app_internal/__init__.py": "VALUE = 4\n",
+            "app_internal/qualified.py": "VALUE = 3\n",
+            "app_internal/deferred.py": "VALUE = 2\n",
+        },
+    )
+    report_path = artifact / "assembly-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["required_external_imports"] = [
+        {"name": "fastapi.FastAPI"},
+        {"name": "google.cloud.firestore"},
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    result_path = (tmp_path / "external-results" / "qualified.json").resolve()
+    result_path.parent.mkdir()
+    validator, _ = _external_harness(tmp_path)
+
+    completed = _run_validator(
+        "mcp", artifact, result_path, cwd=tmp_path, validator=validator
+    )
+
+    _assert_success_result(completed, result_path, "mcp", artifact)
+
+
+def test_validator_allows_absent_guarded_optional_sdk_omitted_from_report(
+    tmp_path: Path,
+) -> None:
+    entry_source = (
+        "try:\n"
+        "    import optional_sdk_that_is_not_installed\n"
+        "except ImportError:\n"
+        "    pass\n"
+        + _success_entry_source("mcp")
+    )
+    artifact = _artifact(
+        tmp_path,
+        "mcp",
+        entry_source,
+        extra_sources={
+            "app_internal/__init__.py": "VALUE = 4\n",
+            "app_internal/qualified.py": "VALUE = 3\n",
+            "app_internal/deferred.py": "VALUE = 2\n",
+        },
+    )
+    result_path = (tmp_path / "external-results" / "optional.json").resolve()
+    result_path.parent.mkdir()
+    validator, _ = _external_harness(tmp_path)
+
+    completed = _run_validator(
+        "mcp", artifact, result_path, cwd=tmp_path, validator=validator
+    )
+
+    _assert_success_result(completed, result_path, "mcp", artifact)
+
+
+def test_validator_fails_safely_for_env_file_with_partial_fingerprint(
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact(tmp_path, "mcp", _success_entry_source("mcp"))
+    secret_marker = "PRIVATE_CONFIG_MARKER_92817"
+    (artifact / ".env.production").write_text(
+        f"API_KEY={secret_marker}\n", encoding="utf-8"
+    )
+    result_path = (tmp_path / "external-results" / "env-file.json").resolve()
+    result_path.parent.mkdir()
+    validator, _ = _external_harness(tmp_path)
+
+    completed = _run_validator(
+        "mcp", artifact, result_path, cwd=tmp_path, validator=validator
+    )
+
+    assert completed.returncode != 0
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "failed"
+    assert result["artifact_fingerprint"]
+    assert result["artifact_fingerprint_state"] == "forbidden_environment_file_contents_omitted"
+    assert secret_marker not in completed.stdout + completed.stderr
+    assert secret_marker not in result_path.read_text(encoding="utf-8")
+
+
+def test_validator_records_immutability_when_smoke_fails(
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact(tmp_path, "mcp", "raise RuntimeError('smoke failure')\n")
+    result_path = (tmp_path / "external-results" / "mutation.json").resolve()
+    result_path.parent.mkdir()
+    validator, _ = _external_harness(tmp_path)
+
+    completed = _run_validator(
+        "mcp", artifact, result_path, cwd=tmp_path, validator=validator
+    )
+
+    assert completed.returncode != 0
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "failed"
+    immutability = next(
+        check for check in result["checks"] if check["name"] == "artifact_immutability"
+    )
+    assert immutability["status"] == "passed"
 
 
 @pytest.mark.parametrize(
