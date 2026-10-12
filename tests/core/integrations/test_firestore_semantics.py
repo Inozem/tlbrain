@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.google_drive import firestore as drive_firestore
+from core.integrations.firestore import transcripts as transcript_repository
 from services.vector_sync.app import index_store
 
 
@@ -47,6 +48,62 @@ def test_save_index_replaces_update_index_merges_and_dotted_paths(firestore_fake
         "status": "replaced", "nested": {"written": True, "added": True}
     }
     assert [event["operation"] for event in _writes(firestore_fake, path)][-2:] == ["set", "set"]
+
+
+def test_transcript_repository_crud_and_legacy_get_exports_share_implementation(firestore_fake):
+    db = _client(firestore_fake)
+    ref = db.collection(INDEX).document("repo-record")
+    ref.set({"value": 1, "optional": None})
+
+    assert index_store.load_index is transcript_repository.load_index
+    assert drive_firestore.get_transcript_record is transcript_repository.get_transcript_record
+    assert index_store.load_index("repo-record") == {"value": 1, "optional": None}
+    assert drive_firestore.get_transcript_record("absent") is None
+
+    transcript_repository.save_index("repo-record", {"replacement": True})
+    assert firestore_fake.documents[f"{INDEX}/repo-record"] == {"replacement": True}
+    transcript_repository.update_index("repo-record", {"nested.path": "updated"})
+    assert firestore_fake.documents[f"{INDEX}/repo-record"] == {
+        "replacement": True, "nested": {"path": "updated"},
+    }
+    ref.set({"status": "synced"})
+    transcript_repository.delete_index("repo-record")
+    assert f"{INDEX}/repo-record" not in firestore_fake.documents
+    assert transcript_repository.list_all_index_ids() == []
+
+
+def test_transcript_repository_lists_filters_and_aggregates(firestore_fake):
+    db = _client(firestore_fake)
+    records = {
+        "old": {"status": "synced", "parent_id": "folder-a", "dialog_date": "2026-01-01", "source_file": "old.docx"},
+        "latest": {"status": "synced", "parent_id": "folder-a", "dialog_date": "2026-01-03", "source_file": "latest.docx"},
+        "tie": {"status": "synced", "parent_id": "folder-a", "dialog_date": "2026-01-03"},
+        "other": {"status": "imported", "parent_id": "folder-b", "dialog_date": "2026-01-02", "source_file": "other.docx", "doc_id": "stored-id"},
+        "placeholder": {"status": "queued", "parent_id": "folder-a", "dialog_date": "2026-01-04"},
+        "unparented": {"status": "synced", "dialog_date": "2026-01-05"},
+    }
+    for doc_id, data in records.items():
+        db.collection(INDEX).document(doc_id).set(data)
+
+    result = transcript_repository.list_transcripts(
+        folder_ids=["folder-a"], date_from="2026-01-01", date_to="2026-01-03", limit=1, offset=1,
+    )
+    assert result == {
+        "total": 3, "returned": 1, "offset": 1, "limit": 1, "has_more": True,
+        "transcripts": [{
+            "doc_id": "tie", "parent_id": "folder-a", "title": "", "dialog_date": "2026-01-03", "status": "synced",
+        }],
+    }
+    assert transcript_repository.list_imported() == [{
+        "doc_id": "stored-id", "status": "imported", "parent_id": "folder-b",
+        "dialog_date": "2026-01-02", "source_file": "other.docx",
+    }]
+    assert transcript_repository.get_doc_ids_by_client("missing") == []
+    db.collection(INDEX).document("client-doc").set({"client_name": "Acme"})
+    assert transcript_repository.get_doc_ids_by_client("Acme") == ["client-doc"]
+    assert transcript_repository.aggregate_transcripts_by_folder() == {
+        "folder-a": {"count": 3, "last_date": "2026-01-03", "last_doc_id": "latest"},
+    }
 
 
 def test_fake_faults_propagate_and_capture_before_after_effects(firestore_fake):

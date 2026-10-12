@@ -12,6 +12,13 @@ from core.integrations.firestore.client import (
     TOKENS_COLLECTION,
     get_client,
 )
+from core.integrations.firestore.transcripts import (
+    aggregate_transcripts_by_folder,
+    get_doc_ids_by_client,
+    get_transcript_record,
+    list_imported,
+    list_transcripts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,64 +204,6 @@ def get_unassigned() -> dict:
             transcripts.append({"doc_id": d.id, "dialog_date": data.get("dialog_date", "")})
     transcripts.sort(key=lambda x: x["dialog_date"], reverse=True)
     return {"count": len(transcripts), "transcripts": transcripts}
-
-
-def list_transcripts(
-    folder_ids: list[str] | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
-) -> dict:
-    """Return paginated list of transcripts sorted by dialog_date desc.
-
-    Skips placeholder records (queued / downloading).
-    Returns: {total, returned, offset, limit, has_more, transcripts}
-    Each transcript: {doc_id, parent_id, title, dialog_date, status}
-    """
-    db = _get_db()
-    transcripts = []
-    for doc in db.collection(COLLECTION_NAME).stream():
-        data = doc.to_dict() or {}
-        if data.get("status") in ("queued", "downloading"):
-            continue
-        if folder_ids is not None and data.get("parent_id") not in folder_ids:
-            continue
-        dialog_date = data.get("dialog_date", "")
-        if date_from and dialog_date < date_from:
-            continue
-        if date_to and dialog_date > date_to:
-            continue
-        transcripts.append({
-            "doc_id": doc.id,
-            "parent_id": data.get("parent_id"),
-            "title": data.get("source_file", ""),
-            "dialog_date": dialog_date,
-            "status": data.get("status", ""),
-        })
-
-    transcripts.sort(key=lambda x: x["dialog_date"], reverse=True)
-    total = len(transcripts)
-    page = transcripts[offset: offset + limit]
-    return {
-        "total": total,
-        "returned": len(page),
-        "offset": offset,
-        "limit": limit,
-        "has_more": offset + len(page) < total,
-        "transcripts": page,
-    }
-
-
-def list_imported() -> list[dict]:
-    """Return all docs with status=imported."""
-    db = _get_db()
-    docs = (
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("status", "==", "imported"))
-        .stream()
-    )
-    return [{"doc_id": doc.id, **doc.to_dict()} for doc in docs]
 
 
 def get_stale_syncing() -> list[str]:
@@ -527,14 +476,6 @@ def get_client_name_by_folder_id(folder_id: str) -> str | None:
     return None
 
 
-def get_transcript_record(doc_id: str) -> dict | None:
-    """Return transcript_index record for a doc, or None if not found."""
-    doc = _get_db().collection(COLLECTION_NAME).document(doc_id).get()
-    if not doc.exists:
-        return None
-    return doc.to_dict()
-
-
 def rename_client_records(old_name: str, new_name: str, folder_id: str) -> list[str]:
     """Rename client in Firestore: copy clients record, delete old, update all transcript_index docs.
 
@@ -599,18 +540,6 @@ def reconcile_client_record(old_name: str, new_name: str, folder_id: str) -> Non
     new_ref.set(record, merge=True)
     old_ref.delete()
     logger.info("Reconciled client record: %s → %s (%s)", old_name, new_name, folder_id)
-
-
-def get_doc_ids_by_client(client_name: str) -> list[str]:
-    """Return all transcript_index doc IDs for a client."""
-    db = _get_db()
-    docs = (
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("client_name", "==", client_name))
-        .select([])
-        .stream()
-    )
-    return [doc.id for doc in docs]
 
 
 def create_client(client_name: str, folder_id: str, description: str | None = None) -> bool:
@@ -694,26 +623,6 @@ def folder_name_exists(name: str, parent_id: str) -> bool:
         .stream()
     )
     return any(True for _ in docs)
-
-
-def aggregate_transcripts_by_folder() -> dict[str, dict]:
-    """Return {parent_id: {count, last_date, last_doc_id}} for all synced transcripts."""
-    db = _get_db()
-    agg: dict[str, dict] = {}
-    for doc in db.collection(COLLECTION_NAME).where(
-        filter=firestore.FieldFilter("status", "==", "synced")
-    ).stream():
-        data = doc.to_dict() or {}
-        parent_id = data.get("parent_id")
-        if not parent_id:
-            continue
-        dialog_date = data.get("dialog_date", "")
-        entry = agg.setdefault(parent_id, {"count": 0, "last_date": None, "last_doc_id": None})
-        entry["count"] += 1
-        if not entry["last_date"] or dialog_date > entry["last_date"]:
-            entry["last_date"] = dialog_date
-            entry["last_doc_id"] = doc.id
-    return agg
 
 
 def expand_subtree(folder_id: str) -> list[str]:
