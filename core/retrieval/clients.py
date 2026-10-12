@@ -3,8 +3,8 @@ from typing import Any
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from core.config import get_root_folder_id
-from core.qdrant.client import get_client
-from core.qdrant.schema import get_collection_name
+from core.integrations.qdrant.client import get_client
+from core.integrations.qdrant.schema import get_collection_name
 
 
 def list_clients() -> list[dict[str, Any]]:

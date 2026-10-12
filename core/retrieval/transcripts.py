@@ -4,8 +4,8 @@ from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, R
 
 from core.config import get_root_folder_id
 from core.google_drive.firestore import expand_subtree, get_all_folders, resolve_folder_path
-from core.qdrant.client import get_client
-from core.qdrant.schema import get_collection_name
+from core.integrations.qdrant.client import get_client
+from core.integrations.qdrant.schema import get_collection_name
 from core.retrieval.pipeline import dedup_and_sort
 from core.retrieval.segments import build_segments, make_folder_path_resolver
 

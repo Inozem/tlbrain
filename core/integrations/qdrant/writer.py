@@ -3,8 +3,8 @@ from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, PointStruct, SparseVector
 
-from core.qdrant.client import get_client
-from core.qdrant.schema import get_collection_name
+from core.integrations.qdrant.client import get_client
+from core.integrations.qdrant.schema import get_collection_name
 from core.utils.retry import with_retry
 
 

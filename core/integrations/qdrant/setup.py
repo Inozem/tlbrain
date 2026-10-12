@@ -1,7 +1,7 @@
 from qdrant_client.models import Distance, PayloadSchemaType, SparseIndexParams, SparseVectorParams, VectorParams
 
-from core.qdrant.client import get_client
-from core.qdrant.schema import COLLECTION_CONFIG, get_collection_name
+from core.integrations.qdrant.client import get_client
+from core.integrations.qdrant.schema import COLLECTION_CONFIG, get_collection_name
 
 _KEYWORD_INDEXES = ["doc_id", "version", "root_folder_id", "type", "parent_id", "dialog_date"]
 _INTEGER_INDEXES = ["order_index", "dialog_date_num", "center_index"]

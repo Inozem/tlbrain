@@ -5,8 +5,8 @@ from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, R
 
 from core.config import get_root_folder_id
 from core.integrations.gemini.embeddings import embed
-from core.qdrant.client import get_client
-from core.qdrant.schema import get_collection_name
+from core.integrations.qdrant.client import get_client
+from core.integrations.qdrant.schema import get_collection_name
 
 _SEARCHABLE_TYPES = ["summary", "fact"]
 _KEYWORD_HALF_WINDOW = 2

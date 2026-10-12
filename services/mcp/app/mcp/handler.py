@@ -31,7 +31,7 @@ from core.google_drive.firestore import (
     update_transcript_source_file,
     upsert_folder,
 )
-from core.qdrant.writer import set_payload_parent_id, upsert_user_facts
+from core.integrations.qdrant.writer import set_payload_parent_id, upsert_user_facts
 
 logger = logging.getLogger(__name__)
 

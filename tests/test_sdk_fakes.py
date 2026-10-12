@@ -16,8 +16,8 @@ from qdrant_client.http.models.models import QueryResponse, ScoredPoint
 from core.integrations.gemini import embeddings, llm
 from core.google_drive import drive_client
 from core.google_drive import docs_reader
-from core.qdrant import client as qdrant_client
-from core.qdrant import setup as qdrant_setup
+from core.integrations.qdrant import client as qdrant_client
+from core.integrations.qdrant import setup as qdrant_setup
 from core.integrations.cloud_tasks.client import enqueue_task
 from tests.fixtures.sdk_fakes import FakeQdrantClient, fake_discovery_build
 from tests.fixtures import sdk_fakes as sdk_fakes_module
@@ -362,7 +362,7 @@ def test_install_and_configure_roll_back_partial_patches(sdk_fakes, monkeypatch)
     conftest.pytest_configure(None)
     active = conftest._saved_sdk_boundaries
     assert active is not None
-    from core.qdrant import client as qdrant_module
+    from core.integrations.qdrant import client as qdrant_module
     from core.retrieval import search
     qdrant_cache_before = qdrant_module._client
     sparse_cache_before = search._bm25_model

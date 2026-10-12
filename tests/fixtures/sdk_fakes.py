@@ -491,7 +491,7 @@ def install() -> dict[str, tuple[Any, str, Any, Any]]:
     originals: dict[str, tuple[Any, str, Any, Any]] = {}
     cache_snapshot: dict[tuple[str, str], tuple[Any, str, Any]] = {}
     cache_symbols = {
-        "core.qdrant.client": ("_client",),
+        "core.integrations.qdrant.client": ("_client",),
         "core.retrieval.search": ("_bm25_model",),
         "services.vector_sync.app.processor": ("_bm25_model",),
     }
@@ -605,7 +605,7 @@ def restore(originals: dict[str, tuple[Any, str, Any, Any]] | None) -> None:
     for module, attr, value in cache_snapshot.values():
         setattr(module, attr, value)
     for module_name, attr, fake_type in (
-        ("core.qdrant.client", "_client", FakeQdrantClient),
+        ("core.integrations.qdrant.client", "_client", FakeQdrantClient),
         ("core.retrieval.search", "_bm25_model", FakeSparseTextEmbedding),
         ("services.vector_sync.app.processor", "_bm25_model", FakeSparseTextEmbedding),
     ):

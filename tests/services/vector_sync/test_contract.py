@@ -7,7 +7,7 @@ import pytest
 from googleapiclient.errors import HttpError
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-from core.qdrant import client as qdrant_client
+from core.integrations.qdrant import client as qdrant_client
 from tests.fixtures.sdk_fakes import FakeQdrantClient
 
 

@@ -9,7 +9,7 @@ from core.google_drive.firestore import acquire_for_syncing, mark_error, mark_sy
 from core.parsing.parser import parse_document
 from core.parsing.processor import build_utterance_payloads, iter_windows
 from core.parsing.windowing import generate_windows
-from core.qdrant.writer import (
+from core.integrations.qdrant.writer import (
     delete_old_versions,
     delete_summaries_by_center_indexes,
     delete_utterances_by_order_indexes,

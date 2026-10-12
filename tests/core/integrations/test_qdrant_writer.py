@@ -4,7 +4,7 @@ from copy import deepcopy
 from google.genai import types
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, PointStruct, SparseVector
 
-from core.qdrant import writer
+from core.integrations.qdrant import writer
 from services.mcp.app.mcp.handler import handle_tools_call
 from services.mcp.app.mcp.schemas import JSONRPCRequest
 

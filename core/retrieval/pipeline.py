@@ -2,8 +2,8 @@ from typing import Any
 
 from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
 
-from core.qdrant.client import get_client
-from core.qdrant.schema import get_collection_name
+from core.integrations.qdrant.client import get_client
+from core.integrations.qdrant.schema import get_collection_name
 
 _HALF_WINDOW = 2
 
