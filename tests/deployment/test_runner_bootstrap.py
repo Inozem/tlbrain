@@ -200,6 +200,29 @@ def test_current_windows_platform_normalizes_major_only_release(
     assert runner._at_least(facts["os_version"], "8.1", "OS version")
 
 
+def test_current_windows_platform_uses_numeric_api_for_marketing_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setattr(runner.host_platform, "win32_ver", lambda: ("2025Server", "", "", ""))
+    monkeypatch.setattr(runner.sys, "getwindowsversion", lambda: (10, 0, 26100, 2, ""), raising=False)
+
+    assert runner._current_platform()["os_version"] == "10.0.26100"
+
+
+def test_current_windows_platform_fails_if_numeric_version_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setattr(runner.host_platform, "win32_ver", lambda: ("2025Server", "", "", ""))
+    monkeypatch.delattr(runner.sys, "getwindowsversion", raising=False)
+
+    with pytest.raises(RuntimeError, match="numeric Windows OS version"):
+        runner._current_platform()
+
+
 @pytest.mark.parametrize(
     ("release", "expected"),
     [("11", "11.0"), ("8.1", "8.1"), ("10.0.22631", "10.0.22631")],
@@ -223,6 +246,43 @@ def test_candidate_probe_normalizes_windows_release(
 
     assert facts["os_version"] == expected
     assert runner._at_least(facts["os_version"], "8.1", "OS version")
+
+
+def test_candidate_probe_uses_numeric_api_for_marketing_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+    raw_facts = {
+        "version": "3.12.13", "ssl": True, "venv": True, "pip": True,
+        "os": "windows", "architecture": "AMD64", "libc": "none",
+        "libc_version": "", "os_version": "2025Server", "windows_version": [10, 0, 26100, 2, ""],
+    }
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(raw_facts), stderr=""),
+    )
+
+    assert runner._probe_interpreter(candidate)["os_version"] == "10.0.26100"
+
+
+def test_candidate_probe_fails_if_numeric_windows_version_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+    raw_facts = {
+        "version": "3.12.13", "ssl": True, "venv": True, "pip": True,
+        "os": "windows", "architecture": "AMD64", "libc": "none",
+        "libc_version": "", "os_version": "2025Server",
+    }
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(raw_facts), stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="numeric Windows OS version"):
+        runner._probe_interpreter(candidate)
 
 
 def _fixture_probe(_path: Path) -> dict[str, object]:
@@ -660,6 +720,59 @@ def test_portable_runner_reuses_acceptable_native_cpython312(tmp_path: Path) -> 
         downloader=downloader,
     )
     assert Path(runtime) == native
+    assert downloader.calls == []
+
+
+def _macos_arm64_lock(tmp_path: Path) -> Path:
+    entry = {
+        "os": "macos", "architecture": "x86_64", "libc": "none",
+        "release": "3.12.99+fixture.1", "url": "https://example.invalid/fixture/cpython.tar.gz",
+        "sha256": hashlib.sha256(_fixture_archive("valid-toolchain.tar.gz").read_bytes()).hexdigest(),
+        "archive_format": "tar.gz", "executable": "python/bin/python3.12",
+        "host_python_min": "3.10", "host_python_max": "3.14", "os_version_min": "10.15",
+    }
+    return _write_lock(tmp_path, {
+        "schema_version": 1, "python_minor": "3.12", "entries": {"macos-x86_64-none": entry},
+    })
+
+
+def test_portable_runner_reuses_native_macos_arm64_without_pinned_download(tmp_path: Path) -> None:
+    runner = _runner()
+    native = tmp_path / "native-python"
+    native.write_text("synthetic native Python 3.12", encoding="utf-8")
+    host = {
+        "os": "macos", "architecture": "arm64", "libc": "none",
+        "os_version": "14.0", "libc_version": "",
+    }
+    downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+
+    runtime = runner.ensure_runtime(
+        _macos_arm64_lock(tmp_path), tmp_path / "cache", host,
+        native_interpreter=native,
+        interpreter_probe=lambda _path: {
+            "version": "3.12.7", "ssl": True, "venv": True, "pip": True, **host,
+        },
+        downloader=downloader,
+    )
+
+    assert runtime == native
+    assert downloader.calls == []
+
+
+def test_portable_runner_fails_closed_for_macos_arm64_without_acceptable_native(tmp_path: Path) -> None:
+    runner = _runner()
+    host = {
+        "os": "macos", "architecture": "arm64", "libc": "none",
+        "os_version": "14.0", "libc_version": "",
+    }
+    downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+
+    with pytest.raises(ValueError, match="unsupported platform: macos-arm64-none"):
+        runner.ensure_runtime(
+            _macos_arm64_lock(tmp_path), tmp_path / "cache", host,
+            downloader=downloader,
+        )
+
     assert downloader.calls == []
 
 
