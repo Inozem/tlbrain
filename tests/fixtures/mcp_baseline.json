@@ -1,0 +1,292 @@
+{
+  "jsonrpc": "2.0",
+  "id": "baseline-tools",
+  "result": {
+    "tools": [
+      {
+        "name": "query",
+        "description": "Search through conversation transcripts using semantic + keyword search. Translate 'query' to English — summaries and facts are indexed in English. Use 'keywords' for names, brands, or terms that must match exactly as spoken.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query in English (used for semantic search over summaries and facts)"
+            },
+            "keywords": {
+              "type": "string",
+              "description": "Optional exact-match terms in the original language of the conversation (used for BM25 keyword search over utterances). Use for names, brands, or specific terms."
+            },
+            "folder_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional folder path from root, e.g. [\"Clients - Active\", \"Acme Corp\"]. Searches the entire subtree."
+            },
+            "date_from": {
+              "type": "string",
+              "description": "ISO date, optional"
+            },
+            "date_to": {
+              "type": "string",
+              "description": "ISO date, optional"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "get_transcript",
+        "description": "Retrieve full conversation transcripts without semantic search. Use when you need the complete text of a specific dialog or the most recent dialogs in a folder.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "doc_id": {
+              "type": "string",
+              "description": "Specific document ID. If provided, all other params are ignored."
+            },
+            "folder_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Folder path from root, e.g. [\"Acme Corp\"]. Returns transcripts from the entire subtree."
+            },
+            "date_from": {
+              "type": "string",
+              "description": "ISO date, optional"
+            },
+            "date_to": {
+              "type": "string",
+              "description": "ISO date, optional"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max number of most recent transcripts to return (default: 1)"
+            }
+          }
+        }
+      },
+      {
+        "name": "list_folders",
+        "description": "List all folders in the knowledge base as a tree with dialog counts and last dialog dates. Call this first to discover the folder hierarchy before querying. If the response contains a 'suggestion' field, present it to the user.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "import_all_transcripts",
+        "description": "Trigger a full import of all transcripts from connected providers. Only transcripts not yet in the database will be imported. Use for initial onboarding or after a long offline period. Import in small batches (default 10), then review and assign transcripts before importing the next batch.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "description": "Max number of transcripts to import in this batch (default: 10)"
+            },
+            "since": {
+              "type": "string",
+              "description": "ISO date to import from (e.g. 2025-01-01). If not set, imports all transcripts."
+            }
+          }
+        }
+      },
+      {
+        "name": "move_transcript",
+        "description": "Move a transcript to a different folder. Updates Google Drive, resets the record for reindexing, and removes old vectors from the search index.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "doc_id": {
+              "type": "string",
+              "description": "Document ID to move"
+            },
+            "folder_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Target folder path from root, e.g. [\"Clients - Active\", \"Acme Corp\"]"
+            }
+          },
+          "required": [
+            "doc_id",
+            "folder_path"
+          ]
+        }
+      },
+      {
+        "name": "move_folder",
+        "description": "Move a folder to a different location in the hierarchy. Updates Google Drive and the folder index. Documents inside are not reindexed — their parent_id remains stable.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "folder_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Path of the folder to move, e.g. [\"Clients - Active\", \"Acme Corp\"]"
+            },
+            "new_parent_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Path of the new parent folder, e.g. [\"Clients - Past\"]. Empty or omitted = move to root."
+            }
+          },
+          "required": [
+            "folder_path"
+          ]
+        }
+      },
+      {
+        "name": "create_folder",
+        "description": "Create a new folder in Google Drive and register it in the knowledge base.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Folder name"
+            },
+            "parent_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Parent folder path from root, e.g. [\"Clients - Active\"]. Empty or omitted = create at root level."
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      {
+        "name": "rename_folder",
+        "description": "Rename a folder in the knowledge base. Updates Google Drive and the folder index. Documents inside are not reindexed.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "folder_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Path of the folder to rename, e.g. [\"Clients - Active\", \"Old Name\"]"
+            },
+            "new_name": {
+              "type": "string",
+              "description": "New name for the folder"
+            }
+          },
+          "required": [
+            "folder_path",
+            "new_name"
+          ]
+        }
+      },
+      {
+        "name": "sync_changes",
+        "description": "Sync recent changes from Google Drive. Use doc_id only when a forced resync of a specific document is needed.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "doc_id": {
+              "type": "string",
+              "description": "Resync a specific document by ID"
+            }
+          }
+        }
+      },
+      {
+        "name": "sync_status",
+        "description": "Show the current sync status: how many transcripts are in each stage (queued, downloading, imported, syncing, synced, error) and how many are unassigned. Use to diagnose stuck imports or check overall system health.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "add_fact",
+        "description": "Manually add a fact to a specific transcript. Use when semantic search missed an important detail — pins the document to relevant future queries.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "doc_id": {
+              "type": "string",
+              "description": "Document ID to attach the fact to"
+            },
+            "text": {
+              "type": "string",
+              "description": "The fact to remember, in English"
+            }
+          },
+          "required": [
+            "doc_id",
+            "text"
+          ]
+        }
+      },
+      {
+        "name": "list_recent_transcripts",
+        "description": "List transcripts sorted by date descending. Use to find recent recordings without knowing the folder. Supports optional folder_path and date range filters, and pagination.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "folder_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Filter by folder path, e.g. [\"Clients - Active\", \"Acme Corp\"] (optional)"
+            },
+            "date_from": {
+              "type": "string",
+              "description": "ISO date, inclusive lower bound (optional)"
+            },
+            "date_to": {
+              "type": "string",
+              "description": "ISO date, inclusive upper bound (optional)"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Page size (default: 20)"
+            },
+            "offset": {
+              "type": "integer",
+              "description": "Pagination offset (default: 0)"
+            }
+          }
+        }
+      },
+      {
+        "name": "rename_transcript",
+        "description": "Rename a transcript: updates the file name in Google Drive and the title visible in list_recent_transcripts.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "doc_id": {
+              "type": "string",
+              "description": "Document ID to rename"
+            },
+            "new_title": {
+              "type": "string",
+              "description": "New title for the transcript"
+            }
+          },
+          "required": [
+            "doc_id",
+            "new_title"
+          ]
+        }
+      }
+    ]
+  }
+}

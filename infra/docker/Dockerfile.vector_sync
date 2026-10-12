@@ -1,19 +1,20 @@
+FROM python:3.12-slim AS builder
+
+WORKDIR /src
+
+COPY . /src
+
+RUN python infra/build/assemble.py --service vector_sync --source-root /src --output /src/.build/vector_sync
+
 FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY requirements-common.txt /app/requirements-common.txt
-COPY core/gemini/requirements.txt /app/core/gemini/requirements.txt
-COPY core/google_drive/requirements.txt /app/core/google_drive/requirements.txt
-COPY core/qdrant/requirements.txt /app/core/qdrant/requirements.txt
-COPY services/vector_sync/requirements.txt /app/services/vector_sync/requirements.txt
+COPY --from=builder /src/.build/vector_sync/ /app/
 
-RUN pip install --no-cache-dir -r /app/services/vector_sync/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='Qdrant/bm25')"
-
-COPY core /app/core
-COPY services/vector_sync /app/services/vector_sync
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8080

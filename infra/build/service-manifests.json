@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "services": {
+    "mcp": {
+      "entry_roots": [
+        "services/mcp/app/main.py"
+      ],
+      "runtime": {
+        "kind": "asgi",
+        "target": "services.mcp.app.main:app"
+      },
+      "path_remaps": {},
+      "module_aliases": {},
+      "requirements_roots": [
+        "services/mcp/requirements.txt"
+      ],
+      "extra_modules": [],
+      "resources": [],
+      "model_preparation": [
+        "Qdrant/bm25"
+      ]
+    },
+    "vector_sync": {
+      "entry_roots": [
+        "services/vector_sync/app/main.py"
+      ],
+      "runtime": {
+        "kind": "asgi",
+        "target": "services.vector_sync.app.main:app"
+      },
+      "path_remaps": {},
+      "module_aliases": {},
+      "requirements_roots": [
+        "services/vector_sync/requirements.txt"
+      ],
+      "extra_modules": [],
+      "resources": [],
+      "model_preparation": [
+        "Qdrant/bm25"
+      ]
+    },
+    "tldv_import": {
+      "entry_roots": [
+        "services/connectors/tldv/import_service/app/main.py"
+      ],
+      "runtime": {
+        "kind": "asgi",
+        "target": "app.main:app"
+      },
+      "path_remaps": {
+        "services/connectors/tldv/import_service": "",
+        "services/connectors/tldv/tldv_client.py": "tldv_client.py"
+      },
+      "module_aliases": {
+        "tldv_client": "services.connectors.tldv.tldv_client"
+      },
+      "requirements_roots": [
+        "services/connectors/tldv/import_service/requirements.txt"
+      ],
+      "extra_modules": [],
+      "resources": [],
+      "model_preparation": []
+    },
+    "sync_checker": {
+      "entry_roots": [
+        "services/sync_checker/main.py"
+      ],
+      "runtime": {
+        "kind": "function",
+        "target": "checker"
+      },
+      "path_remaps": {
+        "services/sync_checker": ""
+      },
+      "module_aliases": {},
+      "requirements_roots": [
+        "services/sync_checker/requirements.txt"
+      ],
+      "extra_modules": [],
+      "resources": [],
+      "model_preparation": []
+    },
+    "tldv_webhook": {
+      "entry_roots": [
+        "services/connectors/tldv/webhook/main.py"
+      ],
+      "runtime": {
+        "kind": "function",
+        "target": "tldv_webhook"
+      },
+      "path_remaps": {
+        "services/connectors/tldv/webhook": ""
+      },
+      "module_aliases": {},
+      "requirements_roots": [
+        "services/connectors/tldv/webhook/requirements.txt"
+      ],
+      "extra_modules": [],
+      "resources": [],
+      "model_preparation": []
+    },
+    "tldv_reconciliation": {
+      "entry_roots": [
+        "services/connectors/tldv/reconciliation/main.py"
+      ],
+      "runtime": {
+        "kind": "function",
+        "target": "tldv_reconciliation"
+      },
+      "path_remaps": {
+        "services/connectors/tldv/reconciliation": "",
+        "services/connectors/tldv/tldv_client.py": "tldv_client.py"
+      },
+      "module_aliases": {
+        "tldv_client": "services.connectors.tldv.tldv_client"
+      },
+      "requirements_roots": [
+        "services/connectors/tldv/reconciliation/requirements.txt"
+      ],
+      "extra_modules": [],
+      "resources": [],
+      "model_preparation": []
+    }
+  }
+}

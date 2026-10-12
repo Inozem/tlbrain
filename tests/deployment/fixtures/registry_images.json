@@ -1,0 +1,77 @@
+{
+  "repository": "registry.synthetic.invalid/team/service",
+  "version": "v1.2.3-synthetic",
+  "platform": "linux/amd64",
+  "service": "mcp",
+  "target": "production",
+  "python_version": "3.12",
+  "workflow": {
+    "repository": "example.invalid/synthetic/project",
+    "run_id": "run-0001",
+    "attempt": "1"
+  },
+  "index": {
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.index.v1+json",
+    "manifests": [
+      {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "platform": {"os": "linux", "architecture": "amd64"},
+        "fixture_manifest": "amd64"
+      },
+      {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "platform": {"os": "linux", "architecture": "arm64"},
+        "fixture_manifest": "arm64"
+      }
+    ]
+  },
+  "images": {
+    "amd64": {
+      "manifest": {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "fixture_config": "amd64"},
+        "layers": []
+      },
+      "config": {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+          "Entrypoint": ["python", "-m", "service"],
+          "Cmd": ["--serve"],
+          "WorkingDir": "/app",
+          "User": "10001",
+          "Env": ["LANG=C.UTF-8", "PYTHONUNBUFFERED=1"],
+          "Labels": {
+          "org.tlbrain.validation": "{\"schema_version\":1,\"service\":\"mcp\",\"target\":\"production\",\"python_version\":\"3.12\",\"platform\":\"linux/amd64\",\"source_fingerprint\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"requirements_fingerprint\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"runtime_fingerprint\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"checks\":[\"compile\",\"imports\",\"startup\",\"cache\"],\"status\":\"passed\",\"workflow\":{\"repository\":\"example.invalid/synthetic/project\",\"run_id\":\"run-0001\",\"attempt\":\"1\"}}"
+          }
+        },
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:1111111111111111111111111111111111111111111111111111111111111111"]}
+      }
+    },
+    "arm64": {
+      "manifest": {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "fixture_config": "arm64"},
+        "layers": []
+      },
+      "config": {
+        "architecture": "arm64",
+        "os": "linux",
+        "config": {
+          "Entrypoint": ["python", "-m", "service"],
+          "Cmd": ["--serve"],
+          "WorkingDir": "/app",
+          "User": "10001",
+          "Env": ["LANG=C.UTF-8", "PYTHONUNBUFFERED=1"],
+          "Labels": {
+          "org.tlbrain.validation": "{\"schema_version\":1,\"service\":\"mcp\",\"target\":\"production\",\"python_version\":\"3.12\",\"platform\":\"linux/arm64\",\"source_fingerprint\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"requirements_fingerprint\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"runtime_fingerprint\":\"sha256:5555555555555555555555555555555555555555555555555555555555555555\",\"checks\":[\"compile\",\"imports\",\"startup\",\"cache\"],\"status\":\"passed\",\"workflow\":{\"repository\":\"example.invalid/synthetic/project\",\"run_id\":\"run-0001\",\"attempt\":\"1\"}}"
+          }
+        },
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:6666666666666666666666666666666666666666666666666666666666666666"]}
+      }
+    }
+  }
+}

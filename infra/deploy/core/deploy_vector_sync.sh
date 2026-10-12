@@ -16,9 +16,19 @@ VECTOR_SYNC_CHECKER_NAME=${VECTOR_SYNC_CHECKER_NAME:-tlbrain-vector-sync-checker
 VECTOR_SYNC_QUEUE=${VECTOR_SYNC_QUEUE:-tlbrain-vector-sync-queue}
 VECTOR_SYNC_MAX_INSTANCES=${VECTOR_SYNC_MAX_INSTANCES:-2}
 
-SYNC_IMAGE="inozem/tlbrain-vector-sync:${VERSION}"
-
 echo "--- Deploying Vector Sync Service ---"
+
+SYNC_DIGEST=$(bash "${REPO_ROOT}/infra/build/preflight.sh" --verify-mode \
+  --repository "inozem/tlbrain-vector-sync" \
+  --version "${VERSION}" \
+  --service vector_sync \
+  --target "services.vector_sync.app.main:app" \
+  --platform linux/amd64 \
+  --required-check compile \
+  --required-check imports \
+  --required-check startup \
+  --required-check cache)
+SYNC_IMAGE="inozem/tlbrain-vector-sync@${SYNC_DIGEST}"
 
 gcloud run deploy "${VECTOR_SYNC_SERVICE_NAME}" \
   --image "${SYNC_IMAGE}" \

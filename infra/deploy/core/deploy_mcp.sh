@@ -23,6 +23,18 @@ MCP_MAX_INSTANCES=${MCP_MAX_INSTANCES:-1}
 
 echo "--- Deploying MCP Service ---"
 
+MCP_DIGEST=$(bash "${REPO_ROOT}/infra/build/preflight.sh" --verify-mode \
+  --repository "inozem/tlbrain-mcp" \
+  --version "${VERSION}" \
+  --service mcp \
+  --target "services.mcp.app.main:app" \
+  --platform linux/amd64 \
+  --required-check compile \
+  --required-check imports \
+  --required-check startup \
+  --required-check cache)
+MCP_IMAGE="inozem/tlbrain-mcp@${MCP_DIGEST}"
+
 VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
   --format='value(status.url)')

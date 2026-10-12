@@ -25,7 +25,11 @@ GEMINI_API_KEY=${GEMINI_API_KEY:-}
 TLDV_IMPORT_MAX_INSTANCES=${TLDV_IMPORT_MAX_INSTANCES:-2}
 
 echo "--- Building TL;DV Import Service image ---"
-docker build -f "${REPO_ROOT}/infra/docker/Dockerfile.tldv_import" -t "${TLDV_IMPORT_IMAGE}" "${REPO_ROOT}"
+docker build --platform linux/amd64 -f "${REPO_ROOT}/infra/docker/Dockerfile.tldv_import" -t "${TLDV_IMPORT_IMAGE}" "${REPO_ROOT}"
+bash "${REPO_ROOT}/infra/build/preflight.sh" --image-mode \
+  --image "${TLDV_IMPORT_IMAGE}" \
+  --service tldv_import \
+  --platform linux/amd64
 docker push "${TLDV_IMPORT_IMAGE}"
 
 echo "--- Deploying TL;DV Import Service ---"

@@ -1,0 +1,73 @@
+{
+  "description": "Small invented transcript inputs for parser and windowing tests; no real records or credentials.",
+  "cases": {
+    "valid_full": {
+      "doc_id": "synthetic-doc-main",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "DATE: 2026-01-12\nTIME: 09:00\nPROVIDER: tldv\n---\nFixture Speaker A :: We will review the sample schedule.\nFixture Speaker B :: The draft has three sections.\nFixture Speaker A :: Each section needs a clear owner.\nFixture Speaker B :: We can track changes in a small table.\nFixture Speaker A :: The first review is on Tuesday.\nFixture Speaker B :: Notes should include the decision.\nFixture Speaker A :: A second pass can check the wording.\nFixture Speaker B :: We will keep the example data invented.\nFixture Speaker A :: The final copy can stay brief.\nFixture Speaker B :: We will record the next step.\n",
+      "expected_valid": true,
+      "expected_utterance_count": 10,
+      "expected_metadata": {"date": "2026-01-12", "time": "09:00", "provider": "tldv"},
+      "expected_anchor_indices": [0, 3, 6, 9],
+      "expected_window_ranges": [[0, 2], [1, 5], [4, 8], [7, 9]]
+    },
+    "valid_minimally_changed": {
+      "doc_id": "synthetic-doc-main",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "DATE: 2026-01-12\nTIME: 09:00\nPROVIDER: tldv\n---\nFixture Speaker A :: We will review the sample schedule.\nFixture Speaker B :: The draft has three sections.\nFixture Speaker A :: Each section needs a clear owner.\nFixture Speaker B :: We can track changes in a small table.\nFixture Speaker A :: The first review is on Wednesday.\nFixture Speaker B :: Notes should include the decision.\nFixture Speaker A :: A second pass can check the wording.\nFixture Speaker B :: We will keep the example data invented.\nFixture Speaker A :: The final copy can stay brief.\nFixture Speaker B :: We will record the next step.\n",
+      "expected_valid": true,
+      "expected_utterance_count": 10
+    },
+    "valid_without_time": {
+      "doc_id": "synthetic-doc-no-time",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "DATE: 2026-01-12\nPROVIDER: tldv\n---\nFixture Speaker A :: This transcript has no time header.\n",
+      "expected_valid": true,
+      "expected_utterance_count": 1,
+      "expected_metadata": {"date": "2026-01-12", "provider": "tldv"}
+    },
+    "empty_raw_text": {
+      "doc_id": "synthetic-doc-empty",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "",
+      "expected_valid": false,
+      "expected_utterance_count": 0
+    },
+    "headers_only": {
+      "doc_id": "synthetic-doc-headers-only",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "DATE: 2026-01-12\nPROVIDER: tldv\n---\n",
+      "expected_valid": false,
+      "expected_utterance_count": 0
+    },
+    "missing_date": {
+      "doc_id": "synthetic-doc-missing-date",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "PROVIDER: tldv\n---\nFixture Speaker A :: This has no date field.\n",
+      "expected_valid": false,
+      "expected_utterance_count": 1
+    },
+    "missing_provider": {
+      "doc_id": "synthetic-doc-missing-provider",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "DATE: 2026-01-12\n---\nFixture Speaker A :: This has no provider field.\n",
+      "expected_valid": false,
+      "expected_utterance_count": 1
+    },
+    "missing_separator": {
+      "doc_id": "synthetic-doc-missing-separator",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "DATE: 2026-01-12\nPROVIDER: tldv\nFixture Speaker A :: This has no separator line.\n",
+      "expected_valid": false,
+      "expected_utterance_count": 1
+    },
+    "mixed_invalid_body_lines": {
+      "doc_id": "synthetic-doc-mixed-lines",
+      "parent_id": "synthetic-folder-ops",
+      "raw": "DATE: 2026-01-12\nPROVIDER: tldv\n---\n\n :: Missing speaker is ignored.\nFixture Speaker A ::   \nThis line has no separator\nFixture Speaker B :: This accepted line has order zero.\n  Fixture Speaker A  ::  This accepted line has order one.  \n",
+      "expected_valid": true,
+      "expected_utterance_count": 2,
+      "expected_order_indices": [0, 1]
+    }
+  }
+}
