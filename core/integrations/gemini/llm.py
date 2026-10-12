@@ -1,11 +1,11 @@
 import json
 import logging
-import os
 from typing import Any
 
 from google import genai
 from google.genai import types
 
+from .client import make_client
 from core.utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
@@ -65,12 +65,12 @@ _CLIENT_DETECTION_SCHEMA = {
 
 
 def call_gemini_json(prompt: str) -> dict:
-    client = _client()
+    client = make_client()
     return _generate_structured(client, prompt, schema=_CLIENT_DETECTION_SCHEMA)
 
 
 def generate_summary_and_facts(utterances: list[dict[str, Any]]) -> tuple[str, list[str]]:
-    client = _client()
+    client = make_client()
     dialog = _format_dialog(utterances)
     prompt = _PROMPT.format(dialog=dialog)
     data = _generate_structured(client, prompt)
@@ -79,10 +79,6 @@ def generate_summary_and_facts(utterances: list[dict[str, Any]]) -> tuple[str, l
         logger.debug("Truncating facts from %d to 10", len(facts))
         facts = facts[:10]
     return data["summary"], facts
-
-
-def _client() -> genai.Client:
-    return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
 def _format_dialog(utterances: list[dict[str, Any]]) -> str:

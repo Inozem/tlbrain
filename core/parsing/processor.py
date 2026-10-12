@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Generator
 
-from core.gemini.llm import GeminiEmptyResponseError, generate_summary_and_facts
+from core.integrations.gemini.llm import GeminiEmptyResponseError, generate_summary_and_facts
 from core.parsing.windowing import generate_windows
 
 

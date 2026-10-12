@@ -4,7 +4,7 @@ from fastembed import SparseTextEmbedding
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, Range, SparseVector
 
 from core.config import get_root_folder_id
-from core.gemini.embeddings import embed
+from core.integrations.gemini.embeddings import embed
 from core.qdrant.client import get_client
 from core.qdrant.schema import get_collection_name
 

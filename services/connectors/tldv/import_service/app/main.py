@@ -10,7 +10,7 @@ from google.cloud import firestore
 from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
-from core.gemini.llm import call_gemini_json
+from core.integrations.gemini.llm import call_gemini_json
 from core.integrations.google_auth.credentials import credentials
 from core.google_drive.firestore import COLLECTION_NAME, FOLDERS_COLLECTION, _speaker_key, delete_queued_placeholder, get_all_folders, mark_download_error, mark_downloading, upsert_folder
 from core.utils.logging import configure_logging

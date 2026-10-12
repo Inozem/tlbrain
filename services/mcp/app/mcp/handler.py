@@ -12,7 +12,7 @@ from services.mcp.app.mcp.tools import (
     build_jsonrpc_result,
 )
 from core.config import get_root_folder_id
-from core.gemini.embeddings import embed
+from core.integrations.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.folders import list_folders

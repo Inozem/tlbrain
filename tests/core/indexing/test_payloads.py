@@ -5,7 +5,7 @@ from copy import deepcopy
 import pytest
 from google.genai import types
 
-from core.gemini import embeddings, llm
+from core.integrations.gemini import embeddings, llm
 from core.parsing import processor
 from core.parsing.parser import parse_document
 

@@ -13,7 +13,7 @@ from google.oauth2.credentials import Credentials
 from qdrant_client.models import Distance, SparseVectorParams, VectorParams
 from qdrant_client.http.models.models import QueryResponse, ScoredPoint
 
-from core.gemini import embeddings, llm
+from core.integrations.gemini import embeddings, llm
 from core.google_drive import drive_client
 from core.google_drive import docs_reader
 from core.qdrant import client as qdrant_client
@@ -130,7 +130,7 @@ def test_gemini_empty_and_error_responses_remain_observable(sdk_fakes):
         candidates=[types.Candidate(finish_reason=types.FinishReason.SAFETY)]
     ))
     with pytest.raises(llm.GeminiEmptyResponseError):
-        llm._generate_structured(llm._client(), "prompt")
+        llm._generate_structured(llm.make_client(), "prompt")
     sdk_fakes.gemini.queue("embed_content", error=ValueError("scripted Gemini failure"))
     with pytest.raises(ValueError, match="scripted Gemini failure"):
         embeddings.make_client().models.embed_content(model="test", contents=["x"])

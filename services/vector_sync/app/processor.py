@@ -3,7 +3,7 @@ import logging
 from fastembed import SparseTextEmbedding
 from qdrant_client.models import SparseVector
 
-from core.gemini.embeddings import embed, make_client
+from core.integrations.gemini.embeddings import embed, make_client
 from core.google_drive.docs_reader import read_google_doc
 from core.google_drive.firestore import acquire_for_syncing, mark_error, mark_synced, update_skipped_utterances
 from core.parsing.parser import parse_document

@@ -1,17 +1,12 @@
-import os
-
 from google import genai
 from google.genai import types
 
+from .client import make_client
 from core.utils.retry import with_retry
 
 _EMBEDDING_MODEL = "gemini-embedding-2"
 _OUTPUT_DIMS = 768
 _BATCH_SIZE = 100
-
-
-def make_client() -> genai.Client:
-    return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
 def embed(texts: list[str], client: genai.Client | None = None) -> list[list[float]]:
