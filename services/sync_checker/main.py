@@ -26,7 +26,7 @@ from core.google_drive.firestore import (
     update_transcript_source_file,
     upsert_folder,
 )
-from core.utils.tasks import enqueue_task
+from core.integrations.cloud_tasks.client import enqueue_task
 
 from core.utils.logging import configure_logging
 

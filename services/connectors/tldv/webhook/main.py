@@ -6,7 +6,7 @@ import functions_framework
 
 from core.google_drive.firestore import write_queued
 from core.utils.logging import configure_logging
-from core.utils.tasks import enqueue_task
+from core.integrations.cloud_tasks.client import enqueue_task
 
 configure_logging()
 logger = logging.getLogger(__name__)

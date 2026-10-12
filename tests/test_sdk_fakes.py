@@ -18,7 +18,7 @@ from core.google_drive import drive_client
 from core.google_drive import docs_reader
 from core.qdrant import client as qdrant_client
 from core.qdrant import setup as qdrant_setup
-from core.utils.tasks import enqueue_task
+from core.integrations.cloud_tasks.client import enqueue_task
 from tests.fixtures.sdk_fakes import FakeQdrantClient, fake_discovery_build
 from tests.fixtures import sdk_fakes as sdk_fakes_module
 
@@ -176,15 +176,29 @@ def test_sparse_vectors_are_configurable_and_deterministic(sdk_fakes):
 
 def test_cloud_tasks_real_paths_named_duplicates_and_anonymous_tasks(sdk_fakes, monkeypatch):
     monkeypatch.setenv("REGION", "test-region")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "override-project")
     assert enqueue_task("queue", "https://worker.invalid/task", "named", {"x": 1}) is True
     assert enqueue_task("queue", "https://worker.invalid/task", "named", {"x": 1}) is False
     assert enqueue_task("queue", "https://worker.invalid/task") is True
+    assert enqueue_task("queue", "https://worker.invalid/task", body={}) is True
     task_calls = [e for e in sdk_fakes.trace if e["operation"] == "create_task"]
-    assert len(task_calls) == 3
-    assert task_calls[0]["arguments"]["task"]["http_request"]["body"] == b'{"x": 1}'
-    assert task_calls[2]["arguments"]["task"].get("name") is None
-
+    assert len(task_calls) == 4
+    parent = "projects/override-project/locations/test-region/queues/queue"
+    assert all(call["arguments"]["parent"] == parent for call in task_calls)
+    named_path = f"{parent}/tasks/named"
+    assert task_calls[0]["arguments"]["task"]["name"] == named_path
+    request = task_calls[0]["arguments"]["task"]["http_request"]
     from google.cloud import tasks_v2
+    assert request["http_method"] == tasks_v2.HttpMethod.POST
+    assert request["url"] == "https://worker.invalid/task"
+    assert request["headers"] == {"Content-Type": "application/json"}
+    assert request["body"] == b'{"x": 1}'
+    assert task_calls[2]["arguments"]["task"].get("name") is None
+    assert "headers" not in task_calls[2]["arguments"]["task"]["http_request"]
+    empty_request = task_calls[3]["arguments"]["task"]["http_request"]
+    assert empty_request["headers"] == {"Content-Type": "application/json"}
+    assert empty_request["body"] == b"{}"
+
     client = tasks_v2.CloudTasksClient()
     parent = client.queue_path("pytest-synthetic-project", "test-region", "queue")
     request = {"http_request": {"http_method": tasks_v2.HttpMethod.POST, "url": "https://worker.invalid/"}}

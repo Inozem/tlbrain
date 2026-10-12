@@ -8,7 +8,7 @@ from google.cloud import firestore
 
 from core.google_drive.firestore import COLLECTION_NAME, mark_download_error, write_queued
 from core.utils.logging import configure_logging
-from core.utils.tasks import enqueue_task
+from core.integrations.cloud_tasks.client import enqueue_task
 from tldv_client import get_meetings, iter_meeting_pages, tldv_get
 
 configure_logging()
