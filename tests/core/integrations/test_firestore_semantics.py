@@ -7,6 +7,7 @@ import pytest
 
 from core.google_drive import firestore as drive_firestore
 from core.integrations.firestore import folders as folder_repository
+from core.integrations.firestore import sync_state as sync_state_repository
 from core.integrations.firestore import transcripts as transcript_repository
 from services.vector_sync.app import index_store
 
@@ -468,12 +469,15 @@ def test_drive_sync_token_uses_exact_path_and_replacement_set(firestore_fake):
     db = _client(firestore_fake)
     ref = db.collection("tokens").document("drive_sync")
 
-    assert drive_firestore.get_drive_sync_token() is None
+    assert sync_state_repository.get_drive_sync_token() is None
     ref.set({"unrelated": True})
-    assert drive_firestore.get_drive_sync_token() is None
+    assert sync_state_repository.get_drive_sync_token() is None
     drive_firestore.set_drive_sync_token("synthetic-token-a")
-    assert drive_firestore.get_drive_sync_token() == "synthetic-token-a"
+    assert sync_state_repository.get_drive_sync_token() == "synthetic-token-a"
     assert firestore_fake.documents["tokens/drive_sync"] == {"page_token": "synthetic-token-a", "updated_at": now}
+    assert drive_firestore.get_drive_sync_token is sync_state_repository.get_drive_sync_token
+    assert drive_firestore.set_drive_sync_token is sync_state_repository.set_drive_sync_token
+    assert _writes(firestore_fake, "tokens/drive_sync")[-1]["operation"] == "set"
     drive_firestore.set_drive_sync_token("synthetic-token-b")
     assert firestore_fake.documents["tokens/drive_sync"] == {"page_token": "synthetic-token-b", "updated_at": now}
     assert [event["operation"] for event in _writes(firestore_fake, "tokens/drive_sync")] == ["set", "set", "set"]

@@ -10,6 +10,7 @@ from core.integrations.firestore.client import (
     TOKENS_COLLECTION,
     get_client,
 )
+from core.integrations.firestore.sync_state import get_drive_sync_token, set_drive_sync_token
 from core.integrations.firestore.transcripts import (
     STALE_SYNCING_MINUTES,
     acquire_for_syncing,
@@ -208,20 +209,6 @@ def get_client_folder_id(client_name: str) -> str | None:
     if not doc.exists:
         return None
     return doc.to_dict().get("folder_id")
-
-
-def get_drive_sync_token() -> str | None:
-    doc = _get_db().collection(TOKENS_COLLECTION).document(DRIVE_SYNC_TOKEN_DOC).get()
-    if not doc.exists:
-        return None
-    return doc.to_dict().get("page_token")
-
-
-def set_drive_sync_token(token: str) -> None:
-    _get_db().collection(TOKENS_COLLECTION).document(DRIVE_SYNC_TOKEN_DOC).set({
-        "page_token": token,
-        "updated_at": firestore.SERVER_TIMESTAMP,
-    })
 
 
 def get_client_name_by_folder_id(folder_id: str) -> str | None:

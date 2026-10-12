@@ -15,17 +15,16 @@ from core.google_drive.firestore import (
     COLLECTION_NAME,
     delete_folder,
     get_all_folders,
-    get_drive_sync_token,
     get_error_docs,
     get_folder_by_id,
     get_stale_syncing,
     move_transcript_record,
     orphan_folder_children,
     orphan_transcript_children,
-    set_drive_sync_token,
     update_transcript_source_file,
     upsert_folder,
 )
+from core.integrations.firestore.sync_state import get_drive_sync_token, set_drive_sync_token
 from core.integrations.cloud_tasks.client import enqueue_task
 
 from core.utils.logging import configure_logging
