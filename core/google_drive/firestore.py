@@ -4,17 +4,22 @@ from datetime import datetime, timezone, timedelta
 from google.cloud import firestore
 
 from core.config import get_root_folder_id
+from core.integrations.firestore.client import (
+    CLIENTS_COLLECTION,
+    COLLECTION_NAME,
+    DRIVE_SYNC_TOKEN_DOC,
+    FOLDERS_COLLECTION,
+    TOKENS_COLLECTION,
+    get_client,
+)
 
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = "transcript_index"
-CLIENTS_COLLECTION = "clients"
-FOLDERS_COLLECTION = "folders"
 STALE_SYNCING_MINUTES = 15
 
 
 def _get_db() -> firestore.Client:
-    return firestore.Client()
+    return get_client()
 
 
 def acquire_for_syncing(doc_id: str) -> bool:
@@ -492,10 +497,6 @@ def get_sync_status() -> dict:
         **counts,
         "_unassigned_count": unassigned,
     }
-
-
-TOKENS_COLLECTION = "tokens"
-DRIVE_SYNC_TOKEN_DOC = "drive_sync"
 
 
 def get_drive_sync_token() -> str | None:
