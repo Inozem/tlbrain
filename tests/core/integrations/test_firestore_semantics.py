@@ -9,7 +9,6 @@ from core.google_drive import firestore as drive_firestore
 from core.integrations.firestore import folders as folder_repository
 from core.integrations.firestore import sync_state as sync_state_repository
 from core.integrations.firestore import transcripts as transcript_repository
-from services.vector_sync.app import index_store
 
 
 INDEX = "transcript_index"
@@ -84,7 +83,6 @@ def test_folder_speaker_index_and_legacy_facade_forwarding(firestore_fake, monke
     name = "Zoë Speaker"
     key = "s" + hashlib.md5(name.encode("utf-8")).hexdigest()[:12]
     assert folder_repository.speaker_key(name) == key
-    assert drive_firestore._speaker_key(name) == key
 
     db.collection(FOLDERS).document("speaker-folder").set({
         "folder_id": "speaker-folder", "name": "Speaker folder", "parent_id": None,
@@ -101,21 +99,10 @@ def test_folder_speaker_index_and_legacy_facade_forwarding(firestore_fake, monke
     drive_firestore.upsert_folder("facade-folder", "Facade", None)
     assert drive_firestore.get_folder_by_id("facade-folder")["folder_id"] == "facade-folder"
     assert drive_firestore.get_all_folders()["facade-folder"]["name"] == "Facade"
-    assert drive_firestore.folder_name_exists("Facade", None)
+    assert folder_repository.folder_name_exists("Facade", None, db)
     assert drive_firestore.orphan_folder_children("speaker-folder") == 0
     drive_firestore.delete_folder("facade-folder")
     assert f"{FOLDERS}/facade-folder" not in firestore_fake.documents
-
-
-def test_unassigned_folder_lookup_reuses_facade_client(firestore_fake, monkeypatch):
-    db = _client(firestore_fake)
-    db.collection(FOLDERS).document("unassigned-id").set({"name": "_unassigned"})
-    calls = []
-    monkeypatch.setattr(drive_firestore, "_get_db", lambda: calls.append(db) or db)
-    monkeypatch.setattr(transcript_repository, "list_unassigned_transcripts", lambda folder_id, client: [])
-
-    assert drive_firestore.get_unassigned() == {"count": 0, "transcripts": []}
-    assert len(calls) == 1
 
 
 def test_folder_repository_default_client_is_lazy(firestore_fake, monkeypatch):
@@ -123,7 +110,7 @@ def test_folder_repository_default_client_is_lazy(firestore_fake, monkeypatch):
     db = _client(firestore_fake)
     monkeypatch.setattr(folder_repository, "get_client", lambda: calls.append(True) or db)
 
-    assert folder_repository.speaker_key("speaker") == drive_firestore._speaker_key("speaker")
+    assert folder_repository.speaker_key("speaker").startswith("s")
     assert calls == []
     assert folder_repository.get_all_folders() == {}
     assert calls == [True]
@@ -136,7 +123,7 @@ def test_save_index_replaces_update_index_merges_and_dotted_paths(firestore_fake
     ref.set({"keep": "initial", "removed": True, "utterance_hashes": {"0": "old", "1": "sibling"}})
     firestore_fake.set_clock(lambda: datetime(2026, 1, 2, tzinfo=timezone.utc))
 
-    index_store.save_index("synthetic-index", {"status": "imported", "version": "v2.0.0"})
+    transcript_repository.save_index("synthetic-index", {"status": "imported", "version": "v2.0.0"})
     assert firestore_fake.documents[path] == {"status": "imported", "version": "v2.0.0"}
     assert _writes(firestore_fake, path)[-1]["operation"] == "set"
 
@@ -144,7 +131,7 @@ def test_save_index_replaces_update_index_merges_and_dotted_paths(firestore_fake
         "status": "reimported", "version": "v2.0.0", "retained": True,
         "utterance_hashes": {"0": "old", "1": "sibling"},
     })
-    index_store.update_index("synthetic-index", {"status": "synced", "utterance_hashes.0": "new"})
+    transcript_repository.update_index("synthetic-index", {"status": "synced", "utterance_hashes.0": "new"})
     assert firestore_fake.documents[path] == {
         "status": "synced", "version": "v2.0.0", "retained": True,
         "utterance_hashes": {"0": "new", "1": "sibling"},
@@ -191,6 +178,39 @@ def test_transcript_reads_and_updates_use_injected_client(firestore_fake, monkey
     }
 
 
+def test_transcript_orphaning_updates_direct_children_and_facade_forwards(firestore_fake, monkeypatch):
+    db = _client(firestore_fake)
+    records = {
+        "child-a": {"parent_id": "removed-folder", "status": "synced", "keep": 1},
+        "child-b": {"parent_id": "removed-folder", "status": "imported"},
+        "other": {"parent_id": "other-folder", "status": "synced"},
+    }
+    for doc_id, data in records.items():
+        db.collection(INDEX).document(doc_id).set(data)
+
+    assert transcript_repository.orphan_transcript_children("removed-folder", db=db) == 2
+    assert firestore_fake.documents[f"{INDEX}/child-a"] == {
+        "parent_id": None, "status": "synced", "keep": 1,
+    }
+    assert firestore_fake.documents[f"{INDEX}/child-b"]["parent_id"] is None
+    assert firestore_fake.documents[f"{INDEX}/other"]["parent_id"] == "other-folder"
+    assert [event["operation"] for event in _writes(firestore_fake, f"{INDEX}/child-a")] == ["set", "update"]
+    assert [event["operation"] for event in _writes(firestore_fake, f"{INDEX}/child-b")] == ["set", "update"]
+
+    monkeypatch.setattr(drive_firestore, "_get_db", lambda: db)
+    delegated = []
+    canonical_orphan = transcript_repository.orphan_transcript_children
+
+    def record_delegation(folder_id, client):
+        delegated.append((folder_id, client))
+        return canonical_orphan(folder_id, client)
+
+    monkeypatch.setattr(transcript_repository, "orphan_transcript_children", record_delegation)
+    assert drive_firestore.orphan_transcript_children("other-folder") == 1
+    assert delegated == [("other-folder", db)]
+    assert firestore_fake.documents[f"{INDEX}/other"]["parent_id"] is None
+
+
 def test_index_stream_preserves_lazy_projected_query():
     events = []
 
@@ -232,10 +252,8 @@ def test_transcript_repository_crud_and_legacy_get_exports_share_implementation(
     ref = db.collection(INDEX).document("repo-record")
     ref.set({"value": 1, "optional": None})
 
-    assert index_store.load_index is transcript_repository.load_index
-    assert drive_firestore.get_transcript_record is transcript_repository.get_transcript_record
-    assert index_store.load_index("repo-record") == {"value": 1, "optional": None}
-    assert drive_firestore.get_transcript_record("absent") is None
+    assert transcript_repository.load_index("repo-record") == {"value": 1, "optional": None}
+    assert transcript_repository.get_transcript_record("absent") is None
 
     transcript_repository.save_index("repo-record", {"replacement": True})
     assert firestore_fake.documents[f"{INDEX}/repo-record"] == {"replacement": True}
@@ -338,12 +356,12 @@ def test_acquire_for_syncing_observes_exact_fifteen_minute_boundary(firestore_fa
     docs.document("no-time").set({"status": "syncing", "extra": 4})
     docs.document("other-status").set({"status": "error", "error": "synthetic", "extra": 5})
 
-    assert drive_firestore.acquire_for_syncing("fresh") is False
-    assert drive_firestore.acquire_for_syncing("boundary") is True
-    assert drive_firestore.acquire_for_syncing("old") is True
-    assert drive_firestore.acquire_for_syncing("no-time") is True
-    assert drive_firestore.acquire_for_syncing("other-status") is True
-    assert drive_firestore.acquire_for_syncing("missing") is True
+    assert transcript_repository.acquire_for_syncing("fresh") is False
+    assert transcript_repository.acquire_for_syncing("boundary") is True
+    assert transcript_repository.acquire_for_syncing("old") is True
+    assert transcript_repository.acquire_for_syncing("no-time") is True
+    assert transcript_repository.acquire_for_syncing("other-status") is True
+    assert transcript_repository.acquire_for_syncing("missing") is True
 
     snapshots = firestore_fake.documents
     assert snapshots[f"{INDEX}/fresh"] == {"status": "syncing", "status_changed_at": now - timedelta(minutes=14, seconds=59), "extra": 1}
@@ -369,8 +387,8 @@ def test_ensure_imported_creates_only_missing_document(firestore_fake):
     db = _client(firestore_fake)
     db.collection(INDEX).document("existing-import").set({"status": "synced", "keep": True})
 
-    assert drive_firestore.ensure_imported("new-import", "synthetic-parent", "fixture.docx") is True
-    assert drive_firestore.ensure_imported("existing-import", "ignored-parent", "ignored.docx") is False
+    assert transcript_repository.ensure_imported("new-import", "synthetic-parent", "fixture.docx") is True
+    assert transcript_repository.ensure_imported("existing-import", "ignored-parent", "ignored.docx") is False
     snapshots = firestore_fake.documents
     assert snapshots[f"{INDEX}/new-import"] == {
         "doc_id": "new-import", "parent_id": "synthetic-parent", "source_file": "fixture.docx",
@@ -428,17 +446,17 @@ def test_sync_error_and_move_writers_preserve_or_clear_fields_explicitly(firesto
         "other": "preserved",
     })
 
-    drive_firestore.mark_synced("synthetic-move")
+    transcript_repository.mark_synced("synthetic-move")
     after_synced = firestore_fake.documents[f"{INDEX}/synthetic-move"]
     assert after_synced["status"] == "synced" and after_synced["error"] is None
     assert after_synced["error_stage"] == "parse" and after_synced["other"] == "preserved"
 
-    drive_firestore.mark_error("synthetic-move", "synthetic vector failure")
+    transcript_repository.mark_error("synthetic-move", "synthetic vector failure")
     after_error = firestore_fake.documents[f"{INDEX}/synthetic-move"]
     assert after_error["status"] == "error" and after_error["error"] == "synthetic vector failure"
     assert after_error["error_stage"] == "vector_sync" and after_error["other"] == "preserved"
 
-    drive_firestore.move_transcript_record("synthetic-move", "new-parent")
+    transcript_repository.move_transcript_record("synthetic-move", "new-parent")
     moved = firestore_fake.documents[f"{INDEX}/synthetic-move"]
     assert moved["parent_id"] == "new-parent" and moved["status"] == "imported"
     assert "modifiedTime" not in moved and "content_hash" not in moved and "version" not in moved
@@ -472,10 +490,7 @@ def test_lifecycle_compatibility_exports_and_recovery_selectors(firestore_fake, 
     for doc_id, data in records.items():
         db.collection(INDEX).document(doc_id).set(data)
 
-    assert drive_firestore.STALE_SYNCING_MINUTES == 15
-    assert drive_firestore.get_stale_syncing is transcript_repository.get_stale_syncing
-    assert drive_firestore.get_error_docs is transcript_repository.get_error_docs
-    assert drive_firestore.get_sync_status is transcript_repository.get_sync_status
+    assert transcript_repository.STALE_SYNCING_MINUTES == 15
     assert transcript_repository.get_stale_syncing() == ["stale"]
     assert transcript_repository.get_error_docs() == ["legacy-error", "retry"]
     assert transcript_repository.get_sync_status() == {
@@ -494,8 +509,6 @@ def test_skipped_utterance_repository_reads_and_writes_keep_legacy_shape(firesto
 
     transcript_repository.update_skipped_utterances("has-skips", [9, 2, 9, 5])
     assert firestore_fake.documents[f"{INDEX}/has-skips"]["skipped_utterances"] == [2, 5, 9]
-    assert drive_firestore.update_skipped_utterances is transcript_repository.update_skipped_utterances
-    assert drive_firestore.get_docs_with_skipped_utterances is transcript_repository.get_docs_with_skipped_utterances
     assert transcript_repository.get_docs_with_skipped_utterances() == [
         {"doc_id": "count-only", "client_name": "", "skipped_utterances": []},
         {"doc_id": "has-skips", "client_name": "Acme", "skipped_utterances": [2, 5, 9]},
@@ -521,30 +534,6 @@ def test_unassigned_filter_is_delegated_and_preserves_facade_response(firestore_
         {"doc_id": "tie", "dialog_date": "2026-01-03"},
         {"doc_id": "first", "dialog_date": "2026-01-02"},
     ]
-    delegated_clients = []
-    original_helper = transcript_repository.list_unassigned_transcripts
-
-    def track_client(folder_id, client):
-        delegated_clients.append(client)
-        return original_helper(folder_id, client)
-
-    monkeypatch.setattr(drive_firestore, "_get_db", lambda: db)
-    monkeypatch.setattr(drive_firestore, "list_unassigned_transcripts", track_client)
-    assert drive_firestore.get_unassigned() == {
-        "count": 3,
-        "transcripts": [
-            {"doc_id": "second", "dialog_date": "2026-01-03"},
-            {"doc_id": "tie", "dialog_date": "2026-01-03"},
-            {"doc_id": "first", "dialog_date": "2026-01-02"},
-        ],
-    }
-    assert delegated_clients == [db]
-
-
-def test_unassigned_without_folder_keeps_empty_legacy_result(firestore_fake):
-    assert drive_firestore.get_unassigned() == {"count": 0, "transcripts": []}
-
-
 def test_drive_sync_token_uses_exact_path_and_replacement_set(firestore_fake):
     now = datetime(2026, 7, 8, tzinfo=timezone.utc)
     firestore_fake.set_clock(lambda: now)
@@ -554,12 +543,10 @@ def test_drive_sync_token_uses_exact_path_and_replacement_set(firestore_fake):
     assert sync_state_repository.get_drive_sync_token() is None
     ref.set({"unrelated": True})
     assert sync_state_repository.get_drive_sync_token() is None
-    drive_firestore.set_drive_sync_token("synthetic-token-a")
+    sync_state_repository.set_drive_sync_token("synthetic-token-a")
     assert sync_state_repository.get_drive_sync_token() == "synthetic-token-a"
     assert firestore_fake.documents["tokens/drive_sync"] == {"page_token": "synthetic-token-a", "updated_at": now}
-    assert drive_firestore.get_drive_sync_token is sync_state_repository.get_drive_sync_token
-    assert drive_firestore.set_drive_sync_token is sync_state_repository.set_drive_sync_token
     assert _writes(firestore_fake, "tokens/drive_sync")[-1]["operation"] == "set"
-    drive_firestore.set_drive_sync_token("synthetic-token-b")
+    sync_state_repository.set_drive_sync_token("synthetic-token-b")
     assert firestore_fake.documents["tokens/drive_sync"] == {"page_token": "synthetic-token-b", "updated_at": now}
     assert [event["operation"] for event in _writes(firestore_fake, "tokens/drive_sync")] == ["set", "set", "set"]

@@ -10,7 +10,7 @@ from google.cloud.firestore_v1.field_path import FieldPath
 from google.cloud.firestore_v1 import _helpers
 
 from core.google_drive import firestore as drive_firestore
-from services.vector_sync.app import index_store
+from core.integrations.firestore import transcripts as transcript_repository
 from tests.fixtures.firestore_fake import FakeFirestoreClient
 
 
@@ -255,12 +255,11 @@ def test_injected_aborted_commit_uses_real_sdk_retry(firestore_fake):
 def test_per_test_state_reset_and_real_consumer_smoke(firestore_fake, app_root):
     assert firestore_fake.documents == {}
     assert Path(drive_firestore.__file__).resolve() == (app_root / "core" / "google_drive" / "firestore.py").resolve()
-    assert Path(index_store.__file__).resolve() == (app_root / "services" / "vector_sync" / "app" / "index_store.py").resolve()
-    assert drive_firestore.ensure_imported("smoke", "parent", "source") is True
-    assert drive_firestore.acquire_for_syncing("arbitrary-new") is True
-    index_store.save_index("smoke", {"nested": {"a": 1}})
-    index_store.update_index("smoke", {"nested.b": 2})
-    assert index_store.load_index("smoke") == {"nested": {"a": 1, "b": 2}}
+    assert transcript_repository.ensure_imported("smoke", "parent", "source") is True
+    assert transcript_repository.acquire_for_syncing("arbitrary-new") is True
+    transcript_repository.save_index("smoke", {"nested": {"a": 1}})
+    transcript_repository.update_index("smoke", {"nested.b": 2})
+    assert transcript_repository.load_index("smoke") == {"nested": {"a": 1, "b": 2}}
 
 
 def test_clock_faults_and_revision_change_for_deleted_missing_document(firestore_fake):

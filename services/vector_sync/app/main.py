@@ -7,12 +7,12 @@ from googleapiclient.errors import HttpError
 from core.config import get_root_folder_id
 from core.google_drive.docs_reader import read_google_doc
 from core.google_drive.drive_client import get_file_parent_folder_id
-from core.google_drive.firestore import ensure_imported, get_folder_by_id, mark_error
+from core.integrations.firestore.folders import get_folder_by_id
+from core.integrations.firestore.transcripts import delete_index, ensure_imported, load_index, mark_error
 from core.parsing.parser import is_valid_format
 from core.integrations.qdrant.setup import ensure_collection
 from core.integrations.qdrant.writer import delete_by_doc_id
 from core.utils.logging import configure_logging
-from services.vector_sync.app.index_store import delete_index, load_index
 from services.vector_sync.app.processor import process_one
 
 configure_logging()

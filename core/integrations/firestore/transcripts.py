@@ -324,6 +324,18 @@ def move_transcript_record(
     logger.info("Moved transcript record: %s → parent=%s", doc_id, new_parent_id)
 
 
+def orphan_transcript_children(folder_id: str, db: firestore.Client | None = None) -> int:
+    """Clear parent_id for all transcript records directly inside a removed folder."""
+    client = db if db is not None else get_client()
+    count = 0
+    for doc in client.collection(COLLECTION_NAME).where("parent_id", "==", folder_id).stream():
+        doc.reference.update({"parent_id": None})
+        count += 1
+    if count:
+        logger.info("Orphaned %d transcript(s) of %s", count, folder_id)
+    return count
+
+
 def list_unassigned_transcripts(
     folder_id: str,
     db: firestore.Client | None = None,

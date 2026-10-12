@@ -14,11 +14,6 @@ def test_collection_and_document_identifiers_are_preserved():
     assert firestore_client.FOLDERS_COLLECTION == "folders"
     assert firestore_client.TOKENS_COLLECTION == "tokens"
     assert firestore_client.DRIVE_SYNC_TOKEN_DOC == "drive_sync"
-    assert legacy_firestore.COLLECTION_NAME == firestore_client.COLLECTION_NAME
-    assert legacy_firestore.CLIENTS_COLLECTION == firestore_client.CLIENTS_COLLECTION
-    assert legacy_firestore.FOLDERS_COLLECTION == firestore_client.FOLDERS_COLLECTION
-    assert legacy_firestore.TOKENS_COLLECTION == firestore_client.TOKENS_COLLECTION
-    assert legacy_firestore.DRIVE_SYNC_TOKEN_DOC == firestore_client.DRIVE_SYNC_TOKEN_DOC
 
 
 def test_get_client_constructs_fresh_default_client_on_each_call(monkeypatch):

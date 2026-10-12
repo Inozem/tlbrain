@@ -17,19 +17,21 @@ from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.retrieval.folders import list_folders
 from core.google_drive.drive_client import create_folder, move_file_to_folder, move_folder_in_drive, rename_file, rename_folder
-from core.google_drive.firestore import (
-    expand_subtree,
+from core.google_drive.firestore import expand_subtree, resolve_folder_path
+from core.integrations.firestore.folders import (
     folder_name_exists,
-    get_all_folders,
     get_folder_by_id,
+    get_folder_id_by_name,
+    upsert_folder,
+)
+from core.integrations.firestore.client import get_client
+from core.integrations.firestore.transcripts import (
     get_sync_status,
     get_transcript_record,
-    get_unassigned,
     list_transcripts,
+    list_unassigned_transcripts,
     move_transcript_record,
-    resolve_folder_path,
-    update_transcript_source_file,
-    upsert_folder,
+    update_index,
 )
 from core.integrations.qdrant.writer import set_payload_parent_id, upsert_user_facts
 
@@ -618,7 +620,13 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
         move_transcript_record(doc_id, new_folder_id)
         set_payload_parent_id(doc_id, root_folder_id, new_folder_id)
 
-        unassigned = get_unassigned()
+        db = get_client()
+        unassigned_folder_id = get_folder_id_by_name("_unassigned", db)
+        unassigned_transcripts = (
+            list_unassigned_transcripts(unassigned_folder_id, db)
+            if unassigned_folder_id else []
+        )
+        unassigned = {"count": len(unassigned_transcripts), "transcripts": unassigned_transcripts}
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -1038,7 +1046,7 @@ def _handle_rename_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
     t0 = time.monotonic()
     try:
         rename_file(doc_id, new_title)
-        update_transcript_source_file(doc_id, new_title)
+        update_index(doc_id, {"source_file": new_title})
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,

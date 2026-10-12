@@ -5,7 +5,14 @@ from qdrant_client.models import SparseVector
 from core.integrations.gemini.embeddings import embed, make_client
 from core.integrations.fastembed.bm25 import get_bm25_model
 from core.google_drive.docs_reader import read_google_doc
-from core.google_drive.firestore import acquire_for_syncing, mark_error, mark_synced, update_skipped_utterances
+from core.integrations.firestore.transcripts import (
+    acquire_for_syncing,
+    load_index,
+    mark_error,
+    mark_synced,
+    update_index,
+    update_skipped_utterances,
+)
 from core.parsing.parser import parse_document
 from core.parsing.processor import build_utterance_payloads, iter_windows
 from core.parsing.windowing import generate_windows
@@ -20,8 +27,6 @@ from core.integrations.qdrant.writer import (
     upsert_utterances,
 )
 from services.vector_sync.app.hashing import sha256_text, sha256_utterance
-from services.vector_sync.app.index_store import load_index, update_index
-
 logger = logging.getLogger(__name__)
 
 def process_one(doc_id: str, parent_id: str, root_folder_id: str, raw_text: str | None = None) -> str:
