@@ -1,6 +1,4 @@
 import logging
-from datetime import datetime, timezone, timedelta
-
 from google.cloud import firestore
 
 from core.config import get_root_folder_id
@@ -13,168 +11,33 @@ from core.integrations.firestore.client import (
     get_client,
 )
 from core.integrations.firestore.transcripts import (
+    STALE_SYNCING_MINUTES,
+    acquire_for_syncing,
     aggregate_transcripts_by_folder,
+    delete_queued_placeholder,
+    ensure_imported,
+    get_docs_with_skipped_utterances,
     get_doc_ids_by_client,
+    get_error_docs,
+    get_stale_syncing,
+    get_sync_status,
     get_transcript_record,
     list_imported,
     list_transcripts,
+    list_unassigned_transcripts,
+    mark_download_error,
+    mark_downloading,
+    mark_error,
+    mark_synced,
+    move_transcript_record,
+    update_skipped_utterances,
+    write_queued,
 )
 
 logger = logging.getLogger(__name__)
 
-STALE_SYNCING_MINUTES = 15
-
-
 def _get_db() -> firestore.Client:
     return get_client()
-
-
-def acquire_for_syncing(doc_id: str) -> bool:
-    db = _get_db()
-    ref = db.collection(COLLECTION_NAME).document(doc_id)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_SYNCING_MINUTES)
-
-    @firestore.transactional
-    def _txn(transaction: firestore.Transaction) -> bool:
-        snapshot = ref.get(transaction=transaction)
-        data = snapshot.to_dict() if snapshot.exists else {}
-
-        if data.get("status") == "syncing":
-            changed_at = data.get("status_changed_at")
-            if changed_at and changed_at > cutoff:
-                return False  # recently acquired
-
-        update = {"doc_id": doc_id, "status": "syncing", "status_changed_at": firestore.SERVER_TIMESTAMP}
-        if snapshot.exists:
-            transaction.update(ref, update)
-        else:
-            transaction.set(ref, update)
-        return True
-
-    result = _txn(db.transaction())
-    if result:
-        logger.info("Acquired for syncing: %s", doc_id)
-    return result
-
-
-def ensure_imported(doc_id: str, parent_id: str, source_file: str = "") -> bool:
-    """Create transcript_index record with status=imported if it doesn't exist. Returns True if created."""
-    db = _get_db()
-    ref = db.collection(COLLECTION_NAME).document(doc_id)
-
-    @firestore.transactional
-    def _txn(transaction: firestore.Transaction) -> bool:
-        if ref.get(transaction=transaction).exists:
-            return False
-        transaction.set(ref, {
-            "doc_id": doc_id,
-            "parent_id": parent_id,
-            "source_file": source_file,
-            "status": "imported",
-            "status_changed_at": firestore.SERVER_TIMESTAMP,
-        })
-        return True
-
-    result = _txn(db.transaction())
-    if result:
-        logger.info("Created imported record: %s (parent=%s)", doc_id, parent_id)
-    return result
-
-
-def mark_synced(doc_id: str) -> None:
-    _get_db().collection(COLLECTION_NAME).document(doc_id).update({
-        "status": "synced",
-        "error": None,
-        "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
-    logger.info("Marked synced: %s", doc_id)
-
-
-def mark_error(doc_id: str, error: str, error_stage: str = "vector_sync") -> None:
-    _get_db().collection(COLLECTION_NAME).document(doc_id).update({
-        "status": "error",
-        "error": error,
-        "error_stage": error_stage,
-        "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
-    logger.info("Marked error: %s — %s (stage=%s)", doc_id, error, error_stage)
-
-
-def write_queued(meeting_id: str) -> bool:
-    """Create a placeholder queued record for a meeting.
-
-    Returns True if created or reset from import error, False if already existed.
-    """
-    db = _get_db()
-    ref = db.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
-
-    @firestore.transactional
-    def _txn(transaction: firestore.Transaction) -> bool:
-        snapshot = ref.get(transaction=transaction)
-        if snapshot.exists:
-            data = snapshot.to_dict() or {}
-            if data.get("status") == "error" and data.get("error_stage") == "import":
-                transaction.update(ref, {
-                    "status": "queued",
-                    "error": None,
-                    "error_stage": None,
-                    "status_changed_at": firestore.SERVER_TIMESTAMP,
-                })
-                return True
-            return False
-        transaction.set(ref, {
-            "meeting_id": meeting_id,
-            "status": "queued",
-            "status_changed_at": firestore.SERVER_TIMESTAMP,
-        })
-        return True
-
-    result = _txn(db.transaction())
-    if result:
-        logger.info("Queued: %s", meeting_id)
-    return result
-
-
-def mark_downloading(meeting_id: str) -> None:
-    _get_db().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
-        "status": "downloading",
-        "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
-    logger.info("Marked downloading: %s", meeting_id)
-
-
-def mark_download_error(meeting_id: str, error: str) -> None:
-    _get_db().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
-        "status": "error",
-        "error": error,
-        "error_stage": "import",
-        "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
-    logger.info("Marked download error: %s — %s", meeting_id, error)
-
-
-def delete_queued_placeholder(meeting_id: str) -> None:
-    _get_db().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").delete()
-    logger.info("Deleted queued placeholder: %s", meeting_id)
-
-
-def move_transcript_record(doc_id: str, new_parent_id: str) -> None:
-    """Update parent_id, reset status to imported for reindexing.
-
-    modifiedTime is deleted so the checker detects a change and re-enqueues sync,
-    even though moving a file in Drive does not update its modifiedTime.
-    """
-    _get_db().collection(COLLECTION_NAME).document(doc_id).update({
-        "parent_id": new_parent_id,
-        "status": "imported",
-        "modifiedTime": firestore.DELETE_FIELD,
-        "content_hash": firestore.DELETE_FIELD,
-        "version": firestore.DELETE_FIELD,
-        "error": None,
-        "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
-    logger.info("Moved transcript record: %s → parent=%s", doc_id, new_parent_id)
-
 
 
 def update_transcript_source_file(doc_id: str, source_file: str) -> None:
@@ -195,81 +58,8 @@ def get_unassigned() -> dict:
     if not unassigned_folder_id:
         return {"count": 0, "transcripts": []}
 
-    transcripts = []
-    for d in db.collection(COLLECTION_NAME).where(
-        filter=firestore.FieldFilter("parent_id", "==", unassigned_folder_id)
-    ).stream():
-        data = d.to_dict() or {}
-        if data.get("status") not in ("queued", "downloading"):
-            transcripts.append({"doc_id": d.id, "dialog_date": data.get("dialog_date", "")})
-    transcripts.sort(key=lambda x: x["dialog_date"], reverse=True)
+    transcripts = list_unassigned_transcripts(unassigned_folder_id, db)
     return {"count": len(transcripts), "transcripts": transcripts}
-
-
-def get_stale_syncing() -> list[str]:
-    """Return doc IDs stuck in syncing beyond the stale threshold."""
-    db = _get_db()
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_SYNCING_MINUTES)
-
-    syncing_docs = (
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("status", "==", "syncing"))
-        .stream()
-    )
-
-    stale = []
-    for doc in syncing_docs:
-        changed_at = doc.to_dict().get("status_changed_at")
-        if changed_at and changed_at < cutoff:
-            stale.append(doc.id)
-            logger.info("Stale syncing detected: %s", doc.id)
-
-    return stale
-
-    return recovered
-
-
-_NO_RETRY_STAGES = {"import", "invalid_format"}
-
-
-def get_error_docs() -> list[str]:
-    """Return doc IDs with error status, excluding stages that should not be auto-retried."""
-    db = _get_db()
-    error_docs = (
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("status", "==", "error"))
-        .stream()
-    )
-    result = []
-    for doc in error_docs:
-        if (doc.to_dict() or {}).get("error_stage") in _NO_RETRY_STAGES:
-            continue
-        result.append(doc.id)
-        logger.info("Error doc detected: %s", doc.id)
-    return result
-
-
-def update_skipped_utterances(doc_id: str, skipped_utterances: list[int]) -> None:
-    _get_db().collection(COLLECTION_NAME).document(doc_id).update({
-        "skipped_utterances": sorted(set(skipped_utterances)),
-    })
-
-
-def get_docs_with_skipped_utterances() -> list[dict]:
-    docs = (
-        _get_db().collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("skipped_utterances_count", ">", 0))
-        .stream()
-    )
-    result = []
-    for doc in docs:
-        data = doc.to_dict() or {}
-        result.append({
-            "doc_id": doc.id,
-            "client_name": data.get("client_name", ""),
-            "skipped_utterances": data.get("skipped_utterances", []),
-        })
-    return result
 
 
 def _speaker_key(name: str) -> str:
@@ -422,30 +212,6 @@ def get_client_folder_id(client_name: str) -> str | None:
     if not doc.exists:
         return None
     return doc.to_dict().get("folder_id")
-
-
-def get_sync_status() -> dict:
-    """Aggregate transcript_index counts by status in a single scan."""
-    db = _get_db()
-    counts: dict[str, int] = {
-        "queued": 0, "downloading": 0, "imported": 0,
-        "syncing": 0, "synced": 0, "error": 0,
-    }
-    unassigned = 0
-
-    for doc in db.collection(COLLECTION_NAME).stream():
-        data = doc.to_dict()
-        status = data.get("status", "")
-        if status in counts:
-            counts[status] += 1
-        if data.get("client_name") == "_unassigned" and status not in ("queued", "downloading"):
-            unassigned += 1
-
-    return {
-        "total": sum(counts.values()),
-        **counts,
-        "_unassigned_count": unassigned,
-    }
 
 
 def get_drive_sync_token() -> str | None:

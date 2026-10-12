@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from core.google_drive import firestore as firestore_service
+from core.integrations.firestore import transcripts as transcript_repository
 from core.parsing.parser import parse_document
 from services.vector_sync.app import processor
 from services.vector_sync.app.hashing import sha256_text, sha256_utterance
@@ -161,7 +162,7 @@ def test_claim_fresh_stale_cutoff_and_missing_document_use_transactional_sdk(
         def now(_tz=None):
             return NOW
 
-    monkeypatch.setattr(firestore_service, "datetime", FrozenDatetime)
+    monkeypatch.setattr(transcript_repository, "datetime", FrozenDatetime)
     ref = firestore_fake.client_class().collection("transcript_index").document(DOC_ID)
     fresh_record = {
         "doc_id": DOC_ID,
@@ -206,7 +207,7 @@ def test_competing_claims_conflict_retry_and_only_one_wins(firestore_fake, monke
         def now(_tz=None):
             return NOW
 
-    monkeypatch.setattr(firestore_service, "datetime", FrozenDatetime)
+    monkeypatch.setattr(transcript_repository, "datetime", FrozenDatetime)
     barrier = threading.Barrier(2)
     first_reads_lock = threading.Lock()
     first_reads = 0

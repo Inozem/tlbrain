@@ -137,7 +137,7 @@ def test_acquire_for_syncing_observes_exact_fifteen_minute_boundary(firestore_fa
         def now(cls, tz=None):
             return now if tz else now.replace(tzinfo=None)
 
-    monkeypatch.setattr(drive_firestore, "datetime", FrozenDateTime)
+    monkeypatch.setattr(transcript_repository, "datetime", FrozenDateTime)
     firestore_fake.set_clock(lambda: now)
     db = _client(firestore_fake)
     docs = db.collection(INDEX)
@@ -254,6 +254,104 @@ def test_sync_error_and_move_writers_preserve_or_clear_fields_explicitly(firesto
     assert moved["error"] is None and moved["parent_id_hash"] == "parent-hash"
     assert moved["utterance_hashes"] == {"0": "a"} and moved["other"] == "preserved"
     assert [event["operation"] for event in _writes(firestore_fake, f"{INDEX}/synthetic-move")] == ["set", "update", "update", "update"]
+
+
+def test_lifecycle_compatibility_exports_and_recovery_selectors(firestore_fake, monkeypatch):
+    now = datetime(2026, 6, 8, 12, 0, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(transcript_repository, "datetime", FrozenDateTime)
+    db = _client(firestore_fake)
+    records = {
+        "stale": {"status": "syncing", "status_changed_at": now - timedelta(minutes=16)},
+        "fresh": {"status": "syncing", "status_changed_at": now - timedelta(minutes=2)},
+        "missing-time": {"status": "syncing"},
+        "retry": {"status": "error", "error_stage": "vector_sync"},
+        "legacy-error": {"status": "error"},
+        "import-error": {"status": "error", "error_stage": "import"},
+        "format-error": {"status": "error", "error_stage": "invalid_format"},
+        "not-error": {"status": "synced"},
+        "unassigned-imported": {"status": "imported", "client_name": "_unassigned"},
+        "unassigned-queued": {"status": "queued", "client_name": "_unassigned"},
+    }
+    for doc_id, data in records.items():
+        db.collection(INDEX).document(doc_id).set(data)
+
+    assert drive_firestore.STALE_SYNCING_MINUTES == 15
+    assert drive_firestore.get_stale_syncing is transcript_repository.get_stale_syncing
+    assert drive_firestore.get_error_docs is transcript_repository.get_error_docs
+    assert drive_firestore.get_sync_status is transcript_repository.get_sync_status
+    assert transcript_repository.get_stale_syncing() == ["stale"]
+    assert transcript_repository.get_error_docs() == ["legacy-error", "retry"]
+    assert transcript_repository.get_sync_status() == {
+        "total": 10, "queued": 1, "downloading": 0, "imported": 1,
+        "syncing": 3, "synced": 1, "error": 4, "_unassigned_count": 1,
+    }
+
+
+def test_skipped_utterance_repository_reads_and_writes_keep_legacy_shape(firestore_fake):
+    db = _client(firestore_fake)
+    db.collection(INDEX).document("has-skips").set({
+        "client_name": "Acme", "skipped_utterances_count": 2, "skipped_utterances": [5, 9],
+    })
+    db.collection(INDEX).document("count-only").set({"skipped_utterances_count": 1})
+    db.collection(INDEX).document("no-skips").set({"skipped_utterances": [3]})
+
+    transcript_repository.update_skipped_utterances("has-skips", [9, 2, 9, 5])
+    assert firestore_fake.documents[f"{INDEX}/has-skips"]["skipped_utterances"] == [2, 5, 9]
+    assert drive_firestore.update_skipped_utterances is transcript_repository.update_skipped_utterances
+    assert drive_firestore.get_docs_with_skipped_utterances is transcript_repository.get_docs_with_skipped_utterances
+    assert transcript_repository.get_docs_with_skipped_utterances() == [
+        {"doc_id": "count-only", "client_name": "", "skipped_utterances": []},
+        {"doc_id": "has-skips", "client_name": "Acme", "skipped_utterances": [2, 5, 9]},
+    ]
+
+
+def test_unassigned_filter_is_delegated_and_preserves_facade_response(firestore_fake, monkeypatch):
+    db = _client(firestore_fake)
+    db.collection("folders").document("unassigned-folder").set({"name": "_unassigned"})
+    records = {
+        "first": {"parent_id": "unassigned-folder", "status": "synced", "dialog_date": "2026-01-02"},
+        "second": {"parent_id": "unassigned-folder", "status": "imported", "dialog_date": "2026-01-03"},
+        "tie": {"parent_id": "unassigned-folder", "status": "error", "dialog_date": "2026-01-03"},
+        "queued": {"parent_id": "unassigned-folder", "status": "queued", "dialog_date": "2026-01-04"},
+        "downloading": {"parent_id": "unassigned-folder", "status": "downloading", "dialog_date": "2026-01-05"},
+        "other-folder": {"parent_id": "other", "status": "synced", "dialog_date": "2026-01-06"},
+    }
+    for doc_id, data in records.items():
+        db.collection(INDEX).document(doc_id).set(data)
+
+    assert transcript_repository.list_unassigned_transcripts("unassigned-folder") == [
+        {"doc_id": "second", "dialog_date": "2026-01-03"},
+        {"doc_id": "tie", "dialog_date": "2026-01-03"},
+        {"doc_id": "first", "dialog_date": "2026-01-02"},
+    ]
+    delegated_clients = []
+    original_helper = transcript_repository.list_unassigned_transcripts
+
+    def track_client(folder_id, client):
+        delegated_clients.append(client)
+        return original_helper(folder_id, client)
+
+    monkeypatch.setattr(drive_firestore, "_get_db", lambda: db)
+    monkeypatch.setattr(drive_firestore, "list_unassigned_transcripts", track_client)
+    assert drive_firestore.get_unassigned() == {
+        "count": 3,
+        "transcripts": [
+            {"doc_id": "second", "dialog_date": "2026-01-03"},
+            {"doc_id": "tie", "dialog_date": "2026-01-03"},
+            {"doc_id": "first", "dialog_date": "2026-01-02"},
+        ],
+    }
+    assert delegated_clients == [db]
+
+
+def test_unassigned_without_folder_keeps_empty_legacy_result(firestore_fake):
+    assert drive_firestore.get_unassigned() == {"count": 0, "transcripts": []}
 
 
 def test_drive_sync_token_uses_exact_path_and_replacement_set(firestore_fake):
