@@ -208,9 +208,18 @@ def _version(value: str) -> tuple[int, int, int]:
     return int(match[1]), int(match[2]), int(match[3] or 0)
 
 
-def _normalize_windows_version(value: str) -> str:
-    """Make major-only Windows releases parseable as numeric OS versions."""
-    return f"{value}.0" if re.fullmatch(r"\d+", value) else value
+def _normalize_windows_version(value: str, api_version: Any = None) -> str:
+    """Return a numeric Windows release, falling back to the OS version API."""
+    if isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+){0,2}", value):
+        return f"{value}.0" if re.fullmatch(r"\d+", value) else value
+    if api_version is not None:
+        try:
+            major, minor, build = (int(api_version[index]) for index in range(3))
+        except (IndexError, KeyError, TypeError, ValueError):
+            major = minor = build = -1
+        if major >= 0 and minor >= 0 and build >= 0:
+            return f"{major}.{minor}.{build}"
+    raise RuntimeError("cannot establish a numeric Windows OS version")
 
 
 def _safe_relative(value: str, *, label: str) -> PurePosixPath:
@@ -299,7 +308,8 @@ def _current_platform() -> dict[str, str]:
     system = sys.platform
     if system.startswith("win"):
         name, libc = "windows", "none"
-        os_version = _normalize_windows_version(host_platform.win32_ver()[0])
+        windows_version = getattr(sys, "getwindowsversion", lambda: None)()
+        os_version = _normalize_windows_version(host_platform.win32_ver()[0], windows_version)
         libc_version = ""
     elif system == "darwin":
         name, libc = "macos", "none"
@@ -330,8 +340,9 @@ def _probe_interpreter(path: Path) -> dict[str, Any]:
         "try:\n import pip; features['pip'] = True\n"
         "except Exception:\n features['pip'] = False\n"
         "os_name = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, 'linux' if sys.platform.startswith('linux') else sys.platform)\n"
+        "windows_version = sys.getwindowsversion() if os_name == 'windows' else None\n"
         "os_version = platform.win32_ver()[0] if os_name == 'windows' else platform.mac_ver()[0] if os_name == 'macos' else ''\n"
-        "print(json.dumps({'version': platform.python_version(), 'ssl': True, 'venv': True, 'pip': features['pip'], 'os': os_name, 'architecture': platform.machine().lower(), 'libc': (libc_name.lower() or 'unknown') if sys.platform.startswith('linux') else 'none', 'libc_version': libc_version, 'os_version': os_version}))"
+        "print(json.dumps({'version': platform.python_version(), 'ssl': True, 'venv': True, 'pip': features['pip'], 'os': os_name, 'architecture': platform.machine().lower(), 'libc': (libc_name.lower() or 'unknown') if sys.platform.startswith('linux') else 'none', 'libc_version': libc_version, 'os_version': os_version, 'windows_version': windows_version}))"
     )
     result = subprocess.run(
         [str(path), "-I", "-c", code], capture_output=True, text=True,
@@ -342,7 +353,7 @@ def _probe_interpreter(path: Path) -> dict[str, Any]:
     try:
         facts = json.loads(result.stdout.strip().splitlines()[-1])
         if facts.get("os") == "windows" and isinstance(facts.get("os_version"), str):
-            facts["os_version"] = _normalize_windows_version(facts["os_version"])
+            facts["os_version"] = _normalize_windows_version(facts["os_version"], facts.get("windows_version"))
         return facts
     except (ValueError, IndexError) as exc:
         raise RuntimeError("interpreter probe returned invalid data") from exc
@@ -584,7 +595,26 @@ def ensure_runtime(
     """Reuse a compatible native 3.12 or activate a verified private runtime."""
     lock = load_lock(lock_path)
     facts = _platform_facts(platform)
-    entry = select_entry(lock, facts["os"], facts["architecture"], facts["libc"], host_python_version)
+    try:
+        entry = select_entry(lock, facts["os"], facts["architecture"], facts["libc"], host_python_version)
+    except ValueError as unsupported:
+        # Native macOS arm64 CPython 3.12 can satisfy the supplementary host
+        # preflight even though the private, digest-pinned bootstrap is x86_64.
+        # Use the reviewed macOS minimum as the baseline and never download for
+        # this unpinned architecture.
+        if facts["os"] == "macos" and facts["libc"] == "none" and facts["architecture"] != "x86_64":
+            reference = select_entry(lock, "macos", "x86_64", "none", host_python_version)
+            if not _meets_minimums(facts, reference):
+                bound_name = "os_version_min"
+                raise RuntimeError(f"host does not meet {bound_name}={reference[bound_name]}")
+            if native_interpreter is not None:
+                try:
+                    native_facts = check_interpreter(native_interpreter, interpreter_probe)
+                    if _native_facts_match(native_facts, facts) and _meets_minimums(native_facts, reference):
+                        return Path(native_interpreter)
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    pass
+        raise unsupported
     if not _meets_minimums(facts, entry):
         bound_name = "os_version_min" if "os_version_min" in entry else "libc_version_min"
         raise RuntimeError(f"host does not meet {bound_name}={entry[bound_name]}")
