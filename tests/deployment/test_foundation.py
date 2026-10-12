@@ -186,9 +186,10 @@ def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
     assert "../integrations/firestore/requirements.txt" in (
         APP_ROOT / "core" / "google_drive" / "requirements.txt"
     ).read_text(encoding="utf-8")
-    assert "../integrations/cloud_tasks/requirements.txt" in (
-        APP_ROOT / "core" / "utils" / "requirements.txt"
-    ).read_text(encoding="utf-8")
+    assert not (APP_ROOT / "core" / "utils" / "requirements.txt").exists()
+    assert (APP_ROOT / "core" / "integrations" / "cloud_tasks" / "requirements.txt").read_text(
+        encoding="utf-8"
+    ).strip() == "google-cloud-tasks>=2.0.0"
 
 
 def test_all_six_current_service_sources_assemble_to_isolated_runtime_artifacts() -> None:

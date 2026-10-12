@@ -60,25 +60,25 @@
       "source_file": "core/utils/retry.py",
       "import_prefix": "googleapiclient.errors",
       "guard": "ImportError",
-      "rationale": "Google API error formatting is optional when the client package is unavailable."
+      "rationale": "Optional retry exception-class check guarded by ImportError; it does not own or force the Google Docs integration requirement, which is selected from required imports."
     },
     {
       "source_file": "core/utils/retry.py",
       "import_prefix": "qdrant_client.http.exceptions",
       "guard": "ImportError",
-      "rationale": "Qdrant error handling is optional when the client package is unavailable."
+      "rationale": "Optional retry exception-class check guarded by ImportError; it does not own or force the Qdrant integration requirement, which is selected from required imports."
     },
     {
       "source_file": "core/utils/retry.py",
       "import_prefix": "google.genai.errors",
       "guard": "ImportError",
-      "rationale": "Gemini error formatting is optional when the client package is unavailable."
+      "rationale": "Optional retry exception-class check guarded by ImportError; it does not own or force the Gemini integration requirement, which is selected from required imports."
     },
     {
       "source_file": "core/utils/retry.py",
       "import_prefix": "requests.exceptions",
       "guard": "ImportError",
-      "rationale": "HTTP error formatting is optional when requests is unavailable."
+      "rationale": "Optional retry exception-class check guarded by ImportError; it does not own or force an integration requirement; required imports select integration providers."
     }
   ]
 }
