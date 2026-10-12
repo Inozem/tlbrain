@@ -1,4 +1,3 @@
-google-auth
-google-auth-httplib2
-google-api-python-client
-google-cloud-firestore
+-r ../integrations/google_auth/requirements.txt
+-r ../integrations/google_docs/requirements.txt
+-r ../integrations/firestore/requirements.txt

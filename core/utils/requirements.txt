@@ -1,1 +1,1 @@
-google-cloud-tasks>=2.0.0
+-r ../integrations/cloud_tasks/requirements.txt

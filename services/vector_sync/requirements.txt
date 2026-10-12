@@ -1,5 +1,1 @@
 -r ../../requirements-common.txt
--r ../../core/gemini/requirements.txt
--r ../../core/google_drive/requirements.txt
--r ../../core/qdrant/requirements.txt
-fastembed

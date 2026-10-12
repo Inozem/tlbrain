@@ -4,12 +4,23 @@
     {
       "import_prefixes": [
         "google.auth",
-        "google_auth_httplib2",
-        "googleapiclient",
-        "google.cloud.firestore"
+        "google.oauth2",
+        "google_auth_httplib2"
       ],
       "requirements_files": [
-        "core/google_drive/requirements.txt"
+        "core/integrations/google_auth/requirements.txt"
+      ]
+    },
+    {
+      "import_prefixes": ["googleapiclient"],
+      "requirements_files": [
+        "core/integrations/google_docs/requirements.txt"
+      ]
+    },
+    {
+      "import_prefixes": ["google.cloud.firestore"],
+      "requirements_files": [
+        "core/integrations/firestore/requirements.txt"
       ]
     },
     {
@@ -17,7 +28,7 @@
         "google.genai"
       ],
       "requirements_files": [
-        "core/gemini/requirements.txt"
+        "core/integrations/gemini/requirements.txt"
       ]
     },
     {
@@ -25,7 +36,13 @@
         "qdrant_client"
       ],
       "requirements_files": [
-        "core/qdrant/requirements.txt"
+        "core/integrations/qdrant/requirements.txt"
+      ]
+    },
+    {
+      "import_prefixes": ["fastembed"],
+      "requirements_files": [
+        "core/integrations/fastembed/requirements.txt"
       ]
     },
     {
@@ -34,7 +51,7 @@
         "google.cloud.tasks_v2"
       ],
       "requirements_files": [
-        "core/utils/requirements.txt"
+        "core/integrations/cloud_tasks/requirements.txt"
       ]
     }
   ],

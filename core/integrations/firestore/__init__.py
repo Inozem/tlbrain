@@ -1,0 +1,1 @@
+"""Firestore integration dependency package."""

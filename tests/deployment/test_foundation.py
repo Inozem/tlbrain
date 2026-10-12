@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ast
 import os
 import shutil
 import subprocess
@@ -34,6 +35,22 @@ EXPECTED_ENTRIES = {
     "tldv_reconciliation": "main.py",
 }
 IMAGE_SERVICES = {"mcp", "vector_sync", "tldv_import"}
+EXPECTED_INTEGRATION_REQUIREMENTS = {
+    "mcp": {
+        "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
+    },
+    "vector_sync": {
+        "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
+    },
+    "tldv_import": {
+        "cloud_tasks", "firestore", "gemini", "google_auth", "google_docs",
+    },
+    "sync_checker": {
+        "cloud_tasks", "firestore", "google_auth", "google_docs",
+    },
+    "tldv_webhook": {"cloud_tasks", "firestore", "google_auth"},
+    "tldv_reconciliation": {"cloud_tasks", "firestore", "google_auth"},
+}
 SENSITIVE_NAME_MARKERS = (
     "_secret_", "_secrets_", "_credential_", "_credentials_",
     "_service_account_", "_private_key_", "_privatekey_", "_id_rsa_",
@@ -121,6 +138,56 @@ def test_credential_like_artifact_paths_are_rejected() -> None:
     assert all(_looks_credential_like(path) for path in credential_paths)
 
 
+def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
+    integrations = {
+        "google_auth": "google-auth\ngoogle-auth-httplib2",
+        "google_drive": "# Google API client dependency is owned by the shared Google Docs API bundle.",
+        "google_docs": "google-api-python-client",
+        "firestore": "google-cloud-firestore",
+        "qdrant": "qdrant-client>=1.9",
+        "gemini": "google-genai>=1.0",
+        "fastembed": "fastembed",
+        "cloud_tasks": "google-cloud-tasks>=2.0.0",
+    }
+    expected_providers = {
+        "google.auth": "google_auth",
+        "google.oauth2": "google_auth",
+        "google_auth_httplib2": "google_auth",
+        "googleapiclient": "google_docs",
+        "google.cloud.firestore": "firestore",
+        "google.genai": "gemini",
+        "qdrant_client": "qdrant",
+        "fastembed": "fastembed",
+        "google.api_core": "cloud_tasks",
+        "google.cloud.tasks_v2": "cloud_tasks",
+    }
+
+    for name, declarations in integrations.items():
+        package = APP_ROOT / "core" / "integrations" / name
+        initializer = ast.parse((package / "__init__.py").read_text(encoding="utf-8"))
+        assert len(initializer.body) == 1
+        assert isinstance(initializer.body[0], ast.Expr)
+        assert isinstance(initializer.body[0].value, ast.Constant)
+        assert isinstance(initializer.body[0].value.value, str)
+        assert (package / "requirements.txt").read_text(encoding="utf-8").strip() == declarations
+
+    registry = json.loads((BUILD_TOOLS / "dependency-providers.json").read_text(encoding="utf-8"))
+    actual_providers = {
+        prefix: PurePosixPath(requirement_file).parent.name
+        for provider in registry["providers"]
+        for prefix in provider["import_prefixes"]
+        for requirement_file in provider["requirements_files"]
+    }
+    assert actual_providers == expected_providers
+    assert all(not prefix == "google" for prefix in actual_providers)
+    assert "../integrations/firestore/requirements.txt" in (
+        APP_ROOT / "core" / "google_drive" / "requirements.txt"
+    ).read_text(encoding="utf-8")
+    assert "../integrations/cloud_tasks/requirements.txt" in (
+        APP_ROOT / "core" / "utils" / "requirements.txt"
+    ).read_text(encoding="utf-8")
+
+
 def test_all_six_current_service_sources_assemble_to_isolated_runtime_artifacts() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     services = manifest["services"]
@@ -162,6 +229,12 @@ def test_all_six_current_service_sources_assemble_to_isolated_runtime_artifacts(
             assert report["runtime_target"] == runtime_target
             assert report["source_files"]
             assert report["import_edges"]
+            selected_integrations = {
+                PurePosixPath(item["runtime_path"]).parent.name
+                for item in report["requirements_graph"]["files"]
+                if item["runtime_path"].startswith(".requirements/core/integrations/")
+            }
+            assert selected_integrations == EXPECTED_INTEGRATION_REQUIREMENTS[service]
             _assert_runtime_only(artifact, service, report)
 
         assert IMAGE_SERVICES == {name for name, (kind, _target) in EXPECTED_SERVICES.items() if kind == "asgi"}

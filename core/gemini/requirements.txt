@@ -1,1 +1,1 @@
-google-genai>=1.0
+-r ../integrations/gemini/requirements.txt
