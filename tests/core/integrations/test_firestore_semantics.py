@@ -1,15 +1,18 @@
 """Offline characterization of Firestore write semantics used by core helpers."""
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from core.google_drive import firestore as drive_firestore
+from core.integrations.firestore import folders as folder_repository
 from core.integrations.firestore import transcripts as transcript_repository
 from services.vector_sync.app import index_store
 
 
 INDEX = "transcript_index"
+FOLDERS = "folders"
 
 
 def _client(firestore_fake):
@@ -18,6 +21,111 @@ def _client(firestore_fake):
 
 def _writes(firestore_fake, path):
     return [event for event in firestore_fake.trace() if event.get("path") == path]
+
+
+def test_folder_repository_preserves_create_and_update_semantics(firestore_fake, monkeypatch):
+    db = _client(firestore_fake)
+    now = datetime(2026, 8, 9, tzinfo=timezone.utc)
+    firestore_fake.set_clock(lambda: now)
+    monkeypatch.setattr(folder_repository, "get_client", lambda: db)
+
+    folder_repository.upsert_folder("stable-drive-id", "New folder", None)
+    path = f"{FOLDERS}/stable-drive-id"
+    assert firestore_fake.documents[path] == {
+        "folder_id": "stable-drive-id", "name": "New folder", "parent_id": None,
+        "speakers": {}, "description": None, "created_at": now,
+    }
+    assert _writes(firestore_fake, path)[-1]["operation"] == "set"
+
+    db.collection(FOLDERS).document("existing-folder").set({
+        "folder_id": "existing-folder", "name": "Old name", "parent_id": "old-parent",
+        "speakers": {"s123": 4}, "description": "Keep this", "created_at": "original-time",
+        "unrelated": "preserved",
+    })
+    folder_repository.upsert_folder("existing-folder", "Renamed", None)
+    existing_path = f"{FOLDERS}/existing-folder"
+    assert firestore_fake.documents[existing_path] == {
+        "folder_id": "existing-folder", "name": "Renamed", "parent_id": None,
+        "speakers": {"s123": 4}, "description": "Keep this", "created_at": "original-time",
+        "unrelated": "preserved",
+    }
+    assert _writes(firestore_fake, existing_path)[-1]["operation"] == "update"
+
+    before = firestore_fake.trace()
+    folder_repository.upsert_folder("existing-folder", "Renamed", None)
+    assert firestore_fake.trace() == before
+
+
+def test_folder_repository_crud_nullable_parent_and_orphaning(firestore_fake, monkeypatch):
+    db = _client(firestore_fake)
+    monkeypatch.setattr(folder_repository, "get_client", lambda: db)
+    folders = db.collection(FOLDERS)
+    folders.document("root-a").set({"folder_id": "root-a", "name": "Root", "parent_id": None})
+    folders.document("child-a").set({"folder_id": "child-a", "name": "Child", "parent_id": "root-a"})
+    folders.document("child-b").set({"folder_id": "child-b", "name": "Child", "parent_id": "root-a"})
+    folders.document("other").set({"folder_id": "other", "name": "Root", "parent_id": "elsewhere"})
+
+    assert folder_repository.folder_name_exists("Root", None)
+    assert not folder_repository.folder_name_exists("Root", "missing")
+    assert folder_repository.get_folder_by_id("root-a")["name"] == "Root"
+    assert folder_repository.get_folder_by_id("missing") is None
+    assert folder_repository.get_all_folders()["child-a"]["parent_id"] == "root-a"
+    assert folder_repository.orphan_folder_children("root-a") == 2
+    assert firestore_fake.documents[f"{FOLDERS}/child-a"]["parent_id"] is None
+    folder_repository.delete_folder("other")
+    assert f"{FOLDERS}/other" not in firestore_fake.documents
+
+
+def test_folder_speaker_index_and_legacy_facade_forwarding(firestore_fake, monkeypatch):
+    db = _client(firestore_fake)
+    monkeypatch.setattr(folder_repository, "get_client", lambda: db)
+    monkeypatch.setattr(drive_firestore, "_get_db", lambda: db)
+    name = "Zoë Speaker"
+    key = "s" + hashlib.md5(name.encode("utf-8")).hexdigest()[:12]
+    assert folder_repository.speaker_key(name) == key
+    assert drive_firestore._speaker_key(name) == key
+
+    db.collection(FOLDERS).document("speaker-folder").set({
+        "folder_id": "speaker-folder", "name": "Speaker folder", "parent_id": None,
+        "speakers": {key: 1},
+    })
+    db.collection(FOLDERS).document("other-folder").set({"name": "Other", "speakers": {key: 0}})
+    matched = list(folder_repository.get_folders_by_speaker(name, db))
+    assert [doc.id for doc in matched] == ["speaker-folder"]
+
+    folder_repository.increment_folder_speakers("speaker-folder", [name], db=db)
+    assert firestore_fake.documents[f"{FOLDERS}/speaker-folder"]["speakers"][key] == 2
+    assert _writes(firestore_fake, f"{FOLDERS}/speaker-folder")[-1]["operation"] == "update"
+
+    drive_firestore.upsert_folder("facade-folder", "Facade", None)
+    assert drive_firestore.get_folder_by_id("facade-folder")["folder_id"] == "facade-folder"
+    assert drive_firestore.get_all_folders()["facade-folder"]["name"] == "Facade"
+    assert drive_firestore.folder_name_exists("Facade", None)
+    assert drive_firestore.orphan_folder_children("speaker-folder") == 0
+    drive_firestore.delete_folder("facade-folder")
+    assert f"{FOLDERS}/facade-folder" not in firestore_fake.documents
+
+
+def test_unassigned_folder_lookup_reuses_facade_client(firestore_fake, monkeypatch):
+    db = _client(firestore_fake)
+    db.collection(FOLDERS).document("unassigned-id").set({"name": "_unassigned"})
+    calls = []
+    monkeypatch.setattr(drive_firestore, "_get_db", lambda: calls.append(db) or db)
+    monkeypatch.setattr(transcript_repository, "list_unassigned_transcripts", lambda folder_id, client: [])
+
+    assert drive_firestore.get_unassigned() == {"count": 0, "transcripts": []}
+    assert len(calls) == 1
+
+
+def test_folder_repository_default_client_is_lazy(firestore_fake, monkeypatch):
+    calls = []
+    db = _client(firestore_fake)
+    monkeypatch.setattr(folder_repository, "get_client", lambda: calls.append(True) or db)
+
+    assert folder_repository.speaker_key("speaker") == drive_firestore._speaker_key("speaker")
+    assert calls == []
+    assert folder_repository.get_all_folders() == {}
+    assert calls == [True]
 
 
 def test_save_index_replaces_update_index_merges_and_dotted_paths(firestore_fake):

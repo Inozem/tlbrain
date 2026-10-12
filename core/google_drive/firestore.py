@@ -33,6 +33,7 @@ from core.integrations.firestore.transcripts import (
     update_skipped_utterances,
     write_queued,
 )
+from core.integrations.firestore import folders as folder_repository
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +49,7 @@ def update_transcript_source_file(doc_id: str, source_file: str) -> None:
 def get_unassigned() -> dict:
     """Return count and list of unassigned transcripts (in _unassigned folder)."""
     db = _get_db()
-    unassigned_folder_id = None
-    for doc in db.collection(FOLDERS_COLLECTION).where(
-        filter=firestore.FieldFilter("name", "==", "_unassigned")
-    ).stream():
-        unassigned_folder_id = doc.id
-        break
+    unassigned_folder_id = folder_repository.get_folder_id_by_name("_unassigned", db)
 
     if not unassigned_folder_id:
         return {"count": 0, "transcripts": []}
@@ -63,8 +59,8 @@ def get_unassigned() -> dict:
 
 
 def _speaker_key(name: str) -> str:
-    import hashlib
-    return "s" + hashlib.md5(name.encode()).hexdigest()[:12]
+    """Compatibility alias for the canonical folder speaker key."""
+    return folder_repository.speaker_key(name)
 
 
 def update_client_speakers(client_name: str, speakers: list[str], delta: int = 1) -> None:
@@ -339,56 +335,22 @@ def create_client(client_name: str, folder_id: str, description: str | None = No
 
 def upsert_folder(folder_id: str, name: str, parent_id: str | None) -> None:
     """Register or update a folder in folders/{folder_id}."""
-    db = _get_db()
-    ref = db.collection(FOLDERS_COLLECTION).document(folder_id)
-    snapshot = ref.get()
-    if snapshot.exists:
-        data = snapshot.to_dict() or {}
-        updates: dict = {}
-        if data.get("name") != name:
-            updates["name"] = name
-        if data.get("parent_id") != parent_id:
-            updates["parent_id"] = parent_id
-        if updates:
-            ref.update(updates)
-            logger.info("Updated folder %s: %s", folder_id, updates)
-    else:
-        ref.set({
-            "folder_id": folder_id,
-            "name": name,
-            "parent_id": parent_id,
-            "speakers": {},
-            "description": None,
-            "created_at": firestore.SERVER_TIMESTAMP,
-        })
-        logger.info("Registered folder: %s name=%r parent=%s", folder_id, name, parent_id)
+    folder_repository.upsert_folder(folder_id, name, parent_id, _get_db())
 
 
 def get_folder_by_id(folder_id: str) -> dict | None:
     """Return folders/{folder_id} data, or None if not found."""
-    doc = _get_db().collection(FOLDERS_COLLECTION).document(folder_id).get()
-    if not doc.exists:
-        return None
-    return doc.to_dict()
+    return folder_repository.get_folder_by_id(folder_id, _get_db())
 
 
 def get_all_folders() -> dict[str, dict]:
     """Return {folder_id: data} for all registered folders."""
-    db = _get_db()
-    return {doc.id: (doc.to_dict() or {}) for doc in db.collection(FOLDERS_COLLECTION).stream()}
+    return folder_repository.get_all_folders(_get_db())
 
 
-def folder_name_exists(name: str, parent_id: str) -> bool:
+def folder_name_exists(name: str, parent_id: str | None) -> bool:
     """Return True if a folder with this name already exists under parent_id."""
-    db = _get_db()
-    docs = (
-        db.collection(FOLDERS_COLLECTION)
-        .where("name", "==", name)
-        .where("parent_id", "==", parent_id)
-        .limit(1)
-        .stream()
-    )
-    return any(True for _ in docs)
+    return folder_repository.folder_name_exists(name, parent_id, _get_db())
 
 
 def expand_subtree(folder_id: str) -> list[str]:
@@ -414,14 +376,7 @@ def expand_subtree(folder_id: str) -> list[str]:
 
 def orphan_folder_children(folder_id: str) -> int:
     """Clear parent_id for all subfolders that are direct children of folder_id."""
-    db = _get_db()
-    count = 0
-    for doc in db.collection(FOLDERS_COLLECTION).where("parent_id", "==", folder_id).stream():
-        doc.reference.update({"parent_id": None})
-        count += 1
-    if count:
-        logger.info("Orphaned %d subfolder(s) of %s", count, folder_id)
-    return count
+    return folder_repository.orphan_folder_children(folder_id, _get_db())
 
 
 def orphan_transcript_children(folder_id: str) -> int:
@@ -438,8 +393,7 @@ def orphan_transcript_children(folder_id: str) -> int:
 
 def delete_folder(folder_id: str) -> None:
     """Remove a folder record from the folders collection."""
-    _get_db().collection(FOLDERS_COLLECTION).document(folder_id).delete()
-    logger.info("Deleted folder record: %s", folder_id)
+    folder_repository.delete_folder(folder_id, _get_db())
 
 
 def resolve_folder_path(path: list[str]) -> list[str]:
