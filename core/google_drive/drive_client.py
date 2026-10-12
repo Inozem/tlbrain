@@ -7,6 +7,7 @@ import httplib2
 from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
+from core.integrations.google_auth.credentials import credentials
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,21 +22,9 @@ def _build_http(credentials) -> google_auth_httplib2.AuthorizedHttp:
 
 
 def _build_credentials(scopes: list[str]):
-    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
-    if refresh_token:
+    if os.environ.get("GOOGLE_REFRESH_TOKEN"):
         logger.info("Drive auth: using user OAuth (GOOGLE_REFRESH_TOKEN)")
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
-        creds = Credentials(
-            token=None,
-            refresh_token=refresh_token,
-            client_id=os.environ["GOOGLE_CLIENT_ID"],
-            client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
-            token_uri="https://oauth2.googleapis.com/token",
-        )
-        creds.refresh(Request())
-        return creds
-    raise RuntimeError("GOOGLE_REFRESH_TOKEN is not set — Drive access requires user OAuth credentials")
+    return credentials(scopes)
 
 
 def build_drive_service():

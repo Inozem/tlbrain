@@ -1,13 +1,13 @@
 from googleapiclient.discovery import build
 
-from core.google_drive.drive_client import _build_credentials
+from core.integrations.google_auth.credentials import credentials
 from core.utils.retry import with_retry
 
 SCOPES = ["https://www.googleapis.com/auth/documents.readonly"]
 
 
 def _build_docs_service():
-    return build("docs", "v1", credentials=_build_credentials(SCOPES))
+    return build("docs", "v1", credentials=credentials(SCOPES))
 
 
 @with_retry

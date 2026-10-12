@@ -3,7 +3,6 @@ import os
 import re
 from datetime import datetime, timezone
 
-import google.auth
 import requests as http_requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -12,6 +11,7 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.gemini.llm import call_gemini_json
+from core.integrations.google_auth.credentials import credentials
 from core.google_drive.firestore import COLLECTION_NAME, FOLDERS_COLLECTION, _speaker_key, delete_queued_placeholder, get_all_folders, mark_download_error, mark_downloading, upsert_folder
 from core.utils.logging import configure_logging
 from core.utils.tasks import enqueue_task
@@ -29,21 +29,7 @@ app = FastAPI()
 
 
 def _build_credentials():
-    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
-    if refresh_token:
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
-        creds = Credentials(
-            token=None,
-            refresh_token=refresh_token,
-            client_id=os.environ["GOOGLE_CLIENT_ID"],
-            client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
-            token_uri="https://oauth2.googleapis.com/token",
-        )
-        creds.refresh(Request())
-        return creds
-    creds, _ = google.auth.default(scopes=_SCOPES)
-    return creds
+    return credentials(_SCOPES, allow_adc_fallback=True)
 
 
 def _build_drive():

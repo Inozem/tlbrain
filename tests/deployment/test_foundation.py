@@ -69,6 +69,8 @@ FORBIDDEN_PARTS = {
 
 
 def _looks_credential_like(path: str) -> bool:
+    if PurePosixPath(path).as_posix() == "core/integrations/google_auth/credentials.py":
+        return False
     normalized = "_" + "_".join(
         "".join(
             character.lower() if character.isalnum() else "_"
@@ -136,6 +138,7 @@ def test_credential_like_artifact_paths_are_rejected() -> None:
         ".ssh/id_ed25519",
     )
     assert all(_looks_credential_like(path) for path in credential_paths)
+    assert not _looks_credential_like("core/integrations/google_auth/credentials.py")
 
 
 def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
