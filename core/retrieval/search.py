@@ -1,25 +1,15 @@
 from typing import Any
 
-from fastembed import SparseTextEmbedding
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, Range, SparseVector
 
 from core.config import get_root_folder_id
 from core.integrations.gemini.embeddings import embed
+from core.integrations.fastembed.bm25 import get_bm25_model
 from core.integrations.qdrant.client import get_client
 from core.integrations.qdrant.schema import get_collection_name
 
 _SEARCHABLE_TYPES = ["summary", "fact"]
 _KEYWORD_HALF_WINDOW = 2
-
-_bm25_model: SparseTextEmbedding | None = None
-
-
-def _get_bm25_model() -> SparseTextEmbedding:
-    global _bm25_model
-    if _bm25_model is None:
-        _bm25_model = SparseTextEmbedding(model_name="Qdrant/bm25")
-    return _bm25_model
-
 
 def search_summaries_and_facts(
     query: str,
@@ -165,7 +155,7 @@ def keyword_search_utterances(
     Returns list of hits: doc_id, parent_id, covered_range (window around hit), score.
     Filters are applied before search; no fallback if results are empty.
     """
-    embedding = next(iter(_get_bm25_model().embed([query])))
+    embedding = next(iter(get_bm25_model().embed([query])))
     sparse_vec = SparseVector(
         indices=embedding.indices.tolist(),
         values=embedding.values.tolist(),

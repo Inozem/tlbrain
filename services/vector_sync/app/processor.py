@@ -1,9 +1,9 @@
 import logging
 
-from fastembed import SparseTextEmbedding
 from qdrant_client.models import SparseVector
 
 from core.integrations.gemini.embeddings import embed, make_client
+from core.integrations.fastembed.bm25 import get_bm25_model
 from core.google_drive.docs_reader import read_google_doc
 from core.google_drive.firestore import acquire_for_syncing, mark_error, mark_synced, update_skipped_utterances
 from core.parsing.parser import parse_document
@@ -23,16 +23,6 @@ from services.vector_sync.app.hashing import sha256_text, sha256_utterance
 from services.vector_sync.app.index_store import load_index, update_index
 
 logger = logging.getLogger(__name__)
-
-_bm25_model: SparseTextEmbedding | None = None
-
-
-def _get_bm25_model() -> SparseTextEmbedding:
-    global _bm25_model
-    if _bm25_model is None:
-        _bm25_model = SparseTextEmbedding(model_name="Qdrant/bm25")
-    return _bm25_model
-
 
 def process_one(doc_id: str, parent_id: str, root_folder_id: str, raw_text: str | None = None) -> str:
     """
@@ -132,7 +122,7 @@ def process_one(doc_id: str, parent_id: str, root_folder_id: str, raw_text: str 
                 changed_utterances, doc_id, version, parent_id, dialog_date, root_folder_id
             )
             if utterance_payloads:
-                bm25_embeddings = list(_get_bm25_model().embed([u["text"] for u in utterance_payloads]))
+                bm25_embeddings = list(get_bm25_model().embed([u["text"] for u in utterance_payloads]))
                 sparse_vectors = [
                     SparseVector(indices=e.indices.tolist(), values=e.values.tolist())
                     for e in bm25_embeddings
@@ -202,7 +192,7 @@ def process_one(doc_id: str, parent_id: str, root_folder_id: str, raw_text: str 
             utterance_payloads = build_utterance_payloads(
                 utterances, doc_id, version, parent_id, dialog_date, root_folder_id
             )
-            bm25_embeddings = list(_get_bm25_model().embed([u["text"] for u in utterance_payloads]))
+            bm25_embeddings = list(get_bm25_model().embed([u["text"] for u in utterance_payloads]))
             sparse_vectors = [
                 SparseVector(indices=e.indices.tolist(), values=e.values.tolist())
                 for e in bm25_embeddings

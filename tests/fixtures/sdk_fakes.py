@@ -492,8 +492,7 @@ def install() -> dict[str, tuple[Any, str, Any, Any]]:
     cache_snapshot: dict[tuple[str, str], tuple[Any, str, Any]] = {}
     cache_symbols = {
         "core.integrations.qdrant.client": ("_client",),
-        "core.retrieval.search": ("_bm25_model",),
-        "services.vector_sync.app.processor": ("_bm25_model",),
+        "core.integrations.fastembed.bm25": ("_bm25_model",),
     }
     for module_name, attrs in cache_symbols.items():
         module = sys.modules.get(module_name)
@@ -606,8 +605,7 @@ def restore(originals: dict[str, tuple[Any, str, Any, Any]] | None) -> None:
         setattr(module, attr, value)
     for module_name, attr, fake_type in (
         ("core.integrations.qdrant.client", "_client", FakeQdrantClient),
-        ("core.retrieval.search", "_bm25_model", FakeSparseTextEmbedding),
-        ("services.vector_sync.app.processor", "_bm25_model", FakeSparseTextEmbedding),
+        ("core.integrations.fastembed.bm25", "_bm25_model", FakeSparseTextEmbedding),
     ):
         module = sys.modules.get(module_name)
         if module is not None and (module_name, attr) not in cache_snapshot:

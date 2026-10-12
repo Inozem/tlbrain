@@ -161,10 +161,10 @@ def test_qdrant_startup_uses_real_models_and_queries_are_scripted(sdk_fakes, mon
 
 
 def test_sparse_vectors_are_configurable_and_deterministic(sdk_fakes):
-    from core.retrieval import search
+    from core.integrations.fastembed import bm25
 
     sdk_fakes.sparse.set_vectors("known phrase", [8, 3], [0.5, 0.25])
-    sparse = search._get_bm25_model()
+    sparse = bm25.get_bm25_model()
     first = next(sparse.embed(["known phrase"]))
     second = next(sparse.embed(["known phrase"]))
     assert first.indices.tolist() == second.indices.tolist() == [8, 3]
@@ -363,15 +363,15 @@ def test_install_and_configure_roll_back_partial_patches(sdk_fakes, monkeypatch)
     active = conftest._saved_sdk_boundaries
     assert active is not None
     from core.integrations.qdrant import client as qdrant_module
-    from core.retrieval import search
+    from core.integrations.fastembed import bm25
     qdrant_cache_before = qdrant_module._client
-    sparse_cache_before = search._bm25_model
+    sparse_cache_before = bm25._bm25_model
     fake_module.restore(active)
     assert qdrant_module._client is qdrant_cache_before
-    assert search._bm25_model is sparse_cache_before
+    assert bm25._bm25_model is sparse_cache_before
     fake_module.restore(active)
     assert qdrant_module._client is qdrant_cache_before
-    assert search._bm25_model is sparse_cache_before
+    assert bm25._bm25_model is sparse_cache_before
     assert google.auth._default.default is original_default
     assert genai_client.Client is original_client
     assert qdrant_impl.QdrantClient is original_qdrant
