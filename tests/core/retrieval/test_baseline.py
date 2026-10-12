@@ -49,6 +49,32 @@ def _seed_folders(firestore_fake):
     folders.document("folder-child").set({"name": "Child", "parent_id": "folder-team"})
 
 
+def test_empty_folder_paths_keep_adapter_policies_without_loading_data(sdk_fakes, monkeypatch):
+    from core.google_drive import firestore as drive_firestore
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("empty folder path must not load folder data or scroll Qdrant")
+
+    monkeypatch.setattr(drive_firestore, "get_root_folder_id", unexpected_call)
+    monkeypatch.setattr(drive_firestore, "get_all_folders", unexpected_call)
+    assert drive_firestore.resolve_folder_path([]) == []
+
+    monkeypatch.setattr(transcripts, "get_root_folder_id", unexpected_call)
+    monkeypatch.setattr(transcripts, "get_all_folders", unexpected_call)
+    monkeypatch.setattr(transcripts, "_scroll_by_folder", unexpected_call)
+    assert transcripts.get_transcripts(folder_path=[]) == ([], {
+        "truncated": False,
+        "total_matches": 0,
+        "returned_segments": 0,
+        "limit_reason": "no_results",
+        "suggestion": "Folder not found: ",
+    })
+    assert not [
+        event for event in sdk_fakes.trace
+        if event["boundary"] == "qdrant" and event["operation"] == "scroll"
+    ]
+
+
 def test_search_operations_keep_separate_types_and_folder_date_filters(sdk_fakes, monkeypatch):
     monkeypatch.setenv("RETRIEVAL_TOP_K", "23")
     sdk_fakes.sparse.set_vectors("review plan", [3, 8], [0.2, 0.7])

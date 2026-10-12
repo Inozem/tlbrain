@@ -3,11 +3,16 @@ from typing import Any
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, Range
 
 from core.config import get_root_folder_id
-from core.google_drive.firestore import expand_subtree, get_all_folders, resolve_folder_path
+from core.google_drive.firestore import get_all_folders
+from core.integrations.google_drive.folders import (
+    expand_subtree,
+    make_folder_path_resolver,
+    resolve_folder_path,
+)
 from core.integrations.qdrant.client import get_client
 from core.integrations.qdrant.schema import get_collection_name
 from core.retrieval.pipeline import dedup_and_sort
-from core.retrieval.segments import build_segments, make_folder_path_resolver
+from core.retrieval.segments import build_segments
 
 
 def get_transcripts(
@@ -21,7 +26,12 @@ def get_transcripts(
     if doc_id is not None:
         utterances = _scroll_by_doc_id(doc_id)
     elif folder_path is not None:
-        terminal_ids = resolve_folder_path(folder_path)
+        if not folder_path:
+            terminal_ids = []
+            all_folders = {}
+        else:
+            all_folders = get_all_folders()
+            terminal_ids = resolve_folder_path(folder_path, all_folders, get_root_folder_id())
         if not terminal_ids:
             return [], {
                 "truncated": False,
@@ -30,8 +40,11 @@ def get_transcripts(
                 "limit_reason": "no_results",
                 "suggestion": f"Folder not found: {'/'.join(folder_path)}",
             }
-        folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
-        all_folders = get_all_folders()
+        folder_ids = [
+            folder_id
+            for terminal_id in terminal_ids
+            for folder_id in expand_subtree(terminal_id, all_folders)
+        ]
         resolve_path = make_folder_path_resolver(all_folders)
         utterances = _scroll_by_folder(folder_ids, date_from, date_to)
     else:

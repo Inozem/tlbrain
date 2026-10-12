@@ -2,7 +2,7 @@
 
 Canonical transcript, folder, and sync-state operations live under
 ``core.integrations.firestore``. This module keeps only operations still used by
-runtime Drive workflows and the pure folder-path helpers pending their extraction.
+runtime Drive workflows, along with compatibility wrappers for current callers.
 Historical migration sources may contain older imports; they are not supported by
 the runtime facade.
 """
@@ -20,6 +20,10 @@ from core.integrations.firestore.transcripts import (
 )
 from core.integrations.firestore import folders as folder_repository
 from core.integrations.firestore import transcripts as transcript_repository
+from core.integrations.google_drive.folders import (
+    expand_subtree as _expand_subtree,
+    resolve_folder_path as _resolve_folder_path,
+)
 
 
 def _get_db() -> firestore.Client:
@@ -43,20 +47,7 @@ def get_all_folders() -> dict[str, dict]:
 
 def expand_subtree(folder_id: str) -> list[str]:
     """Return folder_id plus all its descendants from the folders collection."""
-    all_folders = get_all_folders()
-    children: dict[str, list[str]] = {}
-    for fid, data in all_folders.items():
-        parent_id = data.get("parent_id")
-        if parent_id:
-            children.setdefault(parent_id, []).append(fid)
-
-    result: list[str] = []
-    queue = [folder_id]
-    while queue:
-        current_id = queue.pop(0)
-        result.append(current_id)
-        queue.extend(children.get(current_id, []))
-    return result
+    return _expand_subtree(folder_id, get_all_folders())
 
 
 def orphan_folder_children(folder_id: str) -> int:
@@ -81,21 +72,4 @@ def resolve_folder_path(path: list[str]) -> list[str]:
 
     root_folder_id = get_root_folder_id()
     all_folders = get_all_folders()
-    children: dict[str, list[tuple[str, str]]] = {}
-    for folder_id, data in all_folders.items():
-        parent_id = data.get("parent_id")
-        if parent_id:
-            children.setdefault(parent_id, []).append((folder_id, data.get("name", "")))
-
-    current = [root_folder_id]
-    for segment in path:
-        next_candidates = [
-            folder_id
-            for parent_id in current
-            for folder_id, name in children.get(parent_id, [])
-            if name == segment
-        ]
-        if not next_candidates:
-            return []
-        current = next_candidates
-    return current
+    return _resolve_folder_path(path, all_folders, root_folder_id)

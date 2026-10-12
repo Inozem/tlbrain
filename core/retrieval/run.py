@@ -2,11 +2,16 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from core.config import get_retrieval_score_threshold, get_retrieval_top_k
-from core.google_drive.firestore import expand_subtree, get_all_folders, resolve_folder_path as _resolve_path
+from core.config import get_retrieval_score_threshold, get_retrieval_top_k, get_root_folder_id
+from core.google_drive.firestore import get_all_folders
+from core.integrations.google_drive.folders import (
+    expand_subtree,
+    make_folder_path_resolver,
+    resolve_folder_path,
+)
 from core.retrieval.pipeline import dedup_and_sort, fetch_utterances, merge_ranges
 from core.retrieval.search import keyword_search_utterances, search_summaries_and_facts, search_summaries_for_doc, search_user_facts
-from core.retrieval.segments import build_segments, make_folder_path_resolver
+from core.retrieval.segments import build_segments
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +29,14 @@ def run_retrieval(
     folder_ids: list[str] | None = None
     all_folders = get_all_folders()
     if folder_path:
-        terminal_ids = _resolve_path(folder_path)
+        terminal_ids = resolve_folder_path(folder_path, all_folders, get_root_folder_id())
         if not terminal_ids:
             raise ValueError(f"Folder not found: {'/'.join(folder_path)}")
-        folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
+        folder_ids = [
+            folder_id
+            for terminal_id in terminal_ids
+            for folder_id in expand_subtree(terminal_id, all_folders)
+        ]
 
     resolve_path = make_folder_path_resolver(all_folders)
 
