@@ -172,6 +172,61 @@ def test_save_index_uses_injected_client_without_creating_another(firestore_fake
     assert firestore_fake.documents[f"{INDEX}/injected-client"] == {"status": "imported"}
 
 
+def test_transcript_reads_and_updates_use_injected_client(firestore_fake, monkeypatch):
+    db = _client(firestore_fake)
+    db.collection(INDEX).document("injected-read").set({"status": "imported", "keep": True})
+    monkeypatch.setattr(
+        transcript_repository,
+        "get_client",
+        lambda: pytest.fail("injected client should be used"),
+    )
+
+    assert transcript_repository.get_transcript_record("injected-read", db=db) == {
+        "status": "imported", "keep": True,
+    }
+    transcript_repository.update_index("injected-read", {"status": "synced"}, db=db)
+
+    assert firestore_fake.documents[f"{INDEX}/injected-read"] == {
+        "status": "synced", "keep": True,
+    }
+
+
+def test_index_stream_preserves_lazy_projected_query():
+    events = []
+
+    class Stream:
+        def __iter__(self):
+            events.append("iterated")
+            return iter(())
+
+    stream = Stream()
+
+    class Query:
+        def select(self, fields):
+            events.append(("select", fields))
+            return self
+
+        def stream(self):
+            events.append("stream")
+            return stream
+
+    class Client:
+        def collection(self, collection):
+            events.append(("collection", collection))
+            return Query()
+
+    result = transcript_repository.stream_index_records(["status", "error_stage"], db=Client())
+
+    assert result is stream
+    assert events == [
+        ("collection", INDEX),
+        ("select", ["status", "error_stage"]),
+        "stream",
+    ]
+    iter(result)
+    assert events[-1] == "iterated"
+
+
 def test_transcript_repository_crud_and_legacy_get_exports_share_implementation(firestore_fake):
     db = _client(firestore_fake)
     ref = db.collection(INDEX).document("repo-record")

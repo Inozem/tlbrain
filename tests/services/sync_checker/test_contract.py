@@ -116,8 +116,8 @@ def test_stale_and_error_retries_are_queued_in_order_before_changes(
 
 def test_nonexpired_drive_provider_error_propagates(checker_main, monkeypatch):
     monkeypatch.setenv("VECTOR_SYNC_URL", "https://sync.synthetic.test")
-    monkeypatch.setattr(checker_main, "get_stale_syncing", lambda: [])
-    monkeypatch.setattr(checker_main, "get_error_docs", lambda: [])
+    monkeypatch.setattr(checker_main, "get_stale_syncing", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_error_docs", lambda db=None: [])
     monkeypatch.setattr(checker_main, "get_drive_sync_token", lambda: "page-token")
     error = HttpError(SimpleNamespace(status=503, reason="Unavailable"), b"provider unavailable")
 
@@ -136,8 +136,8 @@ def test_expired_cursor_falls_back_to_scan_and_enqueues_only_eligible_docs(
     checker_main, sdk_fakes, firestore_fake, monkeypatch
 ):
     monkeypatch.setenv("VECTOR_SYNC_URL", "https://sync.synthetic.test")
-    monkeypatch.setattr(checker_main, "get_stale_syncing", lambda: [])
-    monkeypatch.setattr(checker_main, "get_error_docs", lambda: [])
+    monkeypatch.setattr(checker_main, "get_stale_syncing", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_error_docs", lambda db=None: [])
     monkeypatch.setattr(checker_main, "get_drive_sync_token", lambda: "expired-page")
     calls = []
 

@@ -15,9 +15,10 @@ STALE_SYNCING_MINUTES = 15
 _NO_RETRY_STAGES = {"import", "invalid_format"}
 
 
-def get_transcript_record(doc_id: str) -> dict | None:
+def get_transcript_record(doc_id: str, db: firestore.Client | None = None) -> dict | None:
     """Return a transcript_index record for a document, or None if absent."""
-    document = get_client().collection(COLLECTION_NAME).document(doc_id).get()
+    client = db if db is not None else get_client()
+    document = client.collection(COLLECTION_NAME).document(doc_id).get()
     if not document.exists:
         return None
     return document.to_dict()
@@ -52,10 +53,27 @@ def get_index_records_by_meeting_id(meeting_id: str, db: firestore.Client | None
     )
 
 
-def update_index(doc_id: str, fields: dict[str, Any]) -> None:
+def update_index(
+    doc_id: str,
+    fields: dict[str, Any],
+    db: firestore.Client | None = None,
+) -> None:
     """Update fields on a transcript index record, including dotted paths."""
-    get_client().collection(COLLECTION_NAME).document(doc_id).update(fields)
+    client = db if db is not None else get_client()
+    client.collection(COLLECTION_NAME).document(doc_id).update(fields)
     logger.info("Index fields updated: %s", doc_id)
+
+
+def stream_index_records(
+    fields: list[str] | None = None,
+    db: firestore.Client | None = None,
+):
+    """Return a lazy stream of transcript index snapshots, with an optional projection."""
+    client = db if db is not None else get_client()
+    query = client.collection(COLLECTION_NAME)
+    if fields is not None:
+        query = query.select(fields)
+    return query.stream()
 
 
 def delete_index(doc_id: str) -> None:
@@ -223,9 +241,9 @@ def mark_error(doc_id: str, error: str, error_stage: str = "vector_sync") -> Non
     logger.info("Marked error: %s — %s (stage=%s)", doc_id, error, error_stage)
 
 
-def write_queued(meeting_id: str) -> bool:
+def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
     """Create a queued placeholder or reset one with an import error."""
-    db = get_client()
+    db = db if db is not None else get_client()
     ref = db.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
 
     @firestore.transactional
@@ -263,8 +281,13 @@ def mark_downloading(meeting_id: str) -> None:
     logger.info("Marked downloading: %s", meeting_id)
 
 
-def mark_download_error(meeting_id: str, error: str) -> None:
-    get_client().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
+def mark_download_error(
+    meeting_id: str,
+    error: str,
+    db: firestore.Client | None = None,
+) -> None:
+    client = db if db is not None else get_client()
+    client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
         "status": "error",
         "error": error,
         "error_stage": "import",
@@ -278,13 +301,18 @@ def delete_queued_placeholder(meeting_id: str) -> None:
     logger.info("Deleted queued placeholder: %s", meeting_id)
 
 
-def move_transcript_record(doc_id: str, new_parent_id: str) -> None:
+def move_transcript_record(
+    doc_id: str,
+    new_parent_id: str,
+    db: firestore.Client | None = None,
+) -> None:
     """Update parent_id, reset status to imported for reindexing.
 
     modifiedTime is deleted so the checker detects a change and re-enqueues sync,
     even though moving a file in Drive does not update its modifiedTime.
     """
-    get_client().collection(COLLECTION_NAME).document(doc_id).update({
+    client = db if db is not None else get_client()
+    client.collection(COLLECTION_NAME).document(doc_id).update({
         "parent_id": new_parent_id,
         "status": "imported",
         "modifiedTime": firestore.DELETE_FIELD,
@@ -314,10 +342,11 @@ def list_unassigned_transcripts(
     return transcripts
 
 
-def get_stale_syncing() -> list[str]:
+def get_stale_syncing(db: firestore.Client | None = None) -> list[str]:
     """Return doc IDs stuck in syncing beyond the stale threshold."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_SYNCING_MINUTES)
-    syncing_docs = get_client().collection(COLLECTION_NAME).where(
+    client = db if db is not None else get_client()
+    syncing_docs = client.collection(COLLECTION_NAME).where(
         filter=firestore.FieldFilter("status", "==", "syncing")
     ).stream()
     stale = []
@@ -329,9 +358,10 @@ def get_stale_syncing() -> list[str]:
     return stale
 
 
-def get_error_docs() -> list[str]:
+def get_error_docs(db: firestore.Client | None = None) -> list[str]:
     """Return retryable errors, excluding import and invalid-format failures."""
-    error_docs = get_client().collection(COLLECTION_NAME).where(
+    client = db if db is not None else get_client()
+    error_docs = client.collection(COLLECTION_NAME).where(
         filter=firestore.FieldFilter("status", "==", "error")
     ).stream()
     result = []

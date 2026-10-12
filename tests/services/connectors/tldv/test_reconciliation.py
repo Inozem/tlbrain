@@ -96,7 +96,11 @@ def test_recovery_uses_inclusive_age_window_and_only_eligible_statuses(
     monkeypatch.setattr(reconciliation, "get_meetings", lambda _since: [])
     writes = []
     write_queued = reconciliation.write_queued
-    monkeypatch.setattr(reconciliation, "write_queued", lambda mid: writes.append(mid) or write_queued(mid))
+    monkeypatch.setattr(
+        reconciliation,
+        "write_queued",
+        lambda mid, db=None: writes.append(mid) or write_queued(mid, db=db),
+    )
 
     result, status_code = reconciliation.tldv_reconciliation(_request({}))
 
@@ -315,9 +319,9 @@ def test_batch_writes_placeholder_before_named_task_and_already_exists_is_not_co
     write_queued = reconciliation.write_queued
     enqueue_task = reconciliation.enqueue_task
 
-    def record_write(mid):
+    def record_write(mid, db=None):
         effects.append("placeholder")
-        return write_queued(mid)
+        return write_queued(mid, db=db)
 
     def record_enqueue(**kwargs):
         effects.append("task")

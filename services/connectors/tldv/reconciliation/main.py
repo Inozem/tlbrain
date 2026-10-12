@@ -6,7 +6,12 @@ import functions_framework
 import requests
 from google.cloud import firestore
 
-from core.google_drive.firestore import COLLECTION_NAME, mark_download_error, write_queued
+from core.integrations.firestore.transcripts import (
+    mark_download_error,
+    stream_index_records,
+    update_index,
+    write_queued,
+)
 from core.utils.logging import configure_logging
 from core.integrations.cloud_tasks.client import enqueue_task
 from tldv_client import get_meetings, iter_meeting_pages, tldv_get
@@ -37,7 +42,7 @@ def _recover_stale_import_docs(
     recovered = 0
     finalized = 0
 
-    for doc in db.collection(COLLECTION_NAME).stream():
+    for doc in stream_index_records(db=db):
         data = doc.to_dict() or {}
 
         meeting_id = data.get("meeting_id")
@@ -62,7 +67,11 @@ def _recover_stale_import_docs(
             utterances = transcript_resp.get("results", transcript_resp.get("data", []))
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code in (403, 404):
-                mark_download_error(meeting_id, f"HTTP {exc.response.status_code} in reconciliation recovery")
+                mark_download_error(
+                    meeting_id,
+                    f"HTTP {exc.response.status_code} in reconciliation recovery",
+                    db=db,
+                )
                 finalized += 1
                 logger.info(
                     "Finalized stale import doc: meeting_id=%s HTTP %s",
@@ -81,12 +90,12 @@ def _recover_stale_import_docs(
 
         # Transcript is ready — reset to queued and re-enqueue
         if status != "queued":
-            db.collection(COLLECTION_NAME).document(doc.id).update({
+            update_index(doc.id, {
                 "status": "queued",
                 "error": None,
                 "error_stage": None,
                 "status_changed_at": firestore.SERVER_TIMESTAMP,
-            })
+            }, db=db)
 
         if import_service_url:
             enqueued = enqueue_task(
@@ -138,7 +147,7 @@ def tldv_reconciliation(request):
 
     stale_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
     existing: set[str] = set()
-    for doc in db.collection(COLLECTION_NAME).stream():
+    for doc in stream_index_records(db=db):
         data = doc.to_dict() or {}
         mid = data.get("meeting_id")
         if not mid:
@@ -180,7 +189,7 @@ def tldv_reconciliation(request):
     queued = 0
     for meeting in batch:
         meeting_id = meeting["id"]
-        write_queued(meeting_id)
+        write_queued(meeting_id, db=db)
         if enqueue_task(
             queue_name=queue_name,
             task_id=f"tldv-import-{meeting_id}",
