@@ -215,7 +215,7 @@ def test_success_import_writes_canonical_doc_and_enqueues_named_sync_task(
     folder_id = "folder-alex"
     root_id = "pytest-synthetic-root"
     speaker = "Alex"
-    speaker_key = import_main._speaker_key(speaker)
+    speaker_key = import_main.speaker_key(speaker)
     _seed(firestore_fake, "transcript_index", f"tldv-{meeting_id}", {"meeting_id": meeting_id, "status": "queued"})
     _seed(firestore_fake, "folders", folder_id, {
         "folder_id": folder_id,

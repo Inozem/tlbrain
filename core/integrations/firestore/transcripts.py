@@ -31,10 +31,25 @@ def load_index(doc_id: str) -> dict[str, Any] | None:
     return result
 
 
-def save_index(doc_id: str, payload: dict[str, Any]) -> None:
+def save_index(
+    doc_id: str,
+    payload: dict[str, Any],
+    db: firestore.Client | None = None,
+) -> None:
     """Replace a transcript index record."""
-    get_client().collection(COLLECTION_NAME).document(doc_id).set(payload)
+    client = db if db is not None else get_client()
+    client.collection(COLLECTION_NAME).document(doc_id).set(payload)
     logger.info("Index saved: %s", doc_id)
+
+
+def get_index_records_by_meeting_id(meeting_id: str, db: firestore.Client | None = None):
+    """Return transcript index snapshots matching a provider meeting ID."""
+    client = db if db is not None else get_client()
+    return list(
+        client.collection(COLLECTION_NAME)
+        .where(filter=firestore.FieldFilter("meeting_id", "==", meeting_id))
+        .stream()
+    )
 
 
 def update_index(doc_id: str, fields: dict[str, Any]) -> None:

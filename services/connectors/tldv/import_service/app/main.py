@@ -10,9 +10,11 @@ from google.cloud import firestore
 from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
+from core.integrations.firestore.folders import get_folders_by_speaker, increment_folder_speakers, speaker_key
+from core.integrations.firestore.transcripts import get_index_records_by_meeting_id, save_index
 from core.integrations.gemini.llm import call_gemini_json
 from core.integrations.google_auth.credentials import credentials
-from core.google_drive.firestore import COLLECTION_NAME, FOLDERS_COLLECTION, _speaker_key, delete_queued_placeholder, get_all_folders, mark_download_error, mark_downloading, upsert_folder
+from core.google_drive.firestore import delete_queued_placeholder, get_all_folders, mark_download_error, mark_downloading, upsert_folder
 from core.utils.logging import configure_logging
 from core.integrations.cloud_tasks.client import enqueue_task
 from tldv_client import tldv_get
@@ -203,9 +205,7 @@ def _get_folders_by_speakers(db: firestore.Client, speakers: list[str]) -> tuple
 
     for speaker in speakers:
         folder_ids: set[str] = set()
-        docs = db.collection(FOLDERS_COLLECTION) \
-            .where(filter=firestore.FieldFilter(f"speakers.{_speaker_key(speaker)}", ">", 0)) \
-            .stream()
+        docs = get_folders_by_speaker(speaker, db)
         for doc in docs:
             data = doc.to_dict() or {}
             if data.get("name") != "_unassigned":
@@ -241,7 +241,7 @@ def _detect_target_folder_id(db: firestore.Client, meeting: dict, utterances: li
         logger.info("Stage 1: all speakers are placeholders (%s), skipping", speakers)
         candidates, all_candidates = [], []
     else:
-        logger.info("Stage 1: speakers from TL;DV: %s", {s: _speaker_key(s) for s in speakers})
+        logger.info("Stage 1: speakers from TL;DV: %s", {s: speaker_key(s) for s in speakers})
         candidates, all_candidates = _get_folders_by_speakers(db, speakers)
 
     if len(candidates) == 1:
@@ -329,11 +329,7 @@ async def import_meeting(request: Request):
     logger.info("Importing meeting_id=%s", meeting_id)
 
     db = firestore.Client()
-    existing = list(
-        db.collection(COLLECTION_NAME)
-        .where(filter=firestore.FieldFilter("meeting_id", "==", meeting_id))
-        .stream()
-    )
+    existing = get_index_records_by_meeting_id(meeting_id, db)
     if any(d.to_dict().get("status") != "queued" for d in existing):
         logger.info("Already imported: %s", meeting_id)
         return {"ok": True, "skipped": True}
@@ -383,7 +379,7 @@ async def import_meeting(request: Request):
     logger.info("Created Google Doc: doc_id=%s title=%r", doc_id, title)
 
     speakers = _get_speakers(utterances)
-    db.collection(COLLECTION_NAME).document(doc_id).set({
+    save_index(doc_id, {
         "doc_id": doc_id,
         "parent_id": target_folder_id,
         "dialog_date": dialog_date,
@@ -395,12 +391,11 @@ async def import_meeting(request: Request):
         "status": "imported",
         "error": None,
         "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
+    }, db=db)
     logger.info("Saved to Firestore: doc_id=%s", doc_id)
 
     if speakers:
-        speaker_updates = {f"speakers.{_speaker_key(s)}": firestore.Increment(1) for s in speakers}
-        db.collection(FOLDERS_COLLECTION).document(target_folder_id).update(speaker_updates)
+        increment_folder_speakers(target_folder_id, speakers, db=db)
 
     delete_queued_placeholder(meeting_id)
 

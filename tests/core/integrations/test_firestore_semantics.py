@@ -159,6 +159,19 @@ def test_save_index_replaces_update_index_merges_and_dotted_paths(firestore_fake
     assert [event["operation"] for event in _writes(firestore_fake, path)][-2:] == ["set", "set"]
 
 
+def test_save_index_uses_injected_client_without_creating_another(firestore_fake, monkeypatch):
+    db = _client(firestore_fake)
+    monkeypatch.setattr(
+        transcript_repository,
+        "get_client",
+        lambda: pytest.fail("injected client should be used"),
+    )
+
+    transcript_repository.save_index("injected-client", {"status": "imported"}, db=db)
+
+    assert firestore_fake.documents[f"{INDEX}/injected-client"] == {"status": "imported"}
+
+
 def test_transcript_repository_crud_and_legacy_get_exports_share_implementation(firestore_fake):
     db = _client(firestore_fake)
     ref = db.collection(INDEX).document("repo-record")
@@ -179,6 +192,20 @@ def test_transcript_repository_crud_and_legacy_get_exports_share_implementation(
     transcript_repository.delete_index("repo-record")
     assert f"{INDEX}/repo-record" not in firestore_fake.documents
     assert transcript_repository.list_all_index_ids() == []
+
+
+def test_transcript_repository_queries_by_meeting_id(firestore_fake):
+    db = _client(firestore_fake)
+    db.collection(INDEX).document("matching-a").set({"meeting_id": "meeting-a", "status": "queued"})
+    db.collection(INDEX).document("matching-b").set({"meeting_id": "meeting-a"})
+    db.collection(INDEX).document("other-meeting").set({"meeting_id": "meeting-b", "status": "imported"})
+
+    matches = transcript_repository.get_index_records_by_meeting_id("meeting-a", db)
+
+    assert [(doc.id, doc.to_dict()) for doc in matches] == [
+        ("matching-a", {"meeting_id": "meeting-a", "status": "queued"}),
+        ("matching-b", {"meeting_id": "meeting-a"}),
+    ]
 
 
 def test_transcript_repository_lists_filters_and_aggregates(firestore_fake):
