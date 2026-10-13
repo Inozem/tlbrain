@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse
 from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
-from core.google_drive.docs_reader import read_google_doc
+from core.integrations.google_docs.reader import read_google_doc
 from core.google_drive.drive_client import get_file_parent_folder_id
 from core.integrations.firestore.folders import get_folder_by_id
 from core.integrations.firestore.transcripts import delete_index, ensure_imported, load_index, mark_error

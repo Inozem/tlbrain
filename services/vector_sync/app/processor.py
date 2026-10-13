@@ -4,7 +4,7 @@ from qdrant_client.models import SparseVector
 
 from core.integrations.gemini.embeddings import embed, make_client
 from core.integrations.fastembed.bm25 import get_bm25_model
-from core.google_drive.docs_reader import read_google_doc
+from core.integrations.google_docs.reader import read_google_doc
 from core.integrations.firestore.transcripts import (
     acquire_for_syncing,
     load_index,

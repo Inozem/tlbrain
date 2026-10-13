@@ -1,1 +1,1 @@
-"""Google Docs integration dependency package."""
+"""Google Docs API clients and operations."""

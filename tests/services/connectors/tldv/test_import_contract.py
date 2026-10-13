@@ -314,6 +314,20 @@ def test_success_import_writes_canonical_doc_and_enqueues_named_sync_task(
         "firestore.placeholder_delete",
         "tasks.create",
     ]
+    docs_build_index = next(
+        index for index, event in enumerate(sdk_fakes.trace)
+        if event["operation"] == "build" and event["arguments"].get("api") == "docs"
+    )
+    drive_create_index = next(
+        index for index, event in enumerate(sdk_fakes.trace)
+        if event["boundary"] == "drive" and event["operation"] == "files.create"
+        and event["arguments"]["body"].get("mimeType") == "application/vnd.google-apps.document"
+    )
+    batch_update_index = next(
+        index for index, event in enumerate(sdk_fakes.trace)
+        if event["boundary"] == "docs" and event["operation"] == "documents.batchUpdate"
+    )
+    assert docs_build_index < drive_create_index < batch_update_index
 
 
 def test_success_without_sync_configuration_keeps_imported_doc_and_skips_task(

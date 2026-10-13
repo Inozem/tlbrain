@@ -15,6 +15,8 @@ from core.integrations.firestore.transcripts import get_index_records_by_meeting
 from core.integrations.gemini.llm import call_gemini_json
 from core.integrations.google_auth.credentials import credentials
 from core.integrations.google_drive.folder_service import get_unassigned_folder_id
+from core.integrations.google_docs.client import build_docs_service
+from core.integrations.google_docs.writer import create_google_doc
 from core.google_drive.firestore import delete_queued_placeholder, get_all_folders, mark_download_error, mark_downloading
 from core.utils.logging import configure_logging
 from core.integrations.cloud_tasks.client import enqueue_task
@@ -40,7 +42,7 @@ def _build_drive():
 
 
 def _build_docs():
-    return build("docs", "v1", credentials=_build_credentials())
+    return build_docs_service(_SCOPES, allow_adc_fallback=True)
 
 
 def _parse_happened_at(happened_at: str) -> tuple[str, str]:
@@ -86,31 +88,7 @@ def _format_transcript(meeting: dict, utterances: list[dict]) -> tuple[str, list
 
 def _create_google_doc(drive, folder_id: str, title: str, text: str, speaker_ranges: list[tuple[int, int]]) -> tuple[str, str]:
     docs = _build_docs()
-
-    file_meta = drive.files().create(
-        body={
-            "name": title,
-            "mimeType": "application/vnd.google-apps.document",
-            "parents": [folder_id],
-        },
-        fields="id,modifiedTime",
-    ).execute()
-    doc_id = file_meta["id"]
-    modified_time = file_meta.get("modifiedTime", "")
-
-    requests_body = [{"insertText": {"location": {"index": 1}, "text": text}}]
-    for start, end in speaker_ranges:
-        requests_body.append({
-            "updateTextStyle": {
-                "range": {"startIndex": start + 1, "endIndex": end + 1},
-                "textStyle": {"bold": True},
-                "fields": "bold",
-            }
-        })
-
-    docs.documents().batchUpdate(documentId=doc_id, body={"requests": requests_body}).execute()
-
-    return doc_id, modified_time
+    return create_google_doc(drive, docs, folder_id, title, text, speaker_ranges)
 
 
 _CONFIDENCE_THRESHOLD = 0.8
