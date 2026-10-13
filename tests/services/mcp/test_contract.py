@@ -20,6 +20,7 @@ BASELINE = Path(__file__).resolve().parents[2] / "fixtures" / "mcp_baseline.json
 @pytest.fixture(autouse=True)
 def disable_auth_by_default(monkeypatch):
     monkeypatch.delenv("ALLOWED_EMAIL", raising=False)
+    monkeypatch.delenv("K_SERVICE", raising=False)
 
 
 def _run(coroutine):
@@ -271,6 +272,69 @@ def test_oauth_discovery_and_authorize_params():
     empty_scope = _request("get", "/authorize?client_id=synthetic&scope=&state=flow-state")
     empty_params = parse_qs(urlparse(empty_scope.headers["location"]).query, keep_blank_values=True)
     assert empty_params == {"client_id": ["synthetic"], "scope": [""], "state": ["flow-state"]}
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/.well-known/oauth-protected-resource", {
+            "resource": "https://mcp.test/mcp", "authorization_servers": ["https://mcp.test"]
+        }),
+        ("/.well-known/oauth-protected-resource/mcp", {
+            "resource": "https://mcp.test/mcp", "authorization_servers": ["https://mcp.test"]
+        }),
+        ("/.well-known/oauth-authorization-server", {
+            "issuer": "https://mcp.test",
+            "authorization_endpoint": "https://mcp.test/authorize",
+            "token_endpoint": "https://mcp.test/token",
+            "scopes_supported": ["openid", "email", "profile"],
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+        }),
+    ],
+)
+def test_oauth_discovery_uses_https_on_cloud_run(monkeypatch, path, expected):
+    monkeypatch.setenv("K_SERVICE", "synthetic-service")
+    response = _request("get", path)
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
+def test_oauth_discovery_preserves_local_scheme_and_origin_with_forwarded_headers(monkeypatch):
+    monkeypatch.delenv("K_SERVICE", raising=False)
+    request = Request({
+        "type": "http", "method": "GET", "path": "/", "raw_path": b"/",
+        "query_string": b"", "headers": [
+            (b"host", b"mcp.test:8443"),
+            (b"forwarded", b"proto=https;host=spoof.test"),
+            (b"x-forwarded-proto", b"https"),
+            (b"x-forwarded-host", b"spoof.test"),
+        ],
+        "scheme": "http", "server": ("mcp.test", 8443), "client": ("127.0.0.1", 123),
+        "root_path": "/prefix",
+    })
+    assert main._base_url(request) == "http://mcp.test:8443/prefix"
+    monkeypatch.setenv("K_SERVICE", "synthetic-service")
+    assert main._base_url(request) == "https://mcp.test:8443/prefix"
+    monkeypatch.delenv("K_SERVICE", raising=False)
+
+    secure_request = Request({
+        "type": "http", "method": "GET", "path": "/", "raw_path": b"/",
+        "query_string": b"", "headers": [(b"host", b"mcp.test")],
+        "scheme": "https", "server": ("mcp.test", 443), "client": ("127.0.0.1", 123),
+    })
+    assert main._base_url(secure_request) == "https://mcp.test"
+
+
+def test_oauth_discovery_cloud_run_ignores_forged_forwarded_origin(monkeypatch):
+    monkeypatch.setenv("K_SERVICE", "synthetic-service")
+    response = _request("get", "/.well-known/oauth-authorization-server", headers={
+        "forwarded": "proto=http;host=spoof.test",
+        "x-forwarded-proto": "http",
+        "x-forwarded-host": "spoof.test",
+    })
+    assert response.json()["issuer"] == "https://mcp.test"
 
 
 def test_token_proxy_forwards_body_content_type_status_and_json(monkeypatch):

@@ -30,7 +30,11 @@ _GOOGLE_TOKENINFO_URL = "https://www.googleapis.com/oauth2/v2/tokeninfo"
 
 
 def _base_url(request: Request) -> str:
-    return str(request.base_url).rstrip("/")
+    base_url = request.base_url
+    if os.environ.get("K_SERVICE"):
+        # Cloud Run terminates external TLS before the request reaches the container.
+        base_url = base_url.replace(scheme="https")
+    return str(base_url).rstrip("/")
 
 
 def _oauth_enabled() -> bool:
