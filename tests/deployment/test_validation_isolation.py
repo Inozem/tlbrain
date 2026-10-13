@@ -501,6 +501,14 @@ def test_smoke_support_runs_offline_startup_and_benign_route(
             "client = QdrantClient()\n"
             + entry_source
         )
+    if service == "sync_checker":
+        entry_source = (
+            "from google.cloud import firestore\n"
+            "assert getattr(firestore.Client, '__tlbrain_external_fake__', False) is True\n"
+            "client_type = firestore.Client | None\n"
+            "assert firestore.Client().collection('smoke').stream() == []\n"
+            + entry_source
+        )
     entry_source += (
         "from pathlib import Path\n"
         "def health():\n"

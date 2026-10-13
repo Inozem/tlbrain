@@ -136,9 +136,14 @@ def _install_boundary_fakes(service: str) -> None:
 
     if service in {"sync_checker", "tldv_reconciliation"}:
         firestore = importlib.import_module("google.cloud.firestore")
-        _replace_boundary(
-            firestore, "Client", lambda *_args, **_kwargs: _EmptyFirestore()
-        )
+
+        class OfflineFirestoreClient(_EmptyFirestore):
+            __tlbrain_external_fake__ = True
+
+            def __init__(self, *_args: Any, **_kwargs: Any):
+                pass
+
+        _replace_boundary(firestore, "Client", OfflineFirestoreClient)
 
         tasks_v2 = importlib.import_module("google.cloud.tasks_v2")
 

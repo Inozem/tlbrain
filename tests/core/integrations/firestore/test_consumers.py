@@ -5,6 +5,7 @@ import json
 
 from core.google_drive import firestore as drive_firestore
 from core.integrations.firestore import folders, transcripts
+from core.integrations.google_drive import folder_service
 
 
 def test_vector_sync_and_mcp_bind_canonical_repositories(sdk_fakes):
@@ -31,8 +32,7 @@ def test_vector_sync_and_mcp_bind_canonical_repositories(sdk_fakes):
     assert handler.list_transcripts is transcripts.list_transcripts
     assert handler.move_transcript_record is transcripts.move_transcript_record
     assert handler.update_index is transcripts.update_index
-    assert handler.get_folder_by_id is folders.get_folder_by_id
-    assert handler.folder_name_exists is folders.folder_name_exists
+    assert handler.folder_service is folder_service
     assert handler.get_folder_id_by_name is folders.get_folder_id_by_name
     assert handler.list_unassigned_transcripts is transcripts.list_unassigned_transcripts
 
