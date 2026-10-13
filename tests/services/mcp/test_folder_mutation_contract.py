@@ -37,27 +37,31 @@ def test_move_folder_rejects_self_or_descendant_without_side_effects(
         ("Parent", "Child"): ["child-id"],
     }
     side_effects = []
-    monkeypatch.setattr(handler, "resolve_folder_path", lambda path: paths[tuple(path)])
+    from core.integrations.google_drive import folder_service
+
     monkeypatch.setattr(
-        handler, "expand_subtree", lambda folder_id: ["parent-id", "child-id"]
+        folder_service, "_resolve", lambda path, role: paths[tuple(path)][0]
     )
     monkeypatch.setattr(
-        handler,
-        "get_root_folder_id",
-        lambda: "root-id",
+        folder_service.folder_repository,
+        "get_all_folders",
+        lambda: {
+            "parent-id": {"name": "Parent", "parent_id": "root-id"},
+            "child-id": {"name": "Child", "parent_id": "parent-id"},
+        },
     )
     monkeypatch.setattr(
-        handler,
+        folder_service.folder_repository,
         "get_folder_by_id",
         lambda folder_id: {"name": "Parent"},
     )
     monkeypatch.setattr(
-        handler,
+        folder_service.drive_client,
         "move_folder_in_drive",
         lambda *args: side_effects.append(("drive", args)),
     )
     monkeypatch.setattr(
-        handler,
+        folder_service.folder_repository,
         "upsert_folder",
         lambda *args: side_effects.append(("firestore", args)),
     )
@@ -82,3 +86,53 @@ def test_move_folder_rejects_self_or_descendant_without_side_effects(
     }
     assert response["id"] == "move-cycle"
     assert side_effects == []
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize(
+    "operation,arguments,error,expected",
+    [
+        (
+            "create_folder",
+            {"name": "New"},
+            lambda service: service.FolderNotFound(["Missing"], "parent"),
+            {"code": -32602, "message": "Parent folder not found: Missing"},
+        ),
+        (
+            "move_folder",
+            {"folder_path": ["Same"]},
+            lambda service: service.AmbiguousFolderPath(["Same"], "folder", 2),
+            {"code": -32602, "message": "Ambiguous path: Same matches 2 folders. Provide a more specific path."},
+        ),
+        (
+            "rename_folder",
+            {"folder_path": ["Old"], "new_name": "New"},
+            lambda service: service.FolderNameConflict("New"),
+            {
+                "code": -32602,
+                "message": "Folder 'New' already exists in this location.",
+                "details": "Use list_folders to see the existing folder hierarchy.",
+            },
+        ),
+    ],
+)
+def test_folder_domain_errors_keep_existing_mcp_messages(
+    monkeypatch, operation, arguments, error, expected
+):
+    from core.integrations.google_drive import folder_service
+
+    monkeypatch.setattr(
+        folder_service,
+        operation,
+        lambda *args: (_ for _ in ()).throw(error(folder_service)),
+    )
+    request = JSONRPCRequest(
+        jsonrpc="2.0",
+        id="folder-error",
+        method="tools/call",
+        params={"name": operation, "arguments": arguments},
+    )
+
+    response = _run(handler.handle_mcp_request(request.model_dump(exclude_none=True)))
+
+    assert response["error"] == expected

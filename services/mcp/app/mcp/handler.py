@@ -15,15 +15,10 @@ from core.config import get_root_folder_id
 from core.integrations.gemini.embeddings import embed
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
-from core.retrieval.folders import list_folders
-from core.google_drive.drive_client import create_folder, move_file_to_folder, move_folder_in_drive, rename_file, rename_folder
+from core.integrations.google_drive import folder_service
+from core.google_drive.drive_client import move_file_to_folder, rename_file
 from core.google_drive.firestore import expand_subtree, resolve_folder_path
-from core.integrations.firestore.folders import (
-    folder_name_exists,
-    get_folder_by_id,
-    get_folder_id_by_name,
-    upsert_folder,
-)
+from core.integrations.firestore.folders import get_folder_id_by_name
 from core.integrations.firestore.client import get_client
 from core.integrations.firestore.transcripts import (
     get_sync_status,
@@ -56,6 +51,41 @@ def build_jsonrpc_error(
         id=request_id,
         error=error,
     ).model_dump(exclude_none=True)
+
+
+def _folder_domain_error(request: JSONRPCRequest, error: Exception, operation: str) -> dict:
+    from core.integrations.google_drive.folder_service import (
+        AmbiguousFolderPath,
+        FolderNameConflict,
+        FolderNotFound,
+        FolderSubtreeMove,
+    )
+
+    if isinstance(error, FolderNotFound):
+        message = (
+            f"Parent folder not found: {'/'.join(error.path)}"
+            if error.role == "parent"
+            else f"Folder not found: {'/'.join(error.path)}"
+        )
+    elif isinstance(error, AmbiguousFolderPath):
+        if error.role == "parent":
+            message = f"Ambiguous parent path: {'/'.join(error.path)} matches {error.count} folders."
+        else:
+            message = f"Ambiguous path: {'/'.join(error.path)} matches {error.count} folders."
+            if operation == "move":
+                message += " Provide a more specific path."
+    elif isinstance(error, FolderNameConflict):
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Folder '{error.name}' already exists in this location.",
+            details="Use list_folders to see the existing folder hierarchy.",
+        )
+    elif isinstance(error, FolderSubtreeMove):
+        message = "Cannot move a folder into its own subtree."
+    else:
+        raise error
+    return build_jsonrpc_error(request_id=request.id, code=-32602, message=message)
 
 
 async def handle_mcp_request(request_dict: dict) -> dict:
@@ -511,7 +541,7 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
 def _handle_list_folders(request: JSONRPCRequest) -> dict:
     t0 = time.monotonic()
     try:
-        result = list_folders()
+        result = folder_service.list_folders()
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -670,51 +700,9 @@ def _handle_move_folder(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        terminal_ids = resolve_folder_path(folder_path)
-        if not terminal_ids:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Folder not found: {'/'.join(folder_path)}",
-            )
-        if len(terminal_ids) > 1:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Ambiguous path: {'/'.join(folder_path)} matches {len(terminal_ids)} folders. Provide a more specific path.",
-            )
-        folder_id = terminal_ids[0]
-
-        if new_parent_path:
-            parent_ids = resolve_folder_path(new_parent_path)
-            if not parent_ids:
-                return build_jsonrpc_error(
-                    request_id=request.id,
-                    code=-32602,
-                    message=f"Parent folder not found: {'/'.join(new_parent_path)}",
-                )
-            if len(parent_ids) > 1:
-                return build_jsonrpc_error(
-                    request_id=request.id,
-                    code=-32602,
-                    message=f"Ambiguous parent path: {'/'.join(new_parent_path)} matches {len(parent_ids)} folders.",
-                )
-            new_parent_id = parent_ids[0]
-        else:
-            new_parent_id = get_root_folder_id()
-
-        # Cycle check: new_parent must not be in the subtree of folder_id
-        subtree = expand_subtree(folder_id)
-        if new_parent_id in subtree:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message="Cannot move a folder into its own subtree.",
-            )
-
-        folder_data = get_folder_by_id(folder_id) or {}
-        move_folder_in_drive(folder_id, new_parent_id)
-        upsert_folder(folder_id, folder_data.get("name", ""), new_parent_id)
+        folder_id, new_parent_id = folder_service.move_folder(folder_path, new_parent_path)
+    except folder_service.FolderOperationError as e:
+        return _folder_domain_error(request, e, "move")
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -746,34 +734,9 @@ def _handle_create_folder(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        if parent_path:
-            parent_ids = resolve_folder_path(parent_path)
-            if not parent_ids:
-                return build_jsonrpc_error(
-                    request_id=request.id,
-                    code=-32602,
-                    message=f"Parent folder not found: {'/'.join(parent_path)}",
-                )
-            if len(parent_ids) > 1:
-                return build_jsonrpc_error(
-                    request_id=request.id,
-                    code=-32602,
-                    message=f"Ambiguous parent path: {'/'.join(parent_path)} matches {len(parent_ids)} folders.",
-                )
-            parent_id = parent_ids[0]
-        else:
-            parent_id = get_root_folder_id()
-
-        if folder_name_exists(name, parent_id):
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Folder '{name}' already exists in this location.",
-                details="Use list_folders to see the existing folder hierarchy.",
-            )
-
-        folder_id = create_folder(name, parent_id)
-        upsert_folder(folder_id, name, parent_id)
+        folder_id = folder_service.create_folder(name, parent_path)
+    except folder_service.FolderOperationError as e:
+        return _folder_domain_error(request, e, "create")
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -805,34 +768,9 @@ def _handle_rename_folder(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        terminal_ids = resolve_folder_path(folder_path)
-        if not terminal_ids:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Folder not found: {'/'.join(folder_path)}",
-            )
-        if len(terminal_ids) > 1:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Ambiguous path: {'/'.join(folder_path)} matches {len(terminal_ids)} folders.",
-            )
-        folder_id = terminal_ids[0]
-
-        folder_data = get_folder_by_id(folder_id) or {}
-        parent_id = folder_data.get("parent_id", "")
-
-        if folder_name_exists(new_name, parent_id):
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Folder '{new_name}' already exists in this location.",
-                details="Use list_folders to see the existing folder hierarchy.",
-            )
-
-        rename_folder(folder_id, new_name)
-        upsert_folder(folder_id, new_name, parent_id)
+        folder_id = folder_service.rename_folder(folder_path, new_name)
+    except folder_service.FolderOperationError as e:
+        return _folder_domain_error(request, e, "rename")
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,

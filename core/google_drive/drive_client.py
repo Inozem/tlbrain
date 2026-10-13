@@ -1,39 +1,23 @@
 import logging
-import os
 from typing import Any
 
-import google_auth_httplib2
-import httplib2
 from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
-from core.integrations.google_auth.credentials import credentials
+from core.integrations.google_drive.client import (
+    SCOPES_RO,
+    SCOPES_RW,
+    _build_credentials,
+    _build_http,
+    build_drive_service,
+    build_drive_service_rw,
+    create_folder,
+    move_folder_in_drive,
+    rename_folder,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-SCOPES_RO = ["https://www.googleapis.com/auth/drive.readonly"]
-SCOPES_RW = ["https://www.googleapis.com/auth/drive"]
-
-
-def _build_http(credentials) -> google_auth_httplib2.AuthorizedHttp:
-    return google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http(timeout=60))
-
-
-def _build_credentials(scopes: list[str]):
-    if os.environ.get("GOOGLE_REFRESH_TOKEN"):
-        logger.info("Drive auth: using user OAuth (GOOGLE_REFRESH_TOKEN)")
-    return credentials(scopes)
-
-
-def build_drive_service():
-    logger.info("Building Google Drive service")
-    return build("drive", "v3", http=_build_http(_build_credentials(SCOPES_RO)))
-
-
-def build_drive_service_rw():
-    return build("drive", "v3", http=_build_http(_build_credentials(SCOPES_RW)))
 
 
 def list_client_folders() -> list[dict[str, str]]:
@@ -194,45 +178,6 @@ def rename_file(file_id: str, new_name: str) -> None:
         fields="id",
     ).execute()
     logger.info("Renamed file %s to '%s'", file_id, new_name)
-
-
-def rename_folder(folder_id: str, new_name: str) -> None:
-    service = build_drive_service_rw()
-    service.files().update(
-        fileId=folder_id,
-        body={"name": new_name},
-        fields="id",
-    ).execute()
-    logger.info("Renamed folder %s to '%s'", folder_id, new_name)
-
-
-def create_folder(name: str, parent_id: str) -> str:
-    """Create a new folder in Drive under parent_id. Returns the new folder_id."""
-    service = build_drive_service_rw()
-    folder = service.files().create(
-        body={
-            "name": name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        },
-        fields="id",
-    ).execute()
-    logger.info("Created folder %r under %s: %s", name, parent_id, folder["id"])
-    return folder["id"]
-
-
-def move_folder_in_drive(folder_id: str, new_parent_id: str) -> None:
-    """Move folder_id to new_parent_id in Drive."""
-    service = build_drive_service_rw()
-    file = service.files().get(fileId=folder_id, fields="parents").execute()
-    old_parents = ",".join(file.get("parents", []))
-    service.files().update(
-        fileId=folder_id,
-        addParents=new_parent_id,
-        removeParents=old_parents,
-        fields="id,parents",
-    ).execute()
-    logger.info("Moved folder %s → parent %s", folder_id, new_parent_id)
 
 
 def create_client_folder(client_name: str) -> tuple[str, bool]:
