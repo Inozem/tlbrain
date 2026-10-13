@@ -14,7 +14,8 @@ from core.integrations.firestore.folders import get_folders_by_speaker, incremen
 from core.integrations.firestore.transcripts import get_index_records_by_meeting_id, save_index
 from core.integrations.gemini.llm import call_gemini_json
 from core.integrations.google_auth.credentials import credentials
-from core.google_drive.firestore import delete_queued_placeholder, get_all_folders, mark_download_error, mark_downloading, upsert_folder
+from core.integrations.google_drive.folder_service import get_unassigned_folder_id
+from core.google_drive.firestore import delete_queued_placeholder, get_all_folders, mark_download_error, mark_downloading
 from core.utils.logging import configure_logging
 from core.integrations.cloud_tasks.client import enqueue_task
 from tldv_client import tldv_get
@@ -40,26 +41,6 @@ def _build_drive():
 
 def _build_docs():
     return build("docs", "v1", credentials=_build_credentials())
-
-
-def _get_or_create_folder(drive, parent_id: str, name: str) -> str:
-    results = drive.files().list(
-        q=f"name={name!r} and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false",
-        fields="files(id)",
-        pageSize=1,
-    ).execute()
-    files = results.get("files", [])
-    if files:
-        return files[0]["id"]
-    folder = drive.files().create(
-        body={
-            "name": name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        },
-        fields="id",
-    ).execute()
-    return folder["id"]
 
 
 def _parse_happened_at(happened_at: str) -> tuple[str, str]:
@@ -219,17 +200,6 @@ def _get_folders_by_speakers(db: firestore.Client, speakers: list[str]) -> tuple
     return sorted(candidates), sorted(all_folder_ids)
 
 
-def _get_unassigned_folder_id(drive, root_folder_id: str) -> str:
-    """Get or create _unassigned folder in Drive, ensure it's registered in folders/."""
-    all_folders = get_all_folders()
-    for fid, data in all_folders.items():
-        if data.get("name") == "_unassigned" and data.get("parent_id") == root_folder_id:
-            return fid
-    folder_id = _get_or_create_folder(drive, root_folder_id, "_unassigned")
-    upsert_folder(folder_id, "_unassigned", root_folder_id)
-    return folder_id
-
-
 def _detect_target_folder_id(db: firestore.Client, meeting: dict, utterances: list[dict], drive, root_folder_id: str) -> str:
     """Detect target folder_id for the transcript. Returns folder_id from folders/ collection."""
     meeting_name = meeting.get("name", "")
@@ -260,7 +230,7 @@ def _detect_target_folder_id(db: firestore.Client, meeting: dict, utterances: li
 
     if not all_candidates:
         logger.info("No known folders, falling back to _unassigned")
-        return _get_unassigned_folder_id(drive, root_folder_id)
+        return get_unassigned_folder_id(drive, root_folder_id)
 
     ids_to_check = candidates if candidates else all_candidates
     if not candidates:
@@ -311,7 +281,7 @@ def _detect_target_folder_id(db: firestore.Client, meeting: dict, utterances: li
         logger.warning("Stage 3 folder detection failed: %s", exc)
 
     logger.info("Folder not detected, falling back to _unassigned")
-    return _get_unassigned_folder_id(drive, root_folder_id)
+    return get_unassigned_folder_id(drive, root_folder_id)
 
 
 @app.get("/")

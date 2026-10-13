@@ -42,6 +42,43 @@ class FolderSubtreeMove(FolderOperationError):
     pass
 
 
+def get_or_create_folder(drive: Any, parent_id: str, name: str) -> str:
+    """Return the first matching Drive folder, creating it when absent.
+
+    ``drive`` is supplied by the caller so connector-specific authentication and
+    transport policy remain owned by that caller.
+    """
+    results = drive.files().list(
+        q=f"name={name!r} and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false",
+        fields="files(id)",
+        pageSize=1,
+    ).execute()
+    files = results.get("files", [])
+    if files:
+        return files[0]["id"]
+    folder = drive.files().create(
+        body={
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        },
+        fields="id",
+    ).execute()
+    return folder["id"]
+
+
+def get_unassigned_folder_id(drive: Any, root_folder_id: str) -> str:
+    """Get or create the root ``_unassigned`` folder and register its Drive ID."""
+    all_folders = folder_repository.get_all_folders()
+    for folder_id, data in all_folders.items():
+        if data.get("name") == "_unassigned" and data.get("parent_id") == root_folder_id:
+            return folder_id
+
+    folder_id = get_or_create_folder(drive, root_folder_id, "_unassigned")
+    folder_repository.upsert_folder(folder_id, "_unassigned", root_folder_id)
+    return folder_id
+
+
 def _resolve(path: list[str], role: str) -> str:
     root_id = get_root_folder_id()
     matches = resolve_folder_path(path, folder_repository.get_all_folders(), root_id)
