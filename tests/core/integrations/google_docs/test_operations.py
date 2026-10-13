@@ -11,7 +11,7 @@ def _set_oauth(monkeypatch):
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "synthetic-secret")
 
 
-def test_docs_client_uses_requested_scopes_and_default_discovery_transport(
+def test_docs_client_uses_existing_user_grant_and_default_discovery_transport(
     monkeypatch, sdk_fakes
 ):
     _set_oauth(monkeypatch)
@@ -24,14 +24,14 @@ def test_docs_client_uses_requested_scopes_and_default_discovery_transport(
     assert build["arguments"]["api"] == "docs"
     assert build["arguments"]["version"] == "v1"
     assert "http" not in build["arguments"]
-    assert sdk_fakes.trace[0]["arguments"]["scopes"] == scopes
+    assert sdk_fakes.trace[0]["arguments"]["scopes"] is None
     assert [(entry["boundary"], entry["operation"]) for entry in sdk_fakes.trace] == [
         ("auth", "credentials.refresh"),
         ("drive", "build"),
     ]
 
 
-def test_reader_keeps_strict_scope_and_extracts_nonempty_paragraphs(monkeypatch, sdk_fakes):
+def test_reader_uses_strict_oauth_and_extracts_nonempty_paragraphs(monkeypatch, sdk_fakes):
     _set_oauth(monkeypatch)
     sdk_fakes.docs.queue("documents.get", response={"body": {"content": [
         {"paragraph": {"elements": [{"textRun": {"content": "First\n"}}]}},
@@ -43,7 +43,7 @@ def test_reader_keeps_strict_scope_and_extracts_nonempty_paragraphs(monkeypatch,
     assert reader.read_google_doc("doc-1") == "First\nSecond"
     auth = next(entry for entry in sdk_fakes.trace if entry["boundary"] == "auth")
     assert auth["operation"] == "credentials.refresh"
-    assert auth["arguments"]["scopes"] == reader.SCOPES
+    assert auth["arguments"]["scopes"] is None
     assert reader.SCOPES == ["https://www.googleapis.com/auth/documents.readonly"]
     assert sdk_fakes.trace[-1]["operation"] == "documents.get"
 

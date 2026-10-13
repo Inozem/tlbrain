@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib
+import json
+from urllib.parse import parse_qs
 
 import google_auth_httplib2
+import google.auth.transport.requests
 import pytest
 from google.auth.credentials import AnonymousCredentials
 from google.oauth2.credentials import Credentials
@@ -50,7 +53,7 @@ def test_adc_fallback_is_opt_in_and_receives_exact_scopes(monkeypatch, sdk_fakes
     assert sdk_fakes.trace[0]["arguments"]["scopes"] == scopes
 
 
-def test_oauth_precedes_adc_and_refreshes_with_the_supplied_scopes(monkeypatch, sdk_fakes):
+def test_oauth_precedes_adc_and_refreshes_without_user_credential_scopes(monkeypatch, sdk_fakes):
     _set_oauth(monkeypatch)
     scopes = ["https://www.googleapis.com/auth/documents.readonly"]
 
@@ -60,11 +63,77 @@ def test_oauth_precedes_adc_and_refreshes_with_the_supplied_scopes(monkeypatch, 
     assert result.refresh_token == "synthetic-refresh-token"
     assert result.client_id == "synthetic-client-id"
     assert result.client_secret == "synthetic-client-secret"
-    assert result.scopes == scopes
+    assert result.scopes is None
     assert result.token == "pytest-synthetic-access-token"
     assert [(entry["boundary"], entry["operation"]) for entry in sdk_fakes.trace] == [
         ("auth", "credentials.refresh")
     ]
+
+
+@pytest.mark.parametrize(
+    "scopes",
+    [
+        ["https://www.googleapis.com/auth/drive.readonly"],
+        ["https://www.googleapis.com/auth/documents.readonly"],
+        [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/documents",
+        ],
+    ],
+    ids=["drive", "docs", "import-combined"],
+)
+def test_real_oauth_refresh_sends_unscoped_refresh_request(
+    monkeypatch, sdk_fakes, scopes
+):
+    _set_oauth(monkeypatch)
+    from tests.fixtures.sdk_fakes import install
+
+    original_refresh = next(
+        original
+        for obj, name, original, _replacement in install().values()
+        if obj is Credentials and name == "refresh"
+    )
+    monkeypatch.setattr(Credentials, "refresh", original_refresh)
+
+    requests = []
+
+    class Response:
+        def __init__(self, data, status):
+            self.data = data
+            self.status = status
+            self.headers = {"content-type": "application/json"}
+
+    class FakeRequest:
+        def __call__(self, method, url, body=None, headers=None, **kwargs):
+            del headers, kwargs
+            form = parse_qs(body.decode("ascii"))
+            requests.append((method, url, form))
+            if "scope" in form:
+                return Response(json.dumps({"error": "invalid_scope"}).encode(), 400)
+            return Response(
+                json.dumps(
+                    {"access_token": "synthetic-refreshed-access-token", "expires_in": 3600}
+                ).encode(),
+                200,
+            )
+
+    monkeypatch.setattr(
+        google.auth.transport.requests, "Request", lambda: FakeRequest()
+    )
+
+    result = credentials(scopes, allow_adc_fallback=True)
+
+    assert result.token == "synthetic-refreshed-access-token"
+    assert len(requests) == 1
+    method, url, form = requests[0]
+    assert method == "POST"
+    assert url == "https://oauth2.googleapis.com/token"
+    assert form == {
+        "refresh_token": ["synthetic-refresh-token"],
+        "client_id": ["synthetic-client-id"],
+        "client_secret": ["synthetic-client-secret"],
+        "grant_type": ["refresh_token"],
+    }
 
 
 def test_drive_and_docs_keep_their_transport_policies(monkeypatch, sdk_fakes):

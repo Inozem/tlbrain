@@ -16,13 +16,13 @@ def credentials(scopes: Sequence[str], allow_adc_fallback: bool = False):
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
 
+        # Preserve the existing user token grant; requested scopes apply to ADC.
         creds = Credentials(
             token=None,
             refresh_token=refresh_token,
             client_id=os.environ["GOOGLE_CLIENT_ID"],
             client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
             token_uri="https://oauth2.googleapis.com/token",
-            scopes=list(scopes),
         )
         creds.refresh(Request())
         return creds
