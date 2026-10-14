@@ -99,6 +99,51 @@ def _process_fast_skip_or_parent_only(
     return None
 
 
+def _upsert_utterance_payloads(utterance_payloads: list[dict]) -> None:
+    bm25_embeddings = list(get_bm25_model().embed([u["text"] for u in utterance_payloads]))
+    sparse_vectors = [
+        SparseVector(indices=e.indices.tolist(), values=e.values.tolist())
+        for e in bm25_embeddings
+    ]
+    upsert_utterances(utterance_payloads, sparse_vectors)
+
+
+def _upsert_summary_fact_windows(
+    utterances: list[dict],
+    doc_id: str,
+    version: str,
+    parent_id: str,
+    dialog_date: str,
+    root_folder_id: str,
+    *,
+    allowed_center_indexes: set[int] | None = None,
+) -> tuple[int, int, list]:
+    embed_client = make_client()
+    summaries_count = 0
+    facts_count = 0
+    skipped = []
+    if allowed_center_indexes is None:
+        windows = iter_windows(
+            utterances, doc_id, version, parent_id, dialog_date, root_folder_id,
+            skipped_utterances=skipped,
+        )
+    else:
+        windows = iter_windows(
+            utterances, doc_id, version, parent_id, dialog_date, root_folder_id,
+            allowed_center_indexes=allowed_center_indexes,
+            skipped_utterances=skipped,
+        )
+    for summary, facts in windows:
+        summary_vector = embed([summary["text"]], client=embed_client)[0]
+        upsert_summaries([summary], [summary_vector])
+        if facts:
+            fact_vectors = embed([f["text"] for f in facts], client=embed_client)
+            upsert_facts(facts, fact_vectors)
+        summaries_count += 1
+        facts_count += len(facts)
+    return summaries_count, facts_count, skipped
+
+
 def _process_incremental(
     doc_id: str,
     parent_id: str,
@@ -156,32 +201,15 @@ def _process_incremental(
         changed_utterances, doc_id, version, parent_id, dialog_date, root_folder_id
     )
     if utterance_payloads:
-        bm25_embeddings = list(get_bm25_model().embed([u["text"] for u in utterance_payloads]))
-        sparse_vectors = [
-            SparseVector(indices=e.indices.tolist(), values=e.values.tolist())
-            for e in bm25_embeddings
-        ]
-        upsert_utterances(utterance_payloads, sparse_vectors)
+        _upsert_utterance_payloads(utterance_payloads)
         for u in utterance_payloads:
             i_str = str(u["order_index"])
             update_index(doc_id, {f"utterance_hashes.{i_str}": new_hashes[i_str]})
 
-    embed_client = make_client()
-    summaries_count = 0
-    facts_count = 0
-    skipped = []
-    for summary, facts in iter_windows(
+    summaries_count, facts_count, skipped = _upsert_summary_fact_windows(
         utterances, doc_id, version, parent_id, dialog_date, root_folder_id,
         allowed_center_indexes=affected_centers,
-        skipped_utterances=skipped,
-    ):
-        summary_vector = embed([summary["text"]], client=embed_client)[0]
-        upsert_summaries([summary], [summary_vector])
-        if facts:
-            fact_vectors = embed([f["text"] for f in facts], client=embed_client)
-            upsert_facts(facts, fact_vectors)
-        summaries_count += 1
-        facts_count += len(facts)
+    )
 
     reanalyzed = {
         u["order_index"]
@@ -231,28 +259,11 @@ def _process_full(
     utterance_payloads = build_utterance_payloads(
         utterances, doc_id, version, parent_id, dialog_date, root_folder_id
     )
-    bm25_embeddings = list(get_bm25_model().embed([u["text"] for u in utterance_payloads]))
-    sparse_vectors = [
-        SparseVector(indices=e.indices.tolist(), values=e.values.tolist())
-        for e in bm25_embeddings
-    ]
-    upsert_utterances(utterance_payloads, sparse_vectors)
+    _upsert_utterance_payloads(utterance_payloads)
 
-    embed_client = make_client()
-    summaries_count = 0
-    facts_count = 0
-    skipped = []
-    for summary, facts in iter_windows(
+    summaries_count, facts_count, skipped = _upsert_summary_fact_windows(
         utterances, doc_id, version, parent_id, dialog_date, root_folder_id,
-        skipped_utterances=skipped,
-    ):
-        summary_vector = embed([summary["text"]], client=embed_client)[0]
-        upsert_summaries([summary], [summary_vector])
-        if facts:
-            fact_vectors = embed([f["text"] for f in facts], client=embed_client)
-            upsert_facts(facts, fact_vectors)
-        summaries_count += 1
-        facts_count += len(facts)
+    )
 
     delete_old_versions(doc_id, version, root_folder_id)
     update_skipped_utterances(doc_id, skipped)
