@@ -11,7 +11,7 @@ from core.integrations.google_drive import folder_service
 def test_vector_sync_and_mcp_bind_canonical_repositories(sdk_fakes):
     del sdk_fakes
     vector_main = importlib.import_module("services.vector_sync.app.main")
-    processor = importlib.import_module("services.vector_sync.app.processor")
+    processor = importlib.import_module("core.indexing.processor")
     handler = importlib.import_module("services.mcp.app.mcp.handler")
 
     assert vector_main.ensure_imported is transcripts.ensure_imported

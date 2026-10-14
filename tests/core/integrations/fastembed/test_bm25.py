@@ -5,7 +5,7 @@ from core.integrations.fastembed import bm25
 
 def test_model_is_lazy_shared_and_initialized_once(monkeypatch):
     from core.retrieval import search
-    from services.vector_sync.app import processor
+    from core.indexing import processor
 
     constructions = []
 

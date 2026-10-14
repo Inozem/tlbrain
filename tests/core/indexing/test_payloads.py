@@ -8,7 +8,7 @@ from google.genai import types
 from core.indexing.payloads import build_utterance_payloads
 from core.indexing.hashing import sha256_text, sha256_utterance
 from core.integrations.gemini import embeddings, llm
-from core.parsing import processor
+from core.indexing import summaries
 from core.parsing.parser import parse_document
 
 
@@ -109,7 +109,7 @@ def test_iter_windows_preserves_centers_payloads_and_generation_configuration(sd
     sdk_fakes.gemini.queue("generate_content", response=_generation_response("Center six summary.", []))
     sdk_fakes.gemini.queue("generate_content", response=_generation_response("Center nine summary.", []))
 
-    generated = list(processor.iter_windows(
+    generated = list(summaries.iter_windows(
         utterances,
         doc_id="synthetic-doc-main",
         version="v2.0.0",
@@ -197,11 +197,11 @@ def test_iter_windows_preserves_centers_payloads_and_generation_configuration(sd
 
 
 def test_window_filters_empty_input_and_non_iso_date_payload(sdk_fakes):
-    assert list(processor.iter_windows([], "doc", "v2", "parent", "2026-01-01", "root")) == []
+    assert list(summaries.iter_windows([], "doc", "v2", "parent", "2026-01-01", "root")) == []
     assert sdk_fakes.trace == []
 
     sdk_fakes.gemini.queue("generate_content", response=_generation_response("", []))
-    result = list(processor.iter_windows(
+    result = list(summaries.iter_windows(
         _utterances(1), "doc", "v2", "parent", "20260101", "root", allowed_center_indexes={0}
     ))
     assert result == [({
@@ -219,7 +219,7 @@ def test_empty_gemini_window_is_recorded_and_later_windows_continue(sdk_fakes):
     sdk_fakes.gemini.queue("generate_content", response=empty_response)
     sdk_fakes.gemini.queue("generate_content", response=_generation_response("After empty response.", []))
     skipped = [9]
-    result = list(processor.iter_windows(
+    result = list(summaries.iter_windows(
         utterances, "doc", "v1", "parent", "2026-04-05", "root",
         allowed_center_indexes={0, 3, 6}, skipped_utterances=skipped,
     ))
@@ -251,7 +251,7 @@ def test_generation_failures_propagate_without_skipping_or_mutation(sdk_fakes, f
         sdk_fakes.gemini.queue("generate_content", error=failure)
 
     with pytest.raises(type(failure)) as exc_info:
-        list(processor.iter_windows(
+        list(summaries.iter_windows(
             utterances, "doc", "v1", "parent", "2026-04-05", "root",
             allowed_center_indexes={0}, skipped_utterances=skipped,
         ))

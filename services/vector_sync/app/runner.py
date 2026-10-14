@@ -12,7 +12,7 @@ from core.integrations.firestore.transcripts import (
     load_index,
     save_index,
 )
-from services.vector_sync.app.processor import process_one
+from core.indexing.processor import process_one
 
 logger = logging.getLogger(__name__)
 

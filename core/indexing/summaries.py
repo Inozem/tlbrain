@@ -12,6 +12,7 @@ def _date_to_num(dialog_date: str) -> int | None:
     except (ValueError, AttributeError):
         return None
 
+
 logger = logging.getLogger(__name__)
 
 

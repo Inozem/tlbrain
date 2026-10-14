@@ -13,7 +13,7 @@ from core.parsing.parser import is_valid_format
 from core.integrations.qdrant.setup import ensure_collection
 from core.integrations.qdrant.writer import delete_by_doc_id
 from core.utils.logging import configure_logging
-from services.vector_sync.app.processor import process_one
+from core.indexing.processor import process_one
 
 configure_logging()
 logger = logging.getLogger(__name__)

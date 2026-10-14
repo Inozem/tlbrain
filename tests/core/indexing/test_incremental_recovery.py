@@ -11,7 +11,7 @@ from google.genai import types
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
 from core.integrations.qdrant import writer
-from services.vector_sync.app import processor
+from core.indexing import processor
 from core.indexing.hashing import sha256_utterance
 
 
