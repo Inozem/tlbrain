@@ -11,7 +11,7 @@ import pytest
 from core.integrations.firestore import transcripts as transcript_repository
 from core.parsing.parser import parse_document
 from services.vector_sync.app import processor
-from services.vector_sync.app.hashing import sha256_text, sha256_utterance
+from core.indexing.hashing import sha256_text, sha256_utterance
 
 
 DOC_ID = "synthetic-skip-claim-doc"

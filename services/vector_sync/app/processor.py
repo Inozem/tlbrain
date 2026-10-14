@@ -14,7 +14,8 @@ from core.integrations.firestore.transcripts import (
     update_skipped_utterances,
 )
 from core.parsing.parser import parse_document
-from core.parsing.processor import build_utterance_payloads, iter_windows
+from core.indexing.payloads import build_utterance_payloads
+from core.parsing.processor import iter_windows
 from core.parsing.windowing import generate_windows
 from core.integrations.qdrant.writer import (
     delete_old_versions,
@@ -26,7 +27,7 @@ from core.integrations.qdrant.writer import (
     upsert_summaries,
     upsert_utterances,
 )
-from services.vector_sync.app.hashing import sha256_text, sha256_utterance
+from core.indexing.hashing import sha256_text, sha256_utterance
 logger = logging.getLogger(__name__)
 
 def process_one(doc_id: str, parent_id: str, root_folder_id: str, raw_text: str | None = None) -> str:

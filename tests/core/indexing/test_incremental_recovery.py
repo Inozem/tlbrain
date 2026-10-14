@@ -12,7 +12,7 @@ from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
 from core.integrations.qdrant import writer
 from services.vector_sync.app import processor
-from services.vector_sync.app.hashing import sha256_utterance
+from core.indexing.hashing import sha256_utterance
 
 
 DOC_ID = "synthetic-incremental-doc"

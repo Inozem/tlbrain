@@ -5,6 +5,8 @@ from copy import deepcopy
 import pytest
 from google.genai import types
 
+from core.indexing.payloads import build_utterance_payloads
+from core.indexing.hashing import sha256_text, sha256_utterance
 from core.integrations.gemini import embeddings, llm
 from core.parsing import processor
 from core.parsing.parser import parse_document
@@ -31,8 +33,6 @@ def _generation_response(summary, facts):
 
 
 def test_sha256_goldens_lock_exact_utf8_text_and_utterance_inputs(transcript_cases):
-    from services.vector_sync.app.hashing import sha256_text, sha256_utterance
-
     full = transcript_cases["valid_full"]["raw"]
     changed = transcript_cases["valid_minimally_changed"]["raw"]
     assert sha256_text(full) == "215dc0bd8ee293f333847e6669ce76bdafdec48ce39f4b80ab851df13c31d3b3"
@@ -54,7 +54,7 @@ def test_utterance_payload_has_frozen_fields_and_date_conversion(transcript_case
     original_utterances = deepcopy(utterances)
     payload_input = utterances[:2]
     original_payload_input = deepcopy(payload_input)
-    payloads = processor.build_utterance_payloads(
+    payloads = build_utterance_payloads(
         payload_input,
         doc_id="synthetic-doc-main",
         version="v2.0.0",
@@ -90,12 +90,12 @@ def test_utterance_payload_has_frozen_fields_and_date_conversion(transcript_case
     ]
     assert utterances == original_utterances
     assert payload_input == original_payload_input
-    assert processor.build_utterance_payloads([], "doc", "v2", "parent", "2026-01-12", "root") == []
-    assert processor.build_utterance_payloads(
+    assert build_utterance_payloads([], "doc", "v2", "parent", "2026-01-12", "root") == []
+    assert build_utterance_payloads(
         [{"speaker": "Speaker A", "text": "Text", "order_index": 0}],
         "doc", "v2", "parent", "not-a-date", "root",
     )[0]["dialog_date_num"] is None
-    assert processor.build_utterance_payloads(
+    assert build_utterance_payloads(
         [{"speaker": "Speaker A", "text": "Text", "order_index": 0}],
         "doc", "v2", "parent", "", "root",
     )[0]["dialog_date_num"] is None
