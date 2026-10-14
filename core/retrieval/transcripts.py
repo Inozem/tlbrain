@@ -66,6 +66,10 @@ def get_transcripts(
             "suggestion": "No data found for the given period or folder.",
         }
 
+    if doc_id is not None:
+        all_folders = get_all_folders()
+        resolve_path = make_folder_path_resolver(all_folders, get_root_folder_id())
+
     docs: dict[str, list[dict[str, Any]]] = {}
     for u in utterances:
         docs.setdefault(u["doc_id"], []).append(u)

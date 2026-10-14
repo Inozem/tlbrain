@@ -310,6 +310,43 @@ def test_empty_retrieval_and_transcript_defaults_are_stable(sdk_fakes, firestore
     assert transcript_filters["dialog_date_num"].range.lte == 20260131
 
 
+def test_direct_transcript_lookup_returns_root_relative_folder_path(
+    sdk_fakes, firestore_fake, monkeypatch
+):
+    _seed_folders(firestore_fake)
+    sdk_fakes.qdrant.queue("scroll", response=([Record(
+        id="direct-utterance",
+        payload={
+            "doc_id": "doc-direct",
+            "parent_id": "folder-child",
+            "dialog_date": "2026-01-20",
+            "order_index": 0,
+            "speaker": "Speaker",
+            "text": "direct transcript",
+        },
+    )], None))
+
+    segments, metadata = transcripts.get_transcripts(doc_id="doc-direct")
+
+    assert segments[0]["folder_path"] == "Team/Child"
+    assert metadata == {"truncated": False, "total_matches": 1, "returned_segments": 1}
+
+
+def test_direct_transcript_lookup_without_results_skips_folder_loading(monkeypatch):
+    monkeypatch.setattr(transcripts, "_scroll_by_doc_id", lambda _doc_id: [])
+
+    def unexpected_folder_load():
+        raise AssertionError("a missing document must not load folder data")
+
+    monkeypatch.setattr(transcripts, "get_all_folders", unexpected_folder_load)
+    monkeypatch.setattr(transcripts, "get_root_folder_id", unexpected_folder_load)
+
+    segments, metadata = transcripts.get_transcripts(doc_id="missing-doc")
+
+    assert segments == []
+    assert metadata["limit_reason"] == "no_results"
+
+
 def test_range_merge_deduplication_and_order_are_explicit():
     assert pipeline.merge_ranges([
         {"doc_id": "doc", "covered_range": [4, 7]},
