@@ -31,7 +31,8 @@ def get_transcripts(
             all_folders = {}
         else:
             all_folders = get_all_folders()
-            terminal_ids = resolve_folder_path(folder_path, all_folders, get_root_folder_id())
+            root_folder_id = get_root_folder_id()
+            terminal_ids = resolve_folder_path(folder_path, all_folders, root_folder_id)
         if not terminal_ids:
             return [], {
                 "truncated": False,
@@ -45,7 +46,7 @@ def get_transcripts(
             for terminal_id in terminal_ids
             for folder_id in expand_subtree(terminal_id, all_folders)
         ]
-        resolve_path = make_folder_path_resolver(all_folders)
+        resolve_path = make_folder_path_resolver(all_folders, root_folder_id)
         utterances = _scroll_by_folder(folder_ids, date_from, date_to)
     else:
         return [], {

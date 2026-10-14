@@ -53,14 +53,16 @@ def expand_subtree(folder_id: str, all_folders: dict[str, dict]) -> list[str]:
     return result
 
 
-def make_folder_path_resolver(all_folders: dict[str, dict]) -> Callable[[str], str]:
-    """Build a resolver that follows parent links into a slash-joined display path."""
+def make_folder_path_resolver(
+    all_folders: dict[str, dict], root_folder_id: str
+) -> Callable[[str], str]:
+    """Build a resolver for slash-joined paths relative to the configured root."""
 
     def resolve(parent_id: str) -> str:
         path_parts: list[str] = []
         folder_id = parent_id
         visited: set[str] = set()
-        while folder_id and folder_id not in visited:
+        while folder_id and folder_id != root_folder_id and folder_id not in visited:
             visited.add(folder_id)
             data = all_folders.get(folder_id, {})
             name = data.get("name", "")

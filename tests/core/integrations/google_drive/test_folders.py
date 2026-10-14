@@ -156,7 +156,22 @@ def test_display_path_walks_parent_links_and_stops_on_cycles(folders):
             "cycle-b": {"name": "Cycle B", "parent_id": "cycle-a"},
         }
     )
-    resolve_path = make_folder_path_resolver(cyclic_folders)
+    resolve_path = make_folder_path_resolver(cyclic_folders, ROOT_ID)
 
     assert resolve_path("cycle-a") in {"Cycle A/Cycle B", "Cycle B/Cycle A"}
     assert resolve_path("alpha-grandchild") == "Alpha/Child/Grandchild"
+
+
+@pytest.mark.offline
+def test_display_path_excludes_root_and_ancestors():
+    from core.integrations.google_drive.folders import make_folder_path_resolver
+
+    snapshot = {
+        "ancestor": {"name": "Ancestor", "parent_id": "drive-root"},
+        "configured-root": {"name": "Configured Root", "parent_id": "ancestor"},
+        "team": {"name": "Team", "parent_id": "configured-root"},
+        "child": {"name": "Child", "parent_id": "team"},
+    }
+    resolve_path = make_folder_path_resolver(snapshot, "configured-root")
+
+    assert resolve_path("child") == "Team/Child"

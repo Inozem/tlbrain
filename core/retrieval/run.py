@@ -28,8 +28,9 @@ def run_retrieval(
     # Resolve folder_path → subtree-expanded folder_ids; load folders for path display
     folder_ids: list[str] | None = None
     all_folders = get_all_folders()
+    root_folder_id = get_root_folder_id()
     if folder_path:
-        terminal_ids = resolve_folder_path(folder_path, all_folders, get_root_folder_id())
+        terminal_ids = resolve_folder_path(folder_path, all_folders, root_folder_id)
         if not terminal_ids:
             raise ValueError(f"Folder not found: {'/'.join(folder_path)}")
         folder_ids = [
@@ -38,7 +39,7 @@ def run_retrieval(
             for folder_id in expand_subtree(terminal_id, all_folders)
         ]
 
-    resolve_path = make_folder_path_resolver(all_folders)
+    resolve_path = make_folder_path_resolver(all_folders, root_folder_id)
 
     # Stage 1: parallel semantic + keyword search
     with ThreadPoolExecutor(max_workers=2) as executor:

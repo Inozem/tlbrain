@@ -45,6 +45,8 @@ def _must_by_key(qdrant_filter):
 def _seed_folders(firestore_fake):
     client = firestore_fake.client_class()
     folders = client.collection("folders")
+    folders.document("folder-ancestor").set({"name": "Ancestor", "parent_id": "drive-root"})
+    folders.document(ROOT_ID).set({"name": "Configured Root", "parent_id": "folder-ancestor"})
     folders.document("folder-team").set({"name": "Team", "parent_id": ROOT_ID})
     folders.document("folder-child").set({"name": "Child", "parent_id": "folder-team"})
 
