@@ -143,8 +143,8 @@ ROOT_FOLDER_URL=https://drive.google.com/drive/folders/YOUR_FOLDER_ID
 2. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
 3. **Create Credentials → OAuth client ID**, type: **Web application**, name: `TLBrain MCP`
 4. On the same form, scroll down to **Authorized redirect URIs** and add:
-   - `https://claude.ai/api/mcp/auth_callback`
    - `http://localhost:8085`
+   - `https://YOUR-MCP-URL.run.app/oauth/callback` — use the same MCP service hostname configured in your client. Add it after the first deploy, before connecting an MCP client.
 5. Open [APIs & Services → Audience](https://console.cloud.google.com/auth/audience) → **Publish App** → confirm
 
 > Without publishing, refresh tokens expire every 7 days (Testing mode limitation).
@@ -154,7 +154,7 @@ Add to `.env`:
 ```env
 GOOGLE_CLIENT_ID=your-client-id
 GOOGLE_CLIENT_SECRET=your-client-secret
-ALLOWED_EMAIL=your-email@gmail.com  # leave empty to skip OAuth when connecting Claude — simpler setup, but anyone with the MCP URL gets full access to your transcripts
+ALLOWED_EMAIL=your-email@gmail.com  # leave empty to skip OAuth — anyone with the MCP URL then gets access to your transcripts
 ```
 
 ### 8. Get a Gemini API Key
@@ -228,13 +228,31 @@ When finished, the script prints the MCP URL and TL;DV webhook URL — copy them
 
 In TL;DV click your avatar in the bottom-left corner → **Settings → Integrations → Webhooks → Add**, paste the webhook URL from the deploy output → event: `TranscriptReady`.
  
-### 12. Connect Claude
+### 12. Connect an MCP client
  
 1. Open any Claude client → **Customize → MCP Servers → Add**
 2. URL: `https://YOUR-MCP-URL.run.app/mcp`
-3. Claude will detect OAuth automatically and prompt you to sign in with Google
-4. Sign in with the same email as `ALLOWED_EMAIL`
-> After each redeploy, remove the MCP server and add it again — the session is tied to the Cloud Run instance.
+3. Leave manual bearer-token and authorization-header fields empty. The client discovers OAuth and registers automatically.
+4. Approve the named client on the TLBrain confirmation page, then sign in with the Google account specified in `ALLOWED_EMAIL`.
+
+For Codex, add the URL in MCP settings, or use the CLI:
+
+```bash
+codex mcp add tlbrain-test --url https://YOUR-MCP-URL.run.app/mcp
+codex mcp login tlbrain-test
+```
+
+The second command opens a browser. Google must have the exact TLBrain `/oauth/callback` URL in the OAuth client's authorized redirect URIs. `GOOGLE_REFRESH_TOKEN` is used by the server for Drive access; it is not an MCP bearer token.
+
+Clients, login sessions and hashed MCP token identifiers are kept in the separate Firestore `mcp_oauth` collection. Codes are single-use, access tokens expire after one hour, and refresh tokens rotate. These records survive Cloud Run restarts. Existing `tokens/drive_sync` and transcript records keep their current purpose. When upgrading from the old Google-token proxy, reconnect the MCP client once.
+
+For automatic deletion of expired OAuth records, enable Firestore TTL on `mcp_oauth.expires_at` once:
+
+```bash
+gcloud firestore fields ttls update expires_at --collection-group=mcp_oauth --enable-ttl --project=YOUR_PROJECT_ID --async
+```
+
+Expired records are rejected immediately even before TTL cleanup deletes them.
  
 ---
 
