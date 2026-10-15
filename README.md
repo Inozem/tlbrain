@@ -154,8 +154,10 @@ Add to `.env`:
 ```env
 GOOGLE_CLIENT_ID=your-client-id
 GOOGLE_CLIENT_SECRET=your-client-secret
-ALLOWED_EMAIL=your-email@gmail.com  # leave empty to skip OAuth — anyone with the MCP URL then gets access to your transcripts
+ALLOWED_EMAIL=first@example.com,second@example.com
 ```
+
+`ALLOWED_EMAIL` accepts a single email or a comma-separated list. Use no spaces in `.env`; matching is case-insensitive. Every listed account has access to the same TLBrain knowledge base and tools. Leave it empty to skip OAuth — anyone with the MCP URL then gets access to your transcripts.
 
 ### 8. Get a Gemini API Key
 
@@ -233,7 +235,7 @@ In TL;DV click your avatar in the bottom-left corner → **Settings → Integrat
 1. Open any Claude client → **Customize → MCP Servers → Add**
 2. URL: `https://YOUR-MCP-URL.run.app/mcp`
 3. Leave manual bearer-token and authorization-header fields empty. The client discovers OAuth and registers automatically.
-4. Approve the named client on the TLBrain confirmation page, then sign in with the Google account specified in `ALLOWED_EMAIL`.
+4. Approve the named client on the TLBrain confirmation page, then sign in with any Google account listed in `ALLOWED_EMAIL`.
 
 For Codex, add the URL in MCP settings, or use the CLI:
 
@@ -384,7 +386,7 @@ As long as you stay within the free tier limits, you only pay for syncing new tr
 **MCP Service (Cloud Run)**
 - Remote MCP endpoint for Claude clients
 - Retrieval pipeline (semantic + BM25 + pin)
-- Google OAuth 2.0 (single-user via `ALLOWED_EMAIL`)
+- Google OAuth 2.0 (email allowlist via `ALLOWED_EMAIL`)
 
 **Vector Sync Service (Cloud Run, scale to 0)**
 - `POST /sync/doc/{doc_id}` — index a single document

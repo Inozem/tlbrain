@@ -383,6 +383,60 @@ def test_allowlist_change_revokes_access_and_refresh(connection, monkeypatch):
     assert request(connection, "post", "/token", data={"grant_type": "refresh_token", "client_id": client_id, "refresh_token": tokens["refresh_token"]}).status_code == 400
 
 
+@pytest.mark.parametrize("configured,email,allowed", [
+    ("first@example.test", "first@example.test", True),
+    ("first@example.test,second@example.test", "first@example.test", True),
+    ("first@example.test,second@example.test", "second@example.test", True),
+    (" First@Example.Test, ,SECOND@example.test,first@example.test, ", "FIRST@example.test", True),
+    (" First@Example.Test, ,SECOND@example.test,first@example.test, ", "second@example.test", True),
+    ("first@example.test,second@example.test", "other@example.test", False),
+    ("first@example.test,second@example.test", "first@example.test.evil", False),
+    ("first@example.test,second@example.test", "irst@example.test", False),
+    ("*@example.test", "first@example.test", False),
+    ("first@example.test", "", False),
+    ("first@example.test", None, False),
+])
+def test_allowed_email_accepts_exact_comma_separated_members(monkeypatch, configured, email, allowed):
+    monkeypatch.setenv("ALLOWED_EMAIL", configured)
+    assert oauth._allowed(email) is allowed
+
+
+def test_multiple_accounts_can_login_and_removal_revokes_only_removed_account(connection, monkeypatch):
+    monkeypatch.setenv("ALLOWED_EMAIL", " allowed@example.test,SECOND@example.test, ")
+    sessions = {}
+    for email in ("allowed@example.test", "second@example.test"):
+        connection[2]["email"] = email
+        client_id, code = code_flow(connection)
+        tokens = redeem(connection, client_id, code).json()
+        assert mcp(connection, tokens["access_token"]).status_code == 200
+        refreshed = request(connection, "post", "/token", data={
+            "grant_type": "refresh_token", "client_id": client_id, "refresh_token": tokens["refresh_token"],
+        })
+        assert refreshed.status_code == 200
+        sessions[email] = client_id, refreshed.json()
+
+    monkeypatch.setenv("ALLOWED_EMAIL", "allowed@example.test")
+    for email, (client_id, tokens) in sessions.items():
+        retained = email == "allowed@example.test"
+        assert mcp(connection, tokens["access_token"]).status_code == (200 if retained else 401)
+        refreshed = request(connection, "post", "/token", data={
+            "grant_type": "refresh_token", "client_id": client_id, "refresh_token": tokens["refresh_token"],
+        })
+        assert refreshed.status_code == (200 if retained else 400)
+
+
+@pytest.mark.parametrize("configured", [",", ", , ", " ,\t, "])
+def test_empty_list_entries_do_not_disable_auth(connection, monkeypatch, configured):
+    monkeypatch.setenv("ALLOWED_EMAIL", configured)
+    assert oauth.enabled()
+    assert mcp(connection).status_code == 401
+    _, state, _ = begin(connection)
+    response = request(connection, "get", "/oauth/callback", params={"state": state, "code": "synthetic-google-code"})
+    query = parse_qs(urlsplit(response.headers["location"]).query)
+    assert query["error"] == ["access_denied"]
+    assert "code" not in query
+
+
 @pytest.mark.parametrize("scope", ["openid email profile", "email"])
 def test_refresh_accepts_same_or_narrower_scope(connection, scope):
     client_id, code = code_flow(connection)

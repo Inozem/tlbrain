@@ -66,7 +66,12 @@ def _configured() -> None:
 
 
 def _allowed(email: str | None) -> bool:
-    return isinstance(email, str) and bool(email) and email.casefold() == os.environ.get("ALLOWED_EMAIL", "").strip().casefold()
+    allowed_emails = {
+        value.strip().casefold()
+        for value in os.environ.get("ALLOWED_EMAIL", "").split(",")
+        if value.strip()
+    }
+    return isinstance(email, str) and email.casefold() in allowed_emails
 
 
 def _challenge(verifier: str) -> str:
