@@ -1,9 +1,6 @@
 from typing import Any
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
-
-from core.integrations.qdrant.client import get_client
-from core.integrations.qdrant.schema import get_collection_name
+from core.integrations.qdrant.reader import fetch_utterances_in_ranges
 
 _HALF_WINDOW = 2
 
@@ -38,27 +35,7 @@ def fetch_utterances(doc_id: str, merged_ranges: list[list[int]]) -> list[dict[s
     Fetches utterance payloads from Qdrant for all merged ranges of a single doc_id.
     Uses scroll without vectors; filters by type=utterance and order_index range.
     """
-    utterances: list[dict[str, Any]] = []
-
-    for start, end in merged_ranges:
-        results, _ = get_client().scroll(
-            collection_name=get_collection_name(),
-            scroll_filter=Filter(
-                must=[
-                    FieldCondition(key="type", match=MatchValue(value="utterance")),
-                    FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
-                    FieldCondition(key="order_index", range=Range(gte=start, lte=end)),
-                ]
-            ),
-            limit=1000,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for point in results:
-            if point.payload:
-                utterances.append(point.payload)
-
-    return utterances
+    return fetch_utterances_in_ranges(doc_id, merged_ranges)
 
 
 def dedup_and_sort(utterances: list[dict[str, Any]]) -> list[dict[str, Any]]:

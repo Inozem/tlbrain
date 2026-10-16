@@ -1,7 +1,5 @@
 from typing import Any
 
-from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, Range
-
 from core.config import get_root_folder_id
 from core.google_drive.firestore import get_all_folders
 from core.integrations.google_drive.folders import (
@@ -9,8 +7,7 @@ from core.integrations.google_drive.folders import (
     make_folder_path_resolver,
     resolve_folder_path,
 )
-from core.integrations.qdrant.client import get_client
-from core.integrations.qdrant.schema import get_collection_name
+from core.integrations.qdrant import reader
 from core.retrieval.pipeline import dedup_and_sort
 from core.retrieval.segments import build_segments
 
@@ -105,11 +102,7 @@ def get_transcripts(
 
 
 def _scroll_by_doc_id(doc_id: str) -> list[dict[str, Any]]:
-    return _scroll_all(Filter(must=[
-        FieldCondition(key="type", match=MatchValue(value="utterance")),
-        FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
-        FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
-    ]))
+    return reader.fetch_utterances_by_doc_id(doc_id)
 
 
 def _scroll_by_folder(
@@ -117,41 +110,4 @@ def _scroll_by_folder(
     date_from: str | None,
     date_to: str | None,
 ) -> list[dict[str, Any]]:
-    must: list[FieldCondition] = [
-        FieldCondition(key="type", match=MatchValue(value="utterance")),
-        FieldCondition(key="parent_id", match=MatchAny(any=folder_ids)),
-        FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
-    ]
-
-    date_range: dict[str, int] = {}
-    if date_from:
-        date_range["gte"] = int(date_from.replace("-", ""))
-    if date_to:
-        date_range["lte"] = int(date_to.replace("-", ""))
-    if date_range:
-        must.append(FieldCondition(key="dialog_date_num", range=Range(**date_range)))
-
-    return _scroll_all(Filter(must=must))
-
-
-def _scroll_all(scroll_filter: Filter) -> list[dict[str, Any]]:
-    utterances: list[dict[str, Any]] = []
-    offset = None
-
-    while True:
-        results, next_offset = get_client().scroll(
-            collection_name=get_collection_name(),
-            scroll_filter=scroll_filter,
-            limit=1000,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for point in results:
-            if point.payload:
-                utterances.append(point.payload)
-        if next_offset is None:
-            break
-        offset = next_offset
-
-    return utterances
+    return reader.fetch_utterances_by_folder(folder_ids, date_from, date_to)

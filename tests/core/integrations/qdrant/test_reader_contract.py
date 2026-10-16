@@ -4,7 +4,7 @@ from google.genai import types
 from qdrant_client.http.models import QueryResponse
 from qdrant_client.models import Record, ScoredPoint
 
-from core.integrations.qdrant import writer
+from core.integrations.qdrant import reader
 from core.retrieval import pipeline, search, transcripts
 
 
@@ -191,7 +191,7 @@ def test_writer_fetch_uses_doc_root_indexes_and_returns_sorted_payloads(sdk_fake
         Record(id="later", payload=later), Record(id="earlier", payload=earlier),
     ], None))
 
-    assert writer.fetch_utterances_by_order_indexes(
+    assert reader.fetch_utterances_by_order_indexes(
         "doc-write", ROOT_ID, [6, 2, 9]
     ) == [earlier, later]
     [event] = _scroll_events(sdk_fakes)
