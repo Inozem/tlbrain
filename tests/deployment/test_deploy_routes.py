@@ -111,17 +111,27 @@ def make_registry(metadata, repository, version, service, target, checks):
                            "digest": blob_digest, "size": len(blob)}, "layers": []}
     manifest_bytes = compact(manifest)
     manifest_digest = digest(manifest_bytes)
+    index = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+             "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": manifest_digest, "size": len(manifest_bytes),
+                            "platform": {"os": "linux", "architecture": "amd64"}}]}
+    index_bytes = compact(index)
+    index_digest = digest(index_bytes)
     class Registry:
+        def __init__(self):
+            self.tag_digest = index_digest
+            self.manifests = {index_digest: index_bytes, manifest_digest: manifest_bytes}
+            self.blobs = {blob_digest: blob}
         def resolve_tag(self, repo, tag):
             assert (repo, tag) == (repository, version)
             record("verified-version", repo, tag)
-            return manifest_digest
+            return self.tag_digest
         def get_manifest(self, repo, requested):
-            assert repo == repository and requested == manifest_digest
-            return manifest_bytes
+            assert repo == repository and requested in self.manifests
+            return self.manifests[requested]
         def get_blob(self, repo, requested):
-            assert repo == repository and requested == blob_digest
-            return blob
+            assert repo == repository and requested in self.blobs
+            return self.blobs[requested]
     return Registry()
 
 if args and args[0] == "--verify-mode":
@@ -193,6 +203,8 @@ if len(args) == 6 and args[0] == "--service":
         raise SystemExit("Function deploy passed unexpected preflight arguments: " + repr(args))
     report = assemble_and_validate(service, artifact)
     record("validated-function", service, artifact, report["runtime_target"])
+    validation = json.loads((root / ".build" / (service + "-route-validation.json")).read_text(encoding="utf-8"))
+    print("Artifact fingerprint: " + validation["artifact_fingerprint"])
     if os.environ.get("ROUTE_FAIL_SERVICE") == service:
         raise SystemExit(43)
     raise SystemExit(0)
@@ -207,6 +219,9 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     preflight = build / "preflight.sh"
     preflight.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "if [[ \"${1:-}\" == '--verify-source' ]]; then\n"
+        "  exec \"$ROUTE_PYTHON\" \"${BASH_SOURCE[0]%/*}/bootstrap_runner.py\" \"$@\"\n"
+        "fi\n"
         "\"$ROUTE_PYTHON\" \"${BASH_SOURCE[0]%/*}/route_gate.py\" \"$@\"\n",
         encoding="utf-8",
     )

@@ -22,20 +22,25 @@ def test_function_deploy_uses_preflight_artifact_and_fails_closed(
 ) -> None:
     source = script_path.read_text(encoding="utf-8")
     artifact = f'${{REPO_ROOT}}/.build/{service_id}'
-    preflight = re.search(
-        rf'ARTIFACT="(?P<artifact>[^"\n]+)"\n'
-        rf'"\$\{{REPO_ROOT\}}/infra/build/preflight\.sh" \\\n'
-        rf'\s+--service {service_id} \\\n'
-        rf'\s+--source-root "\$\{{REPO_ROOT\}}" \\\n'
-        rf'\s+--output "\$\{{ARTIFACT\}}"\n\n'
-        rf'gcloud functions deploy (?P<deploy>.*?)(?=\n\n|\Z)',
-        source,
-        re.DOTALL,
-    )
+    assert f'ARTIFACT="{artifact}"' in source
+    preflight_at = source.index('PREFLIGHT_RESULT=$("${REPO_ROOT}/infra/build/preflight.sh"')
+    preflight_end = source.index('  --output "${ARTIFACT}")', preflight_at)
+    preflight = source[preflight_at:preflight_end]
+    assert f"--service {service_id}" in preflight
+    assert '--source-root "${REPO_ROOT}"' in preflight
+    assert '--output "${ARTIFACT}"' in source[preflight_end:preflight_end + 64]
 
-    assert preflight is not None, f"{script_path} must preflight immediately before deployment"
-    assert preflight.group("artifact") == artifact
-    deploy = preflight.group("deploy")
+    fingerprint_parse = source.index(
+        'ARTIFACT_FINGERPRINT=$(printf \'%s\\n\' "${PREFLIGHT_RESULT}" | sed -n \'s/^Artifact fingerprint: //p\')'
+    )
+    verify_at = source.index('preflight.sh" --verify-source \\', fingerprint_parse)
+    verify_end = source.index('  --fingerprint "${ARTIFACT_FINGERPRINT}"', verify_at)
+    deploy_at = source.index("gcloud functions deploy ", verify_end)
+    assert preflight_at < fingerprint_parse < verify_at < verify_end < deploy_at
+    verify = source[verify_at:verify_end + len('  --fingerprint "${ARTIFACT_FINGERPRINT}"')]
+    assert '--artifact "${ARTIFACT}"' in verify
+
+    deploy = source[deploy_at:].split("\n\n", 1)[0]
     assert '--source "${ARTIFACT}"' in deploy
     assert "--runtime python312" in deploy
     assert re.search(rf"--entry-point {re.escape(_ENTRY_POINTS[service_id])}", deploy)

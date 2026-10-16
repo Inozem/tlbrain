@@ -727,6 +727,19 @@ def _artifact_fingerprint(artifact: Path) -> str:
     return digest.hexdigest()
 
 
+def verify_source_artifact(artifact: os.PathLike[str] | str, expected_fingerprint: str) -> str:
+    """Reject a staged Function source tree that changed after validation."""
+    path = Path(artifact)
+    if not path.is_absolute() or not path.is_dir():
+        raise ValueError("--artifact must be an absolute directory")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint):
+        raise ValueError("--fingerprint must be a SHA-256 fingerprint")
+    actual = _artifact_fingerprint(path)
+    if actual != expected_fingerprint:
+        raise RuntimeError("source artifact changed after validation; refusing deployment")
+    return actual
+
+
 def _is_inside(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -856,11 +869,22 @@ def run_preflight(service: str, source_root: os.PathLike[str] | str, output: os.
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare and validate one service artifact without publishing it.")
-    parser.add_argument("--service", required=True)
-    parser.add_argument("--source-root", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--verify-source", action="store_true", help="verify a Function source artifact against its validation fingerprint")
+    parser.add_argument("--artifact", type=Path)
+    parser.add_argument("--fingerprint")
+    parser.add_argument("--service")
+    parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.verify_source:
+            if args.artifact is None or args.fingerprint is None:
+                parser.error("--verify-source requires --artifact and --fingerprint")
+            verified = verify_source_artifact(args.artifact, args.fingerprint)
+            print(f"Source artifact fingerprint verified: {verified}")
+            return 0
+        if args.service is None or args.source_root is None or args.output is None:
+            parser.error("preflight requires --service, --source-root, and --output")
         return run_preflight(args.service, args.source_root, args.output)
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"preflight: {exc}", file=sys.stderr)
