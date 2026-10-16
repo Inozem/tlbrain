@@ -73,6 +73,7 @@ def _write_fakes(root: Path, tmp_path: Path, *, runner_status: int) -> tuple[Pat
     interpreter.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf 'bootstrap\\t%s\\t%s\\n' \"$0\" \"$*\" >> \"$RUNNER_COMPAT_EVENTS\"\n"
+        "if [[ \"$RUNNER_COMPAT_STATUS\" == 0 ]]; then printf 'Artifact fingerprint: %064d\\n' 0; fi\n"
         "exit \"$RUNNER_COMPAT_STATUS\"\n",
         encoding="utf-8",
     )
@@ -178,13 +179,21 @@ def test_sync_checker_route_uses_gcloud_bootstrap_fallback_before_cloud_send(
     bootstrap_entries = [line.split("\t", 2)[1:] for line in log if line.startswith("bootstrap\t")]
 
     assert any(call == "info --format=value(basic.python_location)" for call in cloud_calls)
-    assert len(bootstrap_entries) == 1
+    assert len(bootstrap_entries) == (1 if runner_status else 2)
     invoked_executable, bootstrap_args = bootstrap_entries[0]
     assert invoked_executable == _path_for_bash(interpreter)
     assert "Build Area" in invoked_executable
     assert "bootstrap_runner.py" in bootstrap_args
     assert "--service sync_checker" in bootstrap_args
     assert _path_for_bash(checkout) in bootstrap_args
+    if not runner_status:
+        verify_executable, verify_args = bootstrap_entries[1]
+        expected_fingerprint = "0" * 64
+        expected_artifact = _path_for_bash(checkout / ".build" / "sync_checker")
+        assert verify_executable == invoked_executable
+        assert "--verify-source" in verify_args
+        assert f"--artifact {expected_artifact}" in verify_args
+        assert f"--fingerprint {expected_fingerprint}" in verify_args
     assert not any(
         call.lower().startswith("auth ") or "application-default" in call.lower()
         for call in cloud_calls
