@@ -166,6 +166,13 @@ def test_native_smoke_uses_only_synthetic_bootstrap_checks_and_one_function_pref
     assert "--confcutdir=tests/deployment" in command
     assert "discovery_fallback_uses_only_gcloud_python_location" in command
     assert "discovery_refresh_token_uses_gcloud_fallback_without_setup_and_preserves_inputs" in command
+    compatibility = next(
+        step for step in steps
+        if step.get("name") == "Exercise runner compatibility through ordinary deploy routes"
+    )
+    assert compatibility["env"]["TLBRAIN_RUN_BASH_TESTS_ON_WINDOWS"] == "1"
+    assert "tests/deployment/test_runner_compatibility.py" in compatibility["run"]
+    assert "--confcutdir=tests/deployment" in compatibility["run"]
     preflight = next(step for step in steps if step.get("name") == "Validate a lightweight Function on the prepared host")
     assert preflight["shell"] == "bash"
     assert "--service sync_checker" in preflight["run"]
