@@ -57,14 +57,6 @@ def test_reader_refuses_adc_fallback(monkeypatch, sdk_fakes):
     assert sdk_fakes.trace == []
 
 
-def test_legacy_reader_module_forwards_to_canonical_reader():
-    from core.google_drive import docs_reader as legacy_reader
-
-    assert legacy_reader.read_google_doc is reader.read_google_doc
-    assert legacy_reader._build_docs_service is reader._build_docs_service
-    assert legacy_reader._extract_text is reader._extract_text
-
-
 def test_writer_creates_then_fills_doc_with_shifted_bold_ranges(sdk_fakes):
     sdk_fakes.drive.queue(
         "files.create",

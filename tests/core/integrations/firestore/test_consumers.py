@@ -14,8 +14,6 @@ def test_vector_sync_and_mcp_bind_canonical_repositories(sdk_fakes):
     operations = importlib.import_module("core.documents.operations")
 
     assert vector_main.ensure_imported is transcripts.ensure_imported
-    assert vector_main.mark_error is transcripts.mark_error
-    assert vector_main.delete_index is transcripts.delete_index
     assert vector_main.load_index is transcripts.load_index
     assert vector_main.get_folder_by_id is folders.get_folder_by_id
 

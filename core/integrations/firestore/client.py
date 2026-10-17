@@ -4,7 +4,6 @@ from google.cloud import firestore
 
 
 COLLECTION_NAME = "transcript_index"
-CLIENTS_COLLECTION = "clients"
 FOLDERS_COLLECTION = "folders"
 TOKENS_COLLECTION = "tokens"
 DRIVE_SYNC_TOKEN_DOC = "drive_sync"

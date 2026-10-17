@@ -10,7 +10,7 @@ import pytest
 from google.auth.credentials import AnonymousCredentials
 from google.oauth2.credentials import Credentials
 
-from core.google_drive import drive_client
+from core.integrations.google_drive import client as drive_client
 from core.integrations.google_auth.credentials import credentials
 from core.integrations.google_docs import reader as docs_reader
 

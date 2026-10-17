@@ -14,7 +14,7 @@ from qdrant_client.models import Distance, SparseVectorParams, VectorParams
 from qdrant_client.http.models.models import QueryResponse, ScoredPoint
 
 from core.integrations.gemini import embeddings, llm
-from core.google_drive import drive_client
+from core.integrations.google_drive import client as drive_client
 from core.integrations.google_docs import reader as docs_reader
 from core.integrations.qdrant import client as qdrant_client
 from core.integrations.qdrant import setup as qdrant_setup
