@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v2.0.0`
+# 🧠 TLBrain `v2.0.1`
 
 Personal semantic memory for Claude — built on top of your client calls.
  
@@ -12,7 +12,7 @@ graph LR
 ```
  
 Works with **claude.ai** (web) · **Claude Desktop** (Chat · Cowork · Code) · **Claude Mobile** (iOS · Android)
-Google Drive + Qdrant + Gemini · Single-user · Near-zero infrastructure cost · Deploy with one command
+Google Drive + Qdrant + Gemini · Shared corpus for configured accounts · Near-zero infrastructure cost · Deploy with one command
  
 ---
  
@@ -22,7 +22,7 @@ Google Drive + Qdrant + Gemini · Single-user · Near-zero infrastructure cost �
 - [Example queries](#-example-queries)
 - [How it works in practice](#-how-it-works-in-practice)
 - [Quick Start](#-quick-start)
-- [Upgrading from v1 to v2](#-upgrading-from-v1-to-v2)
+- [Compatibility with existing data](#-compatibility-with-existing-data)
 - [Why TLBrain](#-why-tlbrain)
 - [Why not just use Claude Projects?](#-why-not-just-use-claude-projects)
 - [Why MCP?](#-why-mcp)
@@ -67,7 +67,7 @@ You can ask Claude for a full list of folders and their sync status at any time.
  
 ## ⚡ Quick Start
  
-**Prerequisites:** Google Cloud project, TL;DV account, Qdrant Cloud (free tier), Gemini API key.
+**Prerequisites:** Bash, `gcloud` authenticated and configured for a Google Cloud project with the required access, a TL;DV account, Qdrant Cloud, a Gemini API key, and the existing `.env` values described below. Ordinary deployment uses published service images and source packages. It does not require Docker or a system Python installation; build preflight supplies a private Python 3.12 runner. Docker is needed only for local image builds and image checks.
 
 Despite the one-command deployment, all third-party services (Google Cloud, Firebase, Qdrant, Google AI Studio) must be registered and configured manually — the steps below walk you through each one.
 
@@ -174,7 +174,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ### 9. Optional `.env` settings
 
 ```env
-VERSION=2.0.0  # or latest for the most recent build
+VERSION=2.0.1  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -216,13 +216,15 @@ TLDV_RECONCILIATION_SCHEDULE="0 3 * * *"
 bash infra/deploy/deploy.sh
 ```
  
-A browser window will open for Google authorization:
+If `GOOGLE_REFRESH_TOKEN` is not set, deployment opens a browser for Google Drive authorization:
 - If you see a "Google hasn't verified this app" warning — click **Advanced → Go to TLBrain MCP (unsafe)**
 - On the permissions screen, make sure all checkboxes are selected, then click **Continue**
 
-Deploys the MCP server, Sync service, Cloud Tasks queue, and Sync Checker. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
+Deploys the three Cloud Run services (`mcp`, `vector_sync`, `tldv_import`) and three HTTP Cloud Functions gen2 (`sync_checker`, `tldv_webhook`, `tldv_reconciliation`), along with their Cloud Tasks queues and scheduled checker/reconciliation jobs. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
 
 When finished, the script prints the MCP URL and TL;DV webhook URL — copy them, you'll need them in the next steps.
+
+The ordinary deployment uses already-published versioned images for Cloud Run services and deploys Functions from source/preflight artifacts. To build local service images before deployment, use `bash infra/deploy/local_deploy.sh`; this route requires Docker. Neither route adds a migration or reindex step.
 
 > The deploy takes ~7 minutes to complete.
  
@@ -258,29 +260,11 @@ Expired records are rejected immediately even before TTL cleanup deletes them.
  
 ---
 
-## 🔄 Upgrading from v1 to v2
+## 🔄 Compatibility with existing data
 
-If you're already using TLBrain, **do not just redeploy** — the v2 code is incompatible with v1 data. A simple redeploy will break folder search: transcripts will lose their folder association and become unreachable by path.
+Release 2.0.1 reorganizes the code, runtime targets, and build process while preserving existing v2 data and Firestore and Qdrant schemas. This refactor includes no database migration, data transformation, cleanup, or reindex. Deploy it with the existing command `bash infra/deploy/deploy.sh`. The historical v1-to-v2 migration utility is unrelated to this release and should not be run.
 
-v2 changes the core data model: folders are now tracked by Drive folder ID instead of a flat `client_name` string. This enables arbitrary nesting depth and makes folder renames and moves work automatically. To convert your existing data, run the one-time migration **before** redeploying.
-
-The migration runs in four steps:
-
-1. **Build `folders/`** — scans the Drive hierarchy under `ROOT_FOLDER` and populates the new `folders/` Firestore collection.
-2. **Update `transcript_index`** — replaces `client_name` with `parent_id` (Drive folder ID) in every transcript record.
-3. **Update Qdrant** — replaces `client_name` with `parent_id` in vector payloads (no re-embedding needed).
-4. **Delete `clients/`** — removes the old Firestore collection.
-
-```bash
-pip install google-cloud-firestore google-api-python-client google-auth qdrant-client
-gcloud auth application-default login
-
-python -m migrations.v1_to_v2.migrate --dry-run  # preview changes without writing
-python -m migrations.v1_to_v2.migrate            # apply
-python -m migrations.v1_to_v2.verify             # post-migration check
-```
-
-After the migration completes successfully, redeploy all services.
+The existing OAuth and `ALLOWED_EMAIL` configuration continues to apply. `GOOGLE_REFRESH_TOKEN` remains the server's Drive credential; MCP clients authenticate through the existing OAuth flow.
 
 ---
 
@@ -288,7 +272,7 @@ After the migration completes successfully, redeploy all services.
  
 | Feature | TLBrain | Typical RAG |
 |---|---|---|
-| Single-user optimized | ✅ | ❌ |
+| Shared corpus with an account allowlist | ✅ | ❌ |
 | Near-zero infrastructure cost | ✅ | ⚠️ |
 | Conversation-aware retrieval | ✅ | ❌ |
 | MCP-native (works with Claude) | ✅ | ❌ |
@@ -302,13 +286,13 @@ After the migration completes successfully, redeploy all services.
  
 **MCP-native.** Claude connects like a standard MCP server. No plugins, no custom integrations — just the protocol.
  
-**Incremental sync.** One file changed — only that file gets reindexed. SHA-256 hash of file content tracks edits; folder moves are detected separately via Drive Changes API.
+**Incremental sync.** SHA-256 hashes identify changed transcript content, and Drive changes are tracked incrementally. Full-document replacement writes a new version before deleting the prior version. Incremental replacement removes affected entries before writing their replacements, so uninterrupted search availability during that operation is not guaranteed.
  
 **Conversation-aware retrieval.** Retrieval works with utterance windows, not arbitrary chunks. Summaries cover overlapping ranges; facts are anchored to specific dialogue segments.
  
-**Deterministic pipeline.** `temperature=0`, prompt versioning, idempotent operations. Same file → same result.
+**Deterministic pipeline.** `temperature=0` and idempotency keys based on transcript content hash let unchanged content reuse existing index entries.
  
-**No vendor lock-in.** Google Drive, Qdrant Cloud, Gemini — all on free/pay-per-use. Qdrant Cloud free tier is enough for most single-user scenarios.
+**No vendor lock-in.** Google Drive, Qdrant Cloud, and Gemini use free or pay-per-use plans. Qdrant Cloud free tier can suit small deployments.
  
 ---
  
@@ -343,7 +327,7 @@ Connect once, use everywhere. Configuration syncs automatically across clients.
  
 ## 💰 Cost Breakdown
  
-TLBrain is designed so you don't pay for what a single-user scenario doesn't need.
+TLBrain is designed to keep infrastructure costs low for small teams using a shared corpus.
 
 > **Note on initial sync costs:** If you're importing a large backlog of transcripts from TL;DV, expect noticeable Gemini charges during the first sync. Gemini (Tier 1) is billed per token — transcript processing and embedding generation are the main costs. Other services run on free tier, but heavy initial load may push them over their monthly limits and trigger billing. After the first month, free tier limits reset and the system returns to near-zero cost.
  
@@ -351,7 +335,7 @@ TLBrain is designed so you don't pay for what a single-user scenario doesn't nee
 - 1 GiB RAM, 4 GiB disk — free forever
 - Utterances stored with BM25 sparse vectors (not dense) → 4× less space
 - Embeddings only for summaries and facts → ~10–20% of utterance volume
-- Enough for most single-user scenarios
+- Enough for many small deployments
 
 **Gemini (~$0.20 per transcript):**
 - You only pay for Gemini when indexing new transcripts
@@ -361,9 +345,9 @@ TLBrain is designed so you don't pay for what a single-user scenario doesn't nee
 - If a file hasn't changed, it's skipped — Gemini is never called again
 
 **Google Cloud (~$0/month):**
-- Cloud Run: free tier covers all single-user traffic
+- Cloud Run: free tier may cover light traffic
 - Cloud Functions, Cloud Tasks, Cloud Scheduler: included in free tier
-- Firestore: free tier covers 50k reads and 20k writes per day — more than enough for single-user at 15 calls/week
+- Firestore: free tier covers 50k reads and 20k writes per day — often enough for light usage
 
 As long as you stay within the free tier limits, you only pay for syncing new transcripts — roughly $0.20 per call. Everything else is free. You can go on a six-month vacation, come back, and nothing will be lost and nothing will have cost you a penny while you were away.
  
@@ -371,7 +355,7 @@ As long as you stay within the free tier limits, you only pay for syncing new tr
  
 ## ⚠️ Limitations
  
-- **Single-user only** — the architecture does not support multi-tenant
+- **Shared corpus** — multiple `ALLOWED_EMAIL` accounts are supported, but they all access the same data; there is no per-user or tenant isolation
 - **TL;DV as the primary source** — other providers require writing a connector
 - **Polling sync** — changes are picked up with a delay up to `SYNC_CHECKER_SCHEDULE` (default: 15 min)
 - **Native Google Docs only** — other file formats are ignored
@@ -381,36 +365,20 @@ As long as you stay within the free tier limits, you only pay for syncing new tr
 
 ## 🏗️ Technical Architecture
  
-### Services
- 
-**MCP Service (Cloud Run)**
-- Remote MCP endpoint for Claude clients
-- Retrieval pipeline (semantic + BM25 + pin)
-- Google OAuth 2.0 (email allowlist via `ALLOWED_EMAIL`)
+### Runtime targets
 
-**Vector Sync Service (Cloud Run, scale to 0)**
-- `POST /sync/doc/{doc_id}` — index a single document
-- Parsing, windowing, summary/facts generation, write to Qdrant
-- Firestore transactions to prevent double-processing
+The deployment has six targets: three ASGI Cloud Run services (`mcp`, `vector_sync`, and `tldv_import`) and three HTTP Cloud Functions gen2 (`sync_checker`, deployed as target `checker`; `tldv_webhook`; and `tldv_reconciliation`). The MCP service provides remote tools and retrieval; vector sync indexes Google Docs; the TL;DV import service creates transcript documents. The checker processes Drive changes, the webhook accepts TL;DV events, and reconciliation checks for missed imports.
 
-**Sync Checker (Cloud Function gen2)**
-- Triggered by `SYNC_CHECKER_SCHEDULE` (default: `*/15 * * * *`)
-- Drive Changes API — only changed files
-- Recovery of stale tasks
-
-**TL;DV Connector:**
-- Webhook Function — receives `TranscriptReady`, creates a Cloud Tasks job
-- Reconciliation Function — daily check of the last 48h
-- Import Service (Cloud Run) — downloads transcript, detects client, creates Google Doc
+`ALLOWED_EMAIL` may contain multiple approved accounts. Those accounts share one corpus; TLBrain does not isolate data by user or tenant. Google OAuth and the server-side `GOOGLE_REFRESH_TOKEN` Drive credential keep their existing roles.
 
 ### Retrieval Pipeline
  
 When Claude calls `query`, six stages run:
  
-**Stage 1 — Recall (three parallel searches):**
+**Stage 1 — Recall:** semantic and keyword searches run in parallel; user-fact pins are searched afterward.
 - Semantic (dense): search over summaries + facts, top-15, score ≥ 0.6 → `covered_range`
 - Keyword (BM25 sparse): search over utterances, top-10 → window `[i-2, i+2]` around each hit
-- Pin (user_facts): dense search over `type=user_fact`, top-10 — no score threshold; documents with matches are always included
+- Pin (user_facts): dense search over `type=user_fact`, top-10 — matching facts bypass the score threshold, subject to the overall top-three-document limit
 
 **Stage 2 — Range merge:** merge overlapping ranges within the same document. `[121–125]` + `[123–127]` → `[121–127]`.
  
@@ -434,7 +402,7 @@ For each window — one Gemini request returning:
 - **Summary** — brief description of the topic, decisions, and next steps
 - **Facts** — list of structured facts (prices, objections, agreements)
 
-Generation parameters: `temperature=0`, `top_p=1`. Prompts are versioned (`prompt_version`). Idempotency: `summary_key = doc_id + center_index + version` — if it already exists, it's skipped.
+Generation parameters: `temperature=0`, `top_p=1`. The index `version` is the transcript content hash. Idempotency keys combine `doc_id`, center index, and content hash; an existing key is skipped. Prompt changes alone do not change the content hash or trigger reindexing.
  
 Utterances are always saved. A failure in summary/facts generation does not block indexing.
  
@@ -448,10 +416,10 @@ Utterances are always saved. A failure in summary/facts generation does not bloc
 
 **Vector Sync Service** (Cloud Run):
 1. Receives a task from Cloud Tasks: `POST /sync/doc/{doc_id}`
-2. Atomically acquires the document via Firestore transaction (`imported → syncing`)
+2. Transactionally acquires an eligible document record for syncing (new, non-syncing, or stale-syncing records)
 3. Reads the Google Doc via Docs API, parses utterances and metadata
 4. Generates summaries, facts, BM25 sparse vectors
-5. **Append new → delete old**: uploads new chunks with new `version` first, then deletes old ones by `doc_id + old_version`
+5. Full-document replacement writes the new version before deleting the old version. Incremental replacement deletes affected entries before writing replacements, so continuous availability is not guaranteed.
 6. Updates status: `syncing → synced`
 
 Status machine: `queued → downloading → imported → syncing → synced / error`
@@ -476,64 +444,114 @@ Authentication: Google OAuth 2.0 Authorization Code Flow. Claude detects OAuth v
  
 ### Storage Schema
  
-**Qdrant — 4 object types:**
+**Qdrant — 4 point types:**
+
+Drive folder association is stored in the `parent_id` payload field. The current `fact` point type is singular.
  
 | Type | Vectors | Purpose |
 |---|---|---|
 | `summary` | dense (768) | Semantic search, contains `covered_range` |
-| `facts` | dense (768) | Semantic search over specific facts |
+| `fact` | dense (768) | Semantic search over specific facts |
 | `utterance` | BM25 sparse | Keyword search + range retrieval |
 | `user_fact` | dense (768) | Manual facts, protected from deletion on reindex |
  
-**Firestore — 3 collections:**
+**Firestore records:**
  
 - `transcript_index/{doc_id}` — sync status, hashes, metadata
 - `folders/{folder_id}` — folder registry (id, name, parent_id)
-- `config/vector_sync` — service keys (Drive page token)
+- `tokens/drive_sync` — Drive Changes API page token
+- `mcp_oauth` — client registrations, login sessions, and hashed token identifiers
 ### MCP Tools
  
 | Tool | Description |
 |---|---|
-| `query` | Hybrid search (semantic + BM25) over transcripts. Filters: `folder_path`, `date_from`, `date_to`. Searches recursively through nested folders. Documents with `user_facts` are always included. |
-| `get_transcript` | Full transcript without semantic search. By `doc_id` or `folder_path` + date range. |
-| `list_folders` | List the folder hierarchy. Pass `folder_path` to list subfolders of a specific folder. |
-| `list_recent_transcripts` | Flat list of transcripts sorted by date desc. Filters: `folder_path` (recursive), `date_from`, `date_to`. Supports pagination. |
-| `add_fact` | Manually attach a fact to a transcript. Stored as `user_fact`, idempotent. |
-| `create_folder` | Create a folder: Drive subfolder + Firestore record. Pass `folder_path` to nest under an existing folder. |
-| `rename_folder` | Rename a folder: updates Drive, Firestore. Pass `folder_path` to identify the folder. |
-| `move_transcript` | Move a transcript to another folder. Updates Drive, resets for reindexing. |
-| `import_all_transcripts` | Import all missed transcripts from TL;DV. Supports `limit` and `since`. |
-| `sync_changes` | Trigger an immediate sync run without waiting for the schedule. Accepts optional `folder_path` or `doc_id` for targeted resync. |
-| `sync_status` | Sync status counts by stage + number of unassigned transcripts. |
-| `rename_transcript` | Rename a transcript: updates file name in Drive and title in the transcript list. |
+| `query` | Hybrid search across transcripts. Accepts required `query` and optional `keywords`, `folder_path`, `date_from`, and `date_to`. |
+| `get_transcript` | Retrieve transcripts by optional `doc_id`, `folder_path`, date range, and `limit`. |
+| `list_folders` | List the folder hierarchy. |
+| `import_all_transcripts` | Import missed TL;DV transcripts; accepts optional `limit` and `since`. |
+| `move_transcript` | Move a transcript using its `doc_id` and destination `folder_path`. |
+| `move_folder` | Move a folder using `folder_path` and optional `new_parent_path`. |
+| `create_folder` | Create a folder with `name` and optional `parent_path`. |
+| `rename_folder` | Rename a folder using `folder_path` and `new_name`. |
+| `sync_changes` | Trigger a checker pass. Optional `doc_id` targets one document; without it, the checker runs its generic pass. |
+| `sync_status` | Show transcript sync counts and unassigned transcripts. |
+| `add_fact` | Attach a fact to a transcript using `doc_id` and `text`. |
+| `list_recent_transcripts` | List recent transcripts; supports folder/date filters and `limit`/`offset`. |
+| `rename_transcript` | Rename a transcript using `doc_id` and `new_title`. |
  
 ### Repository Structure
  
 ```
 tlbrain/
-├── core/                    # Shared code for both services
-│   ├── config.py
-│   ├── gemini/              # Embeddings + LLM
-│   ├── google_drive/        # Drive client + Docs reader
-│   ├── parsing/             # Parser + windowing
-│   ├── qdrant/              # Client + schema + writer
-│   ├── retrieval/           # Pipeline + search + segments
+├── core/
+│   ├── documents/operations.py
+│   ├── indexing/             # Transcript indexing and user facts
+│   ├── integrations/
+│   │   ├── google_auth/
+│   │   ├── google_drive/
+│   │   ├── google_docs/
+│   │   ├── firestore/
+│   │   ├── qdrant/
+│   │   ├── gemini/
+│   │   ├── fastembed/
+│   │   └── cloud_tasks/
+│   ├── parsing/
+│   ├── retrieval/
+│   ├── google_drive/         # Transitional compatibility modules
 │   └── utils/
 ├── services/
-│   ├── mcp/                 # MCP server
-│   ├── vector_sync/         # Sync service
-│   ├── sync_checker/        # Cloud Function checker
-│   └── connectors/
-│       └── tldv/
-│           ├── import_service/
-│           ├── reconciliation/
-│           └── webhook/
+│   ├── mcp/
+│   ├── vector_sync/
+│   ├── sync_checker/
+│   └── connectors/tldv/      # import_service, webhook, reconciliation
 ├── infra/
-│   ├── docker/
-│   └── deploy/
-├── migrations/
-│   └── v1_to_v2/            # One-time migration from v1 to v2
+│   ├── build/                # Runtime assembly and validation
+│   ├── deploy/
+│   └── docker/               # Optional local image builds and image checks
+├── migrations/               # Historical migration utilities
+├── tests/
+├── requirements-dev.txt
 └── .env.example
+```
+
+### Developer checks
+
+Run these commands from the application root (`tlbrain/`). The virtual environment is created beside the app directory, outside the packaged application.
+
+Windows:
+
+```powershell
+py -3.12 -m venv ../.venv-test
+../.venv-test/Scripts/python.exe -m pip install -r requirements-dev.txt
+../.venv-test/Scripts/python.exe -m pytest -q
+```
+
+Linux:
+
+```bash
+python3.12 -m venv ../.venv-test
+../.venv-test/bin/python -m pip install -r requirements-dev.txt
+../.venv-test/bin/python -m pytest -q
+```
+
+The offline test suite uses synthetic fixtures and boundaries; it does not call cloud or paid APIs.
+
+Assemble all six runtime packages from the application root with Python 3.12 (PowerShell):
+
+```powershell
+$serviceIds = 'mcp', 'vector_sync', 'tldv_import', 'sync_checker', 'tldv_webhook', 'tldv_reconciliation'
+foreach ($serviceId in $serviceIds) {
+    python infra/build/assemble.py --service $serviceId --output ".build/$serviceId"
+    if ($LASTEXITCODE -ne 0) { throw "Assembly failed: $serviceId" }
+}
+```
+
+Optional Docker image builds (Docker is required for these local image builds and image checks):
+
+```bash
+docker build -f infra/docker/Dockerfile.mcp -t tlbrain-mcp:2.0.1-check .
+docker build -f infra/docker/Dockerfile.vector_sync -t tlbrain-vector-sync:2.0.1-check .
+docker build -f infra/docker/Dockerfile.tldv_import -t tlbrain-tldv-import:2.0.1-check .
 ```
  
 ### Google Doc format:
