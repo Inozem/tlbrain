@@ -12,7 +12,12 @@ from services.mcp.app.mcp.tools import (
     build_jsonrpc_result,
 )
 from core.config import get_root_folder_id
-from core.integrations.gemini.embeddings import embed
+from core.indexing.user_facts import (
+    AddFactDocumentNotFound,
+    AddFactInputError,
+    AddFactTranscriptNotSynced,
+    add_user_fact,
+)
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.integrations.google_drive import folder_service
@@ -28,7 +33,7 @@ from core.integrations.firestore.transcripts import (
     move_transcript_record,
     update_index,
 )
-from core.integrations.qdrant.writer import set_payload_parent_id, upsert_user_facts
+from core.integrations.qdrant.writer import set_payload_parent_id
 
 logger = logging.getLogger(__name__)
 
@@ -856,48 +861,19 @@ def _handle_sync_status(request: JSONRPCRequest) -> dict:
 
 
 def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
-    doc_id = arguments.get("doc_id", "").strip()
-    text = arguments.get("text", "").strip()
-
-    if not doc_id or not text:
+    t0 = time.monotonic()
+    try:
+        doc_id = add_user_fact(arguments.get("doc_id", ""), arguments.get("text", ""))
+    except AddFactInputError as e:
         return build_jsonrpc_error(
             request_id=request.id,
             code=-32602,
-            message="doc_id and text are required",
+            message=str(e),
         )
-
-    t0 = time.monotonic()
-    try:
-        record = get_transcript_record(doc_id)
-        if not record:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Document not found: {doc_id}",
-            )
-        if record.get("status") != "synced":
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Document is not synced yet (status={record.get('status')}). Try again after sync completes.",
-            )
-
-        dialog_date = record.get("dialog_date", "")
-        parent_id = record.get("parent_id", "")
-        root_folder_id = get_root_folder_id()
-
-        payload = {
-            "type": "user_fact",
-            "doc_id": doc_id,
-            "text": text,
-            "root_folder_id": root_folder_id,
-            "parent_id": parent_id,
-            "dialog_date": dialog_date,
-            "dialog_date_num": int(dialog_date.replace("-", "")) if dialog_date else 0,
-        }
-
-        vector = embed([text])[0]
-        upsert_user_facts([payload], [vector])
+    except AddFactDocumentNotFound as e:
+        return build_jsonrpc_error(request_id=request.id, code=-32602, message=str(e))
+    except AddFactTranscriptNotSynced as e:
+        return build_jsonrpc_error(request_id=request.id, code=-32602, message=str(e))
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
