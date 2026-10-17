@@ -11,7 +11,6 @@ from services.mcp.app.mcp.tools import (
     build_mcp_content,
     build_jsonrpc_result,
 )
-from core.config import get_root_folder_id
 from core.indexing.user_facts import (
     AddFactDocumentNotFound,
     AddFactInputError,
@@ -21,19 +20,12 @@ from core.indexing.user_facts import (
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.integrations.google_drive import folder_service
-from core.google_drive.drive_client import move_file_to_folder, rename_file
 from core.google_drive.firestore import expand_subtree, resolve_folder_path
-from core.integrations.firestore.folders import get_folder_id_by_name
-from core.integrations.firestore.client import get_client
 from core.integrations.firestore.transcripts import (
     get_sync_status,
-    get_transcript_record,
     list_transcripts,
-    list_unassigned_transcripts,
-    move_transcript_record,
-    update_index,
 )
-from core.integrations.qdrant.writer import set_payload_parent_id
+from core.documents import operations as document_operations
 
 logger = logging.getLogger(__name__)
 
@@ -633,35 +625,21 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        terminal_ids = resolve_folder_path(folder_path)
-        if not terminal_ids:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Folder not found: {'/'.join(folder_path)}",
-                details="Use list_folders to see available folders.",
-            )
-        if len(terminal_ids) > 1:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Ambiguous folder path: {'/'.join(folder_path)} matches {len(terminal_ids)} folders.",
-                details="Use a more specific path.",
-            )
-        new_folder_id = terminal_ids[0]
-
-        root_folder_id = get_root_folder_id()
-        move_file_to_folder(doc_id, new_folder_id)
-        move_transcript_record(doc_id, new_folder_id)
-        set_payload_parent_id(doc_id, root_folder_id, new_folder_id)
-
-        db = get_client()
-        unassigned_folder_id = get_folder_id_by_name("_unassigned", db)
-        unassigned_transcripts = (
-            list_unassigned_transcripts(unassigned_folder_id, db)
-            if unassigned_folder_id else []
+        outcome = document_operations.move_transcript(doc_id, folder_path)
+    except document_operations.FolderPathNotFound as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=str(e),
+            details="Use list_folders to see available folders.",
         )
-        unassigned = {"count": len(unassigned_transcripts), "transcripts": unassigned_transcripts}
+    except document_operations.AmbiguousFolderPathError as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=str(e),
+            details="Use a more specific path.",
+        )
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -680,12 +658,12 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
         "status": "ok",
         "doc_id": doc_id,
         "folder_path": folder_path,
-        "unassigned_remaining": unassigned["count"],
+        "unassigned_remaining": outcome.unassigned_count,
     }
-    if unassigned["count"] > 0:
-        payload["unassigned_transcripts"] = unassigned["transcripts"]
+    if outcome.unassigned_count > 0:
+        payload["unassigned_transcripts"] = outcome.unassigned_transcripts
         payload["suggestion"] = (
-            f"{unassigned['count']} transcript(s) are still unassigned. "
+            f"{outcome.unassigned_count} transcript(s) are still unassigned. "
             f"Show each one using get_transcript(doc_id='...') and move it using move_transcript."
         )
     content = build_mcp_content(payload)
@@ -949,18 +927,15 @@ def _handle_rename_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
             message="doc_id and new_title are required",
         )
 
-    record = get_transcript_record(doc_id)
-    if not record:
+    t0 = time.monotonic()
+    try:
+        document_operations.rename_transcript(doc_id, new_title)
+    except document_operations.TranscriptNotFound as e:
         return build_jsonrpc_error(
             request_id=request.id,
             code=-32602,
-            message=f"Document not found: {doc_id}",
+            message=str(e),
         )
-
-    t0 = time.monotonic()
-    try:
-        rename_file(doc_id, new_title)
-        update_index(doc_id, {"source_file": new_title})
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
