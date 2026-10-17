@@ -7,7 +7,8 @@ from core.google_drive.drive_client import move_file_to_folder, rename_file
 from core.integrations.firestore import folders, transcripts
 from core.integrations.firestore import client as firestore_client
 from core.integrations.google_drive.folders import resolve_folder_path
-from core.integrations.qdrant.writer import set_payload_parent_id
+from core.integrations.qdrant.writer import delete_by_doc_id, set_payload_parent_id
+from core.parsing.parser import is_valid_format
 
 
 class FolderPathNotFound(ValueError):
@@ -69,3 +70,20 @@ def rename_transcript(doc_id: str, new_title: str) -> None:
         raise TranscriptNotFound(doc_id)
     rename_file(doc_id, new_title)
     transcripts.update_index(doc_id, {"source_file": new_title})
+
+
+def validate_document_format(doc_id: str, raw_text: str, indexed: bool) -> bool:
+    """Validate a transcript and mark an existing index when its format is invalid."""
+    if is_valid_format(raw_text):
+        return True
+    if indexed:
+        transcripts.mark_error(doc_id, "invalid TLBrain document format", error_stage="invalid_format")
+    return False
+
+
+def delete_indexed_transcript(doc_id: str, root_folder_id: str, indexed: bool) -> None:
+    """Delete only this document's vector points within the configured root, then its index."""
+    if not indexed:
+        return
+    delete_by_doc_id(doc_id, root_folder_id)
+    transcripts.delete_index(doc_id)

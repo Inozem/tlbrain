@@ -111,3 +111,43 @@ def test_rename_transcript_missing_record_fails_before_drive(monkeypatch):
         operations.rename_transcript("doc-1", "Title")
 
     assert effects == []
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_validate_document_format_marks_only_existing_index(monkeypatch, indexed):
+    effects = []
+    monkeypatch.setattr(operations, "is_valid_format", lambda _text: False)
+    monkeypatch.setattr(
+        operations.transcripts,
+        "mark_error",
+        lambda *args, **kwargs: effects.append((args, kwargs)),
+    )
+
+    assert operations.validate_document_format("doc-1", "invalid", indexed) is False
+    assert effects == (
+        [(('doc-1', "invalid TLBrain document format"), {"error_stage": "invalid_format"})]
+        if indexed else []
+    )
+
+
+def test_validate_document_format_returns_true_without_writes_for_valid_document(monkeypatch):
+    effects = []
+    monkeypatch.setattr(operations, "is_valid_format", lambda _text: True)
+    monkeypatch.setattr(operations.transcripts, "mark_error", lambda *_args, **_kwargs: effects.append("write"))
+
+    assert operations.validate_document_format("doc-1", "valid", True) is True
+    assert effects == []
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_delete_indexed_transcript_is_conditional_and_preserves_scoped_write_order(monkeypatch, indexed):
+    effects = []
+    monkeypatch.setattr(operations, "delete_by_doc_id", lambda *args: effects.append(("qdrant", args)))
+    monkeypatch.setattr(operations.transcripts, "delete_index", lambda *args: effects.append(("firestore", args)))
+
+    operations.delete_indexed_transcript("doc-1", "root-1", indexed)
+
+    assert effects == (
+        [("qdrant", ("doc-1", "root-1")), ("firestore", ("doc-1",))]
+        if indexed else []
+    )
