@@ -488,7 +488,7 @@ tlbrain/
 │   ├── indexing/             # Transcript indexing and user facts
 │   ├── integrations/
 │   │   ├── google_auth/
-│   │   ├── google_drive/
+│   │   ├── google_drive/          # Drive API client, scans, file access, and folder operations
 │   │   ├── google_docs/
 │   │   ├── firestore/
 │   │   ├── qdrant/
@@ -497,7 +497,6 @@ tlbrain/
 │   │   └── cloud_tasks/
 │   ├── parsing/
 │   ├── retrieval/
-│   ├── google_drive/         # Transitional compatibility modules
 │   └── utils/
 ├── services/
 │   ├── mcp/

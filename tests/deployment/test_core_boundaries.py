@@ -276,6 +276,18 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
         "core/integrations/google_drive/folder_service.py": {
             "list_folders",
             "get_or_create_folder",
+            "resolve_registered_folder_path",
+            "expand_registered_subtree",
+        },
+        "core/integrations/google_drive/scanner.py": {"scan_root_folder"},
+        "core/integrations/google_drive/changes.py": {
+            "get_start_page_token",
+            "get_drive_changes",
+        },
+        "core/integrations/google_drive/files.py": {
+            "get_file_parent_folder_id",
+            "move_file_to_folder",
+            "rename_file",
         },
         "core/integrations/fastembed/bm25.py": {"get_bm25_model"},
         "core/integrations/firestore/folders.py": {
@@ -288,14 +300,8 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
         assert expected <= _function_nodes(APP_ROOT / relative).keys(), relative
 
     allowed_definitions = {
-        "resolve_folder_path": {
-            "core/integrations/google_drive/folders.py",
-            "core/google_drive/firestore.py",
-        },
-        "expand_subtree": {
-            "core/integrations/google_drive/folders.py",
-            "core/google_drive/firestore.py",
-        },
+        "resolve_folder_path": {"core/integrations/google_drive/folders.py"},
+        "expand_subtree": {"core/integrations/google_drive/folders.py"},
         "make_folder_path_resolver": {"core/integrations/google_drive/folders.py"},
         "build_folder_tree": {"core/integrations/google_drive/folders.py"},
         "list_folders": {
@@ -303,14 +309,8 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
             "core/retrieval/folders.py",
         },
         "get_or_create_folder": {"core/integrations/google_drive/folder_service.py"},
-        "get_all_folders": {
-            "core/integrations/firestore/folders.py",
-            "core/google_drive/firestore.py",
-        },
-        "upsert_folder": {
-            "core/integrations/firestore/folders.py",
-            "core/google_drive/firestore.py",
-        },
+        "get_all_folders": {"core/integrations/firestore/folders.py"},
+        "upsert_folder": {"core/integrations/firestore/folders.py"},
         "get_bm25_model": {"core/integrations/fastembed/bm25.py"},
         "process_one": {"core/indexing/processor.py"},
     }
@@ -324,17 +324,24 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
 
     wrappers = {
         "core/retrieval/folders.py": {"list_folders": "service_list_folders"},
-        "core/google_drive/firestore.py": {
-            "expand_subtree": "_expand_subtree",
-            "resolve_folder_path": "_resolve_folder_path",
-            "get_all_folders": "get_all_folders",
-            "upsert_folder": "upsert_folder",
-        },
     }
     for relative, expected_calls in wrappers.items():
         functions = _function_nodes(APP_ROOT / relative)
         for name, forwarded_call in expected_calls.items():
             assert forwarded_call in _called_names(functions[name]), f"{relative}:{name}"
+
+
+@pytest.mark.offline
+def test_live_runtime_has_no_legacy_google_drive_package_references() -> None:
+    legacy_package = CORE_ROOT / "google_drive"
+    assert not legacy_package.exists()
+    runtime_files = _python_files(CORE_ROOT) + _python_files(APP_ROOT / "services")
+    references = []
+    for path in runtime_files:
+        source = path.read_text(encoding="utf-8")
+        if "core.google_drive" in source or "core/google_drive" in source:
+            references.append(str(path.relative_to(APP_ROOT)))
+    assert not references, "legacy runtime references remain:\n" + "\n".join(references)
 
 
 def test_architecture_test_index_describes_this_file() -> None:

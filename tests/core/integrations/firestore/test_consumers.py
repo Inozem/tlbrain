@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-from core.google_drive import firestore as drive_firestore
 from core.integrations.firestore import folders, transcripts
 from core.integrations.google_drive import folder_service
 
@@ -31,8 +30,8 @@ def test_vector_sync_and_mcp_bind_canonical_repositories(sdk_fakes):
     assert operations.folders is folders
     assert operations.firestore_client.get_client is importlib.import_module("core.integrations.firestore.client").get_client
 
-    assert handler.resolve_folder_path.__module__ == drive_firestore.__name__
-    assert handler.expand_subtree.__module__ == drive_firestore.__name__
+    assert handler.resolve_folder_path is folder_service.resolve_registered_folder_path
+    assert handler.expand_subtree is folder_service.expand_registered_subtree
 
 
 def test_mcp_move_transcript_uses_canonical_unassigned_repositories(monkeypatch):

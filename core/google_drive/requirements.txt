@@ -1,3 +1,0 @@
--r ../integrations/google_auth/requirements.txt
--r ../integrations/google_docs/requirements.txt
--r ../integrations/firestore/requirements.txt

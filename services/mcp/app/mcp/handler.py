@@ -20,7 +20,10 @@ from core.indexing.user_facts import (
 from core.retrieval.run import run_retrieval
 from core.retrieval.transcripts import get_transcripts
 from core.integrations.google_drive import folder_service
-from core.google_drive.firestore import expand_subtree, resolve_folder_path
+from core.integrations.google_drive.folder_service import (
+    expand_registered_subtree as expand_subtree,
+    resolve_registered_folder_path as resolve_folder_path,
+)
 from core.integrations.firestore.transcripts import (
     get_sync_status,
     list_transcripts,

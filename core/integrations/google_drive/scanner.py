@@ -1,24 +1,16 @@
+"""Read-only scans of the configured Google Drive folder tree."""
+
 import logging
 from typing import Any
 
 from core.config import get_root_folder_id
-from core.integrations.google_drive.client import (
-    build_drive_service,
-    build_drive_service_rw,
-)
+from core.integrations.google_drive.client import build_drive_service
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def scan_root_folder() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Top-down BFS from ROOT_FOLDER.
-
-    Returns (live_folders, live_docs):
-      live_folders — [{id, name, parent_id}] for every folder found (excluding ROOT)
-      live_docs    — [{doc_id, name, parent_id, createdTime, modifiedTime}]
-    Cycle detection via visited set; depth is unlimited.
-    """
+    """Top-down BFS from ROOT_FOLDER, returning live folders and Google Docs."""
     service = build_drive_service()
     root_folder_id = get_root_folder_id()
 
@@ -86,62 +78,3 @@ def scan_root_folder() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
     logger.info("Drive scan complete — folders=%d docs=%d", len(live_folders), len(live_docs))
     return live_folders, live_docs
-
-
-def get_start_page_token() -> str:
-    service = build_drive_service()
-    return service.changes().getStartPageToken().execute()["startPageToken"]
-
-
-def get_drive_changes(page_token: str) -> tuple[list[dict], str]:
-    """Fetch all changes since page_token. Returns (changes, new_token)."""
-    service = build_drive_service()
-    changes = []
-    while page_token:
-        response = service.changes().list(
-            pageToken=page_token,
-            fields="nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,mimeType,modifiedTime,parents,trashed))",
-            spaces="drive",
-            includeItemsFromAllDrives=False,
-        ).execute()
-        changes.extend(response.get("changes", []))
-        page_token = response.get("nextPageToken")
-    return changes, response["newStartPageToken"]
-
-
-def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool, str | None]:
-    """Return (parent_folder_id, is_trashed, file_name) for a Drive file.
-
-    is_trashed=True means the file is in trash and should be treated as deleted.
-    """
-    service = build_drive_service()
-    file = service.files().get(fileId=doc_id, fields="name,parents,trashed").execute()
-    logger.info("Drive file metadata for %s: trashed=%s, parents=%s", doc_id, file.get("trashed"), file.get("parents"))
-    if file.get("trashed"):
-        return None, True, None
-    parents = file.get("parents", [])
-    return (parents[0] if parents else None), False, file.get("name")
-
-
-def move_file_to_folder(doc_id: str, new_folder_id: str) -> None:
-    """Move a Drive file to new_folder_id, removing all current parents."""
-    service = build_drive_service_rw()
-    file = service.files().get(fileId=doc_id, fields="parents").execute()
-    old_parents = ",".join(file.get("parents", []))
-    service.files().update(
-        fileId=doc_id,
-        addParents=new_folder_id,
-        removeParents=old_parents,
-        fields="id",
-    ).execute()
-    logger.info("Moved file %s to folder %s", doc_id, new_folder_id)
-
-
-def rename_file(file_id: str, new_name: str) -> None:
-    service = build_drive_service_rw()
-    service.files().update(
-        fileId=file_id,
-        body={"name": new_name},
-        fields="id",
-    ).execute()
-    logger.info("Renamed file %s to '%s'", file_id, new_name)

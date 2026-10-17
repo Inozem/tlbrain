@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 from google.api_core.exceptions import Aborted, NotFound
@@ -9,7 +8,6 @@ from google.cloud.firestore_v1 import client as firestore_client_module
 from google.cloud.firestore_v1.field_path import FieldPath
 from google.cloud.firestore_v1 import _helpers
 
-from core.google_drive import firestore as drive_firestore
 from core.integrations.firestore import transcripts as transcript_repository
 from tests.fixtures.firestore_fake import FakeFirestoreClient
 
@@ -252,9 +250,8 @@ def test_injected_aborted_commit_uses_real_sdk_retry(firestore_fake):
     assert ref.get().to_dict() == {"attempt": 2}
 
 
-def test_per_test_state_reset_and_real_consumer_smoke(firestore_fake, app_root):
+def test_per_test_state_reset_and_real_consumer_smoke(firestore_fake):
     assert firestore_fake.documents == {}
-    assert Path(drive_firestore.__file__).resolve() == (app_root / "core" / "google_drive" / "firestore.py").resolve()
     assert transcript_repository.ensure_imported("smoke", "parent", "source") is True
     assert transcript_repository.acquire_for_syncing("arbitrary-new") is True
     transcript_repository.save_index("smoke", {"nested": {"a": 1}})

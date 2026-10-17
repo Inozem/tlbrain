@@ -6,17 +6,13 @@ from google.cloud import firestore
 from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
-from core.google_drive.drive_client import (
-    get_drive_changes,
-    get_start_page_token,
-    scan_root_folder,
-)
-from core.google_drive.firestore import (
+from core.integrations.google_drive.changes import get_drive_changes, get_start_page_token
+from core.integrations.google_drive.scanner import scan_root_folder
+from core.integrations.firestore.folders import (
     delete_folder,
     get_all_folders,
     get_folder_by_id,
     orphan_folder_children,
-    orphan_transcript_children,
     upsert_folder,
 )
 from core.integrations.firestore.transcripts import (
@@ -24,6 +20,7 @@ from core.integrations.firestore.transcripts import (
     get_stale_syncing,
     get_transcript_record,
     move_transcript_record,
+    orphan_transcript_children,
     stream_index_records,
     update_index,
 )

@@ -14,7 +14,11 @@ from core.integrations.gemini.llm import call_gemini_json
 from core.integrations.google_auth.credentials import credentials
 from core.integrations.google_docs.client import build_docs_service
 from core.integrations.google_docs.writer import create_google_doc
-from core.google_drive.firestore import delete_queued_placeholder, mark_download_error, mark_downloading
+from core.integrations.firestore.transcripts import (
+    delete_queued_placeholder,
+    mark_download_error,
+    mark_downloading,
+)
 from core.utils.logging import configure_logging
 from core.integrations.cloud_tasks.client import enqueue_task
 from tldv_client import tldv_get

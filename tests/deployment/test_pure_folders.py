@@ -18,7 +18,7 @@ def test_pure_folder_module_imports_without_external_sdk_roots():
         [
             "import importlib.abc, sys",
             f"sys.path.insert(0, {str(APP_ROOT)!r})",
-            "blocked = ('google', 'googleapiclient', 'firebase_admin', 'firebase_functions', 'qdrant_client', 'grpc', 'vertexai', 'fastembed', 'core.config', 'core.integrations.firestore', 'core.google_drive')",
+            "blocked = ('google', 'googleapiclient', 'firebase_admin', 'firebase_functions', 'qdrant_client', 'grpc', 'vertexai', 'fastembed', 'core.config', 'core.integrations.firestore')",
             "class RejectSDKImports(importlib.abc.MetaPathFinder):",
             "    def find_spec(self, fullname, path=None, target=None):",
             "        if any(fullname == root or fullname.startswith(root + '.') for root in blocked):",

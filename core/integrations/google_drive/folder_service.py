@@ -13,6 +13,20 @@ from core.integrations.google_drive.folders import (
 )
 
 
+def resolve_registered_folder_path(path: list[str]) -> list[str]:
+    """Resolve a path against the registered folder snapshot, including duplicates."""
+    if not path:
+        return []
+    root_folder_id = get_root_folder_id()
+    all_folders = folder_repository.get_all_folders()
+    return resolve_folder_path(path, all_folders, root_folder_id)
+
+
+def expand_registered_subtree(folder_id: str) -> list[str]:
+    """Expand a registered folder subtree in breadth-first repository order."""
+    return expand_subtree(folder_id, folder_repository.get_all_folders())
+
+
 class FolderOperationError(Exception):
     """Base class for expected folder-domain failures."""
 

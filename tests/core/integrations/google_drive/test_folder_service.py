@@ -39,6 +39,35 @@ class _Drive:
 
 
 @pytest.mark.offline
+def test_registered_folder_helpers_preserve_empty_path_and_repository_order(monkeypatch):
+    calls = []
+    folders = {
+        "first": {"name": "Same", "parent_id": "root"},
+        "second": {"name": "Same", "parent_id": "root"},
+        "child": {"name": "Child", "parent_id": "first"},
+    }
+
+    def fail_root():
+        calls.append("root")
+        return "root"
+
+    monkeypatch.setattr(folder_service, "get_root_folder_id", fail_root)
+    monkeypatch.setattr(
+        folder_service.folder_repository,
+        "get_all_folders",
+        lambda: calls.append("folders") or folders,
+    )
+
+    assert folder_service.resolve_registered_folder_path([]) == []
+    assert calls == []
+    assert folder_service.resolve_registered_folder_path(["Same"]) == ["first", "second"]
+    assert calls == ["root", "folders"]
+    calls.clear()
+    assert folder_service.expand_registered_subtree("first") == ["first", "child"]
+    assert calls == ["folders"]
+
+
+@pytest.mark.offline
 def test_unassigned_registry_hit_has_no_drive_or_firestore_effects(monkeypatch):
     events = []
     monkeypatch.setattr(

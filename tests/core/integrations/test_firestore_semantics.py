@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from core.google_drive import firestore as drive_firestore
 from core.integrations.firestore import folders as folder_repository
 from core.integrations.firestore import sync_state as sync_state_repository
 from core.integrations.firestore import transcripts as transcript_repository
@@ -76,10 +75,9 @@ def test_folder_repository_crud_nullable_parent_and_orphaning(firestore_fake, mo
     assert f"{FOLDERS}/other" not in firestore_fake.documents
 
 
-def test_folder_speaker_index_and_legacy_facade_forwarding(firestore_fake, monkeypatch):
+def test_folder_speaker_index_and_repository_operations(firestore_fake, monkeypatch):
     db = _client(firestore_fake)
     monkeypatch.setattr(folder_repository, "get_client", lambda: db)
-    monkeypatch.setattr(drive_firestore, "_get_db", lambda: db)
     name = "Zoë Speaker"
     key = "s" + hashlib.md5(name.encode("utf-8")).hexdigest()[:12]
     assert folder_repository.speaker_key(name) == key
@@ -96,12 +94,12 @@ def test_folder_speaker_index_and_legacy_facade_forwarding(firestore_fake, monke
     assert firestore_fake.documents[f"{FOLDERS}/speaker-folder"]["speakers"][key] == 2
     assert _writes(firestore_fake, f"{FOLDERS}/speaker-folder")[-1]["operation"] == "update"
 
-    drive_firestore.upsert_folder("facade-folder", "Facade", None)
-    assert drive_firestore.get_folder_by_id("facade-folder")["folder_id"] == "facade-folder"
-    assert drive_firestore.get_all_folders()["facade-folder"]["name"] == "Facade"
+    folder_repository.upsert_folder("facade-folder", "Facade", None, db)
+    assert folder_repository.get_folder_by_id("facade-folder", db)["folder_id"] == "facade-folder"
+    assert folder_repository.get_all_folders(db)["facade-folder"]["name"] == "Facade"
     assert folder_repository.folder_name_exists("Facade", None, db)
-    assert drive_firestore.orphan_folder_children("speaker-folder") == 0
-    drive_firestore.delete_folder("facade-folder")
+    assert folder_repository.orphan_folder_children("speaker-folder", db) == 0
+    folder_repository.delete_folder("facade-folder", db)
     assert f"{FOLDERS}/facade-folder" not in firestore_fake.documents
 
 
@@ -178,7 +176,7 @@ def test_transcript_reads_and_updates_use_injected_client(firestore_fake, monkey
     }
 
 
-def test_transcript_orphaning_updates_direct_children_and_facade_forwards(firestore_fake, monkeypatch):
+def test_transcript_orphaning_updates_direct_children(firestore_fake, monkeypatch):
     db = _client(firestore_fake)
     records = {
         "child-a": {"parent_id": "removed-folder", "status": "synced", "keep": 1},
@@ -197,17 +195,7 @@ def test_transcript_orphaning_updates_direct_children_and_facade_forwards(firest
     assert [event["operation"] for event in _writes(firestore_fake, f"{INDEX}/child-a")] == ["set", "update"]
     assert [event["operation"] for event in _writes(firestore_fake, f"{INDEX}/child-b")] == ["set", "update"]
 
-    monkeypatch.setattr(drive_firestore, "_get_db", lambda: db)
-    delegated = []
-    canonical_orphan = transcript_repository.orphan_transcript_children
-
-    def record_delegation(folder_id, client):
-        delegated.append((folder_id, client))
-        return canonical_orphan(folder_id, client)
-
-    monkeypatch.setattr(transcript_repository, "orphan_transcript_children", record_delegation)
-    assert drive_firestore.orphan_transcript_children("other-folder") == 1
-    assert delegated == [("other-folder", db)]
+    assert transcript_repository.orphan_transcript_children("other-folder", db) == 1
     assert firestore_fake.documents[f"{INDEX}/other"]["parent_id"] is None
 
 
@@ -403,32 +391,32 @@ def test_tldv_placeholder_stage_fields_and_delete(firestore_fake):
     now = datetime(2026, 5, 6, tzinfo=timezone.utc)
     firestore_fake.set_clock(lambda: now)
 
-    assert drive_firestore.write_queued("meeting-a") is True
+    assert transcript_repository.write_queued("meeting-a") is True
     placeholder_path = f"{INDEX}/tldv-meeting-a"
     assert firestore_fake.documents[placeholder_path] == {
         "meeting_id": "meeting-a", "status": "queued", "status_changed_at": now,
     }
     before_repeat_snapshot = firestore_fake.documents[placeholder_path]
     before_repeat_trace = firestore_fake.trace()
-    assert drive_firestore.write_queued("meeting-a") is False
+    assert transcript_repository.write_queued("meeting-a") is False
     assert firestore_fake.documents[placeholder_path] == before_repeat_snapshot
     assert firestore_fake.trace() == before_repeat_trace
 
-    drive_firestore.mark_downloading("meeting-a")
+    transcript_repository.mark_downloading("meeting-a")
     assert firestore_fake.documents[placeholder_path] == {
         "meeting_id": "meeting-a", "status": "downloading", "status_changed_at": now,
     }
-    drive_firestore.mark_download_error("meeting-a", "synthetic download failure")
+    transcript_repository.mark_download_error("meeting-a", "synthetic download failure")
     assert firestore_fake.documents[placeholder_path] == {
         "meeting_id": "meeting-a", "status": "error", "error": "synthetic download failure",
         "error_stage": "import", "status_changed_at": now,
     }
-    assert drive_firestore.write_queued("meeting-a") is True
+    assert transcript_repository.write_queued("meeting-a") is True
     assert firestore_fake.documents[placeholder_path] == {
         "meeting_id": "meeting-a", "status": "queued", "error": None, "error_stage": None,
         "status_changed_at": now,
     }
-    drive_firestore.delete_queued_placeholder("meeting-a")
+    transcript_repository.delete_queued_placeholder("meeting-a")
     assert placeholder_path not in firestore_fake.documents
     relevant = _writes(firestore_fake, placeholder_path)
     assert [event["operation"] for event in relevant] == ["commit", "update", "update", "commit", "delete"]

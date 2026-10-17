@@ -3,9 +3,9 @@
 from dataclasses import dataclass
 
 from core.config import get_root_folder_id
-from core.google_drive.drive_client import move_file_to_folder, rename_file
 from core.integrations.firestore import folders, transcripts
 from core.integrations.firestore import client as firestore_client
+from core.integrations.google_drive.files import move_file_to_folder, rename_file
 from core.integrations.google_drive.folders import resolve_folder_path
 from core.integrations.qdrant.writer import delete_by_doc_id, set_payload_parent_id
 from core.parsing.parser import is_valid_format

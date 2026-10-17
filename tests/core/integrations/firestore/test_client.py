@@ -5,7 +5,6 @@ from unittest.mock import Mock, call
 from google.cloud import firestore
 
 from core.integrations.firestore import client as firestore_client
-from core.google_drive import firestore as legacy_firestore
 
 
 def test_collection_and_document_identifiers_are_preserved():
@@ -23,17 +22,6 @@ def test_get_client_constructs_fresh_default_client_on_each_call(monkeypatch):
 
     assert firestore_client.get_client() is first
     assert firestore_client.get_client() is second
-    assert constructor.call_args_list == [call(), call()]
-
-
-def test_legacy_database_helper_forwards_to_factory(monkeypatch):
-    first = object()
-    second = object()
-    constructor = Mock(side_effect=[first, second])
-    monkeypatch.setattr(firestore, "Client", constructor)
-
-    assert legacy_firestore._get_db() is first
-    assert legacy_firestore._get_db() is second
     assert constructor.call_args_list == [call(), call()]
 
 
