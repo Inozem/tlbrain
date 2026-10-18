@@ -6,27 +6,26 @@ from google.cloud import firestore
 from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
-from core.google_drive.drive_client import (
-    get_drive_changes,
-    get_start_page_token,
-    scan_root_folder,
-)
-from core.google_drive.firestore import (
-    COLLECTION_NAME,
+from core.integrations.google_drive.changes import get_drive_changes, get_start_page_token
+from core.integrations.google_drive.scanner import scan_root_folder
+from core.integrations.firestore.folders import (
     delete_folder,
     get_all_folders,
-    get_drive_sync_token,
-    get_error_docs,
     get_folder_by_id,
-    get_stale_syncing,
-    move_transcript_record,
     orphan_folder_children,
-    orphan_transcript_children,
-    set_drive_sync_token,
-    update_transcript_source_file,
     upsert_folder,
 )
-from core.utils.tasks import enqueue_task
+from core.integrations.firestore.transcripts import (
+    get_error_docs,
+    get_stale_syncing,
+    get_transcript_record,
+    move_transcript_record,
+    orphan_transcript_children,
+    stream_index_records,
+    update_index,
+)
+from core.integrations.firestore.sync_state import get_drive_sync_token, set_drive_sync_token
+from core.integrations.cloud_tasks.client import enqueue_task
 
 from core.utils.logging import configure_logging
 
@@ -52,13 +51,13 @@ def checker(request):
         logger.info("Targeted resync: doc_id=%s", doc_id)
         return {"mode": "doc", "doc_id": doc_id, "queued": 1}, 200
 
-    stale_syncing = get_stale_syncing()
+    stale_syncing = get_stale_syncing(db=db)
     for doc_id in stale_syncing:
         enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
     if stale_syncing:
         logger.info("Re-enqueued stale syncing: %d doc(s)", len(stale_syncing))
 
-    error_docs = get_error_docs()
+    error_docs = get_error_docs(db=db)
     for doc_id in error_docs:
         enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
     if error_docs:
@@ -121,17 +120,16 @@ def _full_scan(
 
     for file in live_docs:
         doc_id = file["doc_id"]
-        snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
-        existing = snapshot.to_dict() if snapshot.exists else None
+        existing = get_transcript_record(doc_id, db=db)
 
         if existing and existing.get("status") in ("queued", "downloading"):
             continue
 
         if existing and file.get("name") and existing.get("source_file") != file["name"]:
-            update_transcript_source_file(doc_id, file["name"])
+            update_index(doc_id, {"source_file": file["name"]}, db=db)
 
         if existing and existing.get("parent_id") and existing.get("parent_id") != file["parent_id"]:
-            move_transcript_record(doc_id, file["parent_id"])
+            move_transcript_record(doc_id, file["parent_id"], db=db)
             existing = None  # force re-enqueue
 
         if (
@@ -153,7 +151,7 @@ def _full_scan(
             queued += 1
 
     # Enqueue orphaned transcript_index records for deletion
-    for doc in db.collection(COLLECTION_NAME).select(["status", "error_stage"]).stream():
+    for doc in stream_index_records(["status", "error_stage"], db=db):
         if doc.id in live_doc_ids:
             continue
         data = doc.to_dict() or {}
@@ -227,15 +225,14 @@ def _process_changes(
         if parent_id != root_folder_id and not get_folder_by_id(parent_id):
             continue
 
-        snapshot = db.collection(COLLECTION_NAME).document(file_id).get()
-        record = snapshot.to_dict() if snapshot.exists else None
+        record = get_transcript_record(file_id, db=db)
 
         file_name = file.get("name")
         if record and file_name and record.get("source_file") != file_name:
-            update_transcript_source_file(file_id, file_name)
+            update_index(file_id, {"source_file": file_name}, db=db)
 
         if record and record.get("parent_id") and record.get("parent_id") != parent_id:
-            move_transcript_record(file_id, parent_id)
+            move_transcript_record(file_id, parent_id, db=db)
 
         if enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{file_id}"):
             queued += 1

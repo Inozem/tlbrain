@@ -123,11 +123,21 @@ def test_local_gate_runs_after_amd64_build_and_before_push_and_deploy(tmp_path: 
     result, events, _path = _sandbox(tmp_path, "local")
 
     assert result.returncode == 0, result.stderr
-    assert events[0] == (
+    expected_build = (
         "docker:build --platform linux/amd64 -f "
         f"{tmp_path / 'repo' / 'infra' / 'docker' / 'Dockerfile.tldv_import'} "
         f"-t gcr.io/synthetic-project/tlbrain-tldv-import {tmp_path / 'repo'}"
     )
+
+    def normalize_path(value: str) -> str:
+        normalized = value.replace("\\", "/")
+        if tmp_path.drive:
+            normalized = normalized.replace(
+                f"/{tmp_path.drive[0].lower()}/", f"{tmp_path.drive.upper()}/"
+            )
+        return normalized
+
+    assert normalize_path(events[0]) == normalize_path(expected_build)
     assert events[1] == (
         "preflight:--image-mode --image gcr.io/synthetic-project/tlbrain-tldv-import "
         "--service tldv_import --platform linux/amd64"

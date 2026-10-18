@@ -3,13 +3,12 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
 from starlette.requests import Request
 
-from services.mcp.app import main
+from services.mcp.app import main, oauth
 from services.mcp.app.mcp import handler
 from services.mcp.app.mcp.schemas import JSONRPCRequest
 
@@ -20,6 +19,7 @@ BASELINE = Path(__file__).resolve().parents[2] / "fixtures" / "mcp_baseline.json
 @pytest.fixture(autouse=True)
 def disable_auth_by_default(monkeypatch):
     monkeypatch.delenv("ALLOWED_EMAIL", raising=False)
+    monkeypatch.delenv("K_SERVICE", raising=False)
 
 
 def _run(coroutine):
@@ -44,10 +44,6 @@ def _request(method: str, path: str, **kwargs):
             return await getattr(client, method)(path, **kwargs)
 
     return _run(request())
-
-
-def _request_with_client(client, method: str, path: str, **kwargs):
-    return _run(getattr(client, method)(path, **kwargs))
 
 
 def _rpc(method: str, request_id: int | str | None = 1, params: dict | None = None) -> dict:
@@ -241,7 +237,7 @@ def test_existing_tool_argument_defaults_and_conversions(monkeypatch):
     assert posted[-1][1]["json"] == {"limit": "4", "full_scan": True, "since": "2025-01-02"}
 
 
-def test_oauth_discovery_and_authorize_params():
+def test_oauth_discovery():
     protected = _request("get", "/.well-known/oauth-protected-resource")
     assert protected.json() == {
         "resource": "http://mcp.test/mcp", "authorization_servers": ["http://mcp.test"]
@@ -253,123 +249,79 @@ def test_oauth_discovery_and_authorize_params():
         "issuer": "http://mcp.test",
         "authorization_endpoint": "http://mcp.test/authorize",
         "token_endpoint": "http://mcp.test/token",
+        "registration_endpoint": "http://mcp.test/register",
+        "token_endpoint_auth_methods_supported": ["none"],
+        "authorization_response_iss_parameter_supported": True,
         "scopes_supported": ["openid", "email", "profile"],
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
     }
 
-    default_scope = _request("get", "/authorize?client_id=synthetic&state=flow-state")
-    assert default_scope.status_code == 307
-    default_params = parse_qs(urlparse(default_scope.headers["location"]).query)
-    assert default_params == {"client_id": ["synthetic"], "state": ["flow-state"], "scope": ["openid email profile"]}
-
-    supplied_scope = _request("get", "/authorize?client_id=synthetic&scope=openid&state=flow-state")
-    supplied_params = parse_qs(urlparse(supplied_scope.headers["location"]).query)
-    assert supplied_params == {"client_id": ["synthetic"], "scope": ["openid"], "state": ["flow-state"]}
-
-    empty_scope = _request("get", "/authorize?client_id=synthetic&scope=&state=flow-state")
-    empty_params = parse_qs(urlparse(empty_scope.headers["location"]).query, keep_blank_values=True)
-    assert empty_params == {"client_id": ["synthetic"], "scope": [""], "state": ["flow-state"]}
-
-
-def test_token_proxy_forwards_body_content_type_status_and_json(monkeypatch):
-    captured = []
-
-    async def mock_request(request):
-        captured.append(request)
-        return httpx.Response(201, json={"access_token": "synthetic-access", "token_type": "Bearer"})
-
-    transport = httpx.MockTransport(mock_request)
-    original = main.httpx.AsyncClient
-
-    def client_with_mock_transport(*args, **kwargs):
-        kwargs["transport"] = transport
-        return original(*args, **kwargs)
-
-    outer = original(transport=httpx.ASGITransport(app=main.app), base_url="http://mcp.test")
-    monkeypatch.setattr(main.httpx, "AsyncClient", client_with_mock_transport)
-    body = b"grant_type=authorization_code&code=synthetic-code"
-    response = _request_with_client(outer, "post", "/token", content=body, headers={"content-type": "application/x-www-form-urlencoded; charset=utf-8"})
-    _run(outer.aclose())
-    assert response.status_code == 201
-    assert response.json() == {"access_token": "synthetic-access", "token_type": "Bearer"}
-    assert len(captured) == 1
-    assert captured[0].url == "https://oauth2.googleapis.com/token"
-    assert captured[0].content == body
-    assert captured[0].headers["content-type"] == "application/x-www-form-urlencoded; charset=utf-8"
-
-
 @pytest.mark.parametrize(
-    ("email", "status", "authorization", "accepted"),
+    ("path", "expected"),
     [
-        ("allowed@example.test", 200, "Bearer synthetic-good", True),
-        ("allowed@example.test", 400, "Bearer synthetic-bad", False),
-        (None, 200, "Bearer synthetic-missing-email", False),
-        ("other@example.test", 200, "Bearer synthetic-wrong-email", False),
-        ("allowed@example.test", 200, None, False),
+        ("/.well-known/oauth-protected-resource", {
+            "resource": "https://mcp.test/mcp", "authorization_servers": ["https://mcp.test"]
+        }),
+        ("/.well-known/oauth-protected-resource/mcp", {
+            "resource": "https://mcp.test/mcp", "authorization_servers": ["https://mcp.test"]
+        }),
+        ("/.well-known/oauth-authorization-server", {
+            "issuer": "https://mcp.test",
+            "authorization_endpoint": "https://mcp.test/authorize",
+            "token_endpoint": "https://mcp.test/token",
+            "registration_endpoint": "https://mcp.test/register",
+            "token_endpoint_auth_methods_supported": ["none"],
+            "authorization_response_iss_parameter_supported": True,
+            "scopes_supported": ["openid", "email", "profile"],
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+        }),
     ],
 )
-def test_mcp_oauth_enabled_branches(monkeypatch, email, status, authorization, accepted):
-    monkeypatch.setenv("ALLOWED_EMAIL", "allowed@example.test")
-    calls = []
-
-    async def mock_request(request):
-        calls.append(request)
-        return httpx.Response(status, json={"email": email} if email is not None else {"expires_in": 3600})
-
-    transport = httpx.MockTransport(mock_request)
-    original = main.httpx.AsyncClient
-
-    def client_with_mock_transport(*args, **kwargs):
-        kwargs["transport"] = transport
-        return original(*args, **kwargs)
-
-    outer = original(transport=httpx.ASGITransport(app=main.app), base_url="http://mcp.test")
-    monkeypatch.setattr(main.httpx, "AsyncClient", client_with_mock_transport)
-    headers = {"authorization": authorization} if authorization else {}
-    response = _request_with_client(outer, "post", "/mcp", json=_rpc("initialize", "auth-id"), headers=headers)
-    _run(outer.aclose())
-    if accepted:
-        assert response.status_code == 200
-        assert response.json()["id"] == "auth-id"
-    else:
-        assert response.status_code == 401
-        assert response.json() == {"error": "Unauthorized"}
-    if authorization:
-        assert len(calls) == 1
-        assert calls[0].url == "https://www.googleapis.com/oauth2/v2/tokeninfo?access_token=" + authorization[7:].replace(" ", "%20")
-    else:
-        assert calls == []
+def test_oauth_discovery_uses_https_on_cloud_run(monkeypatch, path, expected):
+    monkeypatch.setenv("K_SERVICE", "synthetic-service")
+    response = _request("get", path)
+    assert response.status_code == 200
+    assert response.json() == expected
 
 
-def test_mcp_tokeninfo_is_checked_on_every_request(monkeypatch):
-    monkeypatch.setenv("ALLOWED_EMAIL", "allowed@example.test")
-    calls = []
+def test_oauth_discovery_preserves_local_scheme_and_origin_with_forwarded_headers(monkeypatch):
+    monkeypatch.delenv("K_SERVICE", raising=False)
+    request = Request({
+        "type": "http", "method": "GET", "path": "/", "raw_path": b"/",
+        "query_string": b"", "headers": [
+            (b"host", b"mcp.test:8443"),
+            (b"forwarded", b"proto=https;host=spoof.test"),
+            (b"x-forwarded-proto", b"https"),
+            (b"x-forwarded-host", b"spoof.test"),
+        ],
+        "scheme": "http", "server": ("mcp.test", 8443), "client": ("127.0.0.1", 123),
+        "root_path": "/prefix",
+    })
+    assert oauth.base_url(request) == "http://mcp.test:8443/prefix"
+    monkeypatch.setenv("K_SERVICE", "synthetic-service")
+    assert oauth.base_url(request) == "https://mcp.test:8443/prefix"
+    monkeypatch.delenv("K_SERVICE", raising=False)
 
-    async def mock_request(request):
-        calls.append(request)
-        return httpx.Response(200, json={"email": "allowed@example.test"})
+    secure_request = Request({
+        "type": "http", "method": "GET", "path": "/", "raw_path": b"/",
+        "query_string": b"", "headers": [(b"host", b"mcp.test")],
+        "scheme": "https", "server": ("mcp.test", 443), "client": ("127.0.0.1", 123),
+    })
+    assert oauth.base_url(secure_request) == "https://mcp.test"
 
-    transport = httpx.MockTransport(mock_request)
-    original = main.httpx.AsyncClient
 
-    def client_with_mock_transport(*args, **kwargs):
-        kwargs["transport"] = transport
-        return original(*args, **kwargs)
-
-    outer = original(transport=httpx.ASGITransport(app=main.app), base_url="http://mcp.test")
-    monkeypatch.setattr(main.httpx, "AsyncClient", client_with_mock_transport)
-    headers = {"authorization": "Bearer synthetic-no-cache"}
-    first = _request_with_client(outer, "post", "/mcp", json=_rpc("initialize", "first"), headers=headers)
-    second = _request_with_client(outer, "post", "/mcp", json=_rpc("initialize", "second"), headers=headers)
-    _run(outer.aclose())
-
-    assert first.status_code == second.status_code == 200
-    assert [first.json()["id"], second.json()["id"]] == ["first", "second"]
-    assert len(calls) == 2
-    assert calls[0].url == calls[1].url
-    assert str(calls[0].url).startswith("https://www.googleapis.com/oauth2/v2/tokeninfo?")
+def test_oauth_discovery_cloud_run_ignores_forged_forwarded_origin(monkeypatch):
+    monkeypatch.setenv("K_SERVICE", "synthetic-service")
+    response = _request("get", "/.well-known/oauth-authorization-server", headers={
+        "forwarded": "proto=http;host=spoof.test",
+        "x-forwarded-proto": "http",
+        "x-forwarded-host": "spoof.test",
+    })
+    assert response.json()["issuer"] == "https://mcp.test"
 
 
 def test_mcp_auth_is_disabled_when_allowed_email_is_unset(monkeypatch):

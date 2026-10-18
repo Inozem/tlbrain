@@ -215,7 +215,7 @@ def test_success_import_writes_canonical_doc_and_enqueues_named_sync_task(
     folder_id = "folder-alex"
     root_id = "pytest-synthetic-root"
     speaker = "Alex"
-    speaker_key = import_main._speaker_key(speaker)
+    speaker_key = import_main.speaker_key(speaker)
     _seed(firestore_fake, "transcript_index", f"tldv-{meeting_id}", {"meeting_id": meeting_id, "status": "queued"})
     _seed(firestore_fake, "folders", folder_id, {
         "folder_id": folder_id,
@@ -314,6 +314,20 @@ def test_success_import_writes_canonical_doc_and_enqueues_named_sync_task(
         "firestore.placeholder_delete",
         "tasks.create",
     ]
+    docs_build_index = next(
+        index for index, event in enumerate(sdk_fakes.trace)
+        if event["operation"] == "build" and event["arguments"].get("api") == "docs"
+    )
+    drive_create_index = next(
+        index for index, event in enumerate(sdk_fakes.trace)
+        if event["boundary"] == "drive" and event["operation"] == "files.create"
+        and event["arguments"]["body"].get("mimeType") == "application/vnd.google-apps.document"
+    )
+    batch_update_index = next(
+        index for index, event in enumerate(sdk_fakes.trace)
+        if event["boundary"] == "docs" and event["operation"] == "documents.batchUpdate"
+    )
+    assert docs_build_index < drive_create_index < batch_update_index
 
 
 def test_success_without_sync_configuration_keeps_imported_doc_and_skips_task(
@@ -345,3 +359,111 @@ def test_success_without_sync_configuration_keeps_imported_doc_and_skips_task(
     assert response.json() == {"ok": True, "doc_id": doc_id, "meeting_id": meeting_id}
     assert firestore_fake.documents[f"transcript_index/{doc_id}"]["status"] == "imported"
     assert not [entry for entry in sdk_fakes.trace if entry["boundary"] == "tasks" and entry["operation"] == "create_task"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", ("", "")),
+        ("not-a-date", ("", "")),
+        ("2025-02-03T10:15:00+03:00", ("2025-02-03", "10:15")),
+        ("2025-02-03T10:15:00Z", ("2025-02-03", "10:15")),
+    ],
+)
+def test_provider_date_parsing_preserves_iso_fields_without_timezone_conversion(import_main, value, expected):
+    assert import_main._parse_happened_at(value) == expected
+
+
+def test_provider_formatting_preserves_distinct_label_and_storage_semantics(import_main):
+    meeting = {"happenedAt": "invalid"}
+    utterances = [
+        {"speaker": "  Alex::  ", "text": "spoken"},
+        {"speakerName": " Pat:: ", "transcript": "fallback"},
+        {"speaker": "ignored", "text": "", "transcript": ""},
+    ]
+
+    text, ranges = import_main._format_transcript(meeting, utterances)
+
+    assert text == (
+        "DATE: \nTIME: \nPROVIDER: tldv\n---\n"
+        "  Alex   :: spoken\n\n Pat  :: fallback"
+    )
+    assert [text[start:end] for start, end in ranges] == ["  Alex  ", " Pat "]
+    assert import_main._get_speakers(utterances) == ["Alex"]
+
+
+def test_placeholder_speakers_match_supported_english_and_russian_names(import_main):
+    selection = importlib.import_module("services.connectors.tldv.folder_selection")
+
+    assert selection._is_placeholder_speaker("Speaker 1")
+    assert selection._is_placeholder_speaker("СПИКЕР 2")
+    assert selection._is_placeholder_speaker("participant   3")
+    assert selection._is_placeholder_speaker("Участник4")
+    assert not selection._is_placeholder_speaker("speaker")
+    assert not selection._is_placeholder_speaker("Alex 1")
+
+
+def test_speaker_folder_candidates_stop_at_five_unique_ids(import_main, monkeypatch):
+    selection = importlib.import_module("services.connectors.tldv.folder_selection")
+    queried = []
+
+    class Snapshot:
+        def __init__(self, doc_id):
+            self.id = doc_id
+
+        def to_dict(self):
+            return {"name": "Client"}
+
+    def query(speaker, db):
+        queried.append((speaker, db))
+        return [Snapshot(f"folder-{index}") for index in range(7)]
+
+    monkeypatch.setattr(selection, "get_folders_by_speaker", query)
+    db = object()
+
+    candidates, all_ids = selection._get_folders_by_speakers(db, ["Alex"])
+
+    assert queried == [("Alex", db)]
+    assert candidates == []
+    assert all_ids == [f"folder-{index}" for index in range(5)]
+
+
+def test_folder_detection_uses_title_then_first_fifteen_transcript_utterances(import_main, monkeypatch):
+    selection = importlib.import_module("services.connectors.tldv.folder_selection")
+    db = object()
+    folders = {"folder-a": {"name": "Alpha"}, "folder-b": {"name": "Beta"}}
+    seen_db = []
+    prompts = []
+
+    def all_folders(supplied_db):
+        seen_db.append(supplied_db)
+        return folders
+
+    def gemini(prompt):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return {"folder_name": "Alpha", "confidence": 0.79}
+        return {"folder_name": "Beta", "confidence": 0.8}
+
+    monkeypatch.setattr(selection, "get_all_folders", all_folders)
+    monkeypatch.setattr(selection, "get_folders_by_speaker", lambda _speaker, _db: [])
+    utterances = [
+        {"speaker": "Alex", "text": f"line-{index}"} for index in range(15)
+    ] + [
+        {"speaker": "Alex", "text": "line-15"},
+        {"speaker": "Alex", "text": ""},
+    ]
+
+    result = selection._detect_target_folder_id(
+        db, {"name": "Weekly sync"}, utterances, object(), "root", gemini_json=gemini
+    )
+
+    assert result == "folder-b"
+    assert seen_db == [db]
+    assert len(prompts) == 2
+    assert "Meeting name: Weekly sync" in prompts[0]
+    assert "Transcript excerpt:" not in prompts[0]
+    assert "Transcript excerpt:" in prompts[1]
+    assert "Alex: line-0" in prompts[1]
+    assert "Alex: line-14" in prompts[1]
+    assert "line-15" not in prompts[1]

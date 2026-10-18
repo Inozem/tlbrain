@@ -13,12 +13,12 @@ from google.oauth2.credentials import Credentials
 from qdrant_client.models import Distance, SparseVectorParams, VectorParams
 from qdrant_client.http.models.models import QueryResponse, ScoredPoint
 
-from core.gemini import embeddings, llm
-from core.google_drive import drive_client
-from core.google_drive import docs_reader
-from core.qdrant import client as qdrant_client
-from core.qdrant import setup as qdrant_setup
-from core.utils.tasks import enqueue_task
+from core.integrations.gemini import embeddings, llm
+from core.integrations.google_drive import client as drive_client
+from core.integrations.google_docs import reader as docs_reader
+from core.integrations.qdrant import client as qdrant_client
+from core.integrations.qdrant import setup as qdrant_setup
+from core.integrations.cloud_tasks.client import enqueue_task
 from tests.fixtures.sdk_fakes import FakeQdrantClient, fake_discovery_build
 from tests.fixtures import sdk_fakes as sdk_fakes_module
 
@@ -130,7 +130,7 @@ def test_gemini_empty_and_error_responses_remain_observable(sdk_fakes):
         candidates=[types.Candidate(finish_reason=types.FinishReason.SAFETY)]
     ))
     with pytest.raises(llm.GeminiEmptyResponseError):
-        llm._generate_structured(llm._client(), "prompt")
+        llm._generate_structured(llm.make_client(), "prompt")
     sdk_fakes.gemini.queue("embed_content", error=ValueError("scripted Gemini failure"))
     with pytest.raises(ValueError, match="scripted Gemini failure"):
         embeddings.make_client().models.embed_content(model="test", contents=["x"])
@@ -161,10 +161,10 @@ def test_qdrant_startup_uses_real_models_and_queries_are_scripted(sdk_fakes, mon
 
 
 def test_sparse_vectors_are_configurable_and_deterministic(sdk_fakes):
-    from core.retrieval import search
+    from core.integrations.fastembed import bm25
 
     sdk_fakes.sparse.set_vectors("known phrase", [8, 3], [0.5, 0.25])
-    sparse = search._get_bm25_model()
+    sparse = bm25.get_bm25_model()
     first = next(sparse.embed(["known phrase"]))
     second = next(sparse.embed(["known phrase"]))
     assert first.indices.tolist() == second.indices.tolist() == [8, 3]
@@ -176,15 +176,29 @@ def test_sparse_vectors_are_configurable_and_deterministic(sdk_fakes):
 
 def test_cloud_tasks_real_paths_named_duplicates_and_anonymous_tasks(sdk_fakes, monkeypatch):
     monkeypatch.setenv("REGION", "test-region")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "override-project")
     assert enqueue_task("queue", "https://worker.invalid/task", "named", {"x": 1}) is True
     assert enqueue_task("queue", "https://worker.invalid/task", "named", {"x": 1}) is False
     assert enqueue_task("queue", "https://worker.invalid/task") is True
+    assert enqueue_task("queue", "https://worker.invalid/task", body={}) is True
     task_calls = [e for e in sdk_fakes.trace if e["operation"] == "create_task"]
-    assert len(task_calls) == 3
-    assert task_calls[0]["arguments"]["task"]["http_request"]["body"] == b'{"x": 1}'
-    assert task_calls[2]["arguments"]["task"].get("name") is None
-
+    assert len(task_calls) == 4
+    parent = "projects/override-project/locations/test-region/queues/queue"
+    assert all(call["arguments"]["parent"] == parent for call in task_calls)
+    named_path = f"{parent}/tasks/named"
+    assert task_calls[0]["arguments"]["task"]["name"] == named_path
+    request = task_calls[0]["arguments"]["task"]["http_request"]
     from google.cloud import tasks_v2
+    assert request["http_method"] == tasks_v2.HttpMethod.POST
+    assert request["url"] == "https://worker.invalid/task"
+    assert request["headers"] == {"Content-Type": "application/json"}
+    assert request["body"] == b'{"x": 1}'
+    assert task_calls[2]["arguments"]["task"].get("name") is None
+    assert "headers" not in task_calls[2]["arguments"]["task"]["http_request"]
+    empty_request = task_calls[3]["arguments"]["task"]["http_request"]
+    assert empty_request["headers"] == {"Content-Type": "application/json"}
+    assert empty_request["body"] == b"{}"
+
     client = tasks_v2.CloudTasksClient()
     parent = client.queue_path("pytest-synthetic-project", "test-region", "queue")
     request = {"http_request": {"http_method": tasks_v2.HttpMethod.POST, "url": "https://worker.invalid/"}}
@@ -348,16 +362,16 @@ def test_install_and_configure_roll_back_partial_patches(sdk_fakes, monkeypatch)
     conftest.pytest_configure(None)
     active = conftest._saved_sdk_boundaries
     assert active is not None
-    from core.qdrant import client as qdrant_module
-    from core.retrieval import search
+    from core.integrations.qdrant import client as qdrant_module
+    from core.integrations.fastembed import bm25
     qdrant_cache_before = qdrant_module._client
-    sparse_cache_before = search._bm25_model
+    sparse_cache_before = bm25._bm25_model
     fake_module.restore(active)
     assert qdrant_module._client is qdrant_cache_before
-    assert search._bm25_model is sparse_cache_before
+    assert bm25._bm25_model is sparse_cache_before
     fake_module.restore(active)
     assert qdrant_module._client is qdrant_cache_before
-    assert search._bm25_model is sparse_cache_before
+    assert bm25._bm25_model is sparse_cache_before
     assert google.auth._default.default is original_default
     assert genai_client.Client is original_client
     assert qdrant_impl.QdrantClient is original_qdrant

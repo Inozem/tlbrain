@@ -3,9 +3,19 @@ pytest>=8.0
 pytest-asyncio>=0.24
 PyYAML>=6.0
 
-# Common/core dependencies arrive through these service requirement includes.
+# Include every canonical core integration requirement so the full offline
+# regression suite can import the same SDKs used by runtime services.
+-r core/integrations/cloud_tasks/requirements.txt
+-r core/integrations/fastembed/requirements.txt
+-r core/integrations/firestore/requirements.txt
+-r core/integrations/gemini/requirements.txt
+-r core/integrations/google_auth/requirements.txt
+-r core/integrations/google_docs/requirements.txt
+-r core/integrations/google_drive/requirements.txt
+-r core/integrations/qdrant/requirements.txt
+
+# Service requirements still own shared dependencies, frameworks, and pins.
 # The ASGI test httpx dependency (>=0.27) is provided by the MCP manifest.
-# Runtime SDK roots and pins remain owned by each service manifest.
 -r services/mcp/requirements.txt
 -r services/vector_sync/requirements.txt
 -r services/sync_checker/requirements.txt

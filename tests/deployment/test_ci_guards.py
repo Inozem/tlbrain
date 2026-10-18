@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -53,6 +54,25 @@ def _workflow() -> dict[str, object]:
 
 def _steps(job: dict[str, object]) -> list[dict[str, object]]:
     return job["steps"]
+
+
+def _requirement_include_closure(requirements_file: Path) -> set[Path]:
+    included: set[Path] = set()
+    pending = [requirements_file.resolve()]
+    while pending:
+        current = pending.pop()
+        if current in included:
+            continue
+        included.add(current)
+        for raw_line in current.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if parts[0] in {"-r", "--requirement"}:
+                assert len(parts) == 2, f"unsupported requirements include: {line}"
+                pending.append((current.parent / parts[1]).resolve())
+    return included
 
 
 def test_workflow_keeps_on_as_a_mapping_and_validates_relevant_changes() -> None:
@@ -149,6 +169,23 @@ def test_offline_regression_uses_declared_dev_requirements() -> None:
     assert regression["run"] == "python -m pytest -q"
 
 
+def test_dev_requirements_include_all_service_and_provider_roots() -> None:
+    included = _requirement_include_closure(APP_ROOT / "requirements-dev.txt")
+    manifests = json.loads((APP_ROOT / "infra" / "build" / "service-manifests.json").read_text(encoding="utf-8"))
+    providers = json.loads((APP_ROOT / "infra" / "build" / "dependency-providers.json").read_text(encoding="utf-8"))
+    required = {
+        (APP_ROOT / path).resolve()
+        for service in manifests["services"].values()
+        for path in service["requirements_roots"]
+    }
+    required.update(
+        (APP_ROOT / path).resolve()
+        for provider in providers["providers"]
+        for path in provider["requirements_files"]
+    )
+    assert required <= included, sorted(path.relative_to(APP_ROOT).as_posix() for path in required - included)
+
+
 def test_native_smoke_uses_only_synthetic_bootstrap_checks_and_one_function_preflight() -> None:
     job = _workflow()["jobs"]["native-bootstrap-smoke"]
     assert job["runs-on"] == "${{ matrix.os }}"
@@ -166,6 +203,13 @@ def test_native_smoke_uses_only_synthetic_bootstrap_checks_and_one_function_pref
     assert "--confcutdir=tests/deployment" in command
     assert "discovery_fallback_uses_only_gcloud_python_location" in command
     assert "discovery_refresh_token_uses_gcloud_fallback_without_setup_and_preserves_inputs" in command
+    compatibility = next(
+        step for step in steps
+        if step.get("name") == "Exercise runner compatibility through ordinary deploy routes"
+    )
+    assert compatibility["env"]["TLBRAIN_RUN_BASH_TESTS_ON_WINDOWS"] == "1"
+    assert "tests/deployment/test_runner_compatibility.py" in compatibility["run"]
+    assert "--confcutdir=tests/deployment" in compatibility["run"]
     preflight = next(step for step in steps if step.get("name") == "Validate a lightweight Function on the prepared host")
     assert preflight["shell"] == "bash"
     assert "--service sync_checker" in preflight["run"]

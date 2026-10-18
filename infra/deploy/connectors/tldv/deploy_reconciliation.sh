@@ -24,10 +24,25 @@ IMPORT_SERVICE_URL=$(gcloud run services describe "${TLDV_IMPORT_SERVICE_NAME}" 
   --format='value(status.url)')
 
 ARTIFACT="${REPO_ROOT}/.build/tldv_reconciliation"
-"${REPO_ROOT}/infra/build/preflight.sh" \
+if PREFLIGHT_RESULT=$(bash "${REPO_ROOT}/infra/build/preflight.sh" \
   --service tldv_reconciliation \
   --source-root "${REPO_ROOT}" \
-  --output "${ARTIFACT}"
+  --output "${ARTIFACT}"); then
+  :
+else
+  PREFLIGHT_STATUS=$?
+  printf '%s\n' "${PREFLIGHT_RESULT}"
+  exit "${PREFLIGHT_STATUS}"
+fi
+printf '%s\n' "${PREFLIGHT_RESULT}"
+ARTIFACT_FINGERPRINT=$(printf '%s\n' "${PREFLIGHT_RESULT}" | sed -n 's/^Artifact fingerprint: //p')
+if [[ ! "${ARTIFACT_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "preflight: missing successful artifact fingerprint; refusing Function upload" >&2
+  exit 1
+fi
+bash "${REPO_ROOT}/infra/build/preflight.sh" --verify-source \
+  --artifact "${ARTIFACT}" \
+  --fingerprint "${ARTIFACT_FINGERPRINT}"
 
 gcloud functions deploy "${TLDV_RECONCILIATION_FUNCTION_NAME}" \
   --gen2 \

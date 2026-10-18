@@ -1,21 +1,6 @@
 from typing import Any, Callable
 
-
-def make_folder_path_resolver(all_folders: dict) -> Callable[[str], str]:
-    """Build a resolver that walks parent_id chain to produce a human-readable path."""
-    def resolve(parent_id: str) -> str:
-        path_parts: list[str] = []
-        fid = parent_id
-        visited: set[str] = set()
-        while fid and fid not in visited:
-            visited.add(fid)
-            data = all_folders.get(fid, {})
-            name = data.get("name", "")
-            if name:
-                path_parts.append(name)
-            fid = data.get("parent_id", "")
-        return "/".join(reversed(path_parts))
-    return resolve
+from core.integrations.google_drive.folders import make_folder_path_resolver
 
 
 def build_segments(

@@ -1,12 +1,10 @@
-import json
 from copy import deepcopy
 
 from google.genai import types
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, PointStruct, SparseVector
 
-from core.qdrant import writer
-from services.mcp.app.mcp.handler import handle_tools_call
-from services.mcp.app.mcp.schemas import JSONRPCRequest
+from core.indexing.user_facts import add_user_fact
+from core.integrations.qdrant import writer
 
 
 COLLECTION = "tldv_vectors"
@@ -170,7 +168,7 @@ def test_delete_and_payload_mutation_filters_keep_exact_scope(sdk_fakes):
     assert all(event["arguments"].get("collection_name") == COLLECTION for event in events)
 
 
-def test_add_fact_handler_upserts_versionless_user_fact_with_real_embedding(sdk_fakes, firestore_fake):
+def test_add_user_fact_upserts_versionless_fact_with_real_embedding(sdk_fakes, firestore_fake):
     doc_id = "synthetic-doc-fact"
     firestore_fake.client_class().collection("transcript_index").document(doc_id).set({
         "status": "synced",
@@ -181,17 +179,7 @@ def test_add_fact_handler_upserts_versionless_user_fact_with_real_embedding(sdk_
     sdk_fakes.gemini.queue("embed_content", response=types.EmbedContentResponse(
         embeddings=[types.ContentEmbedding(values=[0.25] * 768)]
     ))
-    request = JSONRPCRequest(
-        jsonrpc="2.0",
-        id="add-fact-1",
-        method="tools/call",
-        params={"name": "add_fact", "arguments": {"doc_id": f" {doc_id} ", "text": "  Remember Tuesday.  "}},
-    )
-
-    response = handle_tools_call(request)
-    assert response["id"] == "add-fact-1"
-    assert "error" not in response
-    assert json.loads(response["result"]["content"][0]["text"]) == {"status": "ok", "doc_id": doc_id}
+    assert add_user_fact(f" {doc_id} ", "  Remember Tuesday.  ") == doc_id
     trace = sdk_fakes.trace
     embed_call = next(event["arguments"] for event in trace if event["boundary"] == "gemini" and event["operation"] == "embed_content")
     assert embed_call["model"] == "gemini-embedding-2"

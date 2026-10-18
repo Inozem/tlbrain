@@ -26,7 +26,6 @@ import pytest
 APP_ROOT = Path(__file__).resolve().parents[2]
 BUILD_DIR = APP_ROOT / "infra" / "build"
 RUNNER = BUILD_DIR / "bootstrap_runner.py"
-POWERSHELL_ADAPTER = BUILD_DIR / "bootstrap_runner.ps1"
 LOCK = BUILD_DIR / "runner-toolchain.json"
 FIXTURES = Path(__file__).parent / "fixtures" / "toolchain"
 
@@ -997,25 +996,3 @@ def test_windows_paths_reject_root_escape_deterministically() -> None:
     runner = _runner()
     with pytest.raises((ValueError, RuntimeError), match="(?i)(outside|escape|relative|path)"):
         runner.normalize_windows_path(r"C:\cache\..\..\Windows\python.exe", root=r"C:\cache")
-
-
-def test_powershell_adapter_forwards_paths_as_arguments_and_propagates_failure(
-    tmp_path: Path,
-) -> None:
-    """Contract: adapter exposes an invocation helper; fake process boundary only."""
-    runner = _runner()
-    calls: list[list[str]] = []
-
-    def run(argv: list[str], **_kwargs: Any) -> SimpleNamespace:
-        calls.append(list(argv))
-        return SimpleNamespace(returncode=7, stdout="", stderr="actionable synthetic failure")
-
-    with pytest.raises((RuntimeError, SystemExit), match="(?i)(synthetic failure|7|bootstrap)"):
-        runner.invoke_powershell_adapter(
-            POWERSHELL_ADAPTER,
-            [r"C:\Build Area\cache", "--offline"],
-            process_runner=run,
-        )
-    assert len(calls) == 1
-    assert r"C:\Build Area\cache" in calls[0]
-

@@ -8,10 +8,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from core.google_drive import firestore as firestore_service
+from core.integrations.firestore import transcripts as transcript_repository
 from core.parsing.parser import parse_document
-from services.vector_sync.app import processor
-from services.vector_sync.app.hashing import sha256_text, sha256_utterance
+from core.indexing import processor
+from core.indexing.hashing import sha256_text, sha256_utterance
 
 
 DOC_ID = "synthetic-skip-claim-doc"
@@ -161,7 +161,7 @@ def test_claim_fresh_stale_cutoff_and_missing_document_use_transactional_sdk(
         def now(_tz=None):
             return NOW
 
-    monkeypatch.setattr(firestore_service, "datetime", FrozenDatetime)
+    monkeypatch.setattr(transcript_repository, "datetime", FrozenDatetime)
     ref = firestore_fake.client_class().collection("transcript_index").document(DOC_ID)
     fresh_record = {
         "doc_id": DOC_ID,
@@ -184,13 +184,13 @@ def test_claim_fresh_stale_cutoff_and_missing_document_use_transactional_sdk(
     assert not any(event["operation"] == "commit" and event.get("outcome") == "committed" for event in firestore_fake.trace())
 
     ref.update({"status_changed_at": NOW - timedelta(minutes=15)})
-    assert firestore_service.acquire_for_syncing(DOC_ID) is True
+    assert transcript_repository.acquire_for_syncing(DOC_ID) is True
     assert firestore_fake.documents[INDEX_PATH]["status"] == "syncing"
     assert firestore_fake.documents[INDEX_PATH]["status_changed_at"] == NOW
     assert [event for event in firestore_fake.trace() if event["operation"] == "commit" and event.get("outcome") == "committed"]
 
     missing_id = "synthetic-missing-claim-doc"
-    assert firestore_service.acquire_for_syncing(missing_id) is True
+    assert transcript_repository.acquire_for_syncing(missing_id) is True
     assert firestore_fake.documents[f"transcript_index/{missing_id}"] == {
         "doc_id": missing_id, "status": "syncing", "status_changed_at": NOW,
     }
@@ -206,7 +206,7 @@ def test_competing_claims_conflict_retry_and_only_one_wins(firestore_fake, monke
         def now(_tz=None):
             return NOW
 
-    monkeypatch.setattr(firestore_service, "datetime", FrozenDatetime)
+    monkeypatch.setattr(transcript_repository, "datetime", FrozenDatetime)
     barrier = threading.Barrier(2)
     first_reads_lock = threading.Lock()
     first_reads = 0
@@ -227,7 +227,7 @@ def test_competing_claims_conflict_retry_and_only_one_wins(firestore_fake, monke
     monkeypatch.setattr(FakeTransaction, "_read", synchronized_read)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(firestore_service.acquire_for_syncing, DOC_ID) for _ in range(2)]
+        futures = [pool.submit(transcript_repository.acquire_for_syncing, DOC_ID) for _ in range(2)]
         results = [future.result(timeout=10) for future in futures]
 
     assert sorted(results) == [False, True]

@@ -1,13 +1,16 @@
+from collections.abc import Callable
 from typing import Any
 
-from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, Range
-
 from core.config import get_root_folder_id
-from core.google_drive.firestore import expand_subtree, get_all_folders, resolve_folder_path
-from core.qdrant.client import get_client
-from core.qdrant.schema import get_collection_name
+from core.integrations.firestore.folders import get_all_folders
+from core.integrations.google_drive.folders import (
+    expand_subtree,
+    make_folder_path_resolver,
+    resolve_folder_path,
+)
+from core.integrations.qdrant import reader
 from core.retrieval.pipeline import dedup_and_sort
-from core.retrieval.segments import build_segments, make_folder_path_resolver
+from core.retrieval.segments import build_segments
 
 
 def get_transcripts(
@@ -19,79 +22,119 @@ def get_transcripts(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     resolve_path = None
     if doc_id is not None:
-        utterances = _scroll_by_doc_id(doc_id)
+        utterances, resolve_path = _load_doc_transcripts(doc_id)
     elif folder_path is not None:
-        terminal_ids = resolve_folder_path(folder_path)
-        if not terminal_ids:
-            return [], {
-                "truncated": False,
-                "total_matches": 0,
-                "returned_segments": 0,
-                "limit_reason": "no_results",
-                "suggestion": f"Folder not found: {'/'.join(folder_path)}",
-            }
-        folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
-        all_folders = get_all_folders()
-        resolve_path = make_folder_path_resolver(all_folders)
-        utterances = _scroll_by_folder(folder_ids, date_from, date_to)
+        folder_result = _load_folder_transcripts(folder_path, date_from, date_to)
+        if folder_result is None:
+            return [], _empty_metadata(f"Folder not found: {'/'.join(folder_path)}")
+        utterances, resolve_path = folder_result
     else:
-        return [], {
-            "truncated": False,
-            "total_matches": 0,
-            "returned_segments": 0,
-            "limit_reason": "no_results",
-            "suggestion": "Provide doc_id or folder_path.",
-        }
+        return [], _empty_metadata("Provide doc_id or folder_path.")
 
     if not utterances:
-        return [], {
-            "truncated": False,
-            "total_matches": 0,
-            "returned_segments": 0,
-            "limit_reason": "no_results",
-            "suggestion": "No data found for the given period or folder.",
-        }
+        return [], _empty_metadata("No data found for the given period or folder.")
 
-    docs: dict[str, list[dict[str, Any]]] = {}
-    for u in utterances:
-        docs.setdefault(u["doc_id"], []).append(u)
-
-    sorted_docs = sorted(
-        docs.items(),
-        key=lambda x: x[1][0].get("dialog_date", "") if x[1] else "",
-        reverse=True,
-    )
-
+    sorted_docs = _group_and_sort_documents(utterances)
     total_docs = len(sorted_docs)
     top_docs = sorted_docs[:limit]
     truncated = total_docs > limit
+    result_segments = _build_selected_segments(top_docs, resolve_path)
+    meta = _build_metadata(total_docs, len(result_segments), truncated)
 
+    return result_segments, meta
+
+
+def _load_doc_transcripts(
+    doc_id: str,
+) -> tuple[list[dict[str, Any]], Callable[[str], str] | None]:
+    utterances = _scroll_by_doc_id(doc_id)
+    if not utterances:
+        return utterances, None
+    return utterances, _load_doc_path_resolver()
+
+
+def _load_doc_path_resolver() -> Callable[[str], str]:
+    all_folders = get_all_folders()
+    return make_folder_path_resolver(all_folders, get_root_folder_id())
+
+
+def _load_folder_transcripts(
+    folder_path: list[str],
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[list[dict[str, Any]], Callable[[str], str]] | None:
+    if not folder_path:
+        return None
+
+    all_folders = get_all_folders()
+    root_folder_id = get_root_folder_id()
+    terminal_ids = resolve_folder_path(folder_path, all_folders, root_folder_id)
+    if not terminal_ids:
+        return None
+
+    folder_ids = [
+        folder_id
+        for terminal_id in terminal_ids
+        for folder_id in expand_subtree(terminal_id, all_folders)
+    ]
+    resolve_path = make_folder_path_resolver(all_folders, root_folder_id)
+    utterances = _scroll_by_folder(folder_ids, date_from, date_to)
+    return utterances, resolve_path
+
+
+def _group_and_sort_documents(
+    utterances: list[dict[str, Any]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    docs: dict[str, list[dict[str, Any]]] = {}
+    for utterance in utterances:
+        docs.setdefault(utterance["doc_id"], []).append(utterance)
+    return sorted(
+        docs.items(),
+        key=lambda item: item[1][0].get("dialog_date", "") if item[1] else "",
+        reverse=True,
+    )
+
+
+def _build_selected_segments(
+    documents: list[tuple[str, list[dict[str, Any]]]],
+    resolve_path: Callable[[str], str] | None,
+) -> list[dict[str, Any]]:
     result_segments = []
-    for doc_id_key, doc_utterances in top_docs:
+    for doc_id, doc_utterances in documents:
         sorted_utterances = dedup_and_sort(doc_utterances)
         if not sorted_utterances:
             continue
         min_idx = sorted_utterances[0]["order_index"]
         max_idx = sorted_utterances[-1]["order_index"]
-        result_segments.append(build_segments(doc_id_key, [[min_idx, max_idx]], sorted_utterances, resolve_path))
+        result_segments.append(
+            build_segments(doc_id, [[min_idx, max_idx]], sorted_utterances, resolve_path)
+        )
+    return result_segments
 
+
+def _empty_metadata(suggestion: str) -> dict[str, Any]:
+    return {
+        "truncated": False,
+        "total_matches": 0,
+        "returned_segments": 0,
+        "limit_reason": "no_results",
+        "suggestion": suggestion,
+    }
+
+
+def _build_metadata(total_docs: int, returned_segments: int, truncated: bool) -> dict[str, Any]:
     meta: dict[str, Any] = {
         "truncated": truncated,
         "total_matches": total_docs,
-        "returned_segments": len(result_segments),
+        "returned_segments": returned_segments,
     }
     if truncated:
         meta["suggestion"] = "Use limit or narrow down the period to retrieve more transcripts."
-
-    return result_segments, meta
+    return meta
 
 
 def _scroll_by_doc_id(doc_id: str) -> list[dict[str, Any]]:
-    return _scroll_all(Filter(must=[
-        FieldCondition(key="type", match=MatchValue(value="utterance")),
-        FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
-        FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
-    ]))
+    return reader.fetch_utterances_by_doc_id(doc_id)
 
 
 def _scroll_by_folder(
@@ -99,41 +142,4 @@ def _scroll_by_folder(
     date_from: str | None,
     date_to: str | None,
 ) -> list[dict[str, Any]]:
-    must: list[FieldCondition] = [
-        FieldCondition(key="type", match=MatchValue(value="utterance")),
-        FieldCondition(key="parent_id", match=MatchAny(any=folder_ids)),
-        FieldCondition(key="root_folder_id", match=MatchValue(value=get_root_folder_id())),
-    ]
-
-    date_range: dict[str, int] = {}
-    if date_from:
-        date_range["gte"] = int(date_from.replace("-", ""))
-    if date_to:
-        date_range["lte"] = int(date_to.replace("-", ""))
-    if date_range:
-        must.append(FieldCondition(key="dialog_date_num", range=Range(**date_range)))
-
-    return _scroll_all(Filter(must=must))
-
-
-def _scroll_all(scroll_filter: Filter) -> list[dict[str, Any]]:
-    utterances: list[dict[str, Any]] = []
-    offset = None
-
-    while True:
-        results, next_offset = get_client().scroll(
-            collection_name=get_collection_name(),
-            scroll_filter=scroll_filter,
-            limit=1000,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for point in results:
-            if point.payload:
-                utterances.append(point.payload)
-        if next_offset is None:
-            break
-        offset = next_offset
-
-    return utterances
+    return reader.fetch_utterances_by_folder(folder_ids, date_from, date_to)

@@ -364,9 +364,10 @@ class FakeQuery:
             filter = firestore.FieldFilter(field_path, op_string, value)
         field = getattr(filter, "field_path", None)
         op = getattr(filter, "op_string", None)
-        if not field or op not in {"==", ">", ">=", "<", "<=", "!="}:
+        op_name = getattr(op, "name", op)
+        if not field or op_name not in {"==", ">", ">=", "<", "<=", "!=", "IS_NULL"}:
             raise NotImplementedError(f"Unsupported Firestore filter: {filter!r}")
-        return FakeQuery(self.collection, self.filters + ((field, op, _copy(filter.value)),), self.projection, self.max_results)
+        return FakeQuery(self.collection, self.filters + ((field, op_name, _copy(filter.value)),), self.projection, self.max_results)
 
     def select(self, field_paths: list[str]) -> "FakeQuery":
         if not isinstance(field_paths, (list, tuple)):
@@ -409,6 +410,7 @@ def _matches(data: dict[str, Any], path: str, op: str, expected: Any) -> bool:
         return False
     try:
         return {"==": lambda: actual == expected, "!=": lambda: actual != expected,
+                "IS_NULL": lambda: actual is None,
                 ">": lambda: actual > expected, ">=": lambda: actual >= expected,
                 "<": lambda: actual < expected, "<=": lambda: actual <= expected}[op]()
     except TypeError:

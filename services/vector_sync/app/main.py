@@ -5,15 +5,14 @@ from fastapi.responses import JSONResponse
 from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
-from core.google_drive.docs_reader import read_google_doc
-from core.google_drive.drive_client import get_file_parent_folder_id
-from core.google_drive.firestore import ensure_imported, get_folder_by_id, mark_error
-from core.parsing.parser import is_valid_format
-from core.qdrant.setup import ensure_collection
-from core.qdrant.writer import delete_by_doc_id
+from core.integrations.google_docs.reader import read_google_doc
+from core.integrations.google_drive.files import get_file_parent_folder_id
+from core.integrations.firestore.folders import get_folder_by_id
+from core.integrations.firestore.transcripts import ensure_imported, load_index
+from core.documents import operations as document_operations
+from core.integrations.qdrant.setup import ensure_collection
 from core.utils.logging import configure_logging
-from services.vector_sync.app.index_store import delete_index, load_index
-from services.vector_sync.app.processor import process_one
+from core.indexing.processor import process_one
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -58,16 +57,12 @@ async def sync_doc_endpoint(doc_id: str):
                 return JSONResponse(content={"status": "ok", "result": "skipped_no_folder"})
 
     if should_delete:
-        if existing:
-            delete_by_doc_id(doc_id, root_folder_id)
-            delete_index(doc_id)
+        document_operations.delete_indexed_transcript(doc_id, root_folder_id, bool(existing))
         return JSONResponse(content={"status": "ok", "result": "deleted"})
 
     raw_text = read_google_doc(doc_id)
-    if not is_valid_format(raw_text):
+    if not document_operations.validate_document_format(doc_id, raw_text, bool(existing)):
         logger.warning("File does not match TLBrain format, skipping: %s", doc_id)
-        if existing:
-            mark_error(doc_id, "invalid TLBrain document format", error_stage="invalid_format")
         return JSONResponse(content={"status": "ok", "result": "skipped_invalid_format"})
 
     ensure_imported(doc_id, parent_id, source_file=file_name or "")

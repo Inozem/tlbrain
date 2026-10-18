@@ -155,28 +155,6 @@ def discover_bootstrap_interpreter(
     raise RuntimeError("no bootstrap interpreter found; provide Python or make gcloud available")
 
 
-def invoke_powershell_adapter(
-    adapter_path: os.PathLike[str] | str,
-    args: list[os.PathLike[str] | str] | tuple[os.PathLike[str] | str, ...],
-    process_runner: Callable[..., Any],
-) -> Any:
-    """Invoke the PowerShell adapter using an argv vector and report failures."""
-    argv = [
-        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass", "-File", os.fspath(adapter_path), "--",
-        *(os.fspath(argument) for argument in args),
-    ]
-    try:
-        result = process_runner(argv, capture_output=True, text=True, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"PowerShell bootstrap adapter could not start: {exc}") from exc
-    if getattr(result, "returncode", 1) != 0:
-        detail = str(getattr(result, "stderr", "")).strip() or str(getattr(result, "stdout", "")).strip()
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"PowerShell bootstrap adapter failed with exit code {result.returncode}{suffix}")
-    return result
-
-
 def _is_reparse_point(path: Path) -> bool:
     try:
         info = path.lstat()
@@ -727,6 +705,19 @@ def _artifact_fingerprint(artifact: Path) -> str:
     return digest.hexdigest()
 
 
+def verify_source_artifact(artifact: os.PathLike[str] | str, expected_fingerprint: str) -> str:
+    """Reject a staged Function source tree that changed after validation."""
+    path = Path(artifact)
+    if not path.is_absolute() or not path.is_dir():
+        raise ValueError("--artifact must be an absolute directory")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint):
+        raise ValueError("--fingerprint must be a SHA-256 fingerprint")
+    actual = _artifact_fingerprint(path)
+    if actual != expected_fingerprint:
+        raise RuntimeError("source artifact changed after validation; refusing deployment")
+    return actual
+
+
 def _is_inside(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -856,11 +847,22 @@ def run_preflight(service: str, source_root: os.PathLike[str] | str, output: os.
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare and validate one service artifact without publishing it.")
-    parser.add_argument("--service", required=True)
-    parser.add_argument("--source-root", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--verify-source", action="store_true", help="verify a Function source artifact against its validation fingerprint")
+    parser.add_argument("--artifact", type=Path)
+    parser.add_argument("--fingerprint")
+    parser.add_argument("--service")
+    parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.verify_source:
+            if args.artifact is None or args.fingerprint is None:
+                parser.error("--verify-source requires --artifact and --fingerprint")
+            verified = verify_source_artifact(args.artifact, args.fingerprint)
+            print(f"Source artifact fingerprint verified: {verified}")
+            return 0
+        if args.service is None or args.source_root is None or args.output is None:
+            parser.error("preflight requires --service, --source-root, and --output")
         return run_preflight(args.service, args.source_root, args.output)
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"preflight: {exc}", file=sys.stderr)

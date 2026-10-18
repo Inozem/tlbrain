@@ -10,8 +10,8 @@ import pytest
 from google.genai import types
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
-from core.qdrant import writer
-from services.vector_sync.app import processor
+from core.integrations.qdrant import writer
+from core.indexing import processor
 
 
 DOC_ID = "synthetic-doc-main"

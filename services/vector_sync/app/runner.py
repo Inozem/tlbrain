@@ -2,16 +2,17 @@ import logging
 
 from google.cloud import firestore as firestore_module
 
-from core.google_drive.firestore import list_imported, upsert_folder
+from core.integrations.firestore.folders import upsert_folder
 from core.config import get_root_folder_id
-from core.google_drive.drive_client import scan_root_folder
-from services.vector_sync.app.index_store import (
+from core.integrations.google_drive.scanner import scan_root_folder
+from core.integrations.firestore.transcripts import (
     delete_index,
     list_all_index_ids,
+    list_imported,
     load_index,
     save_index,
 )
-from services.vector_sync.app.processor import process_one
+from core.indexing.processor import process_one
 
 logger = logging.getLogger(__name__)
 

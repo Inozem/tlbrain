@@ -7,7 +7,8 @@ import pytest
 from googleapiclient.errors import HttpError
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-from core.qdrant import client as qdrant_client
+from core.integrations.qdrant import client as qdrant_client
+from core.documents import operations as document_operations
 from tests.fixtures.sdk_fakes import FakeQdrantClient
 
 
@@ -66,7 +67,7 @@ def test_route_wraps_each_success_result(vector_main, monkeypatch, result):
     monkeypatch.setattr(vector_main, "get_file_parent_folder_id", lambda _doc_id: ("folder-1", False, "sample.docx"))
     monkeypatch.setattr(vector_main, "get_folder_by_id", lambda _folder_id: {"folder_id": "folder-1"})
     monkeypatch.setattr(vector_main, "read_google_doc", lambda _doc_id: "synthetic transcript")
-    monkeypatch.setattr(vector_main, "is_valid_format", lambda _text: True)
+    monkeypatch.setattr(document_operations, "validate_document_format", lambda *_args: True)
     monkeypatch.setattr(vector_main, "ensure_imported", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(vector_main, "process_one", lambda *_args, **_kwargs: result)
 
@@ -81,7 +82,7 @@ def test_process_one_exception_has_controlled_http_500(vector_main, monkeypatch)
     monkeypatch.setattr(vector_main, "get_file_parent_folder_id", lambda _doc_id: ("folder-1", False, "sample.docx"))
     monkeypatch.setattr(vector_main, "get_folder_by_id", lambda _folder_id: {"folder_id": "folder-1"})
     monkeypatch.setattr(vector_main, "read_google_doc", lambda _doc_id: "synthetic transcript")
-    monkeypatch.setattr(vector_main, "is_valid_format", lambda _text: True)
+    monkeypatch.setattr(document_operations, "validate_document_format", lambda *_args: True)
     monkeypatch.setattr(vector_main, "ensure_imported", lambda *_args, **_kwargs: None)
 
     def fail(*_args, **_kwargs):
@@ -174,7 +175,7 @@ def test_invalid_format_only_marks_error_for_existing_index(vector_main, firesto
     monkeypatch.setattr(vector_main, "get_file_parent_folder_id", lambda _doc_id: ("folder-1", False, "sample.docx"))
     monkeypatch.setattr(vector_main, "get_folder_by_id", lambda _folder_id: {"folder_id": "folder-1"})
     monkeypatch.setattr(vector_main, "read_google_doc", lambda _doc_id: "bad format")
-    monkeypatch.setattr(vector_main, "is_valid_format", lambda _text: False)
+    monkeypatch.setattr(document_operations, "is_valid_format", lambda _text: False)
 
     response = _request(vector_main.app, doc_id)
 

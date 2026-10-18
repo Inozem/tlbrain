@@ -1,0 +1,1 @@
+"""FastEmbed integration dependency package."""
