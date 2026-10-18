@@ -155,28 +155,6 @@ def discover_bootstrap_interpreter(
     raise RuntimeError("no bootstrap interpreter found; provide Python or make gcloud available")
 
 
-def invoke_powershell_adapter(
-    adapter_path: os.PathLike[str] | str,
-    args: list[os.PathLike[str] | str] | tuple[os.PathLike[str] | str, ...],
-    process_runner: Callable[..., Any],
-) -> Any:
-    """Invoke the PowerShell adapter using an argv vector and report failures."""
-    argv = [
-        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass", "-File", os.fspath(adapter_path), "--",
-        *(os.fspath(argument) for argument in args),
-    ]
-    try:
-        result = process_runner(argv, capture_output=True, text=True, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"PowerShell bootstrap adapter could not start: {exc}") from exc
-    if getattr(result, "returncode", 1) != 0:
-        detail = str(getattr(result, "stderr", "")).strip() or str(getattr(result, "stdout", "")).strip()
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"PowerShell bootstrap adapter failed with exit code {result.returncode}{suffix}")
-    return result
-
-
 def _is_reparse_point(path: Path) -> bool:
     try:
         info = path.lstat()
