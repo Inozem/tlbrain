@@ -114,13 +114,7 @@ def _write_fakes(root: Path, tmp_path: Path, *, runner_status: int) -> tuple[Pat
         # without inheriting the host's python3 candidate.
         shell_link = bin_dir / "bash"
         shell_link.symlink_to(bash_executable)
-        dirname = bin_dir / "dirname"
-        dirname.write_text(
-            "#!/usr/bin/env bash\ncase \"$1\" in */*) printf '%s\\n' \"${1%/*}\" ;; *) printf '.\\n' ;; esac\n",
-            encoding="utf-8",
-        )
-        dirname.chmod(0o755)
-        for utility in ("sed", "grep", "xargs"):
+        for utility in ("dirname", "sed", "grep", "xargs", "echo"):
             executable = shutil.which(utility)
             if not executable:
                 pytest.fail(f"required POSIX shell utility {utility!r} is unavailable")
@@ -139,6 +133,10 @@ def test_sync_checker_route_uses_gcloud_bootstrap_fallback_before_cloud_send(
     """The ordinary route preserves a spaced interpreter path and stops on gate failure."""
     bash = _bash()
     checkout = _copy_route(tmp_path)
+    preflight = checkout / "infra" / "build" / "preflight.sh"
+    if os.name != "nt":
+        preflight.chmod(0o644)
+        assert preflight.stat().st_mode & 0o111 == 0
     events, isolated_path = _write_fakes(checkout, tmp_path, runner_status=runner_status)
     interpreter = tmp_path / "Build Area" / "bootstrap python"
     environment = {
@@ -188,7 +186,7 @@ def test_sync_checker_route_uses_gcloud_bootstrap_fallback_before_cloud_send(
     invoked_executable, bootstrap_args = bootstrap_entries[0]
     assert invoked_executable == _path_for_bash(interpreter)
     assert "Build Area" in invoked_executable
-    assert "bootstrap_runner.py" in bootstrap_args
+    assert _path_for_bash(checkout / "infra" / "build" / "bootstrap_runner.py") in bootstrap_args
     assert "--service sync_checker" in bootstrap_args
     assert _path_for_bash(checkout) in bootstrap_args
     if not runner_status:
@@ -217,6 +215,10 @@ def test_sync_checker_route_uses_gcloud_bootstrap_fallback_before_cloud_send(
         assert completed.returncode == 0, f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
         assert len(function_deploys) == 1
         assert "--runtime python312" in function_deploys[0]
+        expected_refresh_token = (
+            "synthetic-existing-refresh-token" if refresh_token else ""
+        )
+        assert f"GOOGLE_REFRESH_TOKEN={expected_refresh_token}" in function_deploys[0]
         assert not uploads
 
 
@@ -292,7 +294,7 @@ def test_successful_host_preflight_report_keeps_host_facts_separate_from_linux_t
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(runner, "ensure_runtime", use_synthetic_runtime)
-    monkeypatch.setattr(runner.subprocess, "run", run)
+    monkeypatch.setattr(runner, "subprocess", SimpleNamespace(run=run))
 
     assert runner.run_preflight("sync_checker", root, artifact) == 0
     output = capsys.readouterr().out

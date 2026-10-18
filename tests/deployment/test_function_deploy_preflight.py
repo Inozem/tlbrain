@@ -23,7 +23,7 @@ def test_function_deploy_uses_preflight_artifact_and_fails_closed(
     source = script_path.read_text(encoding="utf-8")
     artifact = f'${{REPO_ROOT}}/.build/{service_id}'
     assert f'ARTIFACT="{artifact}"' in source
-    preflight_at = source.index('PREFLIGHT_RESULT=$("${REPO_ROOT}/infra/build/preflight.sh"')
+    preflight_at = source.index('PREFLIGHT_RESULT=$(bash "${REPO_ROOT}/infra/build/preflight.sh"')
     preflight_end = source.index('  --output "${ARTIFACT}")', preflight_at)
     preflight = source[preflight_at:preflight_end]
     assert f"--service {service_id}" in preflight
@@ -33,7 +33,7 @@ def test_function_deploy_uses_preflight_artifact_and_fails_closed(
     fingerprint_parse = source.index(
         'ARTIFACT_FINGERPRINT=$(printf \'%s\\n\' "${PREFLIGHT_RESULT}" | sed -n \'s/^Artifact fingerprint: //p\')'
     )
-    verify_at = source.index('preflight.sh" --verify-source \\', fingerprint_parse)
+    verify_at = source.index('bash "${REPO_ROOT}/infra/build/preflight.sh" --verify-source \\', fingerprint_parse)
     verify_end = source.index('  --fingerprint "${ARTIFACT_FINGERPRINT}"', verify_at)
     deploy_at = source.index("gcloud functions deploy ", verify_end)
     assert preflight_at < fingerprint_parse < verify_at < verify_end < deploy_at
