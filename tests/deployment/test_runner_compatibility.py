@@ -53,6 +53,25 @@ def _copy_route(root: Path) -> Path:
     return checkout
 
 
+def _windows_git_root(bash_executable: Path) -> Path:
+    bash_executable = bash_executable.resolve()
+    if bash_executable.parent.name.lower() == "bin" and bash_executable.parent.parent.name.lower() == "usr":
+        return bash_executable.parent.parent.parent
+    return bash_executable.parent.parent
+
+
+def _windows_git_path(bash_executable: Path, bin_dir: Path) -> str:
+    """Expose only the selected Git for Windows tools to the synthetic route."""
+    git_root = _windows_git_root(bash_executable)
+    utility_dirs = (
+        git_root / "bin",
+        git_root / "usr" / "bin",
+        git_root / "mingw64" / "bin",
+    )
+    path_parts = [str(bin_dir), *(str(path) for path in utility_dirs if path.is_dir())]
+    return os.pathsep.join(dict.fromkeys(path_parts))
+
+
 def _runner_module():
     spec = importlib.util.spec_from_file_location("runner_compat_bootstrap", RUNNER)
     assert spec is not None and spec.loader is not None
@@ -96,19 +115,7 @@ def _write_fakes(root: Path, tmp_path: Path, *, runner_status: int) -> tuple[Pat
     # the route needs. This forces the gcloud fallback without exposing Python.
     bash_executable = Path(_bash()).resolve()
     if os.name == "nt":
-        # Keep Git's shell utilities and runtime DLL directories, while
-        # removing Python application directories and the WindowsApps alias
-        # so gcloud is the first approved bootstrap source.
-        inherited = []
-        for part in os.environ.get("PATH", "").split(os.pathsep):
-            if "windowsapps" in part.lower():
-                continue
-            if any(Path(part, name).exists() for name in ("python3.exe", "python3")):
-                continue
-            inherited.append(part)
-        if shutil.which("python3", path=os.pathsep.join(inherited)):
-            pytest.skip("cannot isolate gcloud fallback because another python3 is on PATH")
-        utility_dirs = inherited
+        return events, Path(_windows_git_path(bash_executable, bin_dir))
     else:
         # A tiny isolated PATH lets the actual preflight script run under Bash
         # without inheriting the host's python3 candidate.
@@ -123,6 +130,42 @@ def _write_fakes(root: Path, tmp_path: Path, *, runner_status: int) -> tuple[Pat
         utility_dirs = []
     path_parts = [str(bin_dir), *(str(directory) for directory in utility_dirs)]
     return events, Path(os.pathsep.join(dict.fromkeys(path_parts)))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PATH isolation regression")
+@pytest.mark.parametrize("launcher", ["bin", "usr/bin"], ids=["git-bin-bash", "git-usr-bin-bash"])
+def test_windows_fake_path_excludes_host_tools_and_keeps_git_utilities(
+    launcher: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated inherited PATH cannot expose host fallback tools."""
+    selected_bash = Path(_bash()).resolve()
+    git_root = next(
+        (ancestor for ancestor in selected_bash.parents if (ancestor / "usr" / "bin" / "bash.exe").is_file()),
+        None,
+    )
+    assert git_root is not None, "selected Bash is not inside a Git for Windows installation"
+    bash_executable = git_root.joinpath(*launcher.split("/"), "bash.exe")
+    assert bash_executable.is_file(), f"selected Git installation is missing {launcher}/bash.exe"
+
+    hostile = tmp_path / "host tools"
+    hostile.mkdir()
+    for name in ("powershell.exe", "python.exe", "bash.exe"):
+        (hostile / name).write_text("sentinel", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(hostile))
+    monkeypatch.setattr(sys.modules[__name__], "_bash", lambda: str(bash_executable))
+
+    _, isolated_path = _write_fakes(tmp_path, tmp_path, runner_status=0)
+    path_value = str(isolated_path)
+    normalized_parts = {os.path.normcase(os.path.normpath(part)) for part in path_value.split(os.pathsep)}
+
+    assert os.path.normcase(os.path.normpath(str(hostile))) not in normalized_parts
+    for tool in ("powershell.exe", "python.exe", "python3.exe"):
+        assert shutil.which(tool, path=path_value) is None
+    resolved_bash = Path(shutil.which("bash.exe", path=path_value) or "").resolve()
+    assert resolved_bash != (hostile / "bash.exe").resolve()
+    assert resolved_bash.is_relative_to(git_root.resolve())
+    for utility in ("bash", "dirname", "sed", "grep", "xargs", "echo", "cygpath"):
+        assert shutil.which(utility, path=path_value), f"Git utility {utility!r} is missing from isolated PATH"
 
 
 @pytest.mark.parametrize("refresh_token", [False, True], ids=["fresh-token", "existing-token"])
