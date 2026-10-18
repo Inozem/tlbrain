@@ -92,9 +92,8 @@ def _write_fakes(root: Path, tmp_path: Path, *, runner_status: int) -> tuple[Pat
     )
     gcloud.chmod(0o755)
 
-    # Keep PATH limited to the fake commands and Bash itself. This makes the
-    # preflight dispatcher take its gcloud fallback even on developer machines
-    # that have Python installed, while all shell utilities remain local.
+    # Keep PATH limited to fake commands, Bash, and only the real shell utilities
+    # the route needs. This forces the gcloud fallback without exposing Python.
     bash_executable = Path(_bash()).resolve()
     if os.name == "nt":
         # Keep Git's shell utilities and runtime DLL directories, while
@@ -121,6 +120,12 @@ def _write_fakes(root: Path, tmp_path: Path, *, runner_status: int) -> tuple[Pat
             encoding="utf-8",
         )
         dirname.chmod(0o755)
+        for utility in ("sed", "grep", "xargs"):
+            executable = shutil.which(utility)
+            if not executable:
+                pytest.fail(f"required POSIX shell utility {utility!r} is unavailable")
+            utility_link = bin_dir / utility
+            utility_link.symlink_to(Path(executable).resolve())
         utility_dirs = []
     path_parts = [str(bin_dir), *(str(directory) for directory in utility_dirs)]
     return events, Path(os.pathsep.join(dict.fromkeys(path_parts)))

@@ -232,6 +232,7 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     gcloud.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf 'gcloud\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
+        "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n"
         "case \"$*\" in *'services describe'*) printf 'https://synthetic.example/service\\n' ;; "
         "*'functions describe'*) printf 'https://synthetic.example/function\\n' ;; "
         "esac\n",
@@ -241,7 +242,8 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     docker = bin_dir / "docker"
     docker.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
-        "printf 'docker\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n",
+        "printf 'docker\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
+        "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"docker-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n",
         encoding="utf-8",
     )
     docker.chmod(0o755)
@@ -259,13 +261,6 @@ def _read_route_events(log: Path) -> list[list[str]]:
         else:
             events.append(json.loads(line))
     return events
-
-
-def _bash_path(path: Path) -> str:
-    value = path.resolve().as_posix()
-    if os.name == "nt" and len(value) >= 3 and value[1:3] == ":/":
-        return "/" + value[0].lower() + value[2:]
-    return value
 
 
 def _run_route(
@@ -390,8 +385,14 @@ def test_top_level_route_hands_only_validated_sources_and_images_forward(
     ):
         sent = next(event[1] for event in function_sends if event[1].startswith(f"functions deploy {function_name} "))
         artifact_path = root / ".build" / service
-        artifact_shell = _bash_path(artifact_path)
-        assert f"--source {artifact_shell}" in sent
+        native_send = next(
+            event[1:] for event in events
+            if event[0] == "gcloud-argv" and event[1:3] == ["functions", "deploy"]
+            and event[3] == function_name
+        )
+        assert native_send.count("--source") == 1
+        source_index = native_send.index("--source")
+        assert Path(native_send[source_index + 1]).resolve() == artifact_path.resolve()
         assert f"--entry-point {entrypoint}" in sent
         assert "--runtime python312" in sent
         assert "--gen2" in sent and "--trigger-http" in sent and "--allow-unauthenticated" in sent
@@ -421,9 +422,17 @@ def test_top_level_route_hands_only_validated_sources_and_images_forward(
             assert any(docker[1] == f"push {image}" for docker in docker_events)
             assert any(cloud[0] == "gcloud" and "run deploy " in cloud[1] and f"--image {image}" in cloud[1]
                        for cloud in events)
-            built = next(docker[1] for docker in docker_events if docker[1].startswith("build ") and f"-t {image} " in docker[1])
-            dockerfile_path = _bash_path(root / "infra" / "docker" / dockerfile)
-            assert f"build --platform linux/amd64 -f {dockerfile_path} -t {image} {_bash_path(root)}" == built
+            built = next(
+                event[1:] for event in events
+                if event[0] == "docker-argv" and event[1] == "build"
+                and "-t" in event and event[event.index("-t") + 1] == image
+            )
+            dockerfile_path = (root / "infra" / "docker" / dockerfile).resolve()
+            assert len(built) == 8
+            assert built[:3] == ["build", "--platform", "linux/amd64"]
+            assert built[3] == "-f" and Path(built[4]).resolve() == dockerfile_path
+            assert built[5:7] == ["-t", image]
+            assert Path(built[7]).resolve() == root.resolve()
             gate_index = events.index(event)
             push_index = events.index(["docker", f"push {image}"])
             deploy_index = next(index for index, cloud in enumerate(events)

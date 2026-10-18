@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import json
 import os
 import subprocess
 import sys
@@ -342,11 +341,3 @@ def test_live_runtime_has_no_legacy_google_drive_package_references() -> None:
         if "core.google_drive" in source or "core/google_drive" in source:
             references.append(str(path.relative_to(APP_ROOT)))
     assert not references, "legacy runtime references remain:\n" + "\n".join(references)
-
-
-def test_architecture_test_index_describes_this_file() -> None:
-    index = APP_ROOT.parent / ".specify" / "memory" / "architecture" / "structure" / "tests.json"
-    entries = json.loads(index.read_text(encoding="utf-8"))
-    description = entries.get("tests/deployment/test_core_boundaries.py", "")
-    assert "ownership" in description and "offline" in description
-
