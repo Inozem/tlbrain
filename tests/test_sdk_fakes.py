@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import grpc
@@ -258,6 +259,75 @@ def test_http_boundary_allows_mock_transport_and_blocks_external_session(sdk_fak
         requests.Session().get("https://example.invalid/path?private=synthetic")
     assert "example.invalid" not in str(blocked.value)
     assert "private" not in str(blocked.value)
+
+
+def test_synthetic_environment_replaces_external_and_derived_settings(monkeypatch):
+    from tests import conftest
+
+    inherited = {
+        "TELEGRAM_BOT_TOKEN": "real-looking-token-must-not-survive",
+        "TELEGRAM_ALLOWED_USER_IDS": "123456",
+        "VECTOR_SYNC_URL": "https://production.example/sync",
+        "VECTOR_SYNC_QUEUE": "production-vector-queue",
+        "TLDV_IMPORT_SERVICE_URL": "https://production.example/import",
+        "TLDV_IMPORT_QUEUE": "production-import-queue",
+        "TLDV_RECONCILIATION_URL": "https://production.example/reconcile",
+        "SYNC_CHECKER_URL": "https://production.example/check",
+        "OIDC_AUDIENCE": "https://production.example",
+        "OIDC_SERVICE_ACCOUNT_EMAIL": "prod@production.example",
+        "TASK_OIDC_AUDIENCE": "https://production.example/task",
+        "TASK_OIDC_SERVICE_ACCOUNT_EMAIL": "prod-task@production.example",
+        "CLOUD_TASKS_OIDC_AUDIENCE": "https://production.example/task",
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL": "prod-cloud-task@production.example",
+        "INTERNAL_DIALOG_OPERATIONS_URL": "https://production.example/dialog-operations",
+        "DIALOG_OPERATIONS_QUEUE": "production-dialog-operations-queue",
+        "TELEGRAM_CONTROL_QUEUE": "production-telegram-control-queue",
+        "CLOUD_TASKS_QUEUE": "production-cloud-tasks-queue",
+        "TASK_SERVICE_ACCOUNT_EMAIL": "prod-task@production.example",
+        "INTERNAL_FUTURE_URI": "https://production.example/future",
+        "FUTURE_AUDIENCE": "https://production.example/future-audience",
+        "FUTURE_SERVICE_ACCOUNT": "prod-future@production.example",
+        "FUTURE_SERVICE_ACCOUNT_EMAIL": "prod-email@production.example",
+        "FUTURE_QUEUE_NAME": "production-future-queue",
+        "TZ": "Pacific/Honolulu",
+    }
+    for name, value in inherited.items():
+        monkeypatch.setenv(name, value)
+
+    conftest._apply_synthetic_environment()
+
+    # Telegram stays disabled unless an individual test opts in.
+    assert "TELEGRAM_BOT_TOKEN" not in os.environ
+    assert "TELEGRAM_ALLOWED_USER_IDS" not in os.environ
+    assert "TLDV_RECONCILIATION_URL" not in os.environ
+    assert all(os.environ[name] == value for name, value in conftest._SYNTHETIC_ENV.items())
+    assert os.environ["TZ"] == "UTC"
+    assert os.environ["INTERNAL_DIALOG_OPERATIONS_URL"] == "https://dialog-operations.pytest.invalid"
+    assert os.environ["DIALOG_OPERATIONS_QUEUE"] == "pytest-dialog-operations-queue"
+    assert os.environ["TELEGRAM_CONTROL_QUEUE"] == "pytest-telegram-control-queue"
+    assert os.environ["CLOUD_TASKS_QUEUE"] == "pytest-cloud-tasks-queue"
+    assert os.environ["TASK_SERVICE_ACCOUNT_EMAIL"] == "pytest-task-worker@synthetic-project.invalid"
+    assert "INTERNAL_FUTURE_URI" not in os.environ
+    assert "FUTURE_AUDIENCE" not in os.environ
+    assert "FUTURE_SERVICE_ACCOUNT" not in os.environ
+    assert "FUTURE_SERVICE_ACCOUNT_EMAIL" not in os.environ
+    assert "FUTURE_QUEUE_NAME" not in os.environ
+    assert "production" not in repr(conftest._SYNTHETIC_ENV)
+    assert conftest._SYNTHETIC_ENV["VECTOR_SYNC_URL"].endswith(".invalid")
+    assert conftest._SYNTHETIC_ENV["OIDC_AUDIENCE"].endswith(".invalid")
+    assert conftest._SYNTHETIC_ENV["OIDC_SERVICE_ACCOUNT_EMAIL"].endswith(".invalid")
+
+
+def test_fake_clock_is_utc_aware_and_advances_exactly(fake_clock):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert fake_clock() == start
+    assert fake_clock.now() == start
+    assert fake_clock.current_time == start
+    advanced = fake_clock.advance(seconds=12.5)
+    assert advanced == start + timedelta(seconds=12.5)
+    assert fake_clock.now() == advanced
+    assert advanced.tzinfo is not None
+    assert advanced.utcoffset().total_seconds() == 0
 
 
 async def _async_mock_response(request):
