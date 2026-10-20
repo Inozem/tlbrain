@@ -16,6 +16,7 @@ PyYAML>=6.0
 
 # Service requirements still own shared dependencies, frameworks, and pins.
 # The ASGI test httpx dependency (>=0.27) is provided by the MCP manifest.
+-r services/connectors/telegram/requirements.txt
 -r services/mcp/requirements.txt
 -r services/vector_sync/requirements.txt
 -r services/sync_checker/requirements.txt

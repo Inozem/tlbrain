@@ -185,6 +185,12 @@ def test_dev_requirements_include_all_service_and_provider_roots() -> None:
     )
     assert required <= included, sorted(path.relative_to(APP_ROOT).as_posix() for path in required - included)
 
+    telegram_requirements = APP_ROOT / "services" / "connectors" / "telegram" / "requirements.txt"
+    telegram_closure = _requirement_include_closure(telegram_requirements)
+    assert telegram_requirements.resolve() in included
+    assert (APP_ROOT / "requirements-common.txt").resolve() in telegram_closure
+    assert "httpx>=0.27" in telegram_requirements.read_text(encoding="utf-8").splitlines()
+
 
 def test_native_smoke_uses_only_synthetic_bootstrap_checks_and_one_function_preflight() -> None:
     job = _workflow()["jobs"]["native-bootstrap-smoke"]

@@ -190,6 +190,23 @@ def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
     ).strip() == "google-cloud-tasks>=2.0.0"
 
 
+def test_dialog_and_telegram_package_boundaries_are_passive() -> None:
+    package_initializers = (
+        APP_ROOT / "core" / "dialogs" / "__init__.py",
+        APP_ROOT / "core" / "operations" / "__init__.py",
+        APP_ROOT / "services" / "connectors" / "telegram" / "__init__.py",
+        APP_ROOT / "services" / "connectors" / "telegram" / "app" / "__init__.py",
+    )
+    for path in package_initializers:
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        assert all(
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+            for statement in module.body
+        ), path.relative_to(APP_ROOT)
+
+
 def test_all_six_current_service_sources_assemble_to_isolated_runtime_artifacts() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     services = manifest["services"]
