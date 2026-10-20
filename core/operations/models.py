@@ -47,6 +47,12 @@ class OperationError:
     category: str
     message: str
     retryable: bool
+    service: str | None = None
+    stage: str | None = None
+    sanitized_message: str | None = None
+    occurred_at: datetime | None = None
+    failures: int | None = None
+    operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +75,7 @@ class OperationStageRecord:
     last_error: OperationError | None = None
     checkpoint_refs: tuple[str, ...] = ()
     updated_at: datetime | None = None
+    result: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +127,10 @@ class OperationRecord:
     fence: int = 0
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    status_updated_at: datetime | None = None
+    attempts_total: int = 0
 
 
 class Clock(Protocol):

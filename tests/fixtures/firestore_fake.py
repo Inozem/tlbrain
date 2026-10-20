@@ -289,6 +289,11 @@ class FakeDocumentReference:
     def path(self) -> str:
         return _doc_path(self._key)
 
+    def collection(self, name: str) -> "FakeCollectionReference":
+        if not isinstance(name, str) or not name or "/" in name:
+            raise ValueError("collection name must be one non-empty path segment")
+        return FakeCollectionReference(f"{self.path}/{name}")
+
     def get(self, *, transaction: "FakeTransaction | None" = None, **kwargs: Any) -> FakeDocumentSnapshot:
         if kwargs:
             raise TypeError(f"Unsupported get options: {', '.join(kwargs)}")
