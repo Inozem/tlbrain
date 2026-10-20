@@ -148,7 +148,7 @@ def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
         "google_docs": "google-api-python-client",
         "firestore": "google-cloud-firestore",
         "qdrant": "qdrant-client>=1.9",
-        "gemini": "google-genai>=1.0",
+        "gemini": "google-genai>=2.29.0",
         "fastembed": "fastembed",
         "cloud_tasks": "google-cloud-tasks>=2.0.0",
     }
@@ -184,6 +184,7 @@ def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
     assert actual_providers == expected_providers
     assert all(not prefix == "google" for prefix in actual_providers)
     assert not (APP_ROOT / "core" / "utils" / "requirements.txt").exists()
+    assert "tzdata" in (APP_ROOT / "requirements-common.txt").read_text(encoding="utf-8").splitlines()
     assert (APP_ROOT / "core" / "integrations" / "cloud_tasks" / "requirements.txt").read_text(
         encoding="utf-8"
     ).strip() == "google-cloud-tasks>=2.0.0"

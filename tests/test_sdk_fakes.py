@@ -300,6 +300,15 @@ def test_gemini_audio_files_and_function_call_signatures_are_preserved(sdk_fakes
     assert traced_contents[2].parts[0].function_response.id == "call-synthetic-1"
 
 
+def test_google_genai_229_sdk_capabilities_are_available():
+    from google.genai import types
+
+    assert "thinking_level" in types.ThinkingConfig.model_fields
+    assert "id" in types.FunctionResponse.model_fields
+    assert "retry_options" in types.HttpOptions.model_fields
+    assert "attempts" in types.HttpRetryOptions.model_fields
+
+
 def test_cloud_tasks_task_schedule_deadline_and_oidc_fields_are_traced(sdk_fakes):
     from datetime import datetime, timedelta, timezone
     from google.cloud import tasks_v2
