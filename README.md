@@ -1,17 +1,19 @@
 # 🧠 TLBrain `v2.0.1`
 
-Personal semantic memory for Claude — built on top of your client calls.
+Personal semantic memory for Claude and ChatGPT — built on top of your client calls.
  
-TLBrain indexes meeting transcripts from TL;DV, stores everything in Google Drive, and lets Claude search through your conversations by meaning — without you having to paste anything manually.
+TLBrain indexes meeting transcripts from TL;DV, stores everything in Google Drive, and lets Claude and ChatGPT search through your conversations by meaning — without you having to paste anything manually. Connect your preferred assistant through MCP; Codex is supported too.
  
 ```mermaid
 graph LR
     A[TL;DV] -->|transcripts| B[Google Drive]
     B -->|incremental sync| C[TLBrain]
-    C -->|semantic retrieval| D[Claude]
+    C -->|MCP retrieval| D[Claude]
+    C -->|MCP retrieval| E[ChatGPT]
+    C -->|MCP retrieval| F[Codex]
 ```
  
-Works with **claude.ai** (web) · **Claude Desktop** (Chat · Cowork · Code) · **Claude Mobile** (iOS · Android)
+Works with **Claude** · **ChatGPT** · **Codex** via remote MCP
 Google Drive + Qdrant + Gemini · Shared corpus for configured accounts · Near-zero infrastructure cost · Deploy with one command
  
 ---
@@ -45,23 +47,23 @@ Consultants, sales reps, account managers, founders — anyone with a high volum
  
 > "Show the conversation where we discussed extending the contract"
  
-Claude retrieves the most relevant transcript fragments automatically. Saves tokens — only the relevant parts end up in context, not the full transcript. If you need more detail, ask Claude to read the full transcript from that call.
+Your connected assistant retrieves the most relevant transcript fragments automatically. Saves tokens — only the relevant parts end up in context, not the full transcript. If you need more detail, ask your assistant to read the full transcript from that call.
  
 ---
  
 ## 🔑 How it works in practice
  
-Transcripts are automatically organized into folders in Google Drive. The hierarchy is arbitrary — any depth. If a transcript landed in the wrong folder — ask Claude to move it, or drag the file manually. Either way, TLBrain picks up the change automatically.
+Transcripts are automatically organized into folders in Google Drive. The hierarchy is arbitrary — any depth. If a transcript landed in the wrong folder — ask your assistant to move it, or drag the file manually. Either way, TLBrain picks up the change automatically.
  
-Transcripts that couldn't be assigned to any folder land in a special `_unassigned` folder. Claude will notify you and suggest reviewing — just move them to the right folder and they'll be re-synced automatically.
+Transcripts that couldn't be assigned to any folder land in a special `_unassigned` folder. Your assistant can list them for review — just move them to the right folder and they'll be re-synced automatically.
  
-Noticed errors in a transcript? Fix them directly in Google Drive — TLBrain will re-sync within 15 minutes. Or ask Claude to trigger a sync immediately.
+Noticed errors in a transcript? Fix them directly in Google Drive — TLBrain will re-sync within 15 minutes. Or ask your assistant to trigger a sync immediately.
  
-If Claude couldn't find the right transcript — share the Google Drive link and tell Claude what the document is about. TLBrain will remember that hint and use it in future searches.
+If your assistant couldn't find the right transcript — share the Google Drive link and explain what the document is about. TLBrain will remember that hint and use it in future searches.
  
 Already using TL;DV? You can import your entire existing history. Best to do it in small batches — TLBrain may not recognize the client on the very first transcript, but as you correct it, it learns the pattern. Usually only the first transcript per folder needs a fix.
  
-You can ask Claude for a full list of folders and their sync status at any time.
+You can ask your assistant for a full list of folders and their sync status at any time.
  
 ---
  
@@ -71,7 +73,7 @@ You can ask Claude for a full list of folders and their sync status at any time.
 
 Despite the one-command deployment, all third-party services (Google Cloud, Firebase, Qdrant, Google AI Studio) must be registered and configured manually — the steps below walk you through each one.
 
-> Stuck at any step? Share this section of the README and a screenshot of where you are with Claude — it will give you a hint right away.
+> Stuck at any step? Share this section of the README and a screenshot of where you are with Claude or ChatGPT for help.
  
 ### 1. Create `.env`
 
@@ -233,13 +235,28 @@ The ordinary deployment uses already-published versioned images for Cloud Run se
 In TL;DV click your avatar in the bottom-left corner → **Settings → Integrations → Webhooks → Add**, paste the webhook URL from the deploy output → event: `TranscriptReady`.
  
 ### 12. Connect an MCP client
+
+Claude, ChatGPT, and Codex use the same deployed MCP URL: `https://YOUR-MCP-URL.run.app/mcp`. Connect and authorize each client separately; they all access the same TLBrain knowledge base.
+
+#### Claude
  
 1. Open any Claude client → **Customize → MCP Servers → Add**
 2. URL: `https://YOUR-MCP-URL.run.app/mcp`
 3. Leave manual bearer-token and authorization-header fields empty. The client discovers OAuth and registers automatically.
 4. Approve the named client on the TLBrain confirmation page, then sign in with any Google account listed in `ALLOWED_EMAIL`.
 
-For Codex, add the URL in MCP settings, or use the CLI:
+#### ChatGPT
+
+1. Open **ChatGPT Plugins** → **+** → **Add custom MCP server**.
+2. Name the connection `TLBrain`, enter `https://YOUR-MCP-URL.run.app/mcp`, and choose **OAuth** authentication.
+3. Create the connection, approve the TLBrain confirmation page, and sign in with a Google account listed in `ALLOWED_EMAIL`.
+4. Install the resulting plugin, start a new **Work** conversation, then type `@` and select TLBrain to use its tools.
+
+Custom MCP access depends on your account and workspace policies. See the [official ChatGPT MCP connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt) for current setup details.
+
+#### Codex
+
+Add the URL in MCP settings, or use the CLI:
 
 ```bash
 codex mcp add tlbrain-test --url https://YOUR-MCP-URL.run.app/mcp
@@ -275,7 +292,7 @@ The existing OAuth and `ALLOWED_EMAIL` configuration continues to apply. `GOOGLE
 | Shared corpus with an account allowlist | ✅ | ❌ |
 | Near-zero infrastructure cost | ✅ | ⚠️ |
 | Conversation-aware retrieval | ✅ | ❌ |
-| MCP-native (works with Claude) | ✅ | ❌ |
+| MCP-native (Claude, ChatGPT, Codex) | ✅ | ❌ |
 | Utterances stored without dense embeddings | ✅ | ❌ |
 | Incremental sync (no full reindex) | ✅ | ⚠️ |
 | Hybrid search (semantic + BM25) | ✅ | ⚠️ |
@@ -284,7 +301,7 @@ The existing OAuth and `ALLOWED_EMAIL` configuration continues to apply. `GOOGLE
  
 **Works with Google Drive.** Transcripts are stored as native Google Docs — no proprietary formats. Folders mirror your real hierarchy — unlimited nesting depth. If something goes wrong, the data is always directly accessible.
  
-**MCP-native.** Claude connects like a standard MCP server. No plugins, no custom integrations — just the protocol.
+**MCP-native.** Claude, ChatGPT, and Codex connect to TLBrain through the standard remote MCP protocol. Use the same transcript knowledge base from your preferred assistant.
  
 **Incremental sync.** SHA-256 hashes identify changed transcript content, and Drive changes are tracked incrementally. Full-document replacement writes a new version before deleting the prior version. Incremental replacement removes affected entries before writing their replacements, so uninterrupted search availability during that operation is not guaranteed.
  
@@ -313,15 +330,15 @@ Claude Projects is great for small, curated knowledge bases. TLBrain is built fo
  
 ## 🔌 Why MCP?
  
-TLBrain works as a standard remote MCP server. That means Claude can use it directly — no browser extensions, no plugins, no custom UI.
+TLBrain works as a standard remote MCP server. Claude, ChatGPT, and Codex can use its search and document tools through an MCP connection.
  
-Works with any Claude client that supports remote MCP:
+Supported clients include:
  
-- **claude.ai** — web
-- **Claude Desktop** — Chat, Cowork, Code (macOS, Windows)
-- **Claude Mobile** — iOS, Android
+- **Claude** — claude.ai, Claude Desktop, and Claude Mobile with remote MCP support
+- **ChatGPT** — through a custom MCP server connection in ChatGPT Work
+- **Codex** — through MCP settings or the CLI
 
-Connect once, use everywhere. Configuration syncs automatically across clients.
+Connect each client to the same MCP URL and complete its authorization flow. Your transcripts and folder organization stay in the shared TLBrain knowledge base. Custom MCP availability depends on the client, account, and workspace settings.
  
 ---
  
@@ -359,7 +376,7 @@ As long as you stay within the free tier limits, you only pay for syncing new tr
 - **TL;DV as the primary source** — other providers require writing a connector
 - **Polling sync** — changes are picked up with a delay up to `SYNC_CHECKER_SCHEDULE` (default: 15 min)
 - **Native Google Docs only** — other file formats are ignored
-- **No cross-transcript aggregation yet** — a single query returns fragments from the most relevant transcript, not a summary across multiple calls. Workaround: ask Claude to search by client + date range, then ask it to read the full transcript from the results if needed
+- **No cross-transcript aggregation yet** — a single query returns relevant transcript fragments rather than an aggregate summary across calls. Ask your assistant to search by client and date range, then read the full transcripts from the results if needed
 
 ---
 
@@ -373,7 +390,7 @@ The deployment has six targets: three ASGI Cloud Run services (`mcp`, `vector_sy
 
 ### Retrieval Pipeline
  
-When Claude calls `query`, six stages run:
+When an MCP client calls `query`, six stages run:
  
 **Stage 1 — Recall:** semantic and keyword searches run in parallel; user-fact pins are searched afterward.
 - Semantic (dense): search over summaries + facts, top-15, score ≥ 0.6 → `covered_range`
@@ -427,20 +444,20 @@ Status machine: `queued → downloading → imported → syncing → synced / er
 ### MCP Lifecycle
  
 ```
-Claude → initialize
-Claude → tools/list
-Claude → tools/call(query, ...)
+Client (Claude / ChatGPT / Codex) → initialize
+Client → tools/list
+Client → tools/call(query, ...)
      ↓
 MCP Server → retrieval pipeline
      ↓
 MCP Server → returns segments as tool result
      ↓
-Claude → generates response based on context
+Assistant → generates response based on context
 ```
  
-The MCP server returns only context. The final response is generated by Claude.
+The MCP server returns only context. The connected assistant generates the final response.
  
-Authentication: Google OAuth 2.0 Authorization Code Flow. Claude detects OAuth via discovery endpoints automatically.
+Authentication: Google OAuth 2.0 Authorization Code Flow. MCP clients discover the authorization settings through TLBrain's OAuth metadata endpoints.
  
 ### Storage Schema
  
