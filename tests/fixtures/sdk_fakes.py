@@ -76,6 +76,8 @@ class _State:
     tasks: set[str] = field(default_factory=set)
     anonymous_task_counter: int = 0
     qdrant_collections: dict[str, dict[str, Any]] = field(default_factory=dict)
+    docs_revisions: dict[str, str] = field(default_factory=dict)
+    docs_revision_counter: int = 0
     clients: list[Any] = field(default_factory=list)
 
 
@@ -106,6 +108,8 @@ class _Controls:
         _STATE.tasks.clear()
         _STATE.anonymous_task_counter = 0
         _STATE.qdrant_collections.clear()
+        _STATE.docs_revisions.clear()
+        _STATE.docs_revision_counter = 0
         _STATE.clients.clear()
 
     @property
@@ -176,7 +180,31 @@ class _Request:
         if kwargs:
             raise TypeError(f"Unsupported execute options: {', '.join(kwargs)}")
         _record(self.boundary, self.operation, **self.args)
-        return _script(self.boundary, self.operation)
+        if self.boundary == "docs" and self.operation == "documents.batchUpdate":
+            write_control = self.args.get("writeControl") or {}
+            required_revision = write_control.get("requiredRevisionId")
+            document_id = self.args["documentId"]
+            current_revision = _STATE.docs_revisions.get(document_id)
+            if required_revision is not None and current_revision is not None and required_revision != current_revision:
+                raise RuntimeError(
+                    f"Stale Docs revision for {document_id}: required {required_revision}, current {current_revision}"
+                )
+            response = _script(self.boundary, self.operation)
+            response_control = response.get("writeControl", {}) if isinstance(response, dict) else {}
+            new_revision = response_control.get("requiredRevisionId")
+            if new_revision is None and isinstance(response, dict):
+                new_revision = response.get("revisionId")
+            if new_revision is None:
+                _STATE.docs_revision_counter += 1
+                new_revision = f"pytest-docs-revision-{_STATE.docs_revision_counter}"
+            _STATE.docs_revisions[document_id] = new_revision
+            return response
+        response = _script(self.boundary, self.operation)
+        if self.boundary == "docs" and self.operation == "documents.get" and isinstance(response, dict):
+            revision = response.get("revisionId")
+            if revision is not None:
+                _STATE.docs_revisions[self.args["documentId"]] = revision
+        return response
 
 
 class _Resource:
@@ -260,12 +288,29 @@ class _GeminiModels:
         return _script("gemini", "generate_content")
 
 
+class _GeminiFiles:
+    def upload(self, **kwargs: Any):
+        extra = kwargs.keys() - {"file", "config"}
+        if extra:
+            raise TypeError(f"Unsupported Gemini files.upload options: {', '.join(sorted(extra))}")
+        _record("gemini", "files.upload", **kwargs)
+        return _script("gemini", "files.upload")
+
+    def delete(self, **kwargs: Any):
+        extra = kwargs.keys() - {"name", "config"}
+        if extra:
+            raise TypeError(f"Unsupported Gemini files.delete options: {', '.join(sorted(extra))}")
+        _record("gemini", "files.delete", **kwargs)
+        return _script("gemini", "files.delete")
+
+
 class FakeGeminiClient:
     def __init__(self, *, api_key: str, **kwargs: Any) -> None:
         if kwargs:
             raise TypeError(f"Unsupported Gemini client options: {', '.join(kwargs)}")
         _record("gemini", "client", api_key=api_key)
         self.models = _GeminiModels()
+        self.files = _GeminiFiles()
 
 
 class FakeQdrantClient:
@@ -375,7 +420,7 @@ class FakeCloudTasksClient:
     def task_path(project: str, location: str, queue: str, task: str) -> str:
         return RealCloudTasksClient.task_path(project, location, queue, task)
 
-    def create_task(self, *, parent: str, task: dict[str, Any], **kwargs: Any):
+    def create_task(self, *, parent: str, task: dict[str, Any] | tasks_v2.Task, **kwargs: Any):
         if kwargs:
             raise TypeError(f"Unsupported create_task options: {', '.join(kwargs)}")
         _record("tasks", "create_task", parent=parent, task=task)
@@ -383,7 +428,7 @@ class FakeCloudTasksClient:
         configured = injected.popleft() if injected else _MISSING
         if isinstance(configured, BaseException):
             raise configured
-        name = task.get("name")
+        name = task.get("name") if isinstance(task, dict) else task.name
         if name and name in _STATE.tasks:
             raise AlreadyExists("Task already exists")
         if name:

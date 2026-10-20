@@ -222,6 +222,111 @@ def test_google_auth_default_and_tasks_errors_are_scriptable(sdk_fakes, monkeypa
         enqueue_task("queue", "https://worker.invalid/task")
 
 
+def test_drive_app_properties_marker_lookup_is_traced(sdk_fakes):
+    from tests.fixtures.sdk_fakes import fake_discovery_build
+
+    query = "appProperties has { key='tlbrain_save_id' and value='save-42' }"
+    expected = {"files": [{"id": "file-1", "appProperties": {"tlbrain_save_id": "save-42"}}]}
+    sdk_fakes.drive.queue("files.list", response=expected)
+
+    result = fake_discovery_build("drive", "v3").files().list(
+        q=query, fields="files(id,appProperties)", pageSize=1
+    ).execute()
+
+    assert result == expected
+    lookup = next(event for event in sdk_fakes.trace if event["operation"] == "files.list")
+    assert lookup["arguments"]["q"] == query
+    assert lookup["arguments"]["fields"] == "files(id,appProperties)"
+
+
+def test_docs_required_revision_control_is_traced_and_stale_revision_fails(sdk_fakes):
+    from tests.fixtures.sdk_fakes import fake_discovery_build
+
+    documents = fake_discovery_build("docs", "v1").documents()
+    sdk_fakes.docs.queue("documents.get", response={"revisionId": "rev-1"})
+    assert documents.get(documentId="doc-1").execute()["revisionId"] == "rev-1"
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"writeControl": {"requiredRevisionId": "rev-2"}})
+    documents.batchUpdate(
+        documentId="doc-1", body={"requests": []},
+        writeControl={"requiredRevisionId": "rev-1"},
+    ).execute()
+
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"ok": True})
+    with pytest.raises(RuntimeError, match="Stale Docs revision"):
+        documents.batchUpdate(
+            documentId="doc-1", body={"requests": []},
+            writeControl={"requiredRevisionId": "rev-1"},
+        ).execute()
+    update = [event for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate"]
+    assert update[0]["arguments"]["writeControl"] == {"requiredRevisionId": "rev-1"}
+    assert update[1]["arguments"]["writeControl"] == {"requiredRevisionId": "rev-1"}
+
+
+def test_gemini_audio_files_and_function_call_signatures_are_preserved(sdk_fakes):
+    from google.genai import types
+    from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+    client = FakeGeminiClient(api_key="pytest-synthetic-gemini-key")
+    sdk_fakes.gemini.queue("files.upload", response={"name": "files/synthetic-audio"})
+    sdk_fakes.gemini.queue("files.delete", response={"name": "files/synthetic-audio"})
+    upload = client.files.upload(
+        file="synthetic-audio.wav",
+        config=types.UploadFileConfig(mime_type="audio/wav", display_name="synthetic-audio"),
+    )
+    deleted = client.files.delete(name=upload["name"])
+    assert deleted["name"] == "files/synthetic-audio"
+
+    audio = types.Part(inline_data=types.Blob(mime_type="audio/wav", data=b"synthetic-audio"))
+    function_call = types.Part(
+        function_call=types.FunctionCall(id="call-synthetic-1", name="lookup", args={"key": "synthetic"}),
+        thought_signature=b"synthetic-thought-signature",
+    )
+    function_response = types.Part(function_response=types.FunctionResponse(
+        id="call-synthetic-1", name="lookup", response={"value": "synthetic-result"}
+    ))
+    contents = [types.Content(role="user", parts=[audio]), types.Content(role="model", parts=[function_call]),
+                types.Content(role="user", parts=[function_response])]
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse())
+    client.models.generate_content(model="gemini-test", contents=contents, config=types.GenerateContentConfig())
+
+    upload_trace = next(event for event in sdk_fakes.trace if event["operation"] == "files.upload")
+    assert upload_trace["arguments"]["file"] == "synthetic-audio.wav"
+    assert upload_trace["arguments"]["config"].mime_type == "audio/wav"
+    generated = next(event for event in sdk_fakes.trace if event["operation"] == "generate_content")
+    traced_contents = generated["arguments"]["contents"]
+    assert traced_contents[0].parts[0].inline_data.data == b"synthetic-audio"
+    assert traced_contents[1].parts[0].function_call.id == "call-synthetic-1"
+    assert traced_contents[1].parts[0].thought_signature == b"synthetic-thought-signature"
+    assert traced_contents[2].parts[0].function_response.id == "call-synthetic-1"
+
+
+def test_cloud_tasks_task_schedule_deadline_and_oidc_fields_are_traced(sdk_fakes):
+    from datetime import datetime, timedelta, timezone
+    from google.cloud import tasks_v2
+    from tests.fixtures.sdk_fakes import FakeCloudTasksClient
+
+    schedule_time = datetime(2026, 2, 3, 4, 5, tzinfo=timezone.utc)
+    task = tasks_v2.Task(
+        schedule_time=schedule_time,
+        dispatch_deadline=timedelta(seconds=45),
+        http_request=tasks_v2.HttpRequest(
+            url="https://worker.pytest.invalid/task",
+            oidc_token=tasks_v2.OidcToken(
+                service_account_email="pytest-task@synthetic-project.invalid",
+                audience="https://worker.pytest.invalid",
+            ),
+        ),
+    )
+    response = FakeCloudTasksClient().create_task(parent="projects/p/locations/l/queues/q", task=task)
+
+    assert response.name == "projects/p/locations/l/queues/q/tasks/fake-anonymous-1"
+    traced = next(event for event in sdk_fakes.trace if event["operation"] == "create_task")["arguments"]["task"]
+    assert traced.schedule_time == schedule_time
+    assert traced.dispatch_deadline == timedelta(seconds=45)
+    assert traced.http_request.oidc_token.service_account_email == "pytest-task@synthetic-project.invalid"
+    assert traced.http_request.oidc_token.audience == "https://worker.pytest.invalid"
+
+
 def test_http_boundary_allows_mock_transport_and_blocks_external_session(sdk_fakes):
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
     with httpx.Client(transport=transport) as client:
