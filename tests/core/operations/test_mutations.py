@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from google.api_core.exceptions import Aborted
 
 from core.integrations.firestore.operations import claim_operation, create_operation
 from core.integrations.firestore.mutations import (
@@ -209,3 +211,60 @@ def test_independent_resources_can_progress_while_other_effect_is_unsettled(fire
     )
     assert independent == "done"
     assert calls == ["blocked-resource", "independent-resource"]
+
+
+def test_effect_ids_are_scoped_to_the_operation(firestore_fake):
+    client = firestore_fake.client_class()
+    first_lease = _setup(client)
+    second_id = "second-mutation-operation"
+    create_operation(
+        client, operation_id=second_id, origin=OperationOrigin.MCP,
+        caller_binding="synthetic-caller", immutable_input_digest="sha256:second-input",
+        immutable_input_ref="second-input-ref", now=NOW,
+    )
+    second_lease = claim_operation(client, second_id, owner="worker", now=NOW, lease_seconds=30)
+    assert second_lease is not None
+
+    assert dispatch_mutation(
+        client, operation_id=OPERATION_ID, effect_id="same-effect-id", owner="worker",
+        fence=first_lease.fence, kind="content_update", resources=("document:first",),
+        payload_digest="sha256:first", now=NOW, mutation_callback=lambda: "first-result",
+    ) == "first-result"
+    assert dispatch_mutation(
+        client, operation_id=second_id, effect_id="same-effect-id", owner="worker",
+        fence=second_lease.fence, kind="content_update", resources=("document:second",),
+        payload_digest="sha256:second", now=NOW, mutation_callback=lambda: "second-result",
+    ) == "second-result"
+
+    for operation_id, expected in ((OPERATION_ID, "first-result"), (second_id, "second-result")):
+        effect = client.collection("dialog_operations").document(operation_id).collection("effects").document(
+            "same-effect-id",
+        ).get()
+        assert effect.exists and effect.to_dict()["result"] == expected
+
+
+def test_publications_write_shared_resource_records_and_serialize_transactions(firestore_fake):
+    client = firestore_fake.client_class()
+    lease = _setup(client)
+    resource = "document:published"
+    guard_ref = client.collection("resource_mutations").document(hashlib.sha256(resource.encode()).hexdigest())
+
+    concurrent = client.transaction()
+    concurrent._begin()
+    guard_ref.get(transaction=concurrent)
+
+    assert finalize_document(
+        client, operation_id=OPERATION_ID, owner="worker", fence=lease.fence,
+        resources=(resource,), now=NOW,
+    ) is True
+    with pytest.raises(Aborted):
+        concurrent._commit()
+
+    assert publish_index_completion(
+        client, operation_id=OPERATION_ID, owner="worker", fence=lease.fence,
+        resources=(resource,), now=NOW,
+    ) is True
+    guard = guard_ref.get().to_dict()
+    assert guard["document_finalized"]["operation_id"] == OPERATION_ID
+    assert guard["index_completion_published"]["operation_id"] == OPERATION_ID
+    assert guard["mutation_state"] == "index_completion_published"
