@@ -27,6 +27,7 @@ class NormalizedDialogInput:
     dialog_date: str
     folder_path: list[str] | None
     utterances: tuple[DialogUtterance, ...]
+    folder_id: str | None = None
 
 
 def _normalize_provider(arguments: Mapping[str, object]) -> str:
@@ -125,6 +126,17 @@ def _normalize_explicit_folder_path(
     return folder_path
 
 
+def _normalize_folder_id(arguments: Mapping[str, object]) -> str | None:
+    if "folder_id" not in arguments:
+        return None
+    value = arguments["folder_id"]
+    if not isinstance(value, str):
+        raise TypeError("folder_id must be a string")
+    if not value.strip() or "/" in value:
+        raise ValueError("folder_id must be a nonempty document ID")
+    return value
+
+
 def normalize_dialog_input(
     arguments: Mapping[str, object], *, accepted_at: datetime
 ) -> NormalizedDialogInput:
@@ -137,7 +149,7 @@ def normalize_dialog_input(
     if accepted_at.tzinfo is None or accepted_at.utcoffset() is None:
         raise ValueError("accepted_at must be timezone-aware")
 
-    allowed_keys = {"provider", "title", "dialog_date", "folder_path", "utterances"}
+    allowed_keys = {"provider", "title", "dialog_date", "folder_path", "folder_id", "utterances"}
     unknown_keys = set(arguments) - allowed_keys
     if unknown_keys:
         raise ValueError(f"unknown dialog input keys: {sorted(unknown_keys)!r}")
@@ -146,6 +158,9 @@ def normalize_dialog_input(
     utterances = _normalize_utterances(arguments)
     dialog_date, title = _normalize_date_and_title(arguments, accepted_at=accepted_at)
     folder_path = _normalize_explicit_folder_path(arguments)
+    folder_id = _normalize_folder_id(arguments)
+    if folder_path is not None and folder_id is not None:
+        raise ValueError("specify either folder_path or folder_id, not both")
 
     return NormalizedDialogInput(
         provider=provider,
@@ -153,4 +168,5 @@ def normalize_dialog_input(
         dialog_date=dialog_date,
         folder_path=folder_path,
         utterances=utterances,
+        folder_id=folder_id,
     )

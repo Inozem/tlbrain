@@ -32,7 +32,8 @@ class SaveIntentRecord:
     save_intent_id: str
     immutable_input_digest: str
     desired_content_hash: str
-    desired_parent_id_hash: str
+    desired_parent_id_hash: str | None
+    desired_parent_id: str | None
     immutable_title_digest: str | None
     immutable_provider_digest: str | None
     state: SaveIntentState = SaveIntentState.PLANNED
@@ -69,6 +70,7 @@ def _from(data: dict[str, Any]) -> SaveIntentRecord:
         immutable_input_digest=data["immutable_input_digest"],
         desired_content_hash=data["desired_content_hash"],
         desired_parent_id_hash=data["desired_parent_id_hash"],
+        desired_parent_id=data.get("desired_parent_id"),
         immutable_title_digest=data.get("immutable_title_digest"),
         immutable_provider_digest=data.get("immutable_provider_digest"),
         state=SaveIntentState(data.get("state", SaveIntentState.PLANNED.value)),
@@ -84,7 +86,7 @@ def _from(data: dict[str, Any]) -> SaveIntentRecord:
 def _identity(data: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(data.get(key) for key in (
         "immutable_input_digest", "desired_content_hash", "desired_parent_id_hash",
-        "immutable_title_digest", "immutable_provider_digest",
+        "desired_parent_id", "immutable_title_digest", "immutable_provider_digest",
     ))
 
 
@@ -94,7 +96,7 @@ def create_save_intent(
     *,
     operation_id: str,
     desired_content_hash: str,
-    desired_parent_id_hash: str,
+    desired_parent_id_hash: str | None,
     now: datetime,
     owner: str | None = None,
     fence: int | None = None,
@@ -103,8 +105,8 @@ def create_save_intent(
     now = _aware(now)
     if not save_intent_id or "/" in save_intent_id:
         raise ValueError("save_intent_id must be a non-empty Firestore document ID")
-    if not desired_content_hash or not desired_parent_id_hash:
-        raise ValueError("content and parent hashes are required")
+    if not desired_content_hash:
+        raise ValueError("content hash is required")
     if (owner is None) != (fence is None):
         raise ValueError("owner and fence must be provided together")
     db = _db(client)
@@ -125,27 +127,34 @@ def create_save_intent(
         if (operation.get("desired_content_hash") is not None
                 and operation["desired_content_hash"] != desired_content_hash):
             raise ValueError("operation content hash conflicts with save intent identity")
-        if (operation.get("desired_parent_id_hash") is not None
+        if (desired_parent_id_hash is not None and operation.get("desired_parent_id_hash") is not None
                 and operation["desired_parent_id_hash"] != desired_parent_id_hash):
             raise ValueError("operation parent hash conflicts with save intent identity")
         identity_data = {
             "immutable_input_digest": operation["immutable_input_digest"],
             "desired_content_hash": desired_content_hash,
             "desired_parent_id_hash": desired_parent_id_hash,
+            "desired_parent_id": None,
             "immutable_title_digest": _digest(operation.get("title")),
             "immutable_provider_digest": _digest(operation.get("expected_provider") or operation.get("provider")),
         }
         snapshot = intent_ref.get(transaction=transaction)
         if snapshot.exists:
             data = snapshot.to_dict() or {}
-            if _identity(data) != _identity(identity_data):
+            stored_identity = list(_identity(data))
+            requested_identity = list(_identity(identity_data))
+            # An unresolved replay may observe the one-time parent binding made later.
+            if requested_identity[2] is None:
+                requested_identity[2] = stored_identity[2]
+                requested_identity[3] = stored_identity[3]
+            if tuple(stored_identity) != tuple(requested_identity):
                 raise ValueError("save intent ID already belongs to a different immutable identity")
             operation_updates = {}
             if bound is None:
                 operation_updates["save_intent_id"] = save_intent_id
             if operation.get("desired_content_hash") is None:
                 operation_updates["desired_content_hash"] = desired_content_hash
-            if operation.get("desired_parent_id_hash") is None:
+            if desired_parent_id_hash is not None and operation.get("desired_parent_id_hash") is None:
                 operation_updates["desired_parent_id_hash"] = desired_parent_id_hash
             if operation_updates:
                 operation_updates["updated_at"] = now
@@ -159,8 +168,65 @@ def create_save_intent(
             "created_at": now, "updated_at": now,
         }
         transaction.set(intent_ref, data)
-        transaction.update(operation_ref, {"save_intent_id": save_intent_id, "desired_content_hash": desired_content_hash,
-                                            "desired_parent_id_hash": desired_parent_id_hash, "updated_at": now})
+        updates = {"save_intent_id": save_intent_id, "desired_content_hash": desired_content_hash,
+                   "updated_at": now}
+        if desired_parent_id_hash is not None:
+            updates["desired_parent_id_hash"] = desired_parent_id_hash
+        transaction.update(operation_ref, updates)
+        return _from(data)
+
+    return _txn(db.transaction())
+
+
+def bind_save_intent_parent(
+    client: Any | None,
+    save_intent_id: str,
+    *,
+    operation_id: str,
+    desired_parent_id_hash: str,
+    desired_parent_id: str,
+    owner: str,
+    fence: int,
+    now: datetime,
+) -> SaveIntentRecord | None:
+    """Bind the resolved parent exactly once while the operation lease is current."""
+    now = _aware(now)
+    if not desired_parent_id_hash or not desired_parent_id:
+        raise ValueError("parent ID and hash are required")
+    if _digest(desired_parent_id) != desired_parent_id_hash:
+        raise ValueError("parent ID does not match its hash")
+    db = _db(client)
+    intent_ref = db.collection(SAVE_INTENTS_COLLECTION).document(save_intent_id)
+    operation_ref = db.collection(OPERATIONS_COLLECTION).document(operation_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> SaveIntentRecord | None:
+        operation_snapshot = operation_ref.get(transaction=transaction)
+        intent_snapshot = intent_ref.get(transaction=transaction)
+        if not operation_snapshot.exists or not intent_snapshot.exists:
+            return None
+        operation = operation_snapshot.to_dict() or {}
+        data = intent_snapshot.to_dict() or {}
+        if (operation.get("save_intent_id") != save_intent_id
+                or not _valid_lease(operation, owner, fence, now)):
+            return None
+        current = data.get("desired_parent_id_hash")
+        op_parent = operation.get("desired_parent_id_hash")
+        current_parent_id = data.get("desired_parent_id")
+        op_parent_id = operation.get("selected_folder_id")
+        if current is not None and current != desired_parent_id_hash:
+            raise ValueError("save intent parent is already bound to a different folder")
+        if current_parent_id is not None and current_parent_id != desired_parent_id:
+            raise ValueError("save intent parent is already bound to a different folder")
+        if op_parent is not None and op_parent != desired_parent_id_hash:
+            raise ValueError("operation parent conflicts with resolved folder")
+        if op_parent_id is not None and op_parent_id != desired_parent_id:
+            raise ValueError("operation selected folder conflicts with resolved parent")
+        data["desired_parent_id_hash"] = desired_parent_id_hash
+        data["desired_parent_id"] = desired_parent_id
+        data["updated_at"] = now
+        transaction.set(intent_ref, data)
+        transaction.update(operation_ref, {"desired_parent_id_hash": desired_parent_id_hash, "updated_at": now})
         return _from(data)
 
     return _txn(db.transaction())

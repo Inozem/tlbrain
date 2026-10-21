@@ -68,6 +68,39 @@ def test_callback_past_lease_expiry_does_not_commit_or_release_stale_lease(
     assert fake_clock.now() > operation.lease_expires_at
 
 
+def test_run_stage_uses_and_retains_supplied_operation_lease(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    lease = claim_operation(client, OPERATION_ID, owner="outer-worker", now=NOW, lease_seconds=60)
+    assert lease is not None
+    governor = _governor(client, fake_clock)
+
+    assert governor.run_stage(
+        OPERATION_ID, "external-lease", lambda: "saved", now=NOW,
+        owner="outer-worker", fence=lease.fence,
+    ) == "saved"
+    operation = get_operation(client, OPERATION_ID)
+    assert operation.lease_owner == "outer-worker"
+    assert operation.fence == lease.fence
+
+
+def test_run_stage_rejects_stale_supplied_lease_before_callback(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    lease = claim_operation(client, OPERATION_ID, owner="outer-worker", now=NOW, lease_seconds=60)
+    assert lease is not None
+    calls = []
+
+    with pytest.raises(RuntimeError, match="lease is unavailable"):
+        _governor(client, fake_clock).run_stage(
+            OPERATION_ID, "stale-external-lease", lambda: calls.append("called"), now=NOW,
+            owner="wrong-worker", fence=lease.fence,
+        )
+    assert calls == []
+
+
 @pytest.mark.parametrize("outcome", ["success", "failure"])
 def test_short_callback_persists_post_callback_time(firestore_fake, fake_clock, outcome):
     client = firestore_fake.client_class()

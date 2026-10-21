@@ -16,6 +16,7 @@ from core.integrations.firestore.operations import (
     release_operation,
     renew_operation_lease,
     reserve_stage_attempt,
+    validate_operation_lease,
 )
 from core.operations.models import OperationError, OperationStageRecord, StageState
 
@@ -115,6 +116,8 @@ class RetryGovernor:
         reconcile: Callable[[], Any] | None = None,
         save_intent_id: str | None = None,
         checkpoint_refs: tuple[str, ...] = (),
+        owner: str | None = None,
+        fence: int | None = None,
     ) -> Any:
         """Run one reserved callback or reconcile its durable attempt.
 
@@ -122,19 +125,30 @@ class RetryGovernor:
         belongs to the operation record.
         """
         del save_intent_id
+        if (owner is None) != (fence is None):
+            raise ValueError("owner and fence must be provided together")
         now = self._now(now)
+        externally_owned = owner is not None
+        if externally_owned:
+            if not validate_operation_lease(
+                self.client, operation_id, owner=owner, fence=fence, now=now,
+            ):
+                raise RuntimeError("operation lease is unavailable")
         stage = self.get_stage(operation_id, stage_key)
         if stage.state == StageState.COMPLETED:
             return stage.result
         self._check_retry_eligibility(stage, stage_key, now)
 
-        owner = f"retry-governor-{uuid4().hex}"
-        lease = claim_operation(
-            self.client, operation_id, owner=owner, now=now, lease_seconds=self.lease_seconds,
-        )
-        if lease is None:
-            raise RuntimeError("operation lease is unavailable")
-        fence = lease.fence
+        if externally_owned:
+            assert owner is not None and fence is not None
+        else:
+            owner = f"retry-governor-{uuid4().hex}"
+            lease = claim_operation(
+                self.client, operation_id, owner=owner, now=now, lease_seconds=self.lease_seconds,
+            )
+            if lease is None:
+                raise RuntimeError("operation lease is unavailable")
+            fence = lease.fence
         attempt_id = stage.in_flight_attempt_id
         try:
             if attempt_id is not None:
@@ -152,7 +166,8 @@ class RetryGovernor:
                 owner=owner, fence=fence, checkpoint_refs=checkpoint_refs,
             )
         finally:
-            release_operation(self.client, operation_id, owner=owner, fence=fence, now=self._now())
+            if not externally_owned:
+                release_operation(self.client, operation_id, owner=owner, fence=fence, now=self._now())
 
     def _check_retry_eligibility(
         self, stage: OperationStageRecord, stage_key: str, now: datetime,
