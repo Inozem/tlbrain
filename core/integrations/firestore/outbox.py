@@ -173,6 +173,55 @@ def list_due_outbox_records(
     return [_from(snapshot.to_dict() or {}) for snapshot in due]
 
 
+def record_outbox_delivery_result(
+    client: Any,
+    outbox_id: str,
+    *,
+    delivered: bool,
+    now: datetime,
+    safe_error: str | None = None,
+) -> OutboxRecord | None:
+    """Record one enqueue attempt without allowing a late failure to undo delivery.
+
+    ``safe_error`` is a short, caller-controlled diagnostic code. Provider exception
+    text must never be passed here because it can contain request data or secrets.
+    """
+    outbox_id = _id(outbox_id, "outbox_id")
+    now = _aware(now, "now")
+    if not isinstance(delivered, bool):
+        raise ValueError("delivered must be a boolean")
+    if delivered and safe_error is not None:
+        raise ValueError("successful delivery cannot include an error")
+    if safe_error is not None and (
+        not isinstance(safe_error, str)
+        or not re.fullmatch(r"[a-z_]{1,80}", safe_error)
+    ):
+        raise ValueError("safe_error must be a lowercase diagnostic code")
+    ref = client.collection(OUTBOX_COLLECTION).document(outbox_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> OutboxRecord | None:
+        snapshot = ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return None
+        data = snapshot.to_dict() or {}
+        current = OutboxState(data["state"])
+        updates: dict[str, Any] = {
+            "delivery_attempts": int(data.get("delivery_attempts", 0)) + 1,
+            "last_attempt_at": now,
+            "updated_at": now,
+        }
+        if current is not OutboxState.DELIVERED:
+            updates["state"] = (
+                OutboxState.DELIVERED.value if delivered else OutboxState.RETRY.value
+            )
+            updates["last_error"] = None if delivered else safe_error
+        transaction.update(ref, updates)
+        return _from({**data, **updates})
+
+    return _txn(client.transaction(max_attempts=5))
+
+
 def task_payload(record: OutboxRecord) -> dict[str, Any]:
     """Build the only permitted Cloud Tasks body: schema version and identifiers."""
     if not isinstance(record, OutboxRecord):
@@ -199,4 +248,5 @@ __all__ = [
     "MAX_DUE_LIMIT", "OUTBOX_COLLECTION", "OutboxRecord", "OutboxState",
     "OutboxTargetKind", "PAYLOAD_SCHEMA_VERSION", "UNDELIVERED_STATES",
     "create_outbox_record", "get_outbox_record", "list_due_outbox_records", "task_payload",
+    "record_outbox_delivery_result",
 ]

@@ -13,6 +13,7 @@ from core.integrations.firestore.outbox import (
     create_outbox_record,
     get_outbox_record,
     list_due_outbox_records,
+    record_outbox_delivery_result,
     task_payload,
 )
 
@@ -131,6 +132,40 @@ def test_due_query_never_returns_more_than_requested_limit(firestore_fake):
         _create(client, outbox_id=outbox_id, operation_id=f"op-{outbox_id}")
 
     assert len(list_due_outbox_records(client, now=NOW, limit=2)) == 2
+
+
+def test_delivery_results_are_transactional_and_delivered_state_is_monotonic(firestore_fake):
+    client = firestore_fake.client_class()
+    _create(client)
+
+    retried = record_outbox_delivery_result(
+        client, "outbox-1", delivered=False, now=NOW, safe_error="enqueue_failed"
+    )
+    assert retried.state is OutboxState.RETRY
+    assert retried.delivery_attempts == 1
+    assert retried.last_error == "enqueue_failed"
+
+    delivered = record_outbox_delivery_result(client, "outbox-1", delivered=True, now=NOW)
+    late_failure = record_outbox_delivery_result(
+        client, "outbox-1", delivered=False, now=NOW, safe_error="enqueue_failed"
+    )
+    assert delivered.state is OutboxState.DELIVERED
+    assert late_failure.state is OutboxState.DELIVERED
+    assert late_failure.delivery_attempts == 3
+    assert late_failure.last_error is None
+    assert get_outbox_record(client, "outbox-1") == late_failure
+
+
+def test_delivery_result_rejects_unsafe_diagnostic_and_missing_id(firestore_fake):
+    client = firestore_fake.client_class()
+    _create(client)
+    with pytest.raises(ValueError, match="diagnostic code"):
+        record_outbox_delivery_result(
+            client, "outbox-1", delivered=False, now=NOW, safe_error="https://secret.invalid/token"
+        )
+    assert record_outbox_delivery_result(
+        client, "missing", delivered=True, now=NOW
+    ) is None
 
 
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5, 501])
