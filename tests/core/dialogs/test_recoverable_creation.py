@@ -34,19 +34,22 @@ CONTENT = "DATE: 2026-04-02\nPROVIDER: manual\n---\nAda :: hello\n"
 def _reconcile(drive, *, save_intent_id: str = SAVE_ID, expected_parent_id: str = PARENT_ID):
     # The component seam searches Drive by the immutable marker and validates
     # native Doc type and parent before adopting a candidate.
+    from tests.fixtures.sdk_fakes import fake_discovery_build
     from core.integrations.google_docs.creation import reconcile_google_doc_by_marker
 
     return reconcile_google_doc_by_marker(
-        drive, save_intent_id=save_intent_id, expected_parent_id=expected_parent_id
+        fake_discovery_build("drive", "v3"), save_intent_id=save_intent_id,
+        expected_parent_id=expected_parent_id,
     )
 
 
 def _create(drive, *, save_intent_id: str = SAVE_ID):
     # The component seam creates only a native Doc carrying the save marker.
+    from tests.fixtures.sdk_fakes import fake_discovery_build
     from core.integrations.google_docs.creation import create_marked_google_doc
 
     return create_marked_google_doc(
-        drive,
+        fake_discovery_build("drive", "v3"),
         save_intent_id=save_intent_id,
         parent_id=PARENT_ID,
         title=TITLE,
@@ -150,7 +153,7 @@ def test_definitive_drive_rejection_is_distinct_from_unknown_timeout(sdk_fakes):
         _create(sdk_fakes.drive)
 
     assert getattr(rejected.value, "outcome", None) == "rejected"
-    assert [event["operation"] for event in sdk_fakes.trace] == ["files.create"]
+    assert [event["operation"] for event in sdk_fakes.trace if event["operation"].startswith("files.")] == ["files.create"]
 
     sdk_fakes.drive.queue("files.create", error=TimeoutError("provider response unavailable"))
     with pytest.raises(Exception) as unknown:
@@ -180,7 +183,7 @@ def test_creation_reconciles_only_a_valid_marker_match(sdk_fakes):
     assert SAVE_ID in search["arguments"]["q"]
     assert "name" not in search["arguments"]["q"]
     assert "fullText" not in search["arguments"]["q"]
-    assert sdk_fakes.trace == [search]
+    assert [event for event in sdk_fakes.trace if event["operation"].startswith("files.")] == [search]
 
 
 def test_creation_with_no_marker_match_stays_unknown_and_does_not_create(sdk_fakes):
@@ -190,7 +193,7 @@ def test_creation_with_no_marker_match_stays_unknown_and_does_not_create(sdk_fak
 
     assert result.state == "creation_outcome_unknown"
     assert result.document_id is None
-    assert [event["operation"] for event in sdk_fakes.trace] == ["files.list"]
+    assert [event["operation"] for event in sdk_fakes.trace if event["operation"].startswith("files.")] == ["files.list"]
 
 
 def test_multiple_marker_matches_are_an_invariant_error_without_deletion(sdk_fakes):
@@ -199,7 +202,7 @@ def test_multiple_marker_matches_are_an_invariant_error_without_deletion(sdk_fak
     with pytest.raises(ValueError, match="multiple"):
         _reconcile(sdk_fakes.drive)
 
-    assert [event["operation"] for event in sdk_fakes.trace] == ["files.list"]
+    assert [event["operation"] for event in sdk_fakes.trace if event["operation"].startswith("files.")] == ["files.list"]
     assert not any(event["operation"] == "files.delete" for event in sdk_fakes.trace)
 
 
@@ -246,7 +249,7 @@ def test_manual_retry_reuses_intent_and_unknown_gate_after_marker_reconciliation
     assert first_lease is not None
     sdk_fakes.drive.queue("files.create", error=RuntimeError("provider outcome unavailable"))
 
-    with pytest.raises(RuntimeError, match="provider outcome unavailable"):
+    with pytest.raises(Exception) as create_error:
         dispatch_save_intent(
             client,
             SAVE_ID,
@@ -256,6 +259,8 @@ def test_manual_retry_reuses_intent_and_unknown_gate_after_marker_reconciliation
             now=NOW,
             create_callback=lambda: _create(sdk_fakes.drive),
         )
+    assert getattr(create_error.value, "outcome", None) == "unknown"
+    assert "provider outcome unavailable" not in str(create_error.value)
 
     _drive_search(sdk_fakes, matches)
     if matches:
@@ -312,7 +317,7 @@ def test_unknown_create_adopts_one_marker_match_and_retry_returns_same_doc(fires
     assert first_lease is not None
     sdk_fakes.drive.queue("files.create", error=TimeoutError("provider response unavailable"))
 
-    with pytest.raises(TimeoutError, match="provider response unavailable"):
+    with pytest.raises(Exception) as create_error:
         dispatch_save_intent(
             client,
             SAVE_ID,
@@ -322,6 +327,8 @@ def test_unknown_create_adopts_one_marker_match_and_retry_returns_same_doc(fires
             now=NOW,
             create_callback=lambda: _create(sdk_fakes.drive),
         )
+    assert getattr(create_error.value, "outcome", None) == "unknown"
+    assert "provider response unavailable" not in str(create_error.value)
 
     retry_at = NOW + timedelta(seconds=31)
     create_operation(

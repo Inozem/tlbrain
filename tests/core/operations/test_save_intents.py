@@ -102,6 +102,41 @@ def test_unknown_create_can_be_reconciled_under_retry_operation_lease(firestore_
     assert creates == ["create"]
 
 
+def test_definitive_rejection_reopens_gate_for_budgeted_retry(firestore_fake):
+    class RejectedCreate(RuntimeError):
+        outcome = "rejected"
+
+    client = firestore_fake.client_class()
+    _operation(client, "operation-a")
+    _intent(client, "intent-a", "operation-a")
+    lease = claim_operation(client, "operation-a", owner="worker", now=NOW, lease_seconds=30)
+    assert lease is not None
+    attempts = []
+
+    def reject_once():
+        attempts.append("rejected")
+        raise RejectedCreate("safe definitive rejection")
+
+    with pytest.raises(RejectedCreate):
+        dispatch_save_intent(
+            client, "intent-a", operation_id="operation-a", owner="worker", fence=lease.fence,
+            now=NOW, create_callback=reject_once,
+        )
+
+    rejected = get_save_intent(client, "intent-a")
+    assert rejected.state.value == "planned"
+    assert rejected.create_outcome == "rejected"
+    assert rejected.dispatch_token is None
+
+    result = dispatch_save_intent(
+        client, "intent-a", operation_id="operation-a", owner="worker", fence=lease.fence,
+        now=NOW, create_callback=lambda: (attempts.append("confirmed") or OperationResult(document_id="doc-a")),
+    )
+    assert result.document_id == "doc-a"
+    assert get_save_intent(client, "intent-a").state.value == "confirmed"
+    assert attempts == ["rejected", "confirmed"]
+
+
 def test_stale_dispatch_does_not_auto_create_or_bind_missing_intent(firestore_fake):
     client = firestore_fake.client_class()
     _operation(client, "operation-stale")

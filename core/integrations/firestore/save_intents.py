@@ -231,8 +231,11 @@ def dispatch_save_intent(
         return None
     try:
         result = create_callback()
-    except BaseException:
-        _mark_unknown(db, save_intent_id, operation_id, owner, fence, now, reservation)
+    except BaseException as exc:
+        if getattr(exc, "outcome", None) == "rejected":
+            _mark_rejected(db, save_intent_id, operation_id, owner, fence, now, reservation)
+        else:
+            _mark_unknown(db, save_intent_id, operation_id, owner, fence, now, reservation)
         raise
     _confirm(db, save_intent_id, operation_id, owner, fence, now, reservation, result)
     current = get_save_intent(db, save_intent_id)
@@ -253,6 +256,38 @@ def _mark_unknown(db: Any, intent_id: str, operation_id: str, owner: str, fence:
         if not _valid_lease(op, owner, fence, now) or data.get("dispatch_token") != token:
             return
         data.update({"state": SaveIntentState.UNKNOWN.value, "create_outcome": "unknown", "updated_at": now})
+        transaction.set(intent_ref, data)
+
+    _txn(db.transaction())
+
+
+def _mark_rejected(db: Any, intent_id: str, operation_id: str, owner: str, fence: int, now: datetime,
+                   token: str) -> None:
+    """Reopen only a definitively rejected dispatch under its original fence."""
+    intent_ref = db.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+    operation_ref = db.collection(OPERATIONS_COLLECTION).document(operation_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> None:
+        op_snapshot = operation_ref.get(transaction=transaction)
+        intent_snapshot = intent_ref.get(transaction=transaction)
+        if not op_snapshot.exists or not intent_snapshot.exists:
+            return
+        op, data = op_snapshot.to_dict() or {}, intent_snapshot.to_dict() or {}
+        if (op.get("save_intent_id") != intent_id
+                or not _valid_lease(op, owner, fence, now)
+                or data.get("dispatch_token") != token
+                or data.get("state") != SaveIntentState.DISPATCHED.value):
+            return
+        data.update({
+            "state": SaveIntentState.PLANNED.value,
+            "create_outcome": "rejected",
+            "dispatch_token": None,
+            "dispatch_operation_id": None,
+            "dispatch_owner": None,
+            "dispatch_fence": None,
+            "updated_at": now,
+        })
         transaction.set(intent_ref, data)
 
     _txn(db.transaction())
