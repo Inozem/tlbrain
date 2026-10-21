@@ -34,6 +34,16 @@ EXPECTED_ENTRIES = {
     "tldv_webhook": "main.py",
     "tldv_reconciliation": "main.py",
 }
+FOUNDATION_ARTIFACT_EXCLUSIONS = (
+    "core/dialogs/",
+    "services/connectors/telegram/",
+    "core/operations/registry.py",
+)
+MCP_SHARED_OPERATIONS = {
+    "core/operations/read.py",
+    "core/operations/write.py",
+    "core/operations/sync.py",
+}
 IMAGE_SERVICES = {"mcp", "vector_sync", "tldv_import"}
 EXPECTED_INTEGRATION_REQUIREMENTS = {
     "mcp": {
@@ -248,6 +258,14 @@ def test_all_six_current_service_sources_assemble_to_isolated_runtime_artifacts(
             assert report["runtime_target"] == runtime_target
             assert report["source_files"]
             assert report["import_edges"]
+            source_paths = {entry["runtime_path"] for entry in report["source_files"]}
+            for excluded in FOUNDATION_ARTIFACT_EXCLUSIONS:
+                assert not any(
+                    path == excluded.rstrip("/") or path.startswith(excluded)
+                    for path in source_paths
+                ), f"{service} unexpectedly includes {excluded}"
+            if service == "mcp":
+                assert MCP_SHARED_OPERATIONS <= source_paths
             selected_integrations = {
                 PurePosixPath(item["runtime_path"]).parent.name
                 for item in report["requirements_graph"]["files"]

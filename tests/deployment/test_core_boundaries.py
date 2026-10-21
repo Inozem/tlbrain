@@ -218,6 +218,62 @@ def test_importing_integration_modules_constructs_no_clients_or_models() -> None
 
 
 @pytest.mark.offline
+def test_importing_foundation_operations_and_config_is_passive() -> None:
+    module_names = sorted(
+        "core." + ".".join(path.relative_to(CORE_ROOT).with_suffix("").parts)
+        for path in _python_files(CORE_ROOT / "operations")
+        if path.name != "__init__.py"
+    ) + ["core.config"]
+    code = "\n".join(
+        [
+            "import importlib, importlib.abc, os, socket, sys",
+            f"sys.path.insert(0, {str(APP_ROOT)!r})",
+            "blocked = ('services',)",
+            "class RejectServices(importlib.abc.MetaPathFinder):",
+            "    def find_spec(self, fullname, path=None, target=None):",
+            "        if any(fullname == root or fullname.startswith(root + '.') for root in blocked): raise AssertionError('blocked import attempted: ' + fullname)",
+            "sys.meta_path.insert(0, RejectServices())",
+            "os.environ['TELEGRAM_BOT_TOKEN'] = 'synthetic-token'",
+            "os.environ.pop('TELEGRAM_ALLOWED_USER_IDS', None)",
+            "os.environ.pop('TLDV_API_KEY', None)",
+            "def no_network(*args, **kwargs): raise AssertionError('network access attempted')",
+            "socket.create_connection = no_network",
+            "socket.socket.connect = no_network",
+            "socket.socket.connect_ex = no_network",
+            "import google.cloud.firestore as firestore_sdk",
+            "from google.cloud import tasks_v2",
+            "from google import genai",
+            "import google.auth",
+            "from google.oauth2.credentials import Credentials",
+            "import google_auth_httplib2",
+            "import httplib2",
+            "from googleapiclient import discovery",
+            "from qdrant_client import QdrantClient",
+            "from fastembed import SparseTextEmbedding",
+            "calls = []",
+            "def spy(label):",
+            "    def call(*args, **kwargs): calls.append(label); raise AssertionError(label + ' constructed during import')",
+            "    return call",
+            "firestore_sdk.Client.__init__ = spy('Firestore client')",
+            "tasks_v2.CloudTasksClient.__init__ = spy('Cloud Tasks client')",
+            "genai.Client.__init__ = spy('Gemini client')",
+            "google.auth.default = spy('Google ADC credentials')",
+            "Credentials.__init__ = spy('Google OAuth credentials')",
+            "google_auth_httplib2.AuthorizedHttp.__init__ = spy('AuthorizedHttp')",
+            "httplib2.Http.__init__ = spy('httplib2.Http')",
+            "discovery.build = spy('Drive/Docs discovery')",
+            "QdrantClient.__init__ = spy('Qdrant client')",
+            "SparseTextEmbedding.__init__ = spy('FastEmbed model')",
+            f"modules = {module_names!r}",
+            "for name in modules: importlib.import_module(name)",
+            "assert calls == [], repr(calls)",
+        ]
+    )
+    completed = _run_isolated(code)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.offline
 def test_parser_windowing_and_folder_algorithms_import_with_unrelated_roots_blocked() -> None:
     code = "\n".join(
         [

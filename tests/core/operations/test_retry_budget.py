@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.integrations.qdrant import reader as qdrant_reader
-from core.integrations.firestore.operations import claim_operation, create_operation, get_operation
+from core.integrations.firestore.operations import claim_operation, create_operation, get_operation, get_stage
 from core.operations.models import OperationError, OperationOrigin, OperationState
 from core.operations.retries import (
     ConfirmedStageFailure,
@@ -39,6 +39,143 @@ def _new_operation(client):
 
 def _governor(client, fake_clock):
     return RetryGovernor(client, clock=fake_clock, max_failures=3)
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_callback_past_lease_expiry_does_not_commit_or_release_stale_lease(
+    firestore_fake, fake_clock, outcome,
+):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    governor = RetryGovernor(client, clock=fake_clock, lease_seconds=5)
+
+    def callback():
+        fake_clock.advance(seconds=6)
+        if outcome == "failure":
+            raise ValueError("synthetic provider failure")
+        return "saved"
+
+    with pytest.raises(RuntimeError, match="could not persist stage"):
+        governor.run_stage(OPERATION_ID, "slow-callback", callback, now=NOW)
+
+    stage = get_stage(client, OPERATION_ID, "slow-callback")
+    operation = get_operation(client, OPERATION_ID)
+    assert stage.in_flight_attempt_id is not None
+    assert stage.attempts_started == 1 and stage.failures == 0
+    assert operation.lease_owner is not None
+    assert operation.lease_expires_at == NOW + timedelta(seconds=5)
+    assert fake_clock.now() > operation.lease_expires_at
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_short_callback_persists_post_callback_time(firestore_fake, fake_clock, outcome):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    governor = _governor(client, fake_clock)
+    completed_at = NOW + timedelta(seconds=2)
+
+    def callback():
+        fake_clock.advance(seconds=2)
+        if outcome == "failure":
+            raise ValueError("synthetic provider failure")
+        return "saved"
+
+    if outcome == "failure":
+        with pytest.raises(ValueError, match="synthetic provider failure"):
+            governor.run_stage(
+                OPERATION_ID, "short-callback", callback, now=NOW,
+                retryable=lambda error: False,
+            )
+    else:
+        assert governor.run_stage(OPERATION_ID, "short-callback", callback, now=NOW) == "saved"
+
+    stage = get_stage(client, OPERATION_ID, "short-callback")
+    assert stage.updated_at == completed_at
+    if outcome == "failure":
+        assert stage.last_error.occurred_at == completed_at
+        operation = get_operation(client, OPERATION_ID)
+        assert operation.state is OperationState.FAILED
+        assert operation.finished_at == completed_at
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_expired_reconciliation_stays_in_flight_for_fresh_owner(
+    firestore_fake, fake_clock, outcome,
+):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    governor = RetryGovernor(client, clock=fake_clock, lease_seconds=5)
+    provider_calls = []
+
+    def uncertain_provider_call():
+        provider_calls.append("dispatch")
+        raise UnknownOutcome("synthetic uncertain provider result")
+
+    with pytest.raises(UnknownOutcome):
+        governor.run_stage(OPERATION_ID, "slow-reconcile", uncertain_provider_call, now=NOW)
+    attempt_id = get_stage(client, OPERATION_ID, "slow-reconcile").in_flight_attempt_id
+    assert attempt_id
+
+    error = OperationError(
+        code="provider_rejected", category="execution", message="Provider rejected the request",
+        retryable=True, stage="slow-reconcile",
+    )
+
+    def expired_reconcile():
+        fake_clock.advance(seconds=6)
+        if outcome == "failure":
+            return ConfirmedStageFailure(error)
+        return ConfirmedStageSuccess("reconciled")
+
+    with pytest.raises(RuntimeError, match="could not persist reconciled stage"):
+        governor.run_stage(
+            OPERATION_ID, "slow-reconcile", uncertain_provider_call,
+            reconcile=expired_reconcile, now=NOW,
+        )
+
+    stage = get_stage(client, OPERATION_ID, "slow-reconcile")
+    expired_operation = get_operation(client, OPERATION_ID)
+    assert stage.in_flight_attempt_id == attempt_id
+    assert stage.attempts_started == 1 and stage.failures == 0
+    assert expired_operation.lease_owner is not None
+    assert expired_operation.lease_expires_at == NOW + timedelta(seconds=5)
+    assert fake_clock.now() > expired_operation.lease_expires_at
+
+    committed_at = fake_clock.now() + timedelta(seconds=1)
+
+    def fresh_reconcile():
+        fake_clock.advance(seconds=1)
+        if outcome == "failure":
+            return ConfirmedStageFailure(error)
+        return ConfirmedStageSuccess("reconciled")
+
+    if outcome == "failure":
+        with pytest.raises(ReconciledStageFailure):
+            governor.run_stage(
+                OPERATION_ID, "slow-reconcile", uncertain_provider_call,
+                reconcile=fresh_reconcile, now=fake_clock.now(),
+            )
+    else:
+        assert governor.run_stage(
+            OPERATION_ID, "slow-reconcile", uncertain_provider_call,
+            reconcile=fresh_reconcile, now=fake_clock.now(),
+        ) == "reconciled"
+
+    recovered = get_stage(client, OPERATION_ID, "slow-reconcile")
+    recovered_operation = get_operation(client, OPERATION_ID)
+    assert provider_calls == ["dispatch"]
+    assert recovered_operation.fence == expired_operation.fence + 1
+    assert recovered_operation.lease_owner is None
+    assert recovered.attempts_started == 1 and recovered.failures == (outcome == "failure")
+    assert recovered.in_flight_attempt_id is None
+    assert recovered.updated_at == committed_at
+    if outcome == "failure":
+        assert recovered.last_error.occurred_at == committed_at
+    else:
+        assert recovered.result == "reconciled"
 
 
 def test_max_failures_cannot_exceed_three():
