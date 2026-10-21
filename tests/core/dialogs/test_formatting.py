@@ -64,6 +64,33 @@ def test_invalid_declared_encoded_body_is_a_format_error(body: str):
     assert not _is_valid_format(document)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "unstructured content",
+        'Speaker :: "   "',
+        ' :: "spoken text"',
+    ],
+)
+def test_malformed_declared_encoded_records_are_format_errors(body: str):
+    document = f"DATE: 2026-01-09\nPROVIDER: custom\nTEXT_ENCODING: json-string-v1\n---\n{body}"
+    with pytest.raises(ValueError):
+        _parse_document(document)
+    assert not _is_valid_format(document)
+
+
+def test_declared_encoded_body_allows_blank_record_separators():
+    document = (
+        "DATE: 2026-01-09\nPROVIDER: custom\nTEXT_ENCODING: json-string-v1\n---\n"
+        'A :: "first"\n\nB :: "second"'
+    )
+    assert _parse_document(document)[1] == [
+        {"speaker": "A", "text": "first", "order_index": 0},
+        {"speaker": "B", "text": "second", "order_index": 1},
+    ]
+    assert _is_valid_format(document)
+
+
 def test_unknown_declared_encoding_is_a_format_error():
     document = "DATE: 2026-01-09\nPROVIDER: custom\nTEXT_ENCODING: base64\n---\nSpeaker :: eA=="
     with pytest.raises(ValueError):
@@ -156,7 +183,7 @@ def test_formatter_round_trips_through_real_reader_and_parser(monkeypatch, sdk_f
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "synthetic-client")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "synthetic-secret")
     monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "synthetic-refresh")
-    original = "# heading\n- item\n| x | y |\n\tcode\r\n\n  end  \U0001f600"
+    original = "# heading\n- item\n| x | y |\n\tcode\r\n\n  end  \U0001f600\u2028paragraph\u2029next"
     normalized = _normalize(
         {
             "provider": "custom",
@@ -178,12 +205,25 @@ def test_formatter_round_trips_through_real_reader_and_parser(monkeypatch, sdk_f
         response={"body": {"content": paragraphs}},
     )
     from core.integrations.google_docs.reader import read_google_doc
+    from core.indexing.payloads import build_utterance_payloads
 
     restored = read_google_doc("round-trip-doc")
     projected = "\n".join(line for line in text.split("\n") if line.strip())
     assert restored == projected
-    assert _parse_document(restored)[1] == [
+    parsed = _parse_document(restored)[1]
+    assert parsed == [
         {"speaker": "\U0001f9d1\u200d\U0001f4bb Speaker", "text": original, "order_index": 0}
+    ]
+    payloads = build_utterance_payloads(
+        parsed,
+        doc_id="round-trip-doc",
+        version="v1",
+        parent_id="round-trip-parent",
+        dialog_date="2026-01-09",
+        root_folder_id="round-trip-root",
+    )
+    assert [(payload["speaker"], payload["text"], payload["order_index"]) for payload in payloads] == [
+        ("\U0001f9d1\u200d\U0001f4bb Speaker", original, 0)
     ]
 
 
