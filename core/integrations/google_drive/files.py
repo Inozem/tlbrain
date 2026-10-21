@@ -6,6 +6,109 @@ from core.integrations.google_drive.client import build_drive_service, build_dri
 
 logger = logging.getLogger(__name__)
 
+GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
+SAVE_INTENT_PROPERTY = "tlbrain_save_id"
+
+
+class DriveCreateError(RuntimeError):
+    """Safe create failure with an outcome classification for recovery logic."""
+
+    def __init__(self, outcome: str):
+        if outcome not in {"rejected", "unknown"}:
+            raise ValueError("invalid Drive create outcome")
+        self.outcome = outcome
+        message = "Drive document creation was rejected" if outcome == "rejected" else "Drive document creation outcome is unknown"
+        super().__init__(message)
+
+
+def create_native_doc(service, name: str, parent_id: str, save_intent_id: str) -> str:
+    """Create one native Doc carrying its immutable save-intent marker.
+
+    The caller supplies the service so it can control the physical request and
+    decide how to recover when its outcome is uncertain.
+    """
+    body = {
+        "name": name,
+        "mimeType": GOOGLE_DOC_MIME_TYPE,
+        "parents": [parent_id],
+        "appProperties": {SAVE_INTENT_PROPERTY: save_intent_id},
+    }
+    try:
+        result = service.files().create(body=body, fields="id").execute()
+    except Exception as exc:
+        status = getattr(exc, "status_code", None) or getattr(getattr(exc, "resp", None), "status", None)
+        # 408/429 do not establish whether Drive persisted the request.
+        outcome = "rejected" if isinstance(status, int) and 400 <= status < 500 and status not in {408, 429} else "unknown"
+        raise DriveCreateError(outcome) from None
+    if not isinstance(result, dict) or not isinstance(result.get("id"), str) or not result["id"].strip():
+        raise DriveCreateError("unknown")
+    return result["id"]
+
+
+def _escape_drive_query_literal(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def find_native_docs_by_save_intent(service, save_intent_id: str, expected_parent_id: str) -> list[dict]:
+    """Return every valid native Doc matching a save-intent marker.
+
+    This is a read-only recovery query. An empty list is only an observation;
+    callers must decide whether another create attempt is safe.
+    """
+    query_value = _escape_drive_query_literal(save_intent_id)
+    query = f"appProperties has {{ key='{SAVE_INTENT_PROPERTY}' and value='{query_value}' }}"
+    valid = []
+    page_token = None
+    while True:
+        kwargs = {
+            "q": query,
+            "spaces": "drive",
+            "pageSize": 1000,
+            "fields": "nextPageToken,files(id,mimeType,parents,trashed,appProperties)",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        try:
+            response = service.files().list(**kwargs).execute()
+        except Exception:
+            raise RuntimeError("Drive marker lookup is unavailable") from None
+        if not isinstance(response, dict) or not isinstance(response.get("files"), list):
+            raise RuntimeError("Drive marker lookup returned malformed metadata")
+        next_token = response.get("nextPageToken")
+        if next_token is not None and (not isinstance(next_token, str) or not next_token):
+            raise RuntimeError("Drive marker lookup returned malformed metadata")
+        for candidate in response["files"]:
+            if not isinstance(candidate, dict):
+                raise RuntimeError("Drive marker lookup returned malformed metadata")
+            props = candidate.get("appProperties")
+            if (
+                isinstance(candidate.get("id"), str)
+                and candidate["id"].strip()
+                and candidate.get("mimeType") == GOOGLE_DOC_MIME_TYPE
+                and candidate.get("trashed") is False
+                and candidate.get("parents") == [expected_parent_id]
+                and isinstance(props, dict)
+                and props.get(SAVE_INTENT_PROPERTY) == save_intent_id
+            ):
+                valid.append(candidate)
+        page_token = next_token
+        if not page_token:
+            return valid
+
+
+def read_native_doc_metadata(service, file_id: str) -> dict:
+    """Read metadata for a known file ID without accessing document content."""
+    try:
+        result = service.files().get(
+            fileId=file_id,
+            fields="id,mimeType,parents,trashed,appProperties,modifiedTime",
+        ).execute()
+    except Exception:
+        raise RuntimeError("Drive document metadata is unavailable") from None
+    if not isinstance(result, dict) or result.get("id") != file_id:
+        raise RuntimeError("Drive document metadata is unavailable")
+    return result
+
 
 def get_file_metadata(file_id: str) -> dict:
     """Return the minimal current metadata needed by guarded write read-back."""
