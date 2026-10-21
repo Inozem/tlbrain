@@ -277,6 +277,10 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
             "get_or_create_folder",
             "resolve_registered_folder_path",
             "expand_registered_subtree",
+            "prepare_create_folder",
+            "prepare_move_folder",
+            "apply_move_folder",
+            "apply_rename_folder",
         },
         "core/integrations/google_drive/scanner.py": {"scan_root_folder"},
         "core/integrations/google_drive/changes.py": {
@@ -285,6 +289,8 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
         },
         "core/integrations/google_drive/files.py": {
             "get_file_parent_folder_id",
+            "get_file_metadata",
+            "get_file_metadata_if_exists",
             "move_file_to_folder",
             "rename_file",
         },
@@ -294,6 +300,10 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
             "upsert_folder",
         },
         "core/indexing/processor.py": {"process_one"},
+        "core/operations/write.py": {
+            "move_transcript", "rename_transcript", "move_folder", "rename_folder",
+            "create_folder", "add_fact",
+        },
     }
     for relative, expected in owners.items():
         assert expected <= _function_nodes(APP_ROOT / relative).keys(), relative
@@ -313,6 +323,33 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
         "upsert_folder": {"core/integrations/firestore/folders.py"},
         "get_bm25_model": {"core/integrations/fastembed/bm25.py"},
         "process_one": {"core/indexing/processor.py"},
+        "get_file_metadata": {"core/integrations/google_drive/files.py"},
+        "get_file_metadata_if_exists": {"core/integrations/google_drive/files.py"},
+        "prepare_create_folder": {"core/integrations/google_drive/folder_service.py"},
+        "prepare_move_folder": {"core/integrations/google_drive/folder_service.py"},
+        "apply_move_folder": {"core/integrations/google_drive/folder_service.py"},
+        "apply_rename_folder": {"core/integrations/google_drive/folder_service.py"},
+        "get_parent_ids_by_doc_ids": {"core/integrations/qdrant/reader.py"},
+        "get_user_fact_payload": {"core/integrations/qdrant/reader.py"},
+        "user_fact_point_id": {"core/integrations/qdrant/writer.py"},
+        "move_transcript": {
+            "core/documents/operations.py", "core/operations/write.py",
+        },
+        "rename_transcript": {
+            "core/documents/operations.py", "core/operations/write.py",
+        },
+        "move_folder": {
+            "core/integrations/google_drive/folder_service.py", "core/operations/write.py",
+        },
+        "rename_folder": {
+            "core/integrations/google_drive/client.py", "core/integrations/google_drive/folder_service.py",
+            "core/operations/write.py",
+        },
+        "create_folder": {
+            "core/integrations/google_drive/client.py", "core/integrations/google_drive/folder_service.py",
+            "core/operations/write.py",
+        },
+        "add_fact": {"core/operations/write.py"},
     }
     actual_definitions: dict[str, set[str]] = {name: set() for name in allowed_definitions}
     for root in (CORE_ROOT, APP_ROOT / "services"):

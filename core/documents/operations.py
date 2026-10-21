@@ -1,6 +1,7 @@
 """Cross-store operations for transcript documents."""
 
 from dataclasses import dataclass
+from typing import Callable
 
 from core.config import get_root_folder_id
 from core.integrations.firestore import folders, transcripts
@@ -41,21 +42,48 @@ class MoveTranscriptResult:
 
 def move_transcript(doc_id: str, folder_path: list[str]) -> MoveTranscriptResult:
     """Move a transcript and update its canonical indexes in established order."""
-    resolver_root_id = get_root_folder_id()
-    all_folders = folders.get_all_folders()
-    terminal_ids = resolve_folder_path(folder_path, all_folders, resolver_root_id)
+    terminal_ids = resolve_folder_path(folder_path, folders.get_all_folders(), get_root_folder_id())
     if not terminal_ids:
         raise FolderPathNotFound(folder_path)
     if len(terminal_ids) > 1:
         raise AmbiguousFolderPathError(folder_path, len(terminal_ids))
     new_folder_id = terminal_ids[0]
 
-    root_folder_id = get_root_folder_id()
-    move_file_to_folder(doc_id, new_folder_id)
-    transcripts.move_transcript_record(doc_id, new_folder_id)
-    set_payload_parent_id(doc_id, root_folder_id, new_folder_id)
+    return apply_move_transcript(doc_id, new_folder_id, get_root_folder_id())
 
-    db = firestore_client.get_client()
+
+def resolve_move_target(folder_path: list[str], db=None) -> str:
+    """Resolve and validate a unique target folder for guarded move planning."""
+    folder_data = folders.get_all_folders() if db is None else folders.get_all_folders(db)
+    terminal_ids = resolve_folder_path(folder_path, folder_data, get_root_folder_id())
+    if not terminal_ids:
+        raise FolderPathNotFound(folder_path)
+    if len(terminal_ids) > 1:
+        raise AmbiguousFolderPathError(folder_path, len(terminal_ids))
+    return terminal_ids[0]
+
+
+def apply_move_transcript(
+    doc_id: str, new_folder_id: str, root_folder_id: str, *, single_attempt: bool = False,
+    db=None, before_bookkeeping: Callable[[], None] | None = None,
+) -> MoveTranscriptResult:
+    """Apply a previously resolved move in the established Drive/Firestore/Qdrant order."""
+    move_file_to_folder(doc_id, new_folder_id)
+    if before_bookkeeping is not None:
+        before_bookkeeping()
+    if db is None:
+        transcripts.move_transcript_record(doc_id, new_folder_id)
+    else:
+        transcripts.move_transcript_record(doc_id, new_folder_id, db)
+    if before_bookkeeping is not None:
+        before_bookkeeping()
+    if single_attempt:
+        from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
+        set_payload_parent_id(doc_id, root_folder_id, new_folder_id, retry_policy=SINGLE_ATTEMPT_RETRY_POLICY)
+    else:
+        set_payload_parent_id(doc_id, root_folder_id, new_folder_id)
+
+    db = db if db is not None else firestore_client.get_client()
     unassigned_folder_id = folders.get_folder_id_by_name("_unassigned", db)
     unassigned = (
         transcripts.list_unassigned_transcripts(unassigned_folder_id, db)
@@ -68,8 +96,20 @@ def rename_transcript(doc_id: str, new_title: str) -> None:
     """Rename a transcript in Drive and update its canonical transcript record."""
     if not transcripts.get_transcript_record(doc_id):
         raise TranscriptNotFound(doc_id)
+    apply_rename_transcript(doc_id, new_title)
+
+
+def apply_rename_transcript(
+    doc_id: str, new_title: str, db=None, *, before_bookkeeping: Callable[[], None] | None = None,
+) -> None:
+    """Apply a title after the caller has validated and planned the transcript."""
     rename_file(doc_id, new_title)
-    transcripts.update_index(doc_id, {"source_file": new_title})
+    if before_bookkeeping is not None:
+        before_bookkeeping()
+    if db is None:
+        transcripts.update_index(doc_id, {"source_file": new_title})
+    else:
+        transcripts.update_index(doc_id, {"source_file": new_title}, db)
 
 
 def validate_document_format(doc_id: str, raw_text: str, indexed: bool) -> bool:

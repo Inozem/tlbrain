@@ -7,6 +7,32 @@ from core.integrations.google_drive.client import build_drive_service, build_dri
 logger = logging.getLogger(__name__)
 
 
+def get_file_metadata(file_id: str) -> dict:
+    """Return the minimal current metadata needed by guarded write read-back."""
+    service = build_drive_service()
+    result = service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,parents,trashed,appProperties",
+    ).execute()
+    if not isinstance(result, dict) or result.get("id") != file_id:
+        raise RuntimeError("Drive metadata is unavailable")
+    return result
+
+
+def get_file_metadata_if_exists(file_id: str) -> dict | None:
+    """Return None only when the Drive resource is absent; hide provider details."""
+    from googleapiclient.errors import HttpError
+    try:
+        return get_file_metadata(file_id)
+    except HttpError as exc:
+        status = getattr(exc, "status_code", None) or getattr(getattr(exc, "resp", None), "status", None)
+        if status == 404:
+            return None
+        raise RuntimeError("Drive metadata is unavailable") from None
+    except Exception:
+        raise RuntimeError("Drive metadata is unavailable") from None
+
+
 def get_file_parent_folder_id(doc_id: str) -> tuple[str | None, bool, str | None]:
     """Return (parent_folder_id, is_trashed, file_name) for a Drive file."""
     service = build_drive_service()

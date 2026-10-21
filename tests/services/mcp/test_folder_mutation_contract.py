@@ -40,12 +40,12 @@ def test_move_folder_rejects_self_or_descendant_without_side_effects(
     from core.integrations.google_drive import folder_service
 
     monkeypatch.setattr(
-        folder_service, "_resolve", lambda path, role: paths[tuple(path)][0]
+        folder_service, "_resolve", lambda path, role, _db=None: paths[tuple(path)][0]
     )
     monkeypatch.setattr(
         folder_service.folder_repository,
         "get_all_folders",
-        lambda: {
+        lambda _db=None: {
             "parent-id": {"name": "Parent", "parent_id": "root-id"},
             "child-id": {"name": "Child", "parent_id": "parent-id"},
         },
@@ -122,7 +122,7 @@ def test_folder_domain_errors_keep_existing_mcp_messages(
     from core.integrations.google_drive import folder_service
 
     monkeypatch.setattr(
-        folder_service,
+        handler.write_operations,
         operation,
         lambda *args: (_ for _ in ()).throw(error(folder_service)),
     )
@@ -136,3 +136,33 @@ def test_folder_domain_errors_keep_existing_mcp_messages(
     response = _run(handler.handle_mcp_request(request.model_dump(exclude_none=True)))
 
     assert response["error"] == expected
+
+
+@pytest.mark.offline
+def test_fresh_same_name_folder_rename_keeps_legacy_mcp_conflict(
+    monkeypatch, firestore_fake,
+):
+    from core.operations import write as write_operations
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+
+    client = firestore_fake.client_class()
+    root_id = "pytest-synthetic-root"
+    client.collection(FOLDERS_COLLECTION).document("folder-same").set({
+        "folder_id": "folder-same", "name": "Same", "parent_id": root_id,
+    })
+    monkeypatch.setattr(write_operations.firestore_client, "get_client", lambda: client)
+    request = JSONRPCRequest(
+        jsonrpc="2.0", id="rename-same", method="tools/call",
+        params={"name": "rename_folder", "arguments": {
+            "folder_path": ["Same"], "new_name": "Same",
+        }},
+    )
+
+    response = handler.handle_tools_call(request)
+
+    assert response["error"] == {
+        "code": -32602,
+        "message": "Folder 'Same' already exists in this location.",
+        "details": "Use list_folders to see the existing folder hierarchy.",
+    }
+    assert list(client.collection("resource_mutations").stream()) == []

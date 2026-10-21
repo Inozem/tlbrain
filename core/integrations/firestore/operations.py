@@ -255,6 +255,15 @@ def get_operation(client: Any | None, operation_id: str) -> OperationRecord | No
     return _record_from(snapshot.to_dict() or {}) if snapshot.exists else None
 
 
+def validate_operation_lease(
+    client: Any | None, operation_id: str, *, owner: str, fence: int, now: datetime,
+) -> bool:
+    """Check the current lease immediately before a guarded provider callback."""
+    now = _aware(now)
+    data = _db(client).collection(OPERATIONS_COLLECTION).document(operation_id).get().to_dict() or {}
+    return _valid_lease(data, owner, fence, now)
+
+
 def claim_operation(
     client: Any | None,
     operation_id: str,

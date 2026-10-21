@@ -157,9 +157,11 @@ def dispatch_mutation(
     expected_revision: str | None = None,
     desired_state_digest: str | None = None,
     mutation_policy: str | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> Any:
     """Persist an effect and resource epochs before calling external code."""
-    now = _aware(now)
+    clock = clock or (lambda: now)
+    now = _aware(clock())
     resources = tuple(sorted(set(resources)))
     if not effect_id or "/" in effect_id or not resources or any(not r for r in resources):
         raise ValueError("effect_id and at least one non-empty resource are required")
@@ -179,10 +181,11 @@ def dispatch_mutation(
 
     @firestore.transactional
     def _reserve(transaction: firestore.Transaction) -> tuple[str, Any]:
+        commit_now = _aware(clock())
         op_snapshot = op_ref.get(transaction=transaction)
         effect_snapshot = effect_ref.get(transaction=transaction)
         guard_snapshots = [(resource, ref, ref.get(transaction=transaction)) for resource, ref in guard_refs]
-        if not op_snapshot.exists or not _valid_lease(op_snapshot.to_dict() or {}, owner, fence, now):
+        if not op_snapshot.exists or not _valid_lease(op_snapshot.to_dict() or {}, owner, fence, commit_now):
             return "stale", None
         if effect_snapshot.exists:
             existing = effect_snapshot.to_dict() or {}
@@ -207,9 +210,11 @@ def dispatch_mutation(
                 "expires_at": op_snapshot.to_dict().get("lease_expires_at"),
                 "resource_epoch": int(data.get("resource_epoch", 0)) + 1,
                 "mutation_state": EffectState.DISPATCHED.value,
-                "unsettled_effect_ids": list((*unsettled, effect_id)), "updated_at": now,
+                "unsettled_effect_ids": list((*unsettled, effect_id)), "updated_at": commit_now,
             })
             transaction.set(ref, updated)
+        proposed["dispatched_at"] = commit_now
+        proposed["updated_at"] = commit_now
         transaction.set(effect_ref, proposed)
         return "dispatch", None
 
@@ -221,28 +226,30 @@ def dispatch_mutation(
     try:
         result = mutation_callback()
     except BaseException:
-        _mark_unknown(db, operation_id, effect_id, now)
+        _mark_unknown(db, operation_id, effect_id, _aware(clock()), clock=clock)
         raise
     if result is None:
-        _mark_unknown(db, operation_id, effect_id, now)
+        _mark_unknown(db, operation_id, effect_id, _aware(clock()), clock=clock)
         return None
-    if _confirm(db, operation_id, effect_id, owner, fence, now, result):
+    if _confirm(db, operation_id, effect_id, owner, fence, _aware(clock()), result, clock=clock):
         return result
-    _mark_unknown(db, operation_id, effect_id, now)
+    _mark_unknown(db, operation_id, effect_id, _aware(clock()), clock=clock)
     return None
 
 
-def _mark_unknown(db: Any, operation_id: str, effect_id: str, now: datetime) -> None:
+def _mark_unknown(db: Any, operation_id: str, effect_id: str, now: datetime,
+                  *, clock: Callable[[], datetime] | None = None) -> None:
     effect_ref = _effect_ref(db, operation_id, effect_id)
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction) -> None:
+        commit_now = _aware(clock()) if clock is not None else now
         snapshot = effect_ref.get(transaction=transaction)
         if not snapshot.exists:
             return
         data = snapshot.to_dict() or {}
         if data.get("state") == EffectState.DISPATCHED.value:
-            data.update({"state": EffectState.UNKNOWN.value, "updated_at": now})
+            data.update({"state": EffectState.UNKNOWN.value, "updated_at": commit_now})
             guards = []
             for resource in tuple(data.get("resources", ())):
                 ref = _resource_ref(db, resource)
@@ -251,25 +258,26 @@ def _mark_unknown(db: Any, operation_id: str, effect_id: str, now: datetime) -> 
             for ref, guard_snapshot in guards:
                 guard = guard_snapshot.to_dict() or {}
                 if effect_id in guard.get("unsettled_effect_ids", ()):
-                    guard.update({"mutation_state": EffectState.UNKNOWN.value, "updated_at": now})
+                    guard.update({"mutation_state": EffectState.UNKNOWN.value, "updated_at": commit_now})
                     transaction.set(ref, guard)
 
     _txn(db.transaction())
 
 
 def _confirm(db: Any, operation_id: str, effect_id: str, owner: str, fence: int,
-             now: datetime, result: Any) -> bool:
+             now: datetime, result: Any, *, clock: Callable[[], datetime] | None = None) -> bool:
     effect_ref = _effect_ref(db, operation_id, effect_id)
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction) -> bool:
+        commit_now = _aware(clock()) if clock is not None else now
         snapshot = effect_ref.get(transaction=transaction)
         if not snapshot.exists:
             return False
         data = snapshot.to_dict() or {}
         op_ref = db.collection(OPERATIONS_COLLECTION).document(operation_id)
         op_snapshot = op_ref.get(transaction=transaction)
-        if not op_snapshot.exists or not _valid_lease(op_snapshot.to_dict() or {}, owner, fence, now):
+        if not op_snapshot.exists or not _valid_lease(op_snapshot.to_dict() or {}, owner, fence, commit_now):
             return False
         if data.get("owner") != owner or data.get("fence") != fence:
             return False
@@ -281,7 +289,7 @@ def _confirm(db: Any, operation_id: str, effect_id: str, owner: str, fence: int,
         data.update({
             "state": EffectState.CONFIRMED.value,
             "confirmed_result": _result_data(result) if isinstance(result, OperationResult) else None,
-            "result": result, "updated_at": now,
+            "result": result, "updated_at": commit_now,
         })
         transaction.set(effect_ref, data)
         for resource, ref, snap in snapshots:
@@ -289,7 +297,7 @@ def _confirm(db: Any, operation_id: str, effect_id: str, owner: str, fence: int,
             unsettled = [item for item in guard.get("unsettled_effect_ids", ()) if item != effect_id]
             guard.update({"unsettled_effect_ids": unsettled,
                           "mutation_state": EffectState.CONFIRMED.value if not unsettled else guard.get("mutation_state"),
-                          "updated_at": now})
+                          "updated_at": commit_now})
             transaction.set(ref, guard)
         return True
 
@@ -307,6 +315,7 @@ def reconcile_mutation(
     confirmed: bool,
     result: Any = None,
     confirmed_result: Any = None,
+    clock: Callable[[], datetime] | None = None,
     **_: Any,
 ) -> OperationEffect | None:
     """Settle an uncertain effect only under its operation's current lease."""
@@ -334,13 +343,14 @@ def reconcile_mutation(
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction) -> OperationEffect | None:
+        commit_now = _aware(clock()) if clock is not None else now
         effect_snapshot = effect_ref.get(transaction=transaction)
         if not effect_snapshot.exists:
             return None
         data = effect_snapshot.to_dict() or {}
         operation_ref = db.collection(OPERATIONS_COLLECTION).document(resolved_operation_id)
         operation_snapshot = operation_ref.get(transaction=transaction)
-        if not operation_snapshot.exists or not _valid_lease(operation_snapshot.to_dict() or {}, owner, fence, now):
+        if not operation_snapshot.exists or not _valid_lease(operation_snapshot.to_dict() or {}, owner, fence, commit_now):
             return None
         if data.get("state") not in {EffectState.DISPATCHED.value, EffectState.UNKNOWN.value}:
             return _effect_from(data) if data.get("state") in {EffectState.CONFIRMED.value, EffectState.FAILED.value} else None
@@ -355,7 +365,7 @@ def reconcile_mutation(
             "state": final_state.value,
             "confirmed_result": _result_data(final_result) if isinstance(final_result, OperationResult) else None,
             "result": final_result if confirmed else None,
-            "updated_at": now,
+            "updated_at": commit_now,
         })
         transaction.set(effect_ref, data)
         for _, ref, snapshot in snapshots:
@@ -363,6 +373,59 @@ def reconcile_mutation(
             unsettled = [item for item in guard.get("unsettled_effect_ids", ()) if item != effect_id]
             guard.update({"unsettled_effect_ids": unsettled,
                           "mutation_state": final_state.value if not unsettled else guard.get("mutation_state"),
+                          "updated_at": commit_now})
+            transaction.set(ref, guard)
+        return _effect_from(data)
+
+    return _txn(db.transaction())
+
+
+def fail_unsent_mutation(
+    client: Any | None, *, operation_id: str, effect_id: str, owner: str, fence: int,
+    now: datetime,
+) -> OperationEffect | None:
+    """Release a known-unsent reservation only while its original owner/fence remains current.
+
+    Expiry alone permits cleanup; takeover or a guard owned by another effect does not.
+    """
+    now = _aware(now)
+    db = _db(client)
+    operation_ref = db.collection(OPERATIONS_COLLECTION).document(operation_id)
+    effect_ref = _effect_ref(db, operation_id, effect_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> OperationEffect | None:
+        operation_snapshot = operation_ref.get(transaction=transaction)
+        effect_snapshot = effect_ref.get(transaction=transaction)
+        if not operation_snapshot.exists or not effect_snapshot.exists:
+            return None
+        operation = operation_snapshot.to_dict() or {}
+        data = effect_snapshot.to_dict() or {}
+        if (operation.get("lease_owner") != owner or operation.get("fence") != fence
+                or data.get("operation_id") != operation_id or data.get("owner") != owner
+                or data.get("fence") != fence
+                or data.get("state") not in {EffectState.DISPATCHED.value, EffectState.UNKNOWN.value}):
+            return None
+        resources = tuple(sorted(data.get("resources", ())))
+        refs = [(resource, _resource_ref(db, resource)) for resource in resources]
+        snapshots = [(resource, ref, ref.get(transaction=transaction)) for resource, ref in refs]
+        if any(
+            not snapshot.exists
+            or (guard := (snapshot.to_dict() or {})).get("owner_operation_id") != operation_id
+            or guard.get("owner_effect_id") != effect_id
+            or guard.get("owner") != owner
+            or guard.get("fence") != fence
+            or effect_id not in guard.get("unsettled_effect_ids", ())
+            for _, _, snapshot in snapshots
+        ):
+            return None
+        data.update({"state": EffectState.FAILED.value, "result": None, "updated_at": now})
+        transaction.set(effect_ref, data)
+        for _, ref, snapshot in snapshots:
+            guard = snapshot.to_dict() or {}
+            unsettled = [item for item in guard.get("unsettled_effect_ids", ()) if item != effect_id]
+            guard.update({"unsettled_effect_ids": unsettled,
+                          "mutation_state": EffectState.FAILED.value if not unsettled else guard.get("mutation_state"),
                           "updated_at": now})
             transaction.set(ref, guard)
         return _effect_from(data)

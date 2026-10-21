@@ -83,11 +83,11 @@ def test_with_retry_preserves_legacy_rate_limit_backoffs(monkeypatch):
     assert delays == [30, 60]
 
 
-def test_single_attempt_policy_preserves_original_provider_exception(monkeypatch):
+def test_single_attempt_policy_preserves_original_provider_exception_without_logging_it(monkeypatch, caplog):
     physical_calls = []
     delays = []
     monkeypatch.setattr(retry_utils.time, "sleep", delays.append)
-    provider_error = ConnectionError("synthetic outage")
+    provider_error = ConnectionError("synthetic private payload")
 
     @with_retry
     def provider_call():
@@ -100,6 +100,7 @@ def test_single_attempt_policy_preserves_original_provider_exception(monkeypatch
     assert raised.value is provider_error
     assert physical_calls == ["call"]
     assert delays == []
+    assert "synthetic private payload" not in caplog.text
 
 
 def test_failure_budget_survives_recreated_governors_and_caps_physical_executions(firestore_fake, fake_clock):

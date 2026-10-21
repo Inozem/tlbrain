@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import re
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 from google.cloud import firestore
@@ -58,6 +58,7 @@ def validate_effect_allocation_lease(
 def allocate_effect_resource(
     client: Any | None, *, operation_id: str, effect_id: str, kind: str,
     intent_digest: str, owner: str, fence: int, now: datetime, candidate: str,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
     """Persist one resource ID before provider mutation; transactions choose one concurrent winner."""
     if (not isinstance(operation_id, str) or not operation_id or "/" in operation_id
@@ -79,6 +80,9 @@ def allocate_effect_resource(
 
     @firestore.transactional
     def _txn(transaction):
+        commit_now = clock() if clock is not None else now
+        if not isinstance(commit_now, datetime) or commit_now.tzinfo is None or commit_now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
         op_snapshot = op_ref.get(transaction=transaction)
         alloc_snapshot = alloc_ref.get(transaction=transaction)
         if alloc_snapshot.exists:
@@ -89,7 +93,7 @@ def allocate_effect_resource(
             if not _valid_id(kind, existing.get("resource_id")):
                 raise AllocationConflict("effect resource allocation is invalid")
             return existing
-        if not op_snapshot.exists or not _valid_lease(op_snapshot.to_dict() or {}, owner, fence, now):
+        if not op_snapshot.exists or not _valid_lease(op_snapshot.to_dict() or {}, owner, fence, commit_now):
             raise AllocationConflict("current operation lease is required")
         transaction.set(alloc_ref, proposed)
         return proposed

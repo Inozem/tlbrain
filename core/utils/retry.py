@@ -70,6 +70,7 @@ def _is_rate_limit(exc: Exception) -> bool:
 
 
 def with_retry(fn: F) -> F:
+    """Wrap provider calls; one-attempt calls omit retry warnings and exception text."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         retry_policy = kwargs.pop("retry_policy", LEGACY_RETRY_POLICY)
@@ -87,10 +88,11 @@ def with_retry(fn: F) -> F:
                 else:
                     raise
                 last_exc = exc
-                logger.warning(
-                    "Transient error on attempt %d/%d for %s: %s",
-                    attempt + 1, retry_policy.attempts, fn.__name__, exc,
-                )
+                if retry_policy.attempts > 1:
+                    logger.warning(
+                        "Transient error on attempt %d/%d for %s: %s",
+                        attempt + 1, retry_policy.attempts, fn.__name__, exc,
+                    )
                 if attempt < retry_policy.attempts - 1:
                     time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
                 elif retry_policy.attempts == 1:

@@ -175,3 +175,8 @@ def delete_summaries_by_center_indexes(
 
 def _point_id(type_: str, doc_id: str, key: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"{type_}:{doc_id}:{key}"))
+
+
+def user_fact_point_id(doc_id: str, text: str) -> str:
+    """Return the legacy deterministic ID used for sessionless user facts."""
+    return _point_id("user_fact", doc_id, text)

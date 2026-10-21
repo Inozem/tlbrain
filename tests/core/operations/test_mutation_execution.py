@@ -253,6 +253,73 @@ def test_docs_revision_is_forwarded_and_stale_revision_never_writes(firestore_fa
     assert get_resource_guard(stale_client, "document:a").unsettled_effect_ids == ()
 
 
+def test_expired_lease_during_pre_read_cannot_enter_provider_callback(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    lease = _lease(client, now=fake_clock.now(), lease_seconds=5)
+    writes = []
+
+    def read():
+        fake_clock.advance(seconds=6)
+        return MutationSnapshot("sha256:old")
+
+    with pytest.raises(MutationConflict):
+        _execute(
+            client, lease, now=fake_clock.now(), clock=fake_clock.now,
+            read_back=read, mutation_callback=lambda _: writes.append("write"),
+        )
+    assert writes == []
+    assert get_resource_guard(client, "document:a").unsettled_effect_ids == ()
+
+
+def test_pre_read_takeover_prevents_stale_unsent_effect_from_releasing_guard(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    old = _lease(client, now=fake_clock.now(), lease_seconds=5)
+    writes = []
+
+    def read():
+        fake_clock.advance(seconds=6)
+        current = claim_operation(
+            client, OPERATION_ID, owner="new-worker", now=fake_clock.now(), lease_seconds=30,
+        )
+        assert current is not None and current.fence > old.fence
+        return MutationSnapshot("sha256:old")
+
+    with pytest.raises(MutationOutcomeUnknown):
+        _execute(
+            client, old, now=fake_clock.now(), clock=fake_clock.now,
+            read_back=read, mutation_callback=lambda _: writes.append("write"),
+        )
+    assert writes == []
+    assert get_resource_guard(client, "document:a").unsettled_effect_ids == ("effect-a",)
+
+
+def test_expired_lease_after_remote_write_is_not_confirmed(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    lease = _lease(client, now=fake_clock.now(), lease_seconds=5)
+    writes = []
+    reads = []
+
+    def read():
+        reads.append("read")
+        return MutationSnapshot("sha256:old" if len(reads) == 1 else "sha256:desired")
+
+    def write(_revision):
+        writes.append("write")
+        fake_clock.advance(seconds=6)
+        return "provider-result"
+
+    with pytest.raises(MutationOutcomeUnknown):
+        _execute(
+            client, lease, now=fake_clock.now(), clock=fake_clock.now,
+            read_back=read, mutation_callback=write,
+        )
+    assert writes == ["write"]
+    assert get_resource_guard(client, "document:a").unsettled_effect_ids == ("effect-a",)
+
+
 @pytest.mark.parametrize("post_snapshot", [
     MutationSnapshot("sha256:old"),
     MutationSnapshot("sha256:third-state"),

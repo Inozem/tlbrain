@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from qdrant_client.models import SparseVector
+from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, SparseVector
 
 from core.integrations.qdrant import filters
 from core.integrations.qdrant.client import get_client
@@ -10,6 +10,47 @@ from core.integrations.qdrant.schema import get_collection_name
 from core.utils.retry import with_retry
 
 _KEYWORD_HALF_WINDOW = 2
+
+
+def get_parent_ids_by_doc_ids(doc_ids: list[str], root_folder_id: str) -> dict[str, list[str | None]]:
+    """Read and verify all root-scoped parent values for each document."""
+    if not doc_ids:
+        return {}
+    wanted = set(doc_ids)
+    parents: dict[str, list[str | None]] = {doc_id: [] for doc_id in wanted}
+    offset = None
+    while True:
+        points, offset = get_client().scroll(
+            collection_name=get_collection_name(),
+            scroll_filter=Filter(must=[
+                FieldCondition(key="doc_id", match=MatchAny(any=sorted(wanted))),
+                FieldCondition(key="root_folder_id", match=MatchValue(value=root_folder_id)),
+            ]),
+            limit=128, offset=offset,
+            with_payload=["doc_id", "parent_id"], with_vectors=False,
+        )
+        for point in points:
+            payload = point.payload or {}
+            doc_id = payload.get("doc_id")
+            if doc_id in wanted:
+                parents[doc_id].append(payload.get("parent_id"))
+        if offset is None:
+            break
+    return {
+        doc_id: sorted(values, key=lambda value: (value is not None, value or ""))
+        for doc_id, values in parents.items()
+        if values
+    }
+
+
+def get_user_fact_payload(point_id: str) -> dict[str, Any] | None:
+    """Read one user-fact point by stable UUID for mutation verification."""
+    points = get_client().retrieve(
+        collection_name=get_collection_name(), ids=[point_id], with_payload=True, with_vectors=False,
+    )
+    if not points:
+        return None
+    return dict(points[0].payload or {})
 
 
 def search_summaries_and_facts(vector: list[float], folder_ids: list[str] | None,

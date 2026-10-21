@@ -307,9 +307,9 @@ class _GeminiFiles:
 
 class FakeGeminiClient:
     def __init__(self, *, api_key: str, **kwargs: Any) -> None:
-        if kwargs:
+        if kwargs.keys() - {"http_options"}:
             raise TypeError(f"Unsupported Gemini client options: {', '.join(kwargs)}")
-        _record("gemini", "client", api_key=api_key)
+        _record("gemini", "client", api_key=api_key, **kwargs)
         self.models = _GeminiModels()
         self.files = _GeminiFiles()
 
@@ -355,7 +355,7 @@ class FakeQdrantClient:
         return _script("qdrant", "create_payload_index")
 
     def __getattr__(self, operation: str):
-        if operation not in {"upsert", "delete", "set_payload", "scroll", "query_points"}:
+        if operation not in {"upsert", "delete", "set_payload", "scroll", "query_points", "retrieve"}:
             raise AttributeError(operation)
         def call(*args: Any, **kwargs: Any):
             if args:
@@ -366,6 +366,7 @@ class FakeQdrantClient:
                 "set_payload": {"collection_name", "payload", "points", "key", "wait", "ordering", "shard_key_selector", "timeout"},
                 "scroll": {"collection_name", "scroll_filter", "limit", "order_by", "offset", "with_payload", "with_vectors", "consistency", "shard_key_selector", "timeout"},
                 "query_points": {"collection_name", "query", "using", "prefetch", "query_filter", "search_params", "limit", "offset", "with_payload", "with_vectors", "score_threshold", "lookup_from", "consistency", "shard_key_selector", "timeout"},
+                "retrieve": {"collection_name", "ids", "with_payload", "with_vectors", "consistency", "shard_key_selector", "timeout"},
             }[operation]
             extra = kwargs.keys() - allowed_options
             if extra:

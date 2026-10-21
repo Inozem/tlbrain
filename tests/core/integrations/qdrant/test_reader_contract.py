@@ -209,6 +209,26 @@ def test_writer_fetch_uses_doc_root_indexes_and_returns_sorted_payloads(sdk_fake
     assert conditions["type"].match.value == "utterance"
 
 
+def test_parent_readback_pages_all_points_and_preserves_mixed_parent_state(sdk_fakes):
+    sdk_fakes.qdrant.queue("scroll", response=([
+        Record(id="one", payload={"doc_id": "doc-a", "parent_id": "old"}),
+        Record(id="two", payload={"doc_id": "doc-a", "parent_id": "new"}),
+    ], "next-page"))
+    sdk_fakes.qdrant.queue("scroll", response=([
+        Record(id="three", payload={"doc_id": "doc-b", "parent_id": "folder-b"}),
+    ], None))
+
+    assert reader.get_parent_ids_by_doc_ids(["doc-a", "doc-b", "doc-absent"], ROOT_ID) == {
+        "doc-a": ["new", "old"], "doc-b": ["folder-b"],
+    }
+    events = _scroll_events(sdk_fakes)
+    assert [event["offset"] for event in events] == [None, "next-page"]
+    for event in events:
+        conditions = _conditions(event["scroll_filter"])
+        assert set(conditions) == {"doc_id", "root_folder_id"}
+        assert conditions["root_folder_id"].match.value == ROOT_ID
+
+
 def test_reader_consumes_explicit_retry_policy_at_decorated_boundary(sdk_fakes):
     sdk_fakes.qdrant.queue("scroll", response=([], None))
 

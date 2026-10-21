@@ -17,10 +17,12 @@ from typing import Any, Callable, Iterable
 from core.integrations.firestore.mutations import (
     MutationIdentityConflict,
     dispatch_mutation,
+    fail_unsent_mutation,
     get_mutation_effect,
     get_mutation_result,
     reconcile_mutation,
 )
+from core.integrations.firestore.operations import validate_operation_lease
 from core.operations.models import EffectState, OperationEffect
 
 
@@ -54,9 +56,17 @@ class MutationOutcomeUnknown(RuntimeError):
 class MutationNotSent(Exception):
     """Provider callback signal that a rejected write was definitely not sent."""
 
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+        super().__init__("mutation was not sent")
+
 
 class _KnownUnsent(Exception):
     """A safe precondition or read failure before provider dispatch."""
+
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+        super().__init__()
 
 
 class _SentUnconfirmed(Exception):
@@ -145,11 +155,13 @@ def _settle(
     now: datetime,
     confirmed: bool,
     result: Any = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> OperationEffect | None:
     try:
         return reconcile_mutation(
             client, effect_id=effect_id, operation_id=operation_id, owner=owner,
-            fence=fence, now=now, confirmed=confirmed, result=result,
+            fence=fence, now=(clock() if clock is not None else now), confirmed=confirmed, result=result,
+            clock=clock,
         )
     except Exception:
         raise MutationOutcomeUnknown("mutation outcome remains unresolved") from None
@@ -187,6 +199,7 @@ def _reconcile_existing(
     desired_state_digest: str,
     read_back: Callable[[], MutationSnapshot],
     result_from_snapshot: Callable[[MutationSnapshot], Any],
+    clock: Callable[[], datetime] | None = None,
 ) -> Any:
     try:
         snapshot = _safe_snapshot(read_back)
@@ -201,6 +214,7 @@ def _reconcile_existing(
     settled = _settle(
         client, operation_id=operation_id, effect_id=effect_id, owner=owner,
         fence=fence, now=now, confirmed=True, result=_wrapped_result(result),
+        clock=clock,
     )
     if settled is not None and settled.state == EffectState.CONFIRMED:
         found, canonical = _canonical_confirmed_result(client, operation_id, effect_id)
@@ -272,6 +286,56 @@ def _validate_callbacks(
         raise ValueError("result_from_snapshot must be callable")
 
 
+def _check_current_lease_before_dispatch(
+    client: Any, *, operation_id: str, owner: str, fence: int,
+    now: datetime, clock: Callable[[], datetime] | None,
+) -> None:
+    """Reject provider entry when the fresh operation lease check fails."""
+    try:
+        check_time = clock() if clock is not None else now
+        if not validate_operation_lease(
+            client, operation_id, owner=owner, fence=fence, now=check_time,
+        ):
+            raise _KnownUnsent()
+    except _KnownUnsent:
+        raise
+    except Exception:
+        raise _KnownUnsent() from None
+
+
+def _invoke_and_verify_post_write(
+    *,
+    mutation_callback: Callable[[str | None], Any],
+    callback_revision: str | None,
+    read_back: Callable[[], MutationSnapshot],
+    desired_state_digest: str,
+    result_from_snapshot: Callable[[MutationSnapshot], Any],
+) -> dict[str, Any]:
+    """Invoke once, then prove the desired state or recover a lost response."""
+    try:
+        write_result = mutation_callback(callback_revision)
+        write_succeeded = True
+    except MutationNotSent as error:
+        raise _KnownUnsent(error.error) from None
+    except Exception:
+        write_result = None
+        write_succeeded = False
+
+    try:
+        post_snapshot = _safe_snapshot(read_back)
+    except _SnapshotUnavailable:
+        raise _SentUnconfirmed() from None
+    if post_snapshot.state_digest != desired_state_digest:
+        raise _SentUnconfirmed()
+    if write_succeeded:
+        return _wrapped_result(write_result)
+    try:
+        recovered = _safe_snapshot_result(result_from_snapshot, post_snapshot)
+    except _ResultUnavailable:
+        raise _SentUnconfirmed() from None
+    return _wrapped_result(recovered)
+
+
 def execute_mutation(
     client: Any,
     *,
@@ -290,6 +354,7 @@ def execute_mutation(
     read_back: Callable[[], MutationSnapshot],
     mutation_callback: Callable[[str | None], Any],
     result_from_snapshot: Callable[[MutationSnapshot], Any] | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> Any:
     """Execute one guarded mutation or reconcile its existing durable effect.
 
@@ -336,10 +401,12 @@ def execute_mutation(
                 client, operation_id=operation_id, effect_id=effect_id, owner=owner,
                 fence=fence, now=now, desired_state_digest=desired_state_digest,
                 read_back=read_back, result_from_snapshot=result_from_snapshot,
+                clock=clock,
             )
         raise MutationConflict("mutation effect is already settled as failed")
 
     def reserved_attempt() -> Any:
+        """Recheck lease ownership after pre-read and immediately before provider code."""
         try:
             snapshot = _safe_snapshot(read_back)
         except _SnapshotUnavailable:
@@ -353,31 +420,16 @@ def execute_mutation(
             raise _KnownUnsent()
         if policy == MutationPolicy.DOCS_REVISION and snapshot.revision != expected_revision:
             raise _KnownUnsent()
-
-        try:
-            write_result = mutation_callback(
-                expected_revision if policy == MutationPolicy.DOCS_REVISION else None
-            )
-            write_succeeded = True
-        except MutationNotSent:
-            raise _KnownUnsent() from None
-        except Exception:
-            write_result = None
-            write_succeeded = False
-
-        try:
-            post_snapshot = _safe_snapshot(read_back)
-        except _SnapshotUnavailable:
-            raise _SentUnconfirmed() from None
-        if post_snapshot.state_digest != desired_state_digest:
-            raise _SentUnconfirmed()
-        if write_succeeded:
-            return _wrapped_result(write_result)
-        try:
-            recovered = _safe_snapshot_result(result_from_snapshot, post_snapshot)
-        except _ResultUnavailable:
-            raise _SentUnconfirmed() from None
-        return _wrapped_result(recovered)
+        _check_current_lease_before_dispatch(
+            client, operation_id=operation_id, owner=owner, fence=fence,
+            now=now, clock=clock,
+        )
+        callback_revision = expected_revision if policy == MutationPolicy.DOCS_REVISION else None
+        return _invoke_and_verify_post_write(
+            mutation_callback=mutation_callback, callback_revision=callback_revision,
+            read_back=read_back, desired_state_digest=desired_state_digest,
+            result_from_snapshot=result_from_snapshot,
+        )
 
     try:
         dispatch_mutation(
@@ -386,14 +438,20 @@ def execute_mutation(
             payload_digest=payload_digest, desired_state_digest=desired_state_digest,
             mutation_policy=policy.value, now=now, mutation_callback=reserved_attempt,
             expected_pre_state=expected_pre_state, expected_revision=expected_revision,
+            clock=clock,
         )
     except MutationIdentityConflict:
         raise
-    except _KnownUnsent:
-        settled = _settle(
-            client, operation_id=operation_id, effect_id=effect_id, owner=owner,
-            fence=fence, now=now, confirmed=False,
-        )
+    except _KnownUnsent as unsent:
+        try:
+            settled = fail_unsent_mutation(
+                client, operation_id=operation_id, effect_id=effect_id, owner=owner,
+                fence=fence, now=(clock() if clock is not None else now),
+            )
+        except Exception:
+            settled = None
+        if isinstance(unsent.error, Exception):
+            raise unsent.error
         if settled is not None and settled.state == EffectState.FAILED:
             raise MutationConflict("mutation precondition could not be verified") from None
         if settled is not None and settled.state == EffectState.CONFIRMED:

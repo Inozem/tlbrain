@@ -15,9 +15,9 @@ from core.indexing.user_facts import (
     AddFactDocumentNotFound,
     AddFactInputError,
     AddFactTranscriptNotSynced,
-    add_user_fact,
 )
 from core.operations import read as read_operations
+from core.operations import write as write_operations
 from core.integrations.google_drive import folder_service
 from core.integrations.google_drive.folder_service import FolderNotFound
 from core.documents import operations as document_operations
@@ -620,7 +620,7 @@ def _handle_move_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        outcome = document_operations.move_transcript(doc_id, folder_path)
+        outcome = write_operations.move_transcript(doc_id, folder_path)
     except document_operations.FolderPathNotFound as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -678,7 +678,7 @@ def _handle_move_folder(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        folder_id, new_parent_id = folder_service.move_folder(folder_path, new_parent_path)
+        folder_id, new_parent_id = write_operations.move_folder(folder_path, new_parent_path)
     except folder_service.FolderOperationError as e:
         return _folder_domain_error(request, e, "move")
     except Exception as e:
@@ -712,7 +712,7 @@ def _handle_create_folder(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        folder_id = folder_service.create_folder(name, parent_path)
+        folder_id = write_operations.create_folder(name, parent_path)
     except folder_service.FolderOperationError as e:
         return _folder_domain_error(request, e, "create")
     except Exception as e:
@@ -746,7 +746,7 @@ def _handle_rename_folder(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        folder_id = folder_service.rename_folder(folder_path, new_name)
+        folder_id = write_operations.rename_folder(folder_path, new_name)
     except folder_service.FolderOperationError as e:
         return _folder_domain_error(request, e, "rename")
     except Exception as e:
@@ -837,7 +837,7 @@ def _handle_sync_status(request: JSONRPCRequest) -> dict:
 def _handle_add_fact(request: JSONRPCRequest, arguments: dict) -> dict:
     t0 = time.monotonic()
     try:
-        doc_id = add_user_fact(arguments.get("doc_id", ""), arguments.get("text", ""))
+        doc_id = write_operations.add_fact(arguments.get("doc_id", ""), arguments.get("text", ""))
     except AddFactInputError as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -926,7 +926,7 @@ def _handle_rename_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        document_operations.rename_transcript(doc_id, new_title)
+        write_operations.rename_transcript(doc_id, new_title)
     except document_operations.TranscriptNotFound as e:
         return build_jsonrpc_error(
             request_id=request.id,

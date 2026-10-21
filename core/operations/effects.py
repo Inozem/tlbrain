@@ -18,7 +18,7 @@ from core.integrations.google_drive.client import generate_folder_id
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
-def _allocate(client, *, operation_id, effect_id, kind, intent_digest, owner, fence, now, factory):
+def _allocate(client, *, operation_id, effect_id, kind, intent_digest, owner, fence, now, factory, clock=None):
     """Reuse a durable allocation before generating a candidate; Firestore picks the winner."""
     if (
         not isinstance(operation_id, str) or not operation_id or "/" in operation_id
@@ -43,7 +43,7 @@ def _allocate(client, *, operation_id, effect_id, kind, intent_digest, owner, fe
             return allocate_effect_resource(
                 client, operation_id=operation_id, effect_id=effect_id, kind=kind,
                 intent_digest=intent_digest, owner=owner, fence=fence, now=now,
-                candidate=existing.get("resource_id"),
+                candidate=existing.get("resource_id"), clock=clock,
             )
         except AllocationConflict:
             raise
@@ -66,6 +66,7 @@ def _allocate(client, *, operation_id, effect_id, kind, intent_digest, owner, fe
         return allocate_effect_resource(
             client, operation_id=operation_id, effect_id=effect_id, kind=kind,
             intent_digest=intent_digest, owner=owner, fence=fence, now=now, candidate=candidate,
+            clock=clock,
         )
     except AllocationConflict:
         raise
@@ -76,19 +77,21 @@ def _allocate(client, *, operation_id, effect_id, kind, intent_digest, owner, fe
 def allocate_fact_id(
     client, *, operation_id: str, effect_id: str, intent_digest: str,
     owner: str, fence: int, now: datetime, id_factory: Callable[[], str] = lambda: str(uuid4()),
+    clock: Callable[[], datetime] | None = None,
 ) -> str:
     """Return the persisted UUID point ID allocated for one effect."""
     return _allocate(client, operation_id=operation_id, effect_id=effect_id, kind="user_fact",
                      intent_digest=intent_digest, owner=owner, fence=fence, now=now,
-                     factory=id_factory)["resource_id"]
+                     factory=id_factory, clock=clock)["resource_id"]
 
 
 def allocate_folder_id(
     client, *, operation_id: str, effect_id: str, intent_digest: str,
     owner: str, fence: int, now: datetime, id_factory: Callable[[], str] = generate_folder_id,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, str]:
     """Return the persisted Drive folder ID and its stable hashed intent marker."""
     allocation = _allocate(client, operation_id=operation_id, effect_id=effect_id, kind="drive_folder",
                            intent_digest=intent_digest, owner=owner, fence=fence, now=now,
-                           factory=id_factory)
+                           factory=id_factory, clock=clock)
     return {"resource_id": allocation["resource_id"], "intent_marker": allocation["intent_marker"]}
