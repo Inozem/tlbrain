@@ -56,12 +56,14 @@ def _create(drive, *, save_intent_id: str = SAVE_ID):
     )
 
 
-def _fill(docs, *, document_id: str = DOC_ID, expected_revision_id: str = "rev-1"):
+def _fill(*, document_id: str = DOC_ID, expected_revision_id: str = "rev-1"):
     # The component seam performs revision-guarded insert and readback recovery.
+    from tests.fixtures.sdk_fakes import fake_discovery_build
     from core.integrations.google_docs.fill import fill_google_doc_safely
 
     return fill_google_doc_safely(
-        docs,
+        fake_discovery_build("docs", "v1"),
+        drive=fake_discovery_build("drive", "v3"),
         document_id=document_id,
         text=CONTENT,
         speaker_ranges=[(31, 34)],
@@ -388,6 +390,12 @@ def test_unknown_create_adopts_one_marker_match_and_retry_returns_same_doc(fires
 
 def test_lost_docs_insert_response_reads_back_exact_text_without_retrying_insert(sdk_fakes):
     sdk_fakes.docs.queue(
+        "documents.get",
+        response={"revisionId": "rev-1", "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
+        ]}},
+    )
+    sdk_fakes.docs.queue(
         "documents.batchUpdate",
         error=RuntimeError("Docs response unavailable"),
     )
@@ -397,27 +405,41 @@ def test_lost_docs_insert_response_reads_back_exact_text_without_retrying_insert
             "revisionId": "rev-2",
             "body": {
                 "content": [
-                    {"paragraph": {"elements": [{"textRun": {"content": CONTENT}}]}}
+                    {"paragraph": {"elements": [{"textRun": {"content": CONTENT + "\n"}}]}}
                 ]
             },
         },
     )
+    sdk_fakes.drive.queue(
+        "files.get",
+        response={"id": DOC_ID, "mimeType": "application/vnd.google-apps.document", "modifiedTime": "2026-04-02T00:00:00Z"},
+    )
 
-    result = _fill(sdk_fakes.docs)
+    result = _fill()
 
     assert result.state == "confirmed"
     assert result.document_id == DOC_ID
     assert result.revision_id == "rev-2"
-    assert [event["operation"] for event in sdk_fakes.trace] == [
+    assert result.modified_time == "2026-04-02T00:00:00Z"
+    operations = [event["operation"] for event in sdk_fakes.trace if event["operation"] != "build"]
+    assert operations == [
+        "documents.get",
         "documents.batchUpdate",
         "documents.get",
+        "files.get",
     ]
-    update = sdk_fakes.trace[0]["arguments"]
+    update = next(event["arguments"] for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate")
     assert update["writeControl"]["requiredRevisionId"] == "rev-1"
     assert update["body"]["requests"][0]["insertText"]["text"] == CONTENT
 
 
 def test_revision_conflict_is_reread_and_reported_without_blind_overwrite(sdk_fakes):
+    sdk_fakes.docs.queue(
+        "documents.get",
+        response={"revisionId": "rev-1", "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
+        ]}},
+    )
     sdk_fakes.docs.queue("documents.batchUpdate", error=RuntimeError("revision conflict"))
     sdk_fakes.docs.queue(
         "documents.get",
@@ -425,19 +447,122 @@ def test_revision_conflict_is_reread_and_reported_without_blind_overwrite(sdk_fa
             "revisionId": "rev-foreign",
             "body": {
                 "content": [
-                    {"paragraph": {"elements": [{"textRun": {"content": "foreign edit"}}]}}
+                    {"paragraph": {"elements": [{"textRun": {"content": "foreign edit\n"}}]}}
                 ]
             },
         },
     )
 
-    result = _fill(sdk_fakes.docs)
+    result = _fill()
 
     assert result.state == "revision_conflict"
     assert result.document_id == DOC_ID
-    assert [event["operation"] for event in sdk_fakes.trace] == [
+    operations = [event["operation"] for event in sdk_fakes.trace if event["operation"] != "build"]
+    assert operations == [
+        "documents.get",
         "documents.batchUpdate",
         "documents.get",
     ]
-    assert sdk_fakes.trace[0]["arguments"]["writeControl"]["requiredRevisionId"] == "rev-1"
+    update = next(event["arguments"] for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate")
+    assert update["writeControl"]["requiredRevisionId"] == "rev-1"
+
+
+def test_exact_doc_confirms_without_write_and_reads_modified_time(sdk_fakes):
+    sdk_fakes.docs.queue(
+        "documents.get",
+        response={"revisionId": "rev-exact", "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": CONTENT + "\n"}}]}}
+        ]}},
+    )
+    sdk_fakes.drive.queue(
+        "files.get",
+        response={"id": DOC_ID, "mimeType": "application/vnd.google-apps.document", "modifiedTime": "modified"},
+    )
+
+    result = _fill()
+
+    assert (result.state, result.revision_id, result.modified_time) == ("confirmed", "rev-exact", "modified")
+    assert [event["operation"] for event in sdk_fakes.trace if event["operation"] != "build"] == ["documents.get", "files.get"]
+
+
+def test_document_text_preserves_desired_trailing_newline_after_structural_newline():
+    from core.integrations.google_docs.fill import _document_text
+
+    text, revision = _document_text({
+        "revisionId": "rev-exact",
+        "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": CONTENT + "\n"}}]}}
+        ]},
+    })
+
+    assert text == CONTENT
+    assert text.endswith("\n")
+    assert revision == "rev-exact"
+
+
+def test_empty_doc_is_inserted_once_with_guard_and_post_fill_metadata(sdk_fakes):
+    sdk_fakes.docs.queue(
+        "documents.get",
+        response={"revisionId": "rev-1", "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
+        ]}},
+    )
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"revisionId": "rev-2"})
+    sdk_fakes.drive.queue(
+        "files.get",
+        response={"id": DOC_ID, "mimeType": "application/vnd.google-apps.document", "modifiedTime": "modified"},
+    )
+
+    result = _fill()
+
+    assert (result.state, result.revision_id, result.modified_time) == ("confirmed", "rev-2", "modified")
+    updates = [event for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate"]
+    assert len(updates) == 1
+    update = updates[0]["arguments"]
+    assert update["writeControl"]["requiredRevisionId"] == "rev-1"
+    assert update["body"]["requests"][0]["insertText"] == {"location": {"index": 1}, "text": CONTENT}
+    assert update["body"]["requests"][1]["updateTextStyle"]["range"] == {"startIndex": 32, "endIndex": 35}
+
+
+def test_foreign_content_before_write_conflicts_without_mutation(sdk_fakes):
+    sdk_fakes.docs.queue(
+        "documents.get",
+        response={"revisionId": "rev-foreign", "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": "foreign text\n"}}]}}
+        ]}},
+    )
+
+    result = _fill()
+
+    assert result.state == "revision_conflict"
+    assert [event["operation"] for event in sdk_fakes.trace if event["operation"] != "build"] == ["documents.get"]
+
+
+def test_empty_doc_with_changed_revision_conflicts_without_mutation(sdk_fakes):
+    sdk_fakes.docs.queue(
+        "documents.get",
+        response={"revisionId": "rev-newer", "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
+        ]}},
+    )
+
+    result = _fill()
+
+    assert result.state == "revision_conflict"
+    assert [event["operation"] for event in sdk_fakes.trace if event["operation"] != "build"] == ["documents.get"]
+
+
+def test_unresolved_docs_insert_response_remains_unknown_without_retry(sdk_fakes):
+    empty_doc = {"revisionId": "rev-1", "body": {"content": [
+        {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
+    ]}}
+    sdk_fakes.docs.queue("documents.get", response=empty_doc)
+    sdk_fakes.docs.queue("documents.batchUpdate", error=RuntimeError("Docs response unavailable"))
+    sdk_fakes.docs.queue("documents.get", response=empty_doc)
+
+    result = _fill()
+
+    assert result.state == "fill_outcome_unknown"
+    operations = [event["operation"] for event in sdk_fakes.trace if event["operation"] != "build"]
+    assert operations == ["documents.get", "documents.batchUpdate", "documents.get"]
 
