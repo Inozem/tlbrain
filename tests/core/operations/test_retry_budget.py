@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from core.integrations.gemini import llm
+from core.integrations.qdrant import reader as qdrant_reader
 from core.integrations.firestore.operations import claim_operation, create_operation, get_operation
 from core.operations.models import OperationError, OperationOrigin, OperationState
 from core.operations.retries import (
@@ -17,6 +17,8 @@ from core.operations.retries import (
     RetryGovernor,
     UnknownOutcome,
 )
+from core.utils import retry as retry_utils
+from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY, with_retry
 
 
 OPERATION_ID = "synthetic-retry-operation"
@@ -42,6 +44,62 @@ def _governor(client, fake_clock):
 def test_max_failures_cannot_exceed_three():
     with pytest.raises(ValueError, match="between 1 and 3"):
         RetryGovernor(max_failures=4)
+
+
+def test_with_retry_preserves_legacy_default_attempts_and_backoffs(monkeypatch):
+    physical_calls = []
+    delays = []
+    monkeypatch.setattr(retry_utils.time, "sleep", delays.append)
+
+    @with_retry
+    def provider_call():
+        physical_calls.append("call")
+        raise ConnectionError("synthetic outage")
+
+    with pytest.raises(RuntimeError, match="failed after 3 attempts") as raised:
+        provider_call()
+
+    assert isinstance(raised.value.__cause__, ConnectionError)
+    assert len(physical_calls) == 3
+    assert delays == [1, 2]
+
+
+def test_with_retry_preserves_legacy_rate_limit_backoffs(monkeypatch):
+    physical_calls = []
+    delays = []
+    monkeypatch.setattr(retry_utils.time, "sleep", delays.append)
+    monkeypatch.setattr(retry_utils, "_is_rate_limit", lambda error: True)
+
+    @with_retry
+    def provider_call():
+        physical_calls.append("call")
+        raise RuntimeError("synthetic rate limit")
+
+    with pytest.raises(RuntimeError, match="failed after 3 attempts") as raised:
+        provider_call()
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert len(physical_calls) == 3
+    assert delays == [30, 60]
+
+
+def test_single_attempt_policy_preserves_original_provider_exception(monkeypatch):
+    physical_calls = []
+    delays = []
+    monkeypatch.setattr(retry_utils.time, "sleep", delays.append)
+    provider_error = ConnectionError("synthetic outage")
+
+    @with_retry
+    def provider_call():
+        physical_calls.append("call")
+        raise provider_error
+
+    with pytest.raises(ConnectionError) as raised:
+        provider_call(retry_policy=SINGLE_ATTEMPT_RETRY_POLICY)
+
+    assert raised.value is provider_error
+    assert physical_calls == ["call"]
+    assert delays == []
 
 
 def test_failure_budget_survives_recreated_governors_and_caps_physical_executions(firestore_fake, fake_clock):
@@ -306,24 +364,23 @@ def test_durable_execution_makes_at_most_one_physical_provider_attempt(firestore
     firestore_fake.set_clock(fake_clock)
     _new_operation(client)
     for _ in range(3):
-        sdk_fakes.gemini.queue("generate_content", error=ValueError("synthetic provider error"))
-    # This direct callback seam checks one physical call per durable attempt.
-    # T016 will cover the equivalent single-attempt/retry-policy seams through
-    # the real integration path.
+        sdk_fakes.qdrant.queue("scroll", error=ConnectionError("synthetic provider error"))
     physical_attempts = []
 
     def one_provider_call():
         physical_attempts.append("attempt")
-        return llm.make_client().models.generate_content(model="synthetic-model", contents="offline prompt")
+        return qdrant_reader.fetch_utterances_by_order_indexes(
+            "doc-retry", "root-retry", [1], retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+        )
 
     for _ in range(3):
-        with pytest.raises(ValueError):
+        with pytest.raises(ConnectionError):
             _governor(client, fake_clock).run_stage(
                 OPERATION_ID, "provider", one_provider_call, now=fake_clock.now(),
             )
     assert physical_attempts == ["attempt"] * 3
     assert len([event for event in sdk_fakes.trace
-                if event["boundary"] == "gemini" and event["operation"] == "generate_content"]) == 3
+                if event["boundary"] == "qdrant" and event["operation"] == "scroll"]) == 3
 
     with pytest.raises(RetryBudgetExceeded):
         _governor(client, fake_clock).run_stage(

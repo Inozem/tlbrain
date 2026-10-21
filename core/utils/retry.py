@@ -1,5 +1,6 @@
 import logging
 import time
+from dataclasses import dataclass
 from functools import wraps
 from typing import Callable, TypeVar
 
@@ -10,6 +11,21 @@ BACKOFFS = [1, 2, 4]
 RATE_LIMIT_BACKOFFS = [30, 60, 120]
 
 F = TypeVar("F", bound=Callable)
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Controls how many times a decorated provider call is attempted."""
+
+    attempts: int
+
+    def __post_init__(self) -> None:
+        if self.attempts < 1:
+            raise ValueError("retry policy attempts must be at least one")
+
+
+LEGACY_RETRY_POLICY = RetryPolicy(attempts=RETRIES)
+SINGLE_ATTEMPT_RETRY_POLICY = RetryPolicy(attempts=1)
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -56,8 +72,11 @@ def _is_rate_limit(exc: Exception) -> bool:
 def with_retry(fn: F) -> F:
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        retry_policy = kwargs.pop("retry_policy", LEGACY_RETRY_POLICY)
+        if not isinstance(retry_policy, RetryPolicy):
+            raise TypeError("retry_policy must be a RetryPolicy")
         last_exc: Exception | None = None
-        for attempt in range(RETRIES):
+        for attempt in range(retry_policy.attempts):
             try:
                 return fn(*args, **kwargs)
             except Exception as exc:
@@ -70,12 +89,14 @@ def with_retry(fn: F) -> F:
                 last_exc = exc
                 logger.warning(
                     "Transient error on attempt %d/%d for %s: %s",
-                    attempt + 1, RETRIES, fn.__name__, exc,
+                    attempt + 1, retry_policy.attempts, fn.__name__, exc,
                 )
-                if attempt < RETRIES - 1:
-                    time.sleep(backoffs[attempt])
+                if attempt < retry_policy.attempts - 1:
+                    time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+                elif retry_policy.attempts == 1:
+                    raise
         raise RuntimeError(
-            f"{fn.__name__} failed after {RETRIES} attempts"
+            f"{fn.__name__} failed after {retry_policy.attempts} attempts"
         ) from last_exc
 
     return wrapper  # type: ignore[return-value]

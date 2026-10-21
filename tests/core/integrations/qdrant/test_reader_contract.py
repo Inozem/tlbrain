@@ -1,11 +1,13 @@
 """Offline characterization of the existing Qdrant reader calls."""
 
 from google.genai import types
+import pytest
 from qdrant_client.http.models import QueryResponse
 from qdrant_client.models import Record, ScoredPoint
 
-from core.integrations.qdrant import reader
+from core.integrations.qdrant import reader, writer
 from core.retrieval import pipeline, search, transcripts
+from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
 
 
 ROOT_ID = "pytest-synthetic-root"
@@ -205,3 +207,32 @@ def test_writer_fetch_uses_doc_root_indexes_and_returns_sorted_payloads(sdk_fake
     assert conditions["root_folder_id"].match.value == ROOT_ID
     assert conditions["order_index"].match.any == [6, 2, 9]
     assert conditions["type"].match.value == "utterance"
+
+
+def test_reader_consumes_explicit_retry_policy_at_decorated_boundary(sdk_fakes):
+    sdk_fakes.qdrant.queue("scroll", response=([], None))
+
+    assert reader.fetch_utterances_by_order_indexes(
+        "doc-retry", ROOT_ID, [2], retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+    ) == []
+    [event] = _scroll_events(sdk_fakes)
+    assert "retry_policy" not in event
+    assert event["args"] == ()
+
+
+def test_writer_single_attempt_policy_propagates_once_without_sdk_leakage(sdk_fakes):
+    provider_error = ConnectionError("synthetic Qdrant outage")
+    sdk_fakes.qdrant.queue("upsert", error=provider_error)
+
+    with pytest.raises(ConnectionError) as raised:
+        writer.upsert_summaries(
+            [{"doc_id": "doc-retry", "summary_id": "summary-retry"}],
+            [[0.25] * 768],
+            retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+        )
+    assert raised.value is provider_error
+
+    [event] = [entry for entry in sdk_fakes.trace if entry["operation"] == "upsert"]
+    assert event["boundary"] == "qdrant"
+    assert set(event["arguments"]) == {"args", "collection_name", "points"}
+    assert event["arguments"]["args"] == ()

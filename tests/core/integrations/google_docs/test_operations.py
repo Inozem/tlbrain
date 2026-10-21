@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from core.integrations.google_docs import client, reader, writer
+from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
 
 
 def _set_oauth(monkeypatch):
@@ -46,6 +47,15 @@ def test_reader_uses_strict_oauth_and_extracts_nonempty_paragraphs(monkeypatch, 
     assert auth["arguments"]["scopes"] is None
     assert reader.SCOPES == ["https://www.googleapis.com/auth/documents.readonly"]
     assert sdk_fakes.trace[-1]["operation"] == "documents.get"
+
+
+def test_reader_consumes_explicit_retry_policy_at_decorated_boundary(monkeypatch, sdk_fakes):
+    _set_oauth(monkeypatch)
+    sdk_fakes.docs.queue("documents.get", response={"body": {"content": []}})
+
+    assert reader.read_google_doc("doc-1", retry_policy=SINGLE_ATTEMPT_RETRY_POLICY) == ""
+    get_event = next(entry for entry in sdk_fakes.trace if entry["operation"] == "documents.get")
+    assert get_event["arguments"] == {"documentId": "doc-1"}
 
 
 def test_reader_refuses_adc_fallback(monkeypatch, sdk_fakes):
