@@ -91,6 +91,9 @@ class OperationEffect:
     dispatched_at: datetime | None = None
     confirmed_result: OperationResult | None = None
     fence: int = 0
+    resources: tuple[str, ...] = ()
+    desired_state_digest: str | None = None
+    mutation_policy: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

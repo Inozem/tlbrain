@@ -22,6 +22,10 @@ from core.operations.models import EffectState, OperationEffect, OperationResult
 RESOURCE_GUARDS_COLLECTION = "resource_mutations"
 
 
+class MutationIdentityConflict(ValueError):
+    """An effect ID was already reserved for a different immutable identity."""
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceGuard:
     resource: str
@@ -67,6 +71,9 @@ def _effect_from(data: dict[str, Any]) -> OperationEffect:
         expected_pre_state=data.get("expected_pre_state"), expected_revision=data.get("expected_revision"),
         state=EffectState(data["state"]), dispatched_at=data.get("dispatched_at"),
         confirmed_result=result, fence=int(data.get("fence", 0)),
+        resources=tuple(data.get("resources", ())),
+        desired_state_digest=data.get("desired_state_digest"),
+        mutation_policy=data.get("mutation_policy"),
     )
 
 
@@ -75,12 +82,15 @@ def _effect_data(
     payload_digest: str, owner: str, fence: int, state: EffectState, now: datetime,
     result: Any = None, expected_pre_state: str | None = None,
     expected_revision: str | None = None,
+    desired_state_digest: str | None = None,
+    mutation_policy: str | None = None,
 ) -> dict[str, Any]:
     return {
         "effect_id": effect_id, "operation_id": operation_id, "kind": kind,
         "target_resource": resources[0] if resources else "", "resources": list(resources),
         "desired_payload_digest": payload_digest, "expected_pre_state": expected_pre_state,
         "expected_revision": expected_revision, "state": state.value, "dispatched_at": now,
+        "desired_state_digest": desired_state_digest, "mutation_policy": mutation_policy,
         "confirmed_result": _result_data(result) if isinstance(result, OperationResult) else None,
         "result": result, "owner": owner, "fence": fence, "updated_at": now,
     }
@@ -90,6 +100,7 @@ def _identity(data: dict[str, Any]) -> tuple[Any, ...]:
     return (
         data.get("operation_id"), data.get("kind"), tuple(data.get("resources", ())),
         data.get("desired_payload_digest"), data.get("expected_pre_state"), data.get("expected_revision"),
+        data.get("desired_state_digest"), data.get("mutation_policy"),
     )
 
 
@@ -107,6 +118,23 @@ def _guard_from(data: dict[str, Any] | None, resource: str) -> ResourceGuard:
 def get_resource_guard(client: Any | None, resource: str) -> ResourceGuard:
     snapshot = _resource_ref(_db(client), resource).get()
     return _guard_from(snapshot.to_dict() if snapshot.exists else None, resource)
+
+
+def get_mutation_effect(client: Any | None, operation_id: str, effect_id: str) -> OperationEffect | None:
+    """Read the durable typed identity and state for a mutation effect."""
+    snapshot = _effect_ref(_db(client), operation_id, effect_id).get()
+    return _effect_from(snapshot.to_dict() or {}) if snapshot.exists else None
+
+
+def get_mutation_result(client: Any | None, operation_id: str, effect_id: str) -> tuple[bool, Any]:
+    """Read a confirmed result while preserving a legitimate stored ``None``."""
+    snapshot = _effect_ref(_db(client), operation_id, effect_id).get()
+    if not snapshot.exists:
+        return False, None
+    data = snapshot.to_dict() or {}
+    if data.get("state") != EffectState.CONFIRMED.value or "result" not in data:
+        return False, None
+    return True, data.get("result")
 
 
 def _locked_guard(data: dict[str, Any] | None) -> bool:
@@ -127,6 +155,8 @@ def dispatch_mutation(
     mutation_callback: Callable[[], Any],
     expected_pre_state: str | None = None,
     expected_revision: str | None = None,
+    desired_state_digest: str | None = None,
+    mutation_policy: str | None = None,
 ) -> Any:
     """Persist an effect and resource epochs before calling external code."""
     now = _aware(now)
@@ -144,6 +174,7 @@ def dispatch_mutation(
         payload_digest=payload_digest, owner=owner, fence=fence,
         state=EffectState.DISPATCHED, now=now,
         expected_pre_state=expected_pre_state, expected_revision=expected_revision,
+        desired_state_digest=desired_state_digest, mutation_policy=mutation_policy,
     )
 
     @firestore.transactional
@@ -156,7 +187,7 @@ def dispatch_mutation(
         if effect_snapshot.exists:
             existing = effect_snapshot.to_dict() or {}
             if _identity(existing) != _identity(proposed):
-                raise ValueError("effect ID already belongs to a different immutable identity")
+                raise MutationIdentityConflict("effect ID already belongs to a different immutable identity")
             state = EffectState(existing["state"])
             if state == EffectState.CONFIRMED:
                 return "confirmed", existing.get("result")
