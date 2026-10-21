@@ -7,9 +7,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.integrations.gemini import llm
-from core.integrations.firestore.operations import claim_operation, create_operation
-from core.operations.models import OperationOrigin
-from core.operations.retries import RetryBudgetExceeded, RetryGovernor, UnknownOutcome
+from core.integrations.firestore.operations import claim_operation, create_operation, get_operation
+from core.operations.models import OperationError, OperationOrigin, OperationState
+from core.operations.retries import (
+    ConfirmedStageFailure,
+    ConfirmedStageSuccess,
+    ReconciledStageFailure,
+    RetryBudgetExceeded,
+    RetryGovernor,
+    UnknownOutcome,
+)
 
 
 OPERATION_ID = "synthetic-retry-operation"
@@ -30,6 +37,11 @@ def _new_operation(client):
 
 def _governor(client, fake_clock):
     return RetryGovernor(client, clock=fake_clock, max_failures=3)
+
+
+def test_max_failures_cannot_exceed_three():
+    with pytest.raises(ValueError, match="between 1 and 3"):
+        RetryGovernor(max_failures=4)
 
 
 def test_failure_budget_survives_recreated_governors_and_caps_physical_executions(firestore_fake, fake_clock):
@@ -55,6 +67,7 @@ def test_failure_budget_survives_recreated_governors_and_caps_physical_execution
     stage = recreated.get_stage(OPERATION_ID, "generate")
     assert stage.failures == 3
     assert stage.attempts_started == 3
+    assert get_operation(client, OPERATION_ID).state is OperationState.FAILED
 
 
 def test_attempt_is_reserved_before_callback_and_unknown_is_reconciled_before_retry(firestore_fake, fake_clock):
@@ -92,6 +105,124 @@ def test_attempt_is_reserved_before_callback_and_unknown_is_reconciled_before_re
         )
     assert events[-1] == ("reconcile",)
     assert not any(event[0] == "must-not-dispatch" for event in events)
+
+
+def test_process_interruption_preserves_in_flight_attempt_for_reconciliation(firestore_fake, fake_clock):
+    class ProcessInterruption(BaseException):
+        pass
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    governor = _governor(client, fake_clock)
+
+    with pytest.raises(ProcessInterruption, match="interrupted"):
+        governor.run_stage(
+            OPERATION_ID, "interrupted",
+            lambda: (_ for _ in ()).throw(ProcessInterruption("interrupted")),
+            now=fake_clock.now(),
+        )
+
+    stage = governor.get_stage(OPERATION_ID, "interrupted")
+    assert stage.attempts_started == 1
+    assert stage.failures == 0
+    assert stage.in_flight_attempt_id is not None
+
+
+def test_confirmed_reconciliation_failure_is_recorded_before_a_later_retry(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    governor = _governor(client, fake_clock)
+
+    with pytest.raises(UnknownOutcome):
+        governor.run_stage(
+            OPERATION_ID, "reconcile-failure",
+            lambda: (_ for _ in ()).throw(UnknownOutcome("provider outcome unknown")),
+            now=fake_clock.now(),
+        )
+    stage = governor.get_stage(OPERATION_ID, "reconcile-failure")
+    attempt_id = stage.in_flight_attempt_id
+    assert attempt_id is not None
+
+    safe_error = OperationError(
+        code="provider_rejected", category="execution", message="Provider rejected the request",
+        retryable=True, stage="reconcile-failure",
+    )
+    callback_calls = []
+    with pytest.raises(ReconciledStageFailure, match="Provider rejected") as raised:
+        governor.run_stage(
+            OPERATION_ID, "reconcile-failure", lambda: callback_calls.append("unexpected"),
+            reconcile=lambda: ConfirmedStageFailure(safe_error), now=fake_clock.now(),
+        )
+
+    failed = governor.get_stage(OPERATION_ID, "reconcile-failure")
+    assert raised.value.error == safe_error
+    assert callback_calls == []
+    assert failed.failures == 1
+    assert failed.in_flight_attempt_id is None
+    assert failed.attempts_started == 1
+
+    assert governor.run_stage(
+        OPERATION_ID, "reconcile-failure", lambda: callback_calls.append("retry") or "ok",
+        now=fake_clock.now(),
+    ) == "ok"
+    assert callback_calls == ["retry"]
+    assert governor.get_stage(OPERATION_ID, "reconcile-failure").attempts_started == 2
+
+
+def test_permanent_reconciliation_failure_marks_operation_failed(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    governor = _governor(client, fake_clock)
+
+    with pytest.raises(UnknownOutcome):
+        governor.run_stage(
+            OPERATION_ID, "permanent-reconcile-failure",
+            lambda: (_ for _ in ()).throw(UnknownOutcome("provider outcome unknown")),
+            now=fake_clock.now(),
+        )
+
+    safe_error = OperationError(
+        code="provider_rejected", category="execution", message="Provider rejected the request",
+        retryable=False, stage="permanent-reconcile-failure",
+    )
+    with pytest.raises(ReconciledStageFailure):
+        governor.run_stage(
+            OPERATION_ID, "permanent-reconcile-failure", lambda: pytest.fail("must not dispatch"),
+            reconcile=lambda: ConfirmedStageFailure(safe_error), now=fake_clock.now(),
+        )
+
+    assert governor.get_stage(OPERATION_ID, "permanent-reconcile-failure").failures == 1
+    assert get_operation(client, OPERATION_ID).state is OperationState.FAILED
+
+
+def test_confirmed_reconciliation_success_can_complete_with_none(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    governor = _governor(client, fake_clock)
+
+    with pytest.raises(UnknownOutcome):
+        governor.run_stage(
+            OPERATION_ID, "reconcile-success",
+            lambda: (_ for _ in ()).throw(UnknownOutcome("provider outcome unknown")),
+            now=fake_clock.now(),
+        )
+
+    assert governor.run_stage(
+        OPERATION_ID, "reconcile-success", lambda: pytest.fail("must not dispatch"),
+        reconcile=lambda: ConfirmedStageSuccess(None), now=fake_clock.now(),
+    ) is None
+    stage = governor.get_stage(OPERATION_ID, "reconcile-success")
+    assert stage.state.value == "completed"
+    assert stage.result is None
+    assert stage.in_flight_attempt_id is None
+    assert governor.run_stage(
+        OPERATION_ID, "reconcile-success", lambda: pytest.fail("completed stage must be reused"),
+        now=fake_clock.now(),
+    ) is None
 
 
 def test_waiting_yield_status_and_lease_events_do_not_consume_failure_budget(firestore_fake, fake_clock):
@@ -134,6 +265,7 @@ def test_permanent_error_stops_early_and_successful_stage_is_retained(firestore_
             OPERATION_ID, "generate", permanent_failure,
             retryable=lambda error: False, now=fake_clock.now(),
         )
+    assert get_operation(client, OPERATION_ID).state is OperationState.FAILED
     assert calls == ["provider"]
     assert successful_calls == ["parse"]
     assert governor.get_stage(OPERATION_ID, "parse").result == saved
