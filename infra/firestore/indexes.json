@@ -1,0 +1,23 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "task_outbox",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "state", "order": "ASCENDING" },
+        { "fieldPath": "schedule_at", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": [
+    { "collectionGroup": "messages", "fieldPath": "text", "indexes": [] },
+    { "collectionGroup": "messages", "fieldPath": "caption", "indexes": [] },
+    { "collectionGroup": "messages", "fieldPath": "transcription_text", "indexes": [] },
+    { "collectionGroup": "prepared", "fieldPath": "text", "indexes": [] },
+    { "collectionGroup": "turns", "fieldPath": "text", "indexes": [] },
+    { "collectionGroup": "turns", "fieldPath": "parts", "indexes": [] },
+    { "collectionGroup": "operations", "fieldPath": "raw_command_envelope", "indexes": [] },
+    { "collectionGroup": "notification_outbox", "fieldPath": "body", "indexes": [] },
+    { "collectionGroup": "input_parts", "fieldPath": "payload", "indexes": [] }
+  ]
+}
