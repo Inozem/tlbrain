@@ -2,11 +2,13 @@
 
 import logging
 import os
+import re
 from typing import Any
 
 import google_auth_httplib2
 import httplib2
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from core.integrations.google_auth.credentials import credentials
 
@@ -35,19 +37,88 @@ def build_drive_service_rw():
     return build("drive", "v3", http=_build_http(_build_credentials(SCOPES_RW)))
 
 
-def create_folder(name: str, parent_id: str) -> str:
+_FOLDER_MIME = "application/vnd.google-apps.folder"
+_INTENT_MARKER = re.compile(r"v1:[0-9a-f]{64}\Z")
+_DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
+
+
+def _is_drive_id(value: Any) -> bool:
+    return isinstance(value, str) and _DRIVE_ID.fullmatch(value) is not None
+
+
+def generate_folder_id() -> str:
+    """Ask Drive for a pre-generated ID to use in a later folder create."""
+    try:
+        service = build_drive_service_rw()
+        result = service.files().generateIds(count=1, space="drive", type="files", fields="ids").execute()
+    except Exception:
+        raise RuntimeError("Drive folder ID allocation failed") from None
+    if not isinstance(result, dict) or not isinstance(result.get("ids"), list):
+        raise RuntimeError("Drive folder ID allocation failed")
+    ids = result["ids"]
+    if len(ids) != 1 or not _is_drive_id(ids[0]):
+        raise RuntimeError("Drive folder ID allocation failed")
+    return ids[0]
+
+
+def create_folder(
+    name: str, parent_id: str, *, folder_id: str | None = None, intent_marker: str | None = None,
+) -> str:
     """Create a Drive folder and return its stable Drive ID."""
+    if (folder_id is None) != (intent_marker is None):
+        raise ValueError("stable folder creation requires both folder_id and intent_marker")
+    if folder_id is not None:
+        if (not _is_drive_id(folder_id)
+                or not isinstance(intent_marker, str) or not _INTENT_MARKER.fullmatch(intent_marker)):
+            raise ValueError("invalid stable folder creation identity")
+        try:
+            service = build_drive_service_rw()
+        except Exception:
+            raise RuntimeError("Drive folder creation outcome is unresolved") from None
+        body = {"name": name, "mimeType": _FOLDER_MIME, "parents": [parent_id]}
+        body.update({"id": folder_id, "appProperties": {"tlbrain_effect_intent": intent_marker}})
+        try:
+            folder = service.files().create(body=body, fields="id").execute()
+        except HttpError as exc:
+            if getattr(exc, "status_code", None) != 409 and getattr(getattr(exc, "resp", None), "status", None) != 409:
+                raise RuntimeError("Drive folder creation outcome is unresolved") from None
+            try:
+                found = service.files().get(
+                    fileId=folder_id, fields="id,mimeType,name,parents,trashed,appProperties",
+                ).execute()
+            except Exception:
+                raise RuntimeError("Drive folder creation outcome is unresolved") from None
+            if not _matches_planned_folder(found, folder_id, name, parent_id, intent_marker):
+                raise RuntimeError("Drive folder creation conflicts with the persisted intent") from None
+            return folder_id
+        except Exception:
+            raise RuntimeError("Drive folder creation outcome is unresolved") from None
+        if not isinstance(folder, dict) or folder.get("id") != folder_id:
+            raise RuntimeError("Drive folder creation outcome is unresolved")
+        return folder_id
     service = build_drive_service_rw()
+    body = {"name": name, "mimeType": _FOLDER_MIME, "parents": [parent_id]}
     folder = service.files().create(
-        body={
-            "name": name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        },
+        body=body,
         fields="id",
     ).execute()
     logger.info("Created folder %r under %s: %s", name, parent_id, folder["id"])
     return folder["id"]
+
+
+def _matches_planned_folder(file: Any, folder_id: str, name: str, parent_id: str, marker: str) -> bool:
+    return (
+        isinstance(file, dict)
+        and file.get("id") == folder_id
+        and file.get("mimeType") == _FOLDER_MIME
+        and file.get("name") == name
+        and isinstance(file.get("parents"), list)
+        and len(file["parents"]) == 1
+        and file["parents"][0] == parent_id
+        and file.get("trashed") is False
+        and isinstance(file.get("appProperties"), dict)
+        and file["appProperties"].get("tlbrain_effect_intent") == marker
+    )
 
 
 def move_folder_in_drive(folder_id: str, new_parent_id: str) -> None:

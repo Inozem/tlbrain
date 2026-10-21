@@ -57,17 +57,20 @@ def get_all_folders(db: firestore.Client | None = None) -> dict[str, dict]:
     return {doc.id: (doc.to_dict() or {}) for doc in client.collection(FOLDERS_COLLECTION).stream()}
 
 
-def folder_name_exists(name: str, parent_id: str | None, db: firestore.Client | None = None) -> bool:
+def folder_name_exists(
+    name: str, parent_id: str | None, db: firestore.Client | None = None, *, exclude_id: str | None = None,
+) -> bool:
     """Return True when this name exists under the supplied nullable parent ID."""
     client = _db_or_client(db)
-    docs = (
+    query = (
         client.collection(FOLDERS_COLLECTION)
         .where("name", "==", name)
         .where("parent_id", "==", parent_id)
-        .limit(1)
-        .stream()
     )
-    return any(True for _ in docs)
+    if exclude_id is None:
+        return next(iter(query.limit(1).stream()), None) is not None
+    docs = query.limit(2).stream()
+    return any(doc.id != exclude_id for doc in docs)
 
 
 def get_folder_id_by_name(name: str, db: firestore.Client | None = None) -> str | None:

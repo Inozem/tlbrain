@@ -1,6 +1,7 @@
 """Folder use cases coordinating Google Drive and Firestore."""
 
 from typing import Any
+import re
 
 from core.config import get_root_folder_id
 from core.integrations.firestore import folders as folder_repository
@@ -54,6 +55,9 @@ class FolderNameConflict(FolderOperationError):
 
 class FolderSubtreeMove(FolderOperationError):
     pass
+
+
+_STABLE_INTENT_MARKER = re.compile(r"v1:[0-9a-f]{64}\Z")
 
 
 def get_or_create_folder(drive: Any, parent_id: str, name: str) -> str:
@@ -111,13 +115,44 @@ def list_folders() -> dict[str, Any]:
     return build_folder_tree(all_folders, root_folder_id, aggregates)
 
 
-def create_folder(name: str, parent_path: list[str] | None = None) -> str:
+def create_folder(
+    name: str, parent_path: list[str] | None = None, *,
+    folder_id: str | None = None, intent_marker: str | None = None,
+) -> str:
     """Create a sibling-unique folder and register it under its Drive ID."""
     parent_id = _resolve(parent_path, "parent") if parent_path else get_root_folder_id()
-    if folder_repository.folder_name_exists(name, parent_id):
+    stable = folder_id is not None or intent_marker is not None
+    if stable and (folder_id is None or intent_marker is None):
+        raise ValueError("stable folder creation requires both folder_id and intent_marker")
+    if stable and (
+        not isinstance(folder_id, str) or not folder_id
+        or len(folder_id) > 256
+        or not all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in folder_id)
+        or not isinstance(intent_marker, str) or not _STABLE_INTENT_MARKER.fullmatch(intent_marker)
+    ):
+        raise ValueError("invalid stable folder creation identity")
+    try:
+        duplicate = (
+            folder_repository.folder_name_exists(name, parent_id, exclude_id=folder_id)
+            if stable else folder_repository.folder_name_exists(name, parent_id)
+        )
+    except Exception:
+        if stable:
+            raise RuntimeError("Drive folder registration outcome is unresolved") from None
+        raise
+    if duplicate:
         raise FolderNameConflict(name)
-    folder_id = drive_client.create_folder(name, parent_id)
-    folder_repository.upsert_folder(folder_id, name, parent_id)
+    if stable:
+        folder_id = drive_client.create_folder(name, parent_id, folder_id=folder_id, intent_marker=intent_marker)
+    else:
+        folder_id = drive_client.create_folder(name, parent_id)
+    if stable:
+        try:
+            folder_repository.upsert_folder(folder_id, name, parent_id)
+        except Exception:
+            raise RuntimeError("Drive folder registration outcome is unresolved") from None
+    else:
+        folder_repository.upsert_folder(folder_id, name, parent_id)
     return folder_id
 
 

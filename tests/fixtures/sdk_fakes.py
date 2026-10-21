@@ -217,6 +217,7 @@ class _Resource:
                 "list": {"q", "fields", "pageSize", "pageToken", "orderBy", "spaces", "includeItemsFromAllDrives", "supportsAllDrives", "corpora", "driveId"},
                 "get": {"fileId", "fields", "supportsAllDrives", "acknowledgeAbuse"},
                 "create": {"body", "fields", "supportsAllDrives", "supportsTeamDrives"},
+                "generateIds": {"count", "space", "type", "fields"},
                 "update": {"fileId", "body", "addParents", "removeParents", "fields", "supportsAllDrives", "supportsTeamDrives"},
             },
             "changes": {

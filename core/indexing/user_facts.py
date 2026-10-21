@@ -29,12 +29,18 @@ class AddFactTranscriptNotSynced(ValueError):
         )
 
 
-def add_user_fact(doc_id: str, text: str) -> str:
+def add_user_fact(doc_id: str, text: str, *, point_id: str | None = None) -> str:
     """Validate and index a trimmed user fact, returning its trimmed document ID."""
     doc_id = doc_id.strip()
     text = text.strip()
     if not doc_id or not text:
         raise AddFactInputError("doc_id and text are required")
+    if point_id is not None:
+        from uuid import UUID
+        try:
+            UUID(point_id)
+        except (ValueError, AttributeError, TypeError):
+            raise AddFactInputError("point_id must be a UUID") from None
 
     record = get_transcript_record(doc_id)
     if not record:
@@ -55,5 +61,8 @@ def add_user_fact(doc_id: str, text: str) -> str:
     }
 
     vector = embed([text])[0]
-    upsert_user_facts([payload], [vector])
+    if point_id is None:
+        upsert_user_facts([payload], [vector])
+    else:
+        upsert_user_facts([payload], [vector], point_ids=[point_id])
     return doc_id
