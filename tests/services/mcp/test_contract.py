@@ -155,7 +155,7 @@ def test_protocol_and_operation_errors(monkeypatch):
     def fail_retrieval(**kwargs):
         raise RuntimeError("synthetic retrieval failure")
 
-    monkeypatch.setattr(handler, "get_transcripts", fail_retrieval)
+    monkeypatch.setattr(handler.read_operations, "get_transcript", fail_retrieval)
     failed_operation = _request("post", "/mcp", json=_rpc("tools/call", 12, {
         "name": "get_transcript", "arguments": {"doc_id": "synthetic-doc"}
     }))
@@ -171,7 +171,7 @@ def test_protocol_and_operation_errors(monkeypatch):
 
 def test_unicode_tool_content_round_trip(monkeypatch):
     payload = "שלום, réunion 🌍"
-    monkeypatch.setattr(handler, "get_transcripts", lambda **kwargs: ([{"doc_id": "d1", "text": payload}], {
+    monkeypatch.setattr(handler.read_operations, "get_transcript", lambda **kwargs: ([{"doc_id": "d1", "text": payload}], {
         "truncated": False, "total_matches": 1, "returned_segments": 1
     }))
     response = _request("post", "/mcp", json=_rpc("tools/call", "unicode", {
@@ -189,7 +189,7 @@ def test_existing_tool_argument_defaults_and_conversions(monkeypatch):
         transcript_calls.append(kwargs)
         return [], {"truncated": False, "total_matches": 0, "returned_segments": 0}
 
-    monkeypatch.setattr(handler, "get_transcripts", get_transcripts)
+    monkeypatch.setattr(handler.read_operations, "get_transcript", get_transcripts)
     request = JSONRPCRequest(**_rpc("tools/call", "get", {"name": "get_transcript", "arguments": {"limit": 0}}))
     _run(handler.handle_mcp_request(request.model_dump(exclude_none=True)))
     assert transcript_calls[-1]["limit"] == 1
@@ -198,7 +198,7 @@ def test_existing_tool_argument_defaults_and_conversions(monkeypatch):
     assert transcript_calls[-1]["limit"] == "0"
 
     recent_calls = []
-    monkeypatch.setattr(handler, "list_transcripts", lambda **kwargs: recent_calls.append(kwargs) or {
+    monkeypatch.setattr(handler.read_operations, "list_recent_transcripts", lambda **kwargs: recent_calls.append(kwargs) or {
         "transcripts": [], "total": 0, "returned": 0
     })
     request = JSONRPCRequest(**_rpc("tools/call", "recent", {

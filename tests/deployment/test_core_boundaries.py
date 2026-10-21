@@ -305,6 +305,7 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
         "build_folder_tree": {"core/integrations/google_drive/folders.py"},
         "list_folders": {
             "core/integrations/google_drive/folder_service.py",
+            "core/operations/read.py",
             "core/retrieval/folders.py",
         },
         "get_or_create_folder": {"core/integrations/google_drive/folder_service.py"},
@@ -322,6 +323,7 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
     assert actual_definitions == allowed_definitions
 
     wrappers = {
+        "core/operations/read.py": {"list_folders": "list_folders"},
         "core/retrieval/folders.py": {"list_folders": "service_list_folders"},
     }
     for relative, expected_calls in wrappers.items():

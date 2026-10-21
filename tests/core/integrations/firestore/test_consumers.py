@@ -10,6 +10,7 @@ def test_vector_sync_and_mcp_bind_canonical_repositories(sdk_fakes):
     vector_main = importlib.import_module("services.vector_sync.app.main")
     processor = importlib.import_module("core.indexing.processor")
     handler = importlib.import_module("services.mcp.app.mcp.handler")
+    read_operations = importlib.import_module("core.operations.read")
     operations = importlib.import_module("core.documents.operations")
 
     assert vector_main.ensure_imported is transcripts.ensure_imported
@@ -23,15 +24,15 @@ def test_vector_sync_and_mcp_bind_canonical_repositories(sdk_fakes):
     assert processor.load_index is transcripts.load_index
     assert processor.update_index is transcripts.update_index
 
-    assert handler.list_transcripts is transcripts.list_transcripts
+    assert read_operations.list_repository_transcripts is transcripts.list_transcripts
     assert handler.folder_service is folder_service
-    assert handler.get_sync_status is transcripts.get_sync_status
+    assert read_operations.get_repository_sync_status is transcripts.get_sync_status
+    assert read_operations.folder_service is folder_service
     assert operations.transcripts is transcripts
     assert operations.folders is folders
     assert operations.firestore_client.get_client is importlib.import_module("core.integrations.firestore.client").get_client
 
-    assert handler.resolve_folder_path is folder_service.resolve_registered_folder_path
-    assert handler.expand_subtree is folder_service.expand_registered_subtree
+    assert handler.read_operations is read_operations
 
 
 def test_mcp_move_transcript_uses_canonical_unassigned_repositories(monkeypatch):

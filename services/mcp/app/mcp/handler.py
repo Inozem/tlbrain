@@ -17,17 +17,9 @@ from core.indexing.user_facts import (
     AddFactTranscriptNotSynced,
     add_user_fact,
 )
-from core.retrieval.run import run_retrieval
-from core.retrieval.transcripts import get_transcripts
+from core.operations import read as read_operations
 from core.integrations.google_drive import folder_service
-from core.integrations.google_drive.folder_service import (
-    expand_registered_subtree as expand_subtree,
-    resolve_registered_folder_path as resolve_folder_path,
-)
-from core.integrations.firestore.transcripts import (
-    get_sync_status,
-    list_transcripts,
-)
+from core.integrations.google_drive.folder_service import FolderNotFound
 from core.documents import operations as document_operations
 
 logger = logging.getLogger(__name__)
@@ -460,7 +452,7 @@ def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        segments, meta = run_retrieval(
+        segments, meta = read_operations.query(
             query=query,
             keywords=keywords,
             folder_path=folder_path,
@@ -504,7 +496,7 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
 
     t0 = time.monotonic()
     try:
-        segments, meta = get_transcripts(
+        segments, meta = read_operations.get_transcript(
             doc_id=doc_id,
             folder_path=folder_path,
             date_from=date_from,
@@ -541,7 +533,7 @@ def _handle_get_transcript(request: JSONRPCRequest, arguments: dict) -> dict:
 def _handle_list_folders(request: JSONRPCRequest) -> dict:
     t0 = time.monotonic()
     try:
-        result = folder_service.list_folders()
+        result = read_operations.list_folders()
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -814,7 +806,7 @@ def _handle_sync_changes(request: JSONRPCRequest, arguments: dict) -> dict:
 def _handle_sync_status(request: JSONRPCRequest) -> dict:
     t0 = time.monotonic()
     try:
-        status = get_sync_status()
+        status = read_operations.sync_status()
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
@@ -829,6 +821,7 @@ def _handle_sync_status(request: JSONRPCRequest) -> dict:
         extra={"tool": "sync_status", "latency_ms": latency_ms, "total": status.get("total", 0)},
     )
 
+    status = dict(status)
     unassigned = status.pop("_unassigned_count", 0)
     if unassigned > 0:
         status["suggestion"] = (
@@ -880,22 +873,23 @@ def _handle_list_recent_transcripts(request: JSONRPCRequest, arguments: dict) ->
     limit = int(arguments.get("limit") or 20)
     offset = int(arguments.get("offset") or 0)
 
-    folder_ids = None
-    if folder_path:
-        terminal_ids = resolve_folder_path(folder_path)
-        if not terminal_ids:
-            return build_jsonrpc_error(
-                request_id=request.id,
-                code=-32602,
-                message=f"Folder not found: {'/'.join(folder_path)}",
-                details="Use list_folders to see available folders.",
-            )
-        folder_ids = [fid for tid in terminal_ids for fid in expand_subtree(tid)]
-
     t0 = time.monotonic()
     try:
-        result = list_transcripts(folder_ids=folder_ids, date_from=date_from, date_to=date_to, limit=limit, offset=offset)
-    except Exception as e:
+        result = read_operations.list_recent_transcripts(
+            folder_path=folder_path,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
+    except FolderNotFound as e:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message=f"Folder not found: {'/'.join(e.path)}",
+            details="Use list_folders to see available folders.",
+        )
+    except read_operations.TranscriptListingError as e:
         return build_jsonrpc_error(
             request_id=request.id,
             code=-32603,
