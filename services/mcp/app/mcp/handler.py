@@ -17,6 +17,7 @@ from core.indexing.user_facts import (
     AddFactTranscriptNotSynced,
 )
 from core.operations import read as read_operations
+from core.operations import sync as sync_operations
 from core.operations import write as write_operations
 from core.integrations.google_drive import folder_service
 from core.integrations.google_drive.folder_service import FolderNotFound
@@ -768,23 +769,15 @@ def _handle_rename_folder(request: JSONRPCRequest, arguments: dict) -> dict:
 
 
 def _handle_sync_changes(request: JSONRPCRequest, arguments: dict) -> dict:
-    checker_url = os.environ.get("SYNC_CHECKER_URL", "")
-    if not checker_url:
+    t0 = time.monotonic()
+    try:
+        result = sync_operations.sync_changes(arguments.get("doc_id"))
+    except sync_operations.SyncConfigurationError:
         return build_jsonrpc_error(
             request_id=request.id,
             code=-32603,
             message="SYNC_CHECKER_URL is not configured",
         )
-
-    t0 = time.monotonic()
-    try:
-        import httpx
-        body: dict = {}
-        if arguments.get("doc_id"):
-            body["doc_id"] = arguments["doc_id"].strip()
-        resp = httpx.post(checker_url, json=body or None, timeout=300)
-        resp.raise_for_status()
-        result = resp.json()
     except Exception as e:
         return build_jsonrpc_error(
             request_id=request.id,
