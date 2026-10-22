@@ -10,7 +10,7 @@ from core.operations import read, registry, write
 EXPECTED = {
     "query", "get_transcript", "list_recent_transcripts", "list_folders", "sync_status",
     "move_transcript", "rename_transcript", "move_folder", "rename_folder", "create_folder",
-    "add_fact", "sync_changes",
+    "add_fact", "add_dialog", "sync_changes",
 }
 
 
@@ -98,6 +98,35 @@ def test_write_invocation_requires_and_forwards_trusted_context(monkeypatch):
         registry.invoke_operation("move_transcript", {"doc_id": "doc", "folder_path": ["A"]})
     with pytest.raises(registry.OperationValidationError):
         registry.invoke_operation("move_transcript", {"doc_id": "doc", "folder_path": ["A"]}, context=object())
+
+
+def test_add_dialog_dispatch_requires_trusted_typed_acceptance_context(monkeypatch):
+    from datetime import datetime, timezone
+    from core.operations.models import OperationOrigin
+
+    arguments = {"provider": "manual", "utterances": [{"speaker": "A", "text": "words"}]}
+    with pytest.raises(registry.OperationValidationError):
+        registry.invoke_operation("add_dialog", arguments)
+    with pytest.raises(registry.OperationValidationError):
+        registry.invoke_operation("add_dialog", arguments, context=object())
+    spoofed = registry.AddDialogContext(object(), "op", "caller", OperationOrigin.MCP,
+                                        datetime.now(timezone.utc))
+    with pytest.raises(registry.OperationValidationError):
+        registry.invoke_operation("add_dialog", arguments, context=spoofed)
+
+    accepted = object()
+    seen = []
+    monkeypatch.setattr(registry.saving, "accept_save", lambda *args, **kwargs: seen.append((args, kwargs)) or accepted)
+    context = registry._new_add_dialog_context(
+        client="client", operation_id="op", caller_binding="caller",
+        origin=OperationOrigin.MCP, now=datetime.now(timezone.utc),
+    )
+    assert registry.invoke_operation("add_dialog", arguments, context=context) is accepted
+    assert seen[0][0] == ("client", arguments)
+    assert seen[0][1] == {
+        "operation_id": "op", "caller_binding": "caller",
+        "origin": OperationOrigin.MCP, "now": context.now,
+    }
 
 
 @pytest.mark.parametrize(("name", "arguments", "expected"), [

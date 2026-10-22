@@ -88,6 +88,16 @@ async def mcp_endpoint(request: Request):
     finally:
         reset_request_context(context_token)
 
+    params = body.get("params") if isinstance(body, dict) else None
+    is_add_dialog = (
+        body.get("method") == "tools/call" and isinstance(params, dict)
+        and params.get("name") == "add_dialog"
+    )
+    if is_add_dialog and session_state == "absent":
+        return JSONResponse(content={"error": "An initialized MCP session is required"}, status_code=400)
+    if is_add_dialog and session_state == "invalid":
+        return JSONResponse(content={"error": "The MCP session is unavailable"}, status_code=404)
+
     response_session_id = session_id if session_state == "active" else None
     if body.get("method") == "initialize" and "error" not in response:
         protocol_version = response.get("result", {}).get("protocolVersion")

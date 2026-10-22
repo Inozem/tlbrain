@@ -9,6 +9,7 @@ from core.dialogs.saving import accept_save, advance_save
 from core.integrations.firestore.input_parts import read_input_parts
 from core.integrations.firestore.operations import claim_operation, get_operation, get_stage
 from core.integrations.firestore.outbox import get_outbox_record
+from core.integrations.firestore import mcp_sessions
 from core.integrations.firestore.transcripts import get_transcript_record
 from core.operations.models import OperationOrigin
 from core.operations.retries import RetryGovernor, UnknownOutcome
@@ -44,6 +45,33 @@ def test_acceptance_is_side_effect_free_and_replay_is_stable(firestore_fake, sdk
     stored = read_input_parts(client, first.immutable_input_ref)
     assert b"first\\nline" in stored
     assert get_operation(client, first.operation.operation_id).save_intent_id == first.save_intent_id
+
+
+def test_replayed_request_keeps_original_acceptance_defaults(firestore_fake):
+    client = firestore_fake.client_class()
+    accepted_at = datetime(2026, 1, 2, 20, 30, tzinfo=timezone.utc)
+    later = datetime(2026, 1, 2, 22, 30, tzinfo=timezone.utc)
+    session = mcp_sessions.create_session(
+        client, caller_binding="caller-1", protocol_version="v1", now=accepted_at,
+    )
+    arguments = {"provider": "manual", "utterances": [{"speaker": "Alex", "text": "Hello."}]}
+    first = mcp_sessions.resolve_or_reserve_request(
+        client, session.session_id, caller_binding="caller-1", request_id="defaults",
+        arguments=arguments, now=accepted_at,
+    )
+    replay = mcp_sessions.lookup_request_replay(
+        client, session.session_id, caller_binding="caller-1", request_id="defaults",
+        arguments=arguments, now=later,
+    )
+    assert replay is not None and replay.operation_id == first.operation_id
+    assert replay.accepted_at == accepted_at
+
+    accepted = accept_save(
+        client, arguments, operation_id=replay.operation_id, caller_binding="caller-1",
+        origin=OperationOrigin.MCP, now=replay.accepted_at,
+    )
+    assert accepted.operation.date == "2026-01-02"
+    assert accepted.operation.title == "TLBrain dialog 2026-01-02"
 
 
 def test_acceptance_stores_large_dialog_without_trimming_or_token_chunking(firestore_fake):

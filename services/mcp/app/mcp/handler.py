@@ -1,11 +1,16 @@
 import logging
+import json
 import os
 import time
+import uuid
+from datetime import datetime, timezone
 
 from services.mcp.app.mcp.schemas import (
+    ADD_DIALOG_INPUT_SCHEMA,
     JSONRPCRequest,
     JSONRPCResponse,
     TLBrainPayload,
+    validate_add_dialog_schema,
 )
 from services.mcp.app.mcp.tools import (
     build_mcp_content,
@@ -22,6 +27,36 @@ from core.operations import write as write_operations
 from core.integrations.google_drive import folder_service
 from core.integrations.google_drive.folder_service import FolderNotFound
 from core.documents import operations as document_operations
+from core.dialogs import completion as dialog_completion
+from core.dialogs import saving as dialog_saving
+from core.dialogs.classification import (
+    FolderSelectionRequest,
+    classify_dialog_folder,
+    FolderPathNotFoundError,
+    AmbiguousFolderPathError,
+)
+from core.dialogs.models import normalize_dialog_input
+from core.integrations.firestore import folders as folder_repository
+from core.integrations.firestore import mcp_sessions
+from core.integrations.firestore import save_intents as save_intent_repository
+from core.integrations.firestore import outbox as outbox_repository
+from core.integrations.firestore.client import get_client
+from core.integrations.firestore.operations import (
+    claim_operation,
+    complete_operation,
+    fail_operation,
+    get_operation,
+    release_operation,
+)
+from core.integrations.google_drive.client import build_drive_service_rw
+from core.integrations.google_docs.client import build_docs_service
+from core.operations.models import OperationError, OperationResult, OperationOrigin
+from core.operations import outbox as operation_outbox
+from core.operations.outbox import TaskTargetConfig
+from core.integrations.firestore.outbox import OutboxTargetKind
+from core.operations.registry import OperationValidationError, validate_arguments
+from core.config import get_root_folder_id
+from services.mcp.app.mcp.request_context import get_request_context
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +117,17 @@ def _folder_domain_error(request: JSONRPCRequest, error: Exception, operation: s
 
 
 async def handle_mcp_request(request_dict: dict) -> dict:
+    # Pydantic's compatibility parsing is retained for legacy tools. add_dialog
+    # needs the original JSON-RPC ID type for its durable typed replay key.
+    raw_id = request_dict.get("id") if isinstance(request_dict, dict) else None
+    params = request_dict.get("params") if isinstance(request_dict, dict) else None
+    if (isinstance(request_dict, dict) and request_dict.get("method") == "tools/call"
+            and isinstance(params, dict) and params.get("name") == "add_dialog"
+            and type(raw_id) not in (str, int)):
+        return {
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": -32602, "message": "add_dialog requires a string or integer request ID"},
+        }
     try:
         request = JSONRPCRequest(**request_dict)
     except Exception as e:
@@ -388,6 +434,11 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                         "required": ["doc_id", "new_title"],
                     },
                 },
+                {
+                    "name": "add_dialog",
+                    "description": "Save a new dialog transcript and queue it for indexing.",
+                    "inputSchema": ADD_DIALOG_INPUT_SCHEMA,
+                },
             ]
         },
     )
@@ -397,6 +448,9 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
     params = request.params or {}
     tool_name = params.get("name")
     arguments = params.get("arguments", {})
+
+    if tool_name == "add_dialog":
+        return _handle_add_dialog(request, arguments)
 
     if tool_name == "query":
         return _handle_query(request, arguments)
@@ -441,6 +495,494 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
         request_id=request.id,
         code=-32602,
         message="Invalid tool",
+    )
+
+
+def _add_dialog_payload(operation_id: str, operation, provider: str, *, status: str) -> dict:
+    payload = {
+        "operation_id": operation_id,
+        "doc_id": operation.doc_id,
+        "folder_path": list(operation.selected_folder_path or ()),
+        "provider": provider,
+        "status": status,
+    }
+    if operation.error is not None:
+        error = operation.error
+        payload["error"] = {
+            "operation_id": operation_id,
+            "service": error.service or "dialog_save",
+            "stage": error.stage or operation.stage or "save",
+            "code": error.code,
+            "category": error.category,
+            "sanitized_message": error.sanitized_message or error.message,
+            "retryable": error.retryable,
+        }
+    return payload
+
+
+def _add_dialog_in_progress(request: JSONRPCRequest, operation_id: str, operation) -> dict:
+    stage = (operation.stage if operation is not None else None) or "accepted"
+    details = {
+        "operation_id": operation_id,
+        "stage": stage,
+        "retry_same_request": True,
+    }
+    if operation is not None and operation.doc_id:
+        details.update({
+            "doc_id": operation.doc_id,
+            "folder_path": list(operation.selected_folder_path or ()),
+            "service": "google_docs" if stage == "fill" else "dialog_save",
+            "category": "in_progress",
+            "code": "save_stage_in_progress",
+            "sanitized_message": "The save is still being reconciled.",
+        })
+    return {
+        "jsonrpc": "2.0",
+        "id": request.id,
+        "error": {
+            "code": -32010,
+            "message": "Operation is still in progress",
+            "data": details,
+        },
+    }
+
+
+def _map_add_dialog_failure(request: JSONRPCRequest, operation_id: str, operation, provider: str) -> dict:
+    """Render durable failed state with its sanitized diagnostics and known document."""
+    if operation.doc_id:
+        return build_jsonrpc_result(request.id, build_mcp_content(
+            _add_dialog_payload(operation_id, operation, operation.provider or provider, status="error")
+        ))
+    error = operation.error
+    return {
+        "jsonrpc": "2.0", "id": request.id,
+        "error": {
+            "code": -32603, "message": "Dialog save failed",
+            "data": {
+                "operation_id": operation_id,
+                "stage": error.stage if error else operation.stage or "save",
+                "service": error.service if error else "dialog_save",
+                "code": error.code if error else "save_failed",
+                "category": error.category if error else "execution",
+                "sanitized_message": error.sanitized_message if error else "Dialog save failed",
+            },
+        },
+    }
+
+
+def _handle_add_dialog(request: JSONRPCRequest, arguments: dict) -> dict:
+    """Keep implementation failures for this new tool inside its safe error boundary."""
+    try:
+        return _process_add_dialog(request, arguments)
+    except Exception:
+        logger.error("add_dialog request failed outside a checkpointed stage")
+        return build_jsonrpc_error(
+            request_id=request.id, code=-32603,
+            message="Dialog save could not be completed",
+        )
+
+
+def _prepare_add_dialog(request: JSONRPCRequest, arguments: dict):
+    """Validate the request and reserve its typed, session-bound replay key."""
+    context, error_response = _require_add_dialog_session(request)
+    if error_response is not None:
+        return None, error_response
+
+    validated, error_response = _validate_add_dialog_arguments(request, arguments)
+    if error_response is not None:
+        return None, error_response
+
+    client = get_client()
+    now = datetime.now(timezone.utc)
+    reservation, error_response = _lookup_add_dialog_replay(
+        request, context, validated, client, now,
+    )
+    if error_response is not None:
+        return None, error_response
+    if reservation is not None:
+        return _prepare_add_dialog_replay(context, validated, client, now, reservation), None
+
+    root_folder_id = get_root_folder_id()
+    folders = folder_repository.get_all_folders(client)
+    error_response = _validate_add_dialog_folder_path(
+        request, validated, folders, root_folder_id,
+    )
+    if error_response is not None:
+        return None, error_response
+
+    reservation, error_response = _reserve_add_dialog_request(
+        request, context, validated, client, now,
+    )
+    if error_response is not None:
+        return None, error_response
+    return (
+        context, validated, client, root_folder_id, folders,
+        reservation.accepted_at, reservation,
+    ), None
+
+
+def _require_add_dialog_session(request: JSONRPCRequest):
+    """Require an initialized caller-bound session before any add_dialog effects."""
+    context = get_request_context()
+    if (context is None or context.session_state != "active" or not context.session_id
+            or context.session is None or context.identity is None
+            or not getattr(context.identity, "caller_binding", None)):
+        return None, build_jsonrpc_error(
+            request_id=request.id, code=-32602,
+            message="An initialized MCP session is required for add_dialog",
+        )
+    return context, None
+
+
+def _validate_add_dialog_arguments(request: JSONRPCRequest, arguments: dict):
+    """Validate and normalize add_dialog input before session replay lookup."""
+    try:
+        validate_add_dialog_schema(arguments)
+        validated = validate_arguments("add_dialog", arguments)
+        normalize_dialog_input(validated, accepted_at=datetime.now(timezone.utc))
+    except (OperationValidationError, TypeError, ValueError):
+        return None, build_jsonrpc_error(
+            request_id=request.id, code=-32602, message="Invalid add_dialog arguments",
+        )
+    return validated, None
+
+
+def _lookup_add_dialog_replay(request, context, validated, client, now):
+    """Look up the typed request key before checking mutable folder state."""
+    try:
+        reservation = mcp_sessions.lookup_request_replay(
+            client, context.session_id,
+            caller_binding=context.identity.caller_binding,
+            request_id=request.id, arguments=validated, now=now,
+        )
+    except mcp_sessions.RequestArgumentsConflictError:
+        return None, build_jsonrpc_error(
+            request_id=request.id, code=-32602,
+            message="This request ID was already used with different arguments",
+        )
+    except (mcp_sessions.SessionUnavailableError, ValueError):
+        return None, build_jsonrpc_error(
+            request_id=request.id, code=-32602,
+            message="The initialized MCP session is unavailable",
+        )
+    return reservation, None
+
+
+def _prepare_add_dialog_replay(context, validated, client, now, reservation):
+    """Keep an exact replay bound to its durable operation despite current folder changes."""
+    root_folder_id = None
+    folders = None
+    try:
+        root_folder_id = get_root_folder_id()
+        folders = folder_repository.get_all_folders(client)
+    except Exception:
+        pass
+    return context, validated, client, root_folder_id, folders, now, reservation
+
+
+def _validate_add_dialog_folder_path(request, validated, folders, root_folder_id):
+    """Reject a fresh request whose selected folder path is no longer unambiguous."""
+    if "folder_path" in validated:
+        try:
+            classify_dialog_folder(
+                FolderSelectionRequest(
+                    title=validated.get("title", ""), utterances=(),
+                    folder_path=tuple(validated["folder_path"]),
+                ), folders, root_folder_id,
+                speaker_index_lookup=lambda _speaker: (), suggestion=lambda *_args: None,
+            )
+        except (FolderPathNotFoundError, AmbiguousFolderPathError):
+            return build_jsonrpc_error(
+                request_id=request.id, code=-32602,
+                message="folder_path does not identify exactly one folder under the configured root",
+            )
+    return None
+
+
+def _reserve_add_dialog_request(request, context, validated, client, now):
+    """Reserve a new caller-bound request after its mutable folder path is valid."""
+    try:
+        reservation = mcp_sessions.resolve_or_reserve_request(
+            client, context.session_id,
+            caller_binding=context.identity.caller_binding,
+            request_id=request.id, arguments=validated, now=now,
+        )
+    except mcp_sessions.RequestArgumentsConflictError:
+        return None, build_jsonrpc_error(
+            request_id=request.id, code=-32602,
+            message="This request ID was already used with different arguments",
+        )
+    except (mcp_sessions.SessionUnavailableError, ValueError):
+        return None, build_jsonrpc_error(
+            request_id=request.id, code=-32602,
+            message="The initialized MCP session is unavailable",
+        )
+    return reservation, None
+
+
+def _build_add_dialog_folder_callbacks(client, folders):
+    """Build folder classification callbacks using the current caller's index."""
+    def speaker_index_lookup(speaker: str):
+        return [snapshot.id for snapshot in folder_repository.get_folders_by_speaker(speaker, client)]
+
+    def suggestion(stage, folder_ids, title, utterances, topic_hint):
+        from core.integrations.gemini.llm import call_gemini_json
+        names = [folders.get(folder_id, {}).get("name", folder_id) for folder_id in folder_ids]
+        sample = "\n".join(f"{item.speaker}: {item.text}" for item in utterances)
+        prompt = (
+            "Select the best matching existing folder for this dialog. "
+            "Return a folder_name from the candidate list and confidence from 0 to 1. "
+            f"Stage: {stage}\nCandidates: {names!r}\nTitle: {title}\n"
+            f"Topic: {topic_hint or ''}\nDialog:\n{sample}"
+        )
+        result = call_gemini_json(prompt)
+        return result.get("folder_name"), result.get("confidence", 0)
+    return speaker_index_lookup, suggestion
+
+
+def _advance_add_dialog_save(client, operation_id, owner, lease, now,
+                             root_folder_id, folders):
+    """Advance durable dialog save stages and checkpoint provider rejections."""
+    drive = build_drive_service_rw()
+    docs = build_docs_service(["https://www.googleapis.com/auth/documents"])
+    speaker_index_lookup, suggestion = _build_add_dialog_folder_callbacks(client, folders)
+    try:
+        progress = dialog_saving.advance_save(
+            client, operation_id, owner=owner, fence=lease.fence, now=now,
+            folders=folders, root_folder_id=root_folder_id,
+            speaker_index_lookup=speaker_index_lookup, suggestion=suggestion,
+            drive=drive, docs=docs,
+            ensure_unassigned=lambda root: folder_service.get_unassigned_folder_id(drive, root),
+        )
+    except Exception as save_error:
+        _record_add_dialog_provider_rejection(
+            client, operation_id, owner, lease, save_error,
+        )
+        raise
+
+    return progress
+
+
+def _record_add_dialog_provider_rejection(client, operation_id, owner, lease, save_error):
+    """Persist sanitized terminal state when a provider definitively rejects a save."""
+    status = getattr(save_error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(save_error, "resp", None), "status", None)
+    rejected_create = (
+        type(save_error).__name__ == "DriveCreateError"
+        and getattr(save_error, "outcome", None) == "rejected"
+    )
+    if rejected_create or (isinstance(status, int) and 400 <= status < 500 and status not in {408, 429}):
+        failed = get_operation(client, operation_id)
+        fail_operation(
+            client, operation_id, owner=owner, fence=lease.fence,
+            error=OperationError(
+                code="provider_rejected", category="provider", message="Dialog save was rejected",
+                sanitized_message="The provider rejected the save request.", retryable=False,
+                service=("google_docs" if failed and failed.stage == "fill" else "google_drive"),
+                stage=failed.stage if failed else "save",
+            ),
+            now=datetime.now(timezone.utc),
+        )
+
+
+def _publish_add_dialog_index_work(client):
+    """Publish due index outbox records using the configured task target."""
+    target = TaskTargetConfig(
+        queue_name=os.environ["VECTOR_SYNC_QUEUE"], url=os.environ["VECTOR_SYNC_URL"],
+        service_account_email=(os.environ.get("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL")
+                               or os.environ.get("TASK_SERVICE_ACCOUNT_EMAIL")),
+        audience=(os.environ.get("CLOUD_TASKS_OIDC_AUDIENCE")
+                  or os.environ.get("TASK_OIDC_AUDIENCE")),
+    )
+    operation_outbox.publish_due_outbox_records(
+        client, {OutboxTargetKind.INDEX_DISPATCH: target},
+        now=datetime.now(timezone.utc), limit=10,
+    )
+
+
+def _finalize_add_dialog_save(request, context, validated, client, operation_id,
+                              owner, lease, now, progress):
+    """Finalize the save certificate and report this operation's index outbox state."""
+    operation = get_operation(client, operation_id)
+    if operation is None:
+        return None, None, None, None
+
+    binding_material = json.dumps(
+        ["string", context.session_id, type(request.id).__name__, request.id],
+        separators=(",", ":"), ensure_ascii=False,
+    )
+    import hashlib
+    origin_binding = {
+        "context_id": hashlib.sha256(context.session_id.encode("utf-8")).hexdigest(),
+        "draft_id": hashlib.sha256(binding_material.encode("utf-8")).hexdigest(),
+        "manifest_digest": hashlib.sha256(json.dumps(
+            validated, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest(),
+    }
+    try:
+        completed = dialog_completion.finalize_save(
+            client, operation_id=operation_id, save_intent_id=progress.save_intent_id,
+            owner=owner, fence=lease.fence, origin_binding=origin_binding, now=now,
+        )
+    except Exception:
+        completed = None
+    intent = save_intent_repository.get_save_intent(client, progress.save_intent_id)
+    own_index_outbox = (
+        outbox_repository.get_outbox_record(client, intent.index_checkpoint_ref)
+        if intent is not None and intent.index_checkpoint_ref else None
+    )
+    dispatch_undelivered = own_index_outbox is None or own_index_outbox.state.value != "delivered"
+    dispatch_failed = own_index_outbox is not None and own_index_outbox.state.value in {"retry", "failed"}
+    return dispatch_failed, dispatch_undelivered, completed, get_operation(client, operation_id)
+
+
+def _advance_publish_add_dialog(request, context, validated, client, root_folder_id,
+                                folders, operation_id, owner, lease, now):
+    """Advance save checkpoints, dispatch indexing work, then finalize its certificate."""
+    progress = _advance_add_dialog_save(
+        client, operation_id, owner, lease, now, root_folder_id, folders,
+    )
+    _publish_add_dialog_index_work(client)
+    return _finalize_add_dialog_save(
+        request, context, validated, client, operation_id, owner, lease,
+        now, progress,
+    )
+
+
+def _accept_add_dialog_operation(request, context, validated, client, reservation):
+    """Create the validated save once and preserve its operation on uncertain acceptance."""
+    operation_id = reservation.operation_id
+    operation = get_operation(client, operation_id)
+    if operation is not None:
+        return operation, None
+
+    try:
+        dialog_saving.accept_save(
+            client, validated, operation_id=operation_id,
+            caller_binding=context.identity.caller_binding, origin=OperationOrigin.MCP,
+            now=reservation.accepted_at,
+        )
+    except Exception:
+        operation = get_operation(client, operation_id)
+        return operation, _add_dialog_in_progress(request, operation_id, operation)
+    return get_operation(client, operation_id), None
+
+
+def _map_add_dialog_terminal_state(request, operation_id, operation, provider):
+    """Render a persisted failed or completed operation before attempting a lease."""
+    if operation is None:
+        return _add_dialog_in_progress(request, operation_id, None)
+    if operation.state.value == "failed":
+        return _map_add_dialog_failure(request, operation_id, operation, provider)
+    if operation.state.value == "completed":
+        return build_jsonrpc_result(request.id, build_mcp_content(
+            _add_dialog_payload(operation_id, operation, operation.provider or provider, status="synced")
+        ))
+    return None
+
+
+def _claim_add_dialog_lease(client, operation_id, now):
+    """Claim the save operation under a fresh owner token for this request attempt."""
+    owner = "mcp-add-dialog-" + uuid.uuid4().hex
+    lease = claim_operation(client, operation_id, owner=owner, now=now, lease_seconds=300)
+    return owner, lease
+
+
+def _map_add_dialog_advance_result(request, operation_id, provider, result):
+    """Map persisted save, index-dispatch, and completion-certificate outcomes."""
+    dispatch_failed, dispatch_undelivered, completed, operation = result
+    if operation is None:
+        return _add_dialog_in_progress(request, operation_id, None)
+    if operation.state.value == "failed":
+        if operation.doc_id:
+            return _map_add_dialog_failure(request, operation_id, operation, provider)
+        return _add_dialog_in_progress(request, operation_id, operation)
+    if completed is not None:
+        return build_jsonrpc_result(request.id, build_mcp_content(
+            _add_dialog_payload(operation_id, operation, operation.provider or provider, status="synced")
+        ))
+    if not operation.doc_id:
+        return _add_dialog_in_progress(request, operation_id, operation)
+    if dispatch_failed:
+        payload = _add_dialog_payload(
+            operation_id, operation, operation.provider or provider, status="created",
+        )
+        payload["error"] = {
+            "operation_id": operation_id, "service": "cloud_tasks", "stage": "index_dispatch",
+            "code": "cloud_tasks_enqueue_failed", "category": "dispatch",
+            "sanitized_message": "Document was created; indexing dispatch will be retried.",
+            "retryable": True,
+        }
+        return build_jsonrpc_result(request.id, build_mcp_content(payload))
+    status = "created" if dispatch_undelivered else "indexing"
+    return build_jsonrpc_result(request.id, build_mcp_content(
+        _add_dialog_payload(operation_id, operation, operation.provider or provider, status=status)
+    ))
+
+
+def _map_add_dialog_advance_exception(request, operation_id, provider, client):
+    """Map a failed checkpoint safely, or report the durable operation as in progress."""
+    operation = get_operation(client, operation_id)
+    if operation is not None and operation.state.value == "failed":
+        return _map_add_dialog_failure(request, operation_id, operation, provider)
+    return _add_dialog_in_progress(request, operation_id, operation)
+
+
+def _release_add_dialog_lease(client, operation_id, owner, lease):
+    """Release a claimed lease without logging provider or user supplied details."""
+    try:
+        release_operation(
+            client, operation_id, owner=owner, fence=lease.fence,
+            now=datetime.now(timezone.utc),
+        )
+    except Exception:
+        logger.error("add_dialog lease release failed; preserving the mapped operation result")
+
+
+def _run_claimed_add_dialog(request, context, validated, client, root_folder_id,
+                            folders, operation_id, owner, lease, now):
+    """Advance a leased save and always release its lease after response mapping."""
+    try:
+        result = _advance_publish_add_dialog(
+            request, context, validated, client, root_folder_id, folders,
+            operation_id, owner, lease, now,
+        )
+        return _map_add_dialog_advance_result(
+            request, operation_id, validated["provider"], result,
+        )
+    except Exception:
+        return _map_add_dialog_advance_exception(
+            request, operation_id, validated["provider"], client,
+        )
+    finally:
+        _release_add_dialog_lease(client, operation_id, owner, lease)
+
+
+def _process_add_dialog(request: JSONRPCRequest, arguments: dict) -> dict:
+    """Orchestrate replay preparation, terminal mapping, and one leased save attempt."""
+    prepared, error_response = _prepare_add_dialog(request, arguments)
+    if error_response is not None:
+        return error_response
+    context, validated, client, root_folder_id, folders, now, reservation = prepared
+    operation_id = reservation.operation_id
+    operation, error_response = _accept_add_dialog_operation(
+        request, context, validated, client, reservation,
+    )
+    if error_response is not None:
+        return error_response
+    response = _map_add_dialog_terminal_state(
+        request, operation_id, operation, validated["provider"],
+    )
+    if response is not None:
+        return response
+
+    owner, lease = _claim_add_dialog_lease(client, operation_id, now)
+    if lease is None:
+        return _add_dialog_in_progress(request, operation_id, operation)
+    return _run_claimed_add_dialog(
+        request, context, validated, client, root_folder_id, folders,
+        operation_id, owner, lease, now,
     )
 
 

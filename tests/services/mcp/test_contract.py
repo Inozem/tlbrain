@@ -59,7 +59,7 @@ def test_tools_list_matches_static_baseline():
     response = _request("post", "/mcp", json=_rpc("tools/list", "baseline-tools"))
     assert response.status_code == 200
     assert response.json() == expected
-    assert len(expected["result"]["tools"]) == 13
+    assert len(expected["result"]["tools"]) == 14
 
 
 def test_initialize_and_jsonrpc_id_types(monkeypatch):

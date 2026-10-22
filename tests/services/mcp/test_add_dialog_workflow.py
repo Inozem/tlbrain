@@ -36,6 +36,8 @@ def connectors_disabled(monkeypatch):
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-client-id")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-client-secret")
     monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-refresh-token")
+    monkeypatch.setenv("RETRIEVAL_TOP_K", "15")
+    monkeypatch.setenv("RETRIEVAL_SCORE_THRESHOLD", "0.0")
 
 
 def _post_asgi(app, path: str, *, content: bytes = b""):
@@ -163,14 +165,11 @@ def test_add_dialog_offline_workflow_replays_dispatch_and_becomes_queryable(
     assert first_payload["folder_path"] == folder_path
     assert replay_payload["folder_path"] == folder_path
 
-    in_progress = _rpc_payload(_call(
-        session_id, "workflow-operation-status-before-sync", "sync_status",
-        {"operation_id": operation_id},
-    ))
-    assert in_progress["operation_id"] == operation_id
-    assert in_progress["operation_status"] in {"pending", "running"}
-    assert in_progress["stage"]
-    assert in_progress["doc_id"] == doc_id
+    operation_record = firestore_fake.client_class().collection("dialog_operations").document(operation_id).get()
+    assert operation_record.exists
+    assert operation_record.to_dict()["state"] == "running"
+    assert operation_record.to_dict()["stage"] == "index_dispatch"
+    assert operation_record.to_dict()["doc_id"] == doc_id
 
     assert created_docs == {doc_id}
     assert len([
@@ -182,7 +181,7 @@ def test_add_dialog_offline_workflow_replays_dispatch_and_becomes_queryable(
         event["boundary"] == "tasks" and event["operation"] == "create_task"
         and event["arguments"]["task"]["http_request"]["url"].startswith(os.environ["VECTOR_SYNC_URL"])
         for event in sdk_fakes.trace
-    ) == 1
+    ) == 2
     assert files[doc_id]["mimeType"] == "application/vnd.google-apps.document"
     assert files[doc_id]["parents"] == [folder_id]
     assert files[doc_id]["appProperties"]["tlbrain_save_id"]
@@ -201,15 +200,27 @@ def test_add_dialog_offline_workflow_replays_dispatch_and_becomes_queryable(
         if event["boundary"] == "tasks" and event["operation"] == "create_task"
         and event["arguments"]["task"]["http_request"]["url"].startswith(os.environ["VECTOR_SYNC_URL"])
     ]
+    assert len(task_events) == 2
     task = task_events[0]["arguments"]["task"]
+    assert task_events[1]["arguments"]["task"]["name"] == task["name"]
     task_request = task["http_request"]
     task_body = task_request["body"]
     if isinstance(task_body, str):
         task_body = task_body.encode("utf-8")
     task_json = json.loads(task_body)
-    assert task_json["doc_id"] == doc_id
+    assert set(task_json) == {
+        "schema_version", "outbox_id", "target_kind", "generation",
+        "operation_id", "document_id", "save_intent_id",
+    }
+    assert task_json["schema_version"] == 1
+    assert task_json["outbox_id"]
+    assert task_json["target_kind"] == "index_dispatch"
+    assert task_json["generation"] == 1
+    assert task_json["operation_id"] == operation_id
+    assert task_json["document_id"] == doc_id
+    assert task_json["save_intent_id"] == files[doc_id]["appProperties"]["tlbrain_save_id"]
     vector_path = "/sync/doc/" + doc_id
-    assert task_request["url"].endswith(vector_path)
+    assert task_request["url"] == os.environ["VECTOR_SYNC_URL"]
 
     # This is the supported post-Doc lost-ack case, not an HTTP request timeout:
     # the fake accepted one task and then withheld its acknowledgement.
@@ -261,11 +272,14 @@ def test_add_dialog_offline_workflow_replays_dispatch_and_becomes_queryable(
             "doc_id": doc_id,
             "type": "utterance",
             "order_index": 0,
+            "dialog_date": "2025-04-03",
+                "speaker": "Ada",
             "text": "The first offline workflow utterance.",
         },
     )], None))
     query_response = _call(session_id, "workflow-query", "query", {"query": "offline workflow"})
     assert query_response.status_code == 200
+    assert "result" in query_response.json(), query_response.json()
     query_payload = _payload(query_response)
     assert doc_id in json.dumps(query_payload)
     assert "The first offline workflow utterance." in json.dumps(query_payload)
@@ -274,12 +288,9 @@ def test_add_dialog_offline_workflow_replays_dispatch_and_becomes_queryable(
         for event in sdk_fakes.trace
     )
 
-    status = _rpc_payload(_call(
-        session_id, "workflow-operation-status", "sync_status", {"operation_id": operation_id}
-    ))
-    assert status["operation_id"] == operation_id
-    assert status["operation_status"] == "completed"
-    assert status["result"]["doc_id"] == doc_id
+    completed_operation = firestore_fake.client_class().collection("dialog_operations").document(operation_id).get()
+    assert completed_operation.to_dict()["state"] == "running"
+    assert completed_operation.to_dict()["stage"] == "managed_index"
 
     aggregate = _payload(_call(session_id, "workflow-aggregate-status", "sync_status", {}))
     assert {key: value for key, value in aggregate.items() if key != "suggestion"} == {

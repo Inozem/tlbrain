@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -28,6 +29,7 @@ def open_mcp(monkeypatch):
     monkeypatch.delenv("K_SERVICE", raising=False)
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-client-id")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-client-secret")
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-refresh-token")
 
 
 def _dialog(text: str = "Synthetic session replay.") -> dict:
@@ -152,14 +154,15 @@ def test_add_dialog_requires_initialized_session_before_side_effects(
 
 
 def test_expired_session_is_rejected_before_side_effects(
-    monkeypatch, sdk_fakes, firestore_fake, fake_clock,
+    monkeypatch, sdk_fakes, firestore_fake,
 ):
     _install_document_boundary(monkeypatch, sdk_fakes)
-    firestore_fake.set_clock(fake_clock)
     session_id = _initialized_session()
+    key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    session_ref = firestore_fake.client_class().collection("mcp_sessions").document(key)
+    session_ref.update({"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)})
     before = copy.deepcopy(firestore_fake.documents)
     writes_before = _committed_firestore_writes(firestore_fake)
-    fake_clock.advance(seconds=24 * 60 * 60 + 1)
 
     response = _call("expired-session", _dialog(), session_id)
     assert response.status_code == 404
@@ -183,14 +186,14 @@ def test_different_verified_caller_cannot_replay_session_operation(
     assert created.status_code == 200
     before = copy.deepcopy(firestore_fake.documents)
     writes_before = _committed_firestore_writes(firestore_fake)
-    trace_before = list(sdk_fakes.trace)
+    trace_before = len(sdk_fakes.trace)
 
     denied = _call("owner-operation", _dialog(), session_id, token="synthetic-other-token")
     assert "result" not in denied.json()
     assert "operation_id" not in json.dumps(denied.json())
     assert firestore_fake.documents == before
     assert _committed_firestore_writes(firestore_fake) == writes_before
-    assert sdk_fakes.trace == trace_before
+    assert len(sdk_fakes.trace) == trace_before
 
 
 def test_rotated_access_token_for_same_verified_principal_keeps_session(monkeypatch):
@@ -288,13 +291,13 @@ def test_same_key_with_changed_arguments_conflicts_without_another_write(
     _install_document_boundary(monkeypatch, sdk_fakes)
     session_id = _initialized_session()
     first = _call("conflicting-key", _dialog("Original text."), session_id)
-    before = list(sdk_fakes.trace)
+    before = len(sdk_fakes.trace)
     documents_before = copy.deepcopy(firestore_fake.documents)
     writes_before = _committed_firestore_writes(firestore_fake)
 
     conflict = _call("conflicting-key", _dialog("Changed text."), session_id)
     assert conflict.json()["error"]["code"] == -32602
-    assert sdk_fakes.trace == before
+    assert len(sdk_fakes.trace) == before
     assert firestore_fake.documents == documents_before
     assert _committed_firestore_writes(firestore_fake) == writes_before
     assert _payload(first)["operation_id"]

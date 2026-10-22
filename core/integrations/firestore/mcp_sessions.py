@@ -47,6 +47,7 @@ class SessionInitialization:
 class RequestReservation:
     operation_id: str
     replayed: bool
+    accepted_at: datetime
 
 
 def _db(client: Any | None) -> Any:
@@ -198,7 +199,10 @@ def resolve_or_reserve_request(
             request_data = request_snapshot.to_dict() or {}
             if request_data.get("arguments_digest") != arguments_digest:
                 raise RequestArgumentsConflictError("request ID was already used with different arguments")
-            return RequestReservation(operation_id=request_data["operation_id"], replayed=True)
+            return RequestReservation(
+                operation_id=request_data["operation_id"], replayed=True,
+                accepted_at=request_data["created_at"],
+            )
 
         operation_id = uuid4().hex
         transaction.set(request_ref, {
@@ -207,6 +211,49 @@ def resolve_or_reserve_request(
             "arguments_digest": arguments_digest,
             "created_at": now,
         })
-        return RequestReservation(operation_id=operation_id, replayed=False)
+        return RequestReservation(operation_id=operation_id, replayed=False, accepted_at=now)
+
+    return _txn(db.transaction())
+
+
+def lookup_request_replay(
+    client: Any | None,
+    session_id: str,
+    *,
+    caller_binding: str,
+    request_id: str | int,
+    arguments: dict[str, Any],
+    now: datetime,
+) -> RequestReservation | None:
+    """Read an existing typed request mapping without reserving a fresh key."""
+    now = _aware_utc(now, "now")
+    if not isinstance(caller_binding, str) or not caller_binding:
+        raise ValueError("caller_binding must be a non-empty string")
+    session_key = _session_hash(session_id)
+    request_key = _request_id_hash(request_id)
+    arguments_digest = _canonical_arguments_digest(arguments)
+    db = _db(client)
+    session_ref = db.collection(MCP_SESSIONS_COLLECTION).document(session_key)
+    request_ref = session_ref.collection("requests").document(request_key)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> RequestReservation | None:
+        session_snapshot = session_ref.get(transaction=transaction)
+        if not session_snapshot.exists:
+            raise SessionUnavailableError("MCP session is unavailable")
+        session_data = session_snapshot.to_dict() or {}
+        expiry = session_data.get("expires_at")
+        if session_data.get("caller_binding") != caller_binding or not isinstance(expiry, datetime) or expiry <= now:
+            raise SessionUnavailableError("MCP session is unavailable")
+        request_snapshot = request_ref.get(transaction=transaction)
+        if not request_snapshot.exists:
+            return None
+        request_data = request_snapshot.to_dict() or {}
+        if request_data.get("arguments_digest") != arguments_digest:
+            raise RequestArgumentsConflictError("request ID was already used with different arguments")
+        return RequestReservation(
+            operation_id=request_data["operation_id"], replayed=True,
+            accepted_at=request_data["created_at"],
+        )
 
     return _txn(db.transaction())

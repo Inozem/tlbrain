@@ -7,10 +7,32 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from core.operations import read, sync, write
+from core.dialogs import saving
 
 
 class OperationValidationError(ValueError):
     """Safe input diagnostic that never retains or displays supplied values."""
+
+
+_ADD_DIALOG_CONTEXT_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class AddDialogContext:
+    """Trusted acceptance data required by the dialog save use case."""
+
+    client: Any
+    operation_id: str
+    caller_binding: str
+    origin: Any
+    now: Any
+    _token: object | None = None
+
+
+def _new_add_dialog_context(*, client: Any, operation_id: str, caller_binding: str,
+                            origin: Any, now: Any) -> AddDialogContext:
+    """Create the internal-only context used to accept a dialog operation."""
+    return AddDialogContext(client, operation_id, caller_binding, origin, now, _ADD_DIALOG_CONTEXT_TOKEN)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +62,18 @@ _REQUIRED_NONEMPTY_PATH = Field("path", required=True)
 _DATE = Field("string")
 _LIMIT = Field("integer", minimum=1)
 _OFFSET = Field("integer", minimum=0)
+_UTTERANCES = Field("utterances", required=True)
+_DATE_ONLY = Field("date", minimum=10)
+
+
+def _accept_add_dialog(arguments: dict[str, Any], *, context: AddDialogContext) -> Any:
+    if (not isinstance(context, AddDialogContext) or context._token is not _ADD_DIALOG_CONTEXT_TOKEN
+            or not context.operation_id or not context.caller_binding):
+        _fail("a trusted dialog acceptance context is required")
+    return saving.accept_save(
+        context.client, arguments, operation_id=context.operation_id,
+        caller_binding=context.caller_binding, origin=context.origin, now=context.now,
+    )
 
 
 OPERATIONS: Mapping[str, Operation] = MappingProxyType({
@@ -73,6 +107,10 @@ OPERATIONS: Mapping[str, Operation] = MappingProxyType({
     "add_fact": Operation("add_fact", _fields(
         doc_id=_NONBLANK, text=_NONBLANK,
     ), write.add_fact, write=True),
+    "add_dialog": Operation("add_dialog", _fields(
+        provider=_NONBLANK, utterances=_UTTERANCES, title=_STRING,
+        dialog_date=_DATE_ONLY, folder_path=_PATH,
+    ), _accept_add_dialog, write=True),
     "sync_changes": Operation("sync_changes", _fields(doc_id=_STRING), sync.sync_changes),
 })
 
@@ -103,6 +141,30 @@ def validate_arguments(name: str, arguments: Any) -> dict[str, Any]:
                 _fail(f"field {key} must be a string")
             if field.required and not value.strip():
                 _fail(f"field {key} must be nonblank")
+        elif field.kind == "date":
+            from datetime import date
+
+            if (not isinstance(value, str) or len(value) != 10
+                    or value[4:5] != "-" or value[7:8] != "-"):
+                _fail(f"field {key} must be an ISO date")
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                _fail(f"field {key} must be an ISO date")
+        elif field.kind == "utterances":
+            if not isinstance(value, list) or not value:
+                _fail(f"field {key} must be a nonempty list")
+            for item in value:
+                if not isinstance(item, dict) or set(item) != {"speaker", "text"}:
+                    _fail(f"field {key} contains an invalid item")
+                for item_key in ("speaker", "text"):
+                    item_value = item[item_key]
+                    if not isinstance(item_value, str) or not item_value.strip():
+                        _fail(f"field {key} contains an invalid item")
+                if "\n" in item["speaker"] or "\r" in item["speaker"]:
+                    _fail(f"field {key} contains an invalid item")
+                if not item["speaker"].replace("::", "").strip():
+                    _fail(f"field {key} contains an invalid item")
         elif field.kind == "integer":
             if isinstance(value, bool) or not isinstance(value, int):
                 _fail(f"field {key} must be an integer")
@@ -115,13 +177,19 @@ def validate_arguments(name: str, arguments: Any) -> dict[str, Any]:
                 _fail(f"field {key} must be nonempty")
             if any(not segment.strip() for segment in value):
                 _fail(f"field {key} contains a blank path element")
+            if name == "add_dialog" and any(not segment for segment in value):
+                _fail(f"field {key} contains a blank path element")
     return dict(arguments)
 
 
-def invoke_operation(name: str, arguments: Any, *, context: write.WriteContext | None = None) -> Any:
+def invoke_operation(name: str, arguments: Any, *, context: write.WriteContext | AddDialogContext | None = None) -> Any:
     """Validate and invoke exactly one shared operation, returning its raw result."""
     validated = validate_arguments(name, arguments)
     operation = OPERATIONS[name]
+    if name == "add_dialog":
+        if not isinstance(context, AddDialogContext):
+            _fail("a trusted dialog acceptance context is required")
+        return operation.function(validated, context=context)
     if operation.write:
         if not isinstance(context, write.WriteContext):
             _fail("a trusted write context is required")

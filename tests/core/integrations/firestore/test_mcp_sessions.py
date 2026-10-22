@@ -78,7 +78,10 @@ def test_request_replay_is_typed_canonical_and_independent_by_id(firestore_fake)
         client, new_session.session_id, request_id=7, **kwargs,
     )
 
-    assert canonical_replay == mcp_sessions.RequestReservation(first.operation_id, replayed=True)
+    assert canonical_replay == mcp_sessions.RequestReservation(
+        first.operation_id, replayed=True, accepted_at=NOW,
+    )
+    assert canonical_replay.accepted_at == first.accepted_at == NOW
     request_record = (
         client.collection(mcp_sessions.MCP_SESSIONS_COLLECTION)
         .document(mcp_sessions._session_hash(initialized.session_id))
@@ -92,6 +95,28 @@ def test_request_replay_is_typed_canonical_and_independent_by_id(firestore_fake)
     assert other_id.operation_id != first.operation_id
     assert fresh_session.operation_id != first.operation_id
     assert len({first.operation_id, string_id.operation_id, other_id.operation_id, fresh_session.operation_id}) == 4
+
+
+def test_read_only_request_lookup_returns_persisted_acceptance_time(firestore_fake):
+    client = firestore_fake.client_class()
+    initialized = mcp_sessions.create_session(
+        client, caller_binding="principal:alice", protocol_version="v1", now=NOW,
+    )
+    first = mcp_sessions.resolve_or_reserve_request(
+        client, initialized.session_id, caller_binding="principal:alice", request_id="same",
+        arguments={"value": 1}, now=NOW,
+    )
+    replay = mcp_sessions.lookup_request_replay(
+        client, initialized.session_id, caller_binding="principal:alice", request_id="same",
+        arguments={"value": 1}, now=NOW + timedelta(minutes=5),
+    )
+    assert replay == mcp_sessions.RequestReservation(
+        first.operation_id, replayed=True, accepted_at=NOW,
+    )
+    assert mcp_sessions.lookup_request_replay(
+        client, initialized.session_id, caller_binding="principal:alice", request_id="fresh",
+        arguments={"value": 1}, now=NOW,
+    ) is None
 
 
 def test_changed_arguments_conflict_without_writing(firestore_fake):

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from datetime import datetime, timezone
 
 import httpx
 import httplib2
@@ -187,11 +188,18 @@ def _install_document_boundary(
             return {"id": args["fileId"], "modifiedTime": file_data["modifiedTime"]}
         if request.boundary == "drive" and request.operation == "files.list":
             sdk_fake_module._record(request.boundary, request.operation, **args)
-            return {"files": [
+            listed_folders = [
                 dict(file_data)
                 for file_data in files.values()
                 if file_data.get("mimeType") == "application/vnd.google-apps.folder"
-            ]}
+            ]
+            if "name='_unassigned'" in args.get("q", ""):
+                listed_folders = [
+                    item for item in listed_folders
+                    if item.get("name") == "_unassigned"
+                    and os.environ["ROOT_FOLDER_URL"].rsplit("/", 1)[-1] in item.get("parents", [])
+                ]
+            return {"files": listed_folders}
         if request.boundary == "docs" and request.operation == "documents.batchUpdate":
             sdk_fake_module._record(request.boundary, request.operation, **args)
             if fill_error is not None:
@@ -293,6 +301,75 @@ def test_tools_list_preserves_legacy_schemas_and_exposes_add_dialog_schema():
     assert "enum" not in schema["properties"]["provider"]
 
 
+@pytest.mark.parametrize("raw_id", [None, True, 7.5])
+def test_add_dialog_rejects_invalid_raw_request_ids_without_side_effects(raw_id, firestore_fake, sdk_fakes):
+    from services.mcp.app.mcp.handler import handle_mcp_request
+
+    response = asyncio.run(handle_mcp_request({
+        "jsonrpc": "2.0", "id": raw_id, "method": "tools/call",
+        "params": {"name": "add_dialog", "arguments": {
+            "provider": "manual", "utterances": [{"speaker": "A", "text": "words"}],
+        }},
+    }), loop_factory=_selector_loop)
+    assert response["id"] is None
+    assert response["error"]["code"] == -32602
+    assert not list(firestore_fake.client_class().collection("mcp_sessions").stream())
+    assert not list(firestore_fake.client_class().collection("dialog_operations").stream())
+    assert sdk_fakes.trace == []
+
+
+def test_add_dialog_unexpected_pre_reservation_failure_is_sanitized(monkeypatch, firestore_fake, caplog):
+    from services.mcp.app.mcp import handler
+
+    session_id = _initialized_session()
+    monkeypatch.setattr(handler, "get_root_folder_id", lambda: (_ for _ in ()).throw(
+        RuntimeError("SECRET_SENTINEL provider URL_SENTINEL https://private.invalid/raw")
+    ))
+    response = _call_add_dialog({
+        "provider": "manual", "utterances": [{"speaker": "A", "text": "words"}],
+    }, "sanitized-preflight-failure", session_id=session_id)
+    assert response.status_code == 200
+    serialized = response.text
+    assert "SECRET_SENTINEL" not in serialized
+    assert "URL_SENTINEL" not in serialized
+    assert "private.invalid/raw" not in serialized
+    assert "SECRET_SENTINEL" not in caplog.text
+    assert "URL_SENTINEL" not in caplog.text
+    assert "private.invalid/raw" not in caplog.text
+    assert response.json()["error"]["code"] == -32603
+    assert not list(firestore_fake.client_class().collection("dialog_operations").stream())
+
+
+def test_add_dialog_replay_survives_changed_explicit_folder_lookup(monkeypatch, sdk_fakes, firestore_fake):
+    from services.mcp.app.mcp import handler
+
+    client = firestore_fake.client_class()
+    client.collection("folders").document("replay-folder").set({
+        "folder_id": "replay-folder", "name": "Replay folder", "parent_id": "pytest-synthetic-root",
+    })
+    _install_document_boundary(monkeypatch, sdk_fakes)
+    session_id = _initialized_session()
+    arguments = {
+        "provider": "manual", "utterances": [{"speaker": "A", "text": "Stable replay."}],
+        "title": "Stable replay", "dialog_date": "2026-10-22", "folder_path": ["Replay folder"],
+    }
+    first = _call_add_dialog(arguments, "folder-replay", session_id=session_id)
+    assert first.status_code == 200
+    first_payload = _payload(first)
+    assert first_payload["status"] in {"indexing", "synced"}
+
+    def unavailable(_client):
+        raise RuntimeError("SECRET_FOLDER_LOOKUP")
+
+    monkeypatch.setattr(handler.folder_repository, "get_all_folders", unavailable)
+    replay = _call_add_dialog(arguments, "folder-replay", session_id=session_id)
+    assert replay.status_code == 200
+    replay_payload = _payload(replay)
+    assert replay_payload["operation_id"] == first_payload["operation_id"]
+    assert replay_payload["doc_id"] == first_payload["doc_id"]
+    assert "SECRET_FOLDER_LOOKUP" not in replay.text
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -362,6 +439,22 @@ def test_ambiguous_explicit_folder_path_returns_invalid_params_without_creating_
     assert not any(event["boundary"] == "gemini" for event in sdk_fakes.trace)
 
 
+def test_fresh_invalid_explicit_folder_path_does_not_reserve_request(monkeypatch, firestore_fake):
+    from core.integrations.firestore import mcp_sessions
+
+    session_id = _initialized_session()
+    response = _call_add_dialog({
+        "provider": "manual", "utterances": [{"speaker": "A", "text": "words"}],
+        "folder_path": ["missing-folder"],
+    }, "invalid-folder-no-reservation", session_id=session_id)
+    assert response.json()["error"]["code"] == -32602
+    request_documents = (
+        firestore_fake.client_class().collection(mcp_sessions.MCP_SESSIONS_COLLECTION)
+        .document(mcp_sessions._session_hash(session_id)).collection("requests").stream()
+    )
+    assert list(request_documents) == []
+
+
 def test_explicit_empty_folder_path_selects_root_and_reports_accepted_index_task(
     monkeypatch, sdk_fakes, firestore_fake,
 ):
@@ -422,7 +515,11 @@ def test_explicit_empty_folder_path_selects_root_and_reports_accepted_index_task
     ]
     assert len(index_tasks) == 1
     task_body = json.loads(index_tasks[0]["arguments"]["task"]["http_request"]["body"])
-    assert task_body["doc_id"] == payload["doc_id"]
+    assert task_body["schema_version"] == 1
+    assert task_body["target_kind"] == "index_dispatch"
+    assert task_body["document_id"] == payload["doc_id"]
+    assert task_body["operation_id"] == payload["operation_id"]
+    assert task_body["save_intent_id"]
 
     index_record = firestore_fake.client_class().collection("transcript_index").document(payload["doc_id"]).get()
     assert index_record.exists
@@ -430,6 +527,27 @@ def test_explicit_empty_folder_path_selects_root_and_reports_accepted_index_task
     assert index_record.to_dict()["status"] in {"queued", "downloading", "imported", "syncing"}
     assert index_record.to_dict()["status"] != "synced"
     assert not any(event["boundary"] in {"qdrant", "gemini", "sparse"} for event in sdk_fakes.trace)
+
+
+def test_omitted_folder_path_uses_shared_unassigned_classification(
+    monkeypatch, sdk_fakes,
+):
+    files, documents, created_docs = _install_document_boundary(monkeypatch, sdk_fakes)
+    response = _call_add_dialog({
+        "provider": "custom-source",
+        "utterances": [{"speaker": "Ada", "text": "Automatically classified conversation."}],
+        "title": "Automatic classification",
+        "dialog_date": "2025-04-03",
+    }, "automatic-folder-add-dialog")
+
+    assert response.status_code == 200
+    payload = _payload(response)
+    assert payload["status"] == "indexing"
+    assert payload["folder_path"] == ["_unassigned"]
+    assert payload["doc_id"] in created_docs
+    parent_id = files[payload["doc_id"]]["parents"][0]
+    assert files[parent_id]["name"] == "_unassigned"
+    assert "Automatically classified conversation." in documents[payload["doc_id"]]["text"]
 
 
 def test_identical_content_with_distinct_request_ids_creates_distinct_documents_in_one_session(
@@ -528,6 +646,86 @@ def test_vector_sync_dispatch_failure_reports_created_document_and_safe_error(
     assert any(item.get("stage") for item in diagnostic_fields)
     assert _has_safe_error_category(diagnostic_fields)
     assert any(item.get("sanitized_message") or item.get("message") for item in diagnostic_fields)
+
+
+def _seed_index_backlog(client, count: int):
+    from core.integrations.firestore.outbox import create_outbox_record
+
+    schedule_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    for index in range(count):
+        create_outbox_record(
+            client, f"backlog-index-{index}", target_kind="index_dispatch", generation=1,
+            schedule_at=schedule_at, now=schedule_at, operation_id=f"backlog-operation-{index}",
+        )
+
+
+def test_add_dialog_status_uses_own_outbox_when_record_is_outside_sweep_limit(
+    monkeypatch, sdk_fakes, firestore_fake,
+):
+    from core.integrations.firestore.outbox import get_outbox_record
+    from core.integrations.firestore.save_intents import get_save_intent
+    from core.integrations.firestore.operations import get_operation
+
+    _install_document_boundary(monkeypatch, sdk_fakes)
+    client = firestore_fake.client_class()
+    _seed_index_backlog(client, 11)
+    response = _call_add_dialog({
+        "provider": "manual", "utterances": [{"speaker": "A", "text": "Backlog status."}],
+        "title": "Backlog status", "dialog_date": "2026-10-22", "folder_path": [],
+    }, "backlog-status")
+    payload = _payload(response)
+    operation = get_operation(client, payload["operation_id"])
+    intent = get_save_intent(client, operation.save_intent_id)
+    own_record = get_outbox_record(client, intent.index_checkpoint_ref)
+    assert own_record.state.value == "pending"
+    assert payload["status"] == "created"
+
+
+def test_add_dialog_status_ignores_unrelated_outbox_dispatch_failure(
+    monkeypatch, sdk_fakes, firestore_fake,
+):
+    from tests.fixtures.sdk_fakes import FakeCloudTasksClient
+
+    _install_document_boundary(monkeypatch, sdk_fakes)
+    client = firestore_fake.client_class()
+    _seed_index_backlog(client, 1)
+    original_create_task = FakeCloudTasksClient.create_task
+    did_fail = False
+    vector_url = os.environ["VECTOR_SYNC_URL"]
+
+    def fail_backlog_once(self, *, parent, task, **kwargs):
+        nonlocal did_fail
+        if not did_fail and task.get("http_request", {}).get("url", "").startswith(vector_url):
+            did_fail = True
+            raise RuntimeError("unrelated dispatch failure")
+        return original_create_task(self, parent=parent, task=task, **kwargs)
+
+    monkeypatch.setattr(FakeCloudTasksClient, "create_task", fail_backlog_once)
+    response = _call_add_dialog({
+        "provider": "manual", "utterances": [{"speaker": "A", "text": "Own status."}],
+        "title": "Own status", "dialog_date": "2026-10-22", "folder_path": [],
+    }, "own-status")
+    assert did_fail
+    assert _payload(response)["status"] == "indexing"
+
+
+def test_add_dialog_lease_release_exception_is_absent_from_logs(monkeypatch, sdk_fakes, caplog):
+    from services.mcp.app.mcp import handler
+
+    _install_document_boundary(monkeypatch, sdk_fakes)
+
+    def fail_release(*_args, **_kwargs):
+        raise RuntimeError("SECRET_RELEASE_SENTINEL provider-data")
+
+    monkeypatch.setattr(handler, "release_operation", fail_release)
+    response = _call_add_dialog({
+        "provider": "manual", "utterances": [{"speaker": "A", "text": "Release log safety."}],
+        "title": "Release log safety", "dialog_date": "2026-10-22", "folder_path": [],
+    }, "safe-release-log")
+    assert response.status_code == 200
+    assert response.json()["id"] == "safe-release-log"
+    assert "SECRET_RELEASE_SENTINEL" not in caplog.text
+    assert "provider-data" not in caplog.text
 
 
 def test_docs_fill_rejection_preserves_known_document_and_safe_error(monkeypatch, sdk_fakes):
@@ -686,3 +884,27 @@ def test_no_argument_sync_status_omits_suggestion_when_every_dialog_is_assigned(
         "total": 1, "queued": 0, "downloading": 0, "imported": 0,
         "syncing": 0, "synced": 1, "error": 0,
     }
+
+
+def test_add_dialog_missing_operation_after_publish_returns_in_progress(monkeypatch):
+    from types import SimpleNamespace
+
+    from services.mcp.app.mcp import handler
+
+    context = SimpleNamespace(identity=SimpleNamespace(caller_binding="caller"))
+    reservation = SimpleNamespace(operation_id="missing-operation")
+    prepared = (context, {"provider": "google"}, object(), None, {}, None, reservation)
+    monkeypatch.setattr(handler, "_prepare_add_dialog", lambda *_args: (prepared, None))
+
+    saving_operation = SimpleNamespace(state=SimpleNamespace(value="saving"))
+    operation_results = iter((saving_operation, None))
+    monkeypatch.setattr(handler, "get_operation", lambda *_args: next(operation_results))
+    monkeypatch.setattr(handler, "claim_operation", lambda *_args, **_kwargs: SimpleNamespace(fence=1))
+    monkeypatch.setattr(handler, "_advance_add_dialog_save", lambda *_args: object())
+    monkeypatch.setattr(handler, "_publish_add_dialog_index_work", lambda *_args: None)
+    monkeypatch.setattr(handler, "release_operation", lambda *_args, **_kwargs: None)
+
+    response = handler._process_add_dialog(SimpleNamespace(id="missing-operation-request"), {})
+
+    assert response["error"]["code"] == -32010
+    assert response["error"]["data"]["operation_id"] == "missing-operation"
