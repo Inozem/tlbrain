@@ -1,5 +1,6 @@
 import logging
 
+from google.cloud import firestore
 from qdrant_client.models import SparseVector
 
 from core.indexing.hashing import sha256_text, sha256_utterance
@@ -52,6 +53,7 @@ def process_one(doc_id: str, parent_id: str, root_folder_id: str, raw_text: str 
         fast_result = _process_fast_skip_or_parent_only(
             doc_id, root_folder_id, parent_id, parent_id_hash,
             existing_utterance_hashes, text_in_sync, parent_in_sync,
+            has_pending_windows=bool((existing or {}).get("pending_window_centers")),
         )
         if fast_result is not None:
             return fast_result
@@ -83,8 +85,12 @@ def _process_fast_skip_or_parent_only(
     existing_utterance_hashes: dict | None,
     text_in_sync: bool,
     parent_in_sync: bool,
+    *,
+    has_pending_windows: bool = False,
 ) -> str | None:
     if not existing_utterance_hashes:
+        return None
+    if has_pending_windows:
         return None
     if text_in_sync and parent_in_sync:
         mark_synced(doc_id)
@@ -171,8 +177,9 @@ def _process_incremental(
         if existing_utterance_hashes.get(k) != new_hashes.get(k)
     }
     changed_indexes = [int(k) for k in changed_str_keys]
+    pending_centers = set((existing or {}).get("pending_window_centers") or [])
 
-    if not changed_indexes:
+    if not changed_indexes and not pending_centers:
         if dialog_date != (existing or {}).get("dialog_date", ""):
             try:
                 dialog_date_num = int(dialog_date.replace("-", "")) if dialog_date else None
@@ -184,15 +191,21 @@ def _process_incremental(
         logger.info("Incremental skip (no utterance changes): %s", doc_id)
         return "skipped"
 
-    update_index(doc_id, {"dialog_date": dialog_date, "provider": provider})
-
     affected_centers: set[int] = set()
     for i in changed_indexes:
         for c in range(i - 2, i + 3):
             if c >= 0:
                 affected_centers.add(c)
+    affected_centers.update(pending_centers)
 
-    delete_utterances_by_order_indexes(doc_id, root_folder_id, changed_indexes)
+    # Reserve all affected centers before changing Qdrant or advancing any
+    # transcript checkpoint. A retry can then reconstruct these windows even
+    # when the utterance hashes already match the new document.
+    update_index(doc_id, {"pending_window_centers": sorted(affected_centers)})
+    update_index(doc_id, {"dialog_date": dialog_date, "provider": provider})
+
+    if changed_indexes:
+        delete_utterances_by_order_indexes(doc_id, root_folder_id, changed_indexes)
     delete_summaries_by_center_indexes(doc_id, root_folder_id, list(affected_centers))
 
     new_changed_keys = changed_str_keys & new_keys
@@ -226,6 +239,7 @@ def _process_incremental(
 
     speakers = sorted({u["speaker"] for u in utterances if u.get("speaker")})
     update_index(doc_id, {"speakers": speakers})
+    update_index(doc_id, {"pending_window_centers": firestore.DELETE_FIELD})
     logger.info(
         "Incremental sync: %s | changed=%d summaries=%d facts=%d",
         doc_id, len(changed_indexes), summaries_count, facts_count,
