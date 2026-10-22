@@ -15,6 +15,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib
+import os
+import socket
+from datetime import datetime, timezone
 
 import pytest
 
@@ -27,7 +30,41 @@ def _value(record, name):
 
 
 def _run(awaitable):
-    return asyncio.run(awaitable)
+    return asyncio.run(awaitable, loop_factory=_selector_loop)
+
+
+def _selector_loop():
+    """Use loopback datagrams for asyncio's Windows self-pipe fallback."""
+    if os.name != "nt":
+        return asyncio.SelectorEventLoop()
+    old_socketpair = socket.socketpair
+    local_pairs = []
+
+    def local_datagram_pair(*_args, **_kwargs):
+        reader = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        writer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            reader.bind(("127.0.0.1", 0))
+            writer.bind(("127.0.0.1", 0))
+            writer.connect(reader.getsockname())
+            reader.connect(writer.getsockname())
+            local_pairs.append((reader, writer))
+            return reader, writer
+        except BaseException:
+            reader.close()
+            writer.close()
+            raise
+
+    socket.socketpair = local_datagram_pair
+    try:
+        return asyncio.SelectorEventLoop()
+    except BaseException:
+        for reader, writer in local_pairs:
+            reader.close()
+            writer.close()
+        raise
+    finally:
+        socket.socketpair = old_socketpair
 
 
 def _save_type():
@@ -47,6 +84,8 @@ def _message(message_id, text, *, sequence=None, audio=False):
         "message_id": message_id,
         "intake_sequence": message_id if sequence is None else sequence,
         "text": text,
+        "received_at": datetime(2026, 10, 20, tzinfo=timezone.utc),
+        "original_date": datetime(2026, 10, 19, tzinfo=timezone.utc),
     }
     if audio:
         row["audio_file_id"] = f"synthetic-file-{message_id}"
@@ -173,6 +212,7 @@ class _Pipeline:
         self.receipt = receipt
         self.fail_save = fail_save
         self.contexts = []
+        self.saved_inputs = []
 
     async def preprocess(self, messages):
         self.events.append("preprocess")
@@ -189,6 +229,7 @@ class _Pipeline:
 
     async def save(self, result, *, draft_id, manifest_digest, intent_id, operation_id):
         self.events.append("save")
+        self.saved_inputs.append(copy.deepcopy(result))
         if self.fail_save:
             raise RuntimeError("synthetic save failure")
         return copy.deepcopy(self.receipt)
@@ -198,6 +239,7 @@ def _workflow(repository, events, pipeline, *, audio=None):
     return _save_type()(
         repository=repository,
         audio_transcriber=audio or _Audio(repository, events),
+        context_id="telegram-context-1",
         preprocess=pipeline.preprocess,
         analyze=pipeline.analyze,
         classify=pipeline.classify,
@@ -278,7 +320,7 @@ def test_failure_preserves_raw_manifest_and_never_authorizes_cleanup(failure):
         repository.commit_error = RuntimeError("synthetic completion commit failure")
     workflow = _workflow(repository, events, pipeline, audio=audio)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as raised:
         _run(workflow.save(
             draft_id="draft-original", intent_id="intent-1", operation_id="operation-1"
         ))
@@ -286,6 +328,16 @@ def test_failure_preserves_raw_manifest_and_never_authorizes_cleanup(failure):
     assert (repository.draft["messages"], repository.draft["source_manifest"]) == original
     assert repository.certificate is None
     assert repository.deleted == []
+    expected_stage = {
+        "transcription": "transcription",
+        "save": "save",
+        "completion": "completion",
+    }[failure]
+    assert workflow.status["stage"] == expected_stage
+    assert workflow.status["state"] == "failed"
+    assert workflow.status["error_code"]
+    assert getattr(raised.value, "stage") == expected_stage
+    assert "synthetic source" not in str(raised.value)
 
 
 @pytest.mark.parametrize("receipt_ok,guard_current", [(False, True), (True, False)])
@@ -304,6 +356,51 @@ def test_save_requires_verified_receipt_and_current_resource_guard(receipt_ok, g
 
     assert repository.certificate is None
     assert repository.draft["messages"]
+
+
+@pytest.mark.parametrize("identity_field", ["save_intent_id", "operation_id"])
+def test_save_rejects_receipt_bound_to_different_intent_or_operation(identity_field):
+    repository = _Repository()
+    events = []
+    receipt = _receipt(repository)
+    receipt[identity_field] = "foreign-identity"
+    pipeline = _Pipeline(events, receipt=receipt)
+    workflow = _workflow(repository, events, pipeline)
+
+    with pytest.raises(RuntimeError, match="completion"):
+        _run(workflow.save(
+            draft_id="draft-original", intent_id="intent-1", operation_id="operation-1"
+        ))
+
+    assert repository.certificate is None
+    assert workflow.status["stage"] == "completion"
+
+
+def test_injected_telegram_save_error_sets_safe_failed_workflow_status():
+    repository = _Repository()
+    events = []
+    pipeline = _Pipeline(events, receipt=_receipt(repository))
+    workflow = _workflow(repository, events, pipeline)
+    error_type = importlib.import_module(
+        "services.connectors.telegram.save"
+    ).TelegramSaveError
+
+    async def fail_classification(result, *, draft_id):
+        raise error_type("unsafe customer stage", "private customer detail")
+
+    workflow.classify = fail_classification
+    with pytest.raises(error_type) as raised:
+        _run(workflow.save(
+            draft_id="draft-original", intent_id="intent-1", operation_id="operation-1"
+        ))
+
+    assert workflow.status["stage"] == "classification"
+    assert workflow.status["state"] == "failed"
+    assert workflow.status["error_code"] == "telegramsaveerror_failed"
+    assert "private customer detail" not in repr(workflow.status)
+    assert raised.value.stage == "classification"
+    assert raised.value.error_code == "telegramsaveerror_failed"
+    assert "private customer detail" not in str(raised.value)
 
 
 def test_success_commits_certificate_bound_to_exact_draft_manifest_intent_and_operation():
@@ -326,9 +423,32 @@ def test_success_commits_certificate_bound_to_exact_draft_manifest_intent_and_op
     assert _value(certificate, "operation_id") == "operation-1"
     assert _value(certificate, "receipt_ref") == "receipt-ref-1"
     assert _value(certificate, "receipt_version") == 3
+    assert _value(certificate, "context_id") == "telegram-context-1"
+    assert _value(certificate, "origin_binding") == (
+        "telegram-context-1", "draft-original", manifest_digest
+    )
     assert repository.draft["source_manifest"] == manifest
     assert repository.draft["manifest_digest"] == manifest_digest
     assert result is not None
+    assert pipeline.saved_inputs[0]["provider"] == "telegram"
+    assert pipeline.saved_inputs[0]["dialog_date"] == "2026-10-19"
+
+
+def test_dialog_date_uses_received_at_when_first_message_has_no_original_date():
+    message = _message(1, "first source")
+    message["original_date"] = None
+    message["received_at"] = datetime(2026, 10, 20, 23, 30, tzinfo=timezone.utc)
+    repository = _Repository(messages=[message])
+    events = []
+    pipeline = _Pipeline(events, receipt=_receipt(repository))
+    workflow = _workflow(repository, events, pipeline)
+
+    _run(workflow.save(
+        draft_id="draft-original", intent_id="intent-1", operation_id="operation-1"
+    ))
+
+    assert pipeline.saved_inputs[0]["provider"] == "telegram"
+    assert pipeline.saved_inputs[0]["dialog_date"] == "2026-10-20"
 
 
 @pytest.mark.parametrize(
@@ -441,6 +561,8 @@ def test_new_draft_analysis_context_excludes_previous_saved_draft_content():
         "verified": True,
         "draft_id": "draft-original",
         "manifest_digest": repository.draft["manifest_digest"],
+        "save_intent_id": "prior-intent",
+        "operation_id": "prior-operation",
         "receipt_ref": "prior-receipt-ref",
         "receipt_version": 1,
     })
@@ -465,7 +587,7 @@ def test_new_draft_analysis_context_excludes_previous_saved_draft_content():
     ]
     repository.add_draft({
         "draft_id": "draft-new",
-        "status": "collecting",
+        "status": "sealed",
         "messages": [_message(2, "new draft only")],
         "source_manifest": [_message(2, "new draft only")],
         "manifest_digest": "manifest:draft-new:v1",
@@ -476,6 +598,8 @@ def test_new_draft_analysis_context_excludes_previous_saved_draft_content():
         "verified": True,
         "draft_id": "draft-new",
         "manifest_digest": repository.drafts["draft-new"]["manifest_digest"],
+        "save_intent_id": "new-intent",
+        "operation_id": "new-operation",
         "receipt_ref": "new-receipt-ref",
         "receipt_version": 2,
     })
