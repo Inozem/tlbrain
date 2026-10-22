@@ -1,0 +1,296 @@
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from services.connectors.telegram.notifications import TelegramNotificationPublisher
+from services.connectors.telegram.client import TelegramAPIError
+from services.connectors.telegram.repository import TelegramRepository
+
+
+NOW = datetime(2026, 10, 22, tzinfo=timezone.utc)
+
+
+def _accepted(repo, update=1):
+    return repo.accept_forward(
+        update, chat_id=-10042, thread_id=5,
+        message={"message_id": 10 + update, "text": "source"}, now=NOW,
+    )
+
+
+class _Clock:
+    def __init__(self):
+        self.now = NOW
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+class _Telegram:
+    def __init__(self, *, failures=0, failure_category=None):
+        self.failures = failures
+        self.failure_category = failure_category
+        self.sent = []
+        self.edited = []
+
+    async def send_message(self, chat_id, text, *, message_thread_id=None):
+        self.sent.append((chat_id, text, message_thread_id))
+        if self.failures:
+            self.failures -= 1
+            if self.failure_category is not None:
+                raise TelegramAPIError(self.failure_category)
+            raise TimeoutError("synthetic unknown outcome")
+        return {"message_id": 901}
+
+    async def edit_message_text(self, chat_id, message_id, text):
+        self.edited.append((chat_id, message_id, text))
+        return {"message_id": message_id}
+
+
+def _run(awaitable):
+    import asyncio
+    return asyncio.run(awaitable)
+
+
+def test_ack_is_immutable_and_progress_send_then_edit_adds_no_conversation_turn(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    row = repo.get_notification(accepted.notification_id)
+    assert row["kind"] == "draft_ack"
+    assert row["chat_id"] == -10042 and row["thread_id"] == 5
+    assert row["message_id"] is None and row["send_attempts_started"] == 0
+    assert row["body"] == "Диалог №1: сообщение принято"
+
+    clock, telegram = _Clock(), _Telegram()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish(accepted.notification_id)) == "delivered"
+    row = repo.get_notification(accepted.notification_id)
+    assert row["message_id"] == 901 and row["send_attempts_started"] == 1
+    assert telegram.sent == [(-10042, row["body"], 5)]
+    with pytest.raises(ValueError, match="delivered draft acknowledgement"):
+        repo.revise_notification(accepted.notification_id, body="updated control text", now=clock())
+
+    progress_id = "progress-edit"
+    repo.create_notification(progress_id, context_id=accepted.context_id, kind="progress",
+                             body="working", dialog_number=1, now=clock())
+    assert _run(publisher.publish(progress_id)) == "delivered"
+    repo.revise_notification(progress_id, body="updated progress", now=clock())
+    assert _run(publisher.publish(progress_id)) == "delivered"
+    assert telegram.sent == [(-10042, row["body"], 5), (-10042, "working", 5)]
+    assert telegram.edited == [(-10042, 901, "updated progress")]
+    assert len(repo.list_messages(accepted.context_id, accepted.draft_id)) == 1
+
+
+def test_create_notification_validates_kind_and_derives_persisted_target(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    for kind in ("queued", "switch_notice", "progress", "final", "error"):
+        row = repo.create_notification(f"n-{kind}", context_id=accepted.context_id,
+                                       kind=kind, body="trusted", now=NOW)
+        assert (row["chat_id"], row["thread_id"]) == (-10042, 5)
+    linked = repo.create_notification("n-linked", context_id=accepted.context_id,
+                                      kind="queued", body="queued", dialog_number=4,
+                                      operation_id="save-4", now=NOW)
+    assert (linked["dialog_number"], linked["operation_id"], linked["desired_status_revision"]) == (4, "save-4", 1)
+    with pytest.raises(ValueError):
+        repo.create_notification("n-invalid", context_id=accepted.context_id,
+                                 kind="unknown", body="trusted", now=NOW)
+    with pytest.raises(TypeError):
+        repo.create_notification("n-target", context_id=accepted.context_id,
+                                 kind="queued", body="trusted", chat_id=7, now=NOW)
+    with pytest.raises(TypeError):
+        repo.create_notification("n-body", context_id=accepted.context_id,
+                                 kind="queued", now=NOW)
+
+
+def test_unknown_send_attempt_budget_survives_replay_and_becomes_delivery_unknown(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    clock, telegram = _Clock(), _Telegram(failures=3)
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+    clock.advance(1)
+    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+    clock.advance(2)
+    assert _run(publisher.publish(accepted.notification_id)) == "delivery_unknown"
+    assert _run(publisher.publish(accepted.notification_id)) == "delivery_unknown"
+    row = repo.get_notification(accepted.notification_id)
+    assert row["send_attempts_started"] == 3
+    assert row["state"] == "delivery_unknown"
+    assert len(telegram.sent) == 3
+
+
+def test_telegram_timeout_error_is_unknown_and_consumes_send_budget(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    clock, telegram = _Clock(), _Telegram(failures=1, failure_category="timeout")
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+    row = repo.get_notification(accepted.notification_id)
+    assert row["last_outcome"] == "unknown"
+    assert row["unknown_send_outcome"] is True
+    assert row["send_attempts_started"] == 1
+
+
+def test_default_thread_zero_is_persisted_as_no_thread_for_ack_and_new_notice(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = repo.accept_forward(
+        1, chat_id=-10042, thread_id=0,
+        message={"message_id": 11, "text": "source"}, now=NOW,
+    )
+    ack = repo.get_notification(accepted.notification_id)
+    assert ack["thread_id"] is None
+    notice = repo.create_notification("default-thread", context_id=accepted.context_id,
+                                      kind="switch_notice", body="switched", now=NOW)
+    assert notice["thread_id"] is None
+    clock, telegram = _Clock(), _Telegram()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish("default-thread")) == "delivered"
+    assert telegram.sent == [(-10042, "switched", None)]
+
+
+def test_message_id_prevents_any_later_send_and_stale_attempt_cannot_settle(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    reserved = repo.reserve_notification_attempt(accepted.notification_id, attempt_id="attempt-old", now=NOW)
+    revised = repo.revise_notification(accepted.notification_id, body="new revision", now=NOW)
+    stale = repo.settle_notification_attempt(accepted.notification_id, attempt_id="attempt-old",
+                                             revision=reserved["attempt_revision"], outcome="sent",
+                                             message_id=111, now=NOW)
+    assert stale["settled"] is False
+    assert revised["message_id"] is None
+    repo.settle_notification_attempt(accepted.notification_id, attempt_id="attempt-new",
+                                     revision=revised["revision"], outcome="sent",
+                                     message_id=222, now=NOW)  # stale, no current reservation
+    row = repo.get_notification(accepted.notification_id)
+    assert row["message_id"] is None
+    next_attempt = repo.reserve_notification_attempt(accepted.notification_id,
+                                                     attempt_id="attempt-current", now=NOW)
+    assert next_attempt["reserved"] is True
+    repo.settle_notification_attempt(accepted.notification_id, attempt_id="attempt-current",
+                                     revision=next_attempt["attempt_revision"], outcome="sent",
+                                     message_id=333, now=NOW)
+    assert repo.reserve_notification_attempt(accepted.notification_id,
+                                             attempt_id="attempt-after-id", now=NOW)["state"] == "delivered"
+    assert repo.get_notification(accepted.notification_id)["send_attempts_started"] == 2
+
+
+def test_terminal_ack_failure_keeps_collecting_draft_and_sealed_identity(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    collecting = _accepted(repo, 1)
+    for i in range(3):
+        attempt_id = f"collecting-{i}"
+        reserved = repo.reserve_notification_attempt(collecting.notification_id, attempt_id=attempt_id,
+                                                     now=NOW + timedelta(seconds=i * 3))
+        result = repo.settle_notification_attempt(collecting.notification_id, attempt_id=attempt_id,
+                                                  revision=reserved["attempt_revision"], outcome="unknown",
+                                                  now=NOW + timedelta(seconds=i * 3))
+    assert result["state"] == "delivery_unknown"
+    context = repo.get_context(collecting.context_id)
+    assert context["active_draft_id"] == collecting.draft_id
+    assert context["lock_owner"] is None
+    assert repo.get_draft(collecting.context_id, collecting.draft_id)["state"] == "collecting"
+
+    sealed = repo.accept_forward(
+        2, chat_id=-10043, thread_id=5,
+        message={"message_id": 12, "text": "sealed source"}, now=NOW,
+    )
+    draft_ref = client.collection("telegram_sessions").document(sealed.context_id).collection("drafts").document(sealed.draft_id)
+    original = {**repo.get_draft(sealed.context_id, sealed.draft_id),
+                "state": "processing", "sealed_at": NOW, "manifest_ref": "manifests/m1",
+                "manifest_digest": "digest-1", "active_save_operation_id": "save-child"}
+    draft_ref.set(original)
+    parent_ref = client.collection("telegram_sessions").document(sealed.context_id).collection("operations").document("fifo-parent")
+    parent_ref.set({"operation_id": "fifo-parent", "sequence": 1, "state": "pending",
+                    "target_draft_id": sealed.draft_id, "save_operation_id": "save-child", "next_operation_id": None})
+    save_ref = client.collection("dialog_operations").document("save-child")
+    save_ref.set({"operation_id": "save-child", "state": "running",
+                  "lease_owner": "worker-1", "lease_expires_at": NOW + timedelta(minutes=1)})
+    ctx_ref = client.collection("telegram_sessions").document(sealed.context_id)
+    ctx_ref.update({"reserved_operation_id": "fifo-parent", "head_sequence": 1,
+                    "active_draft_id": sealed.draft_id, "draft_status": "collecting"})
+    for i in range(3):
+        attempt_id = f"sealed-{i}"
+        reserved = repo.reserve_notification_attempt(sealed.notification_id, attempt_id=attempt_id,
+                                                     now=NOW + timedelta(seconds=i * 3))
+        result = repo.settle_notification_attempt(sealed.notification_id, attempt_id=attempt_id,
+                                                  revision=reserved["attempt_revision"], outcome="unknown",
+                                                  now=NOW + timedelta(seconds=i * 3))
+    failed = repo.get_draft(sealed.context_id, sealed.draft_id)
+    assert result["ack_failure_action"]["dialog_number"] == 1
+    assert result["ack_failure_action"]["operation_id"] == "save-child"
+    assert result["ack_failure_action"]["parent_operation_id"] == "fifo-parent"
+    assert result["ack_failure_action"]["queue_release_required"] is False
+    assert failed["state"] == "failed"
+    assert failed["manifest_ref"] == original["manifest_ref"]
+    assert failed["manifest_digest"] == original["manifest_digest"]
+    assert failed["ordered_message_ids"] == original["ordered_message_ids"]
+    assert repo.get_context(sealed.context_id)["reserved_operation_id"] is None
+    assert repo.get_context(sealed.context_id)["active_draft_id"] is None
+    assert parent_ref.get().to_dict()["failure_code"] == "ack_delivery_failed"
+    child = save_ref.get().to_dict()
+    assert child["state"] == "failed"
+    assert child["error"]["code"] == "ack_delivery_failed"
+    assert child["lease_owner"] is None and child["lease_expires_at"] is None
+
+
+def test_delivered_ack_cannot_be_revised_and_edit_failure_does_not_fail_sealed_draft(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    reserved = repo.reserve_notification_attempt(accepted.notification_id,
+                                                 attempt_id="ack-send", now=NOW)
+    repo.settle_notification_attempt(accepted.notification_id, attempt_id="ack-send",
+                                     revision=reserved["attempt_revision"], outcome="sent",
+                                     message_id=901, now=NOW)
+    with pytest.raises(ValueError, match="delivered draft acknowledgement"):
+        repo.revise_notification(accepted.notification_id, body="new acknowledgement", now=NOW)
+
+    draft_ref = client.collection("telegram_sessions").document(accepted.context_id).collection("drafts").document(accepted.draft_id)
+    draft_ref.update({"state": "processing", "sealed_at": NOW,
+                      "manifest_ref": "manifests/m1", "manifest_digest": "digest-1"})
+    notification_ref = client.collection("notification_outbox").document(accepted.notification_id)
+    notification_ref.update({"state": "editing", "revision": 2, "desired_status_revision": 2,
+                             "edit_attempts_started": 3, "in_flight_attempt_id": "edit-3",
+                             "attempt_revision": 2, "attempt_expires_at": NOW})
+    result = repo.settle_notification_attempt(accepted.notification_id, attempt_id="edit-3",
+                                              revision=2, outcome="rejected", now=NOW)
+    assert result["state"] == "failed"
+    assert repo.get_draft(accepted.context_id, accepted.draft_id)["state"] == "processing"
+
+
+def test_sealed_ack_failure_preserves_newer_collecting_pointer_without_exact_parent_link(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        1, chat_id=-10045, thread_id=5,
+        message={"message_id": 21, "text": "sealed source"}, now=NOW,
+    )
+    draft_ref = client.collection("telegram_sessions").document(accepted.context_id).collection("drafts").document(accepted.draft_id)
+    draft = {**repo.get_draft(accepted.context_id, accepted.draft_id), "state": "processing",
+             "sealed_at": NOW, "manifest_ref": "manifests/old", "manifest_digest": "old-digest",
+             "active_save_operation_id": "save-child"}
+    draft_ref.set(draft)
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    context_ref.update({"active_draft_id": "newer-draft", "draft_status": "collecting",
+                        "reserved_operation_id": "unrelated-parent", "head_sequence": 8})
+    client.collection("telegram_sessions").document(accepted.context_id).collection("drafts").document("newer-draft").set(
+        {"draft_id": "newer-draft", "state": "collecting"}
+    )
+    for i in range(3):
+        attempt_id = f"unlinked-{i}"
+        moment = NOW + timedelta(seconds=i * 3)
+        reserved = repo.reserve_notification_attempt(accepted.notification_id, attempt_id=attempt_id, now=moment)
+        result = repo.settle_notification_attempt(accepted.notification_id, attempt_id=attempt_id,
+                                                  revision=reserved["attempt_revision"], outcome="unknown", now=moment)
+    state = repo.get_context(accepted.context_id)
+    assert result["ack_failure_action"]["queue_release_required"] is True
+    assert state["active_draft_id"] == "newer-draft"
+    assert state["draft_status"] == "collecting"
+    assert state["reserved_operation_id"] == "unrelated-parent"
+    assert repo.get_draft(accepted.context_id, accepted.draft_id)["manifest_digest"] == "old-digest"
