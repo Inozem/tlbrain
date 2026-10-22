@@ -491,7 +491,7 @@ Drive folder association is stored in the `parent_id` payload field. The current
 | `create_folder` | Create a folder with `name` and optional `parent_path`. |
 | `rename_folder` | Rename a folder using `folder_path` and `new_name`. |
 | `sync_changes` | Trigger a checker pass. Optional `doc_id` targets one document; without it, the checker runs its generic pass. |
-| `sync_status` | Show transcript sync counts and unassigned transcripts. |
+| `sync_status` | Show transcript sync counts and unassigned transcripts, or look up one operation by optional `operation_id`. |
 | `add_fact` | Attach a fact to a transcript using `doc_id` and `text`. |
 | `list_recent_transcripts` | List recent transcripts; supports folder/date filters and `limit`/`offset`. |
 | `rename_transcript` | Rename a transcript using `doc_id` and `new_title`. |

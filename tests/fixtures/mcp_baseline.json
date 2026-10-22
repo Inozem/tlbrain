@@ -210,7 +210,12 @@
         "description": "Show the current sync status: how many transcripts are in each stage (queued, downloading, imported, syncing, synced, error) and how many are unassigned. Use to diagnose stuck imports or check overall system health.",
         "inputSchema": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "operation_id": {
+              "type": "string",
+              "description": "Optional operation ID to inspect its status"
+            }
+          }
         }
       },
       {

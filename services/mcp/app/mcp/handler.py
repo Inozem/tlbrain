@@ -365,7 +365,12 @@ def handle_tools_list(request: JSONRPCRequest) -> dict:
                     "description": "Show the current sync status: how many transcripts are in each stage (queued, downloading, imported, syncing, synced, error) and how many are unassigned. Use to diagnose stuck imports or check overall system health.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "operation_id": {
+                                "type": "string",
+                                "description": "Optional operation ID to inspect its status",
+                            },
+                        },
                     },
                 },
                 {
@@ -480,7 +485,7 @@ def handle_tools_call(request: JSONRPCRequest) -> dict:
         return _handle_sync_changes(request, arguments)
 
     if tool_name == "sync_status":
-        return _handle_sync_status(request)
+        return _handle_sync_status(request, arguments)
 
     if tool_name == "add_fact":
         return _handle_add_fact(request, arguments)
@@ -1338,7 +1343,90 @@ def _handle_sync_changes(request: JSONRPCRequest, arguments: dict) -> dict:
     return build_jsonrpc_result(request.id, content)
 
 
-def _handle_sync_status(request: JSONRPCRequest) -> dict:
+def _operation_status_payload(operation, operation_id: str) -> dict:
+    """Project public status fields without exposing operation internals or links."""
+    def field(value, name, default=None):
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    def timestamp(value):
+        return value.isoformat() if isinstance(value, datetime) else value
+
+    state = field(operation, "state")
+    payload = {
+        "operation_id": field(operation, "operation_id", operation_id),
+        "operation_status": getattr(state, "value", state),
+        "stage": field(operation, "stage"),
+        "status_changed_at": timestamp(field(operation, "status_updated_at")),
+        "started_at": timestamp(field(operation, "started_at")),
+        "finished_at": timestamp(field(operation, "finished_at")),
+        "stage_failure_counts": dict(field(operation, "stage_failure_counts", ()) or ()),
+        "doc_id": field(operation, "doc_id"),
+    }
+    folder_path = field(operation, "selected_folder_path")
+    if folder_path is not None:
+        payload["folder_path"] = list(folder_path)
+    provider = field(operation, "provider")
+    if provider is not None:
+        payload["provider"] = provider
+
+    result = field(operation, "result")
+    payload["result"] = None if result is None else {
+        name: list(value) if name == "skipped_utterances" else value
+        for name in ("document_id", "title", "skipped_utterances")
+        if (value := field(result, name)) is not None
+    }
+
+    error = field(operation, "error")
+    if error is None:
+        payload["error"] = None
+    else:
+        error_payload = {
+            "message": field(error, "sanitized_message") or "Operation failed",
+        }
+        for name in ("code", "category", "service", "stage", "retryable", "failures"):
+            value = field(error, name)
+            if value is not None:
+                error_payload[name] = value
+        occurred_at = timestamp(field(error, "occurred_at"))
+        if occurred_at is not None:
+            error_payload["occurred_at"] = occurred_at
+        payload["error"] = error_payload
+    return payload
+
+
+def _handle_sync_status_operation(request: JSONRPCRequest, operation_id) -> dict:
+    """Read one durable operation and return a sanitized MCP projection."""
+    if not isinstance(operation_id, str) or not operation_id.strip() or "/" in operation_id:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="operation_id must be a non-empty string",
+        )
+    try:
+        operation = get_operation(get_client(), operation_id)
+    except Exception:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="Failed to get operation status",
+        )
+    if operation is None:
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32602,
+            message="Operation not found",
+        )
+    return build_jsonrpc_result(
+        request.id, build_mcp_content(_operation_status_payload(operation, operation_id))
+    )
+
+
+def _handle_sync_status(request: JSONRPCRequest, arguments: dict | None = None) -> dict:
+    if isinstance(arguments, dict) and "operation_id" in arguments:
+        return _handle_sync_status_operation(request, arguments.get("operation_id"))
+
     t0 = time.monotonic()
     try:
         status = read_operations.sync_status()
