@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 
 import httpx
 import pytest
 
 from services.mcp.app import main, oauth_store
+from services.mcp.app.mcp.request_context import get_request_context
 from tests.services.mcp.test_add_dialog import (
     _initialized_session,
     _install_document_boundary,
@@ -63,11 +65,17 @@ def _committed_firestore_writes(firestore_fake):
     return [event for event in firestore_fake.trace() if event.get("outcome") == "committed"]
 
 
-def test_json_initialize_issues_a_session_header_reused_on_session_aware_response():
+def test_json_initialize_issues_a_session_header_reused_on_session_aware_response(firestore_fake):
     body = _rpc("initialize", "session-init")
     initialized = _post(body)
     assert initialized.status_code == 200
     session_id = initialized.headers["mcp-session-id"]
+    key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    stored = firestore_fake.client_class().collection("mcp_sessions").document(key).get().to_dict()
+    assert stored["caller_binding"] == "anonymous:installation"
+    assert stored["protocol_version"] == "2024-11-05"
+    assert stored["created_at"].tzinfo is not None
+    assert session_id not in json.dumps(stored, default=str)
 
     subsequent = _post(_rpc("tools/list", "session-tools"), headers={"Mcp-Session-Id": session_id})
     assert subsequent.status_code == 200
@@ -108,6 +116,13 @@ def test_sessionless_legacy_tool_and_protected_auth_contract_remain_compatible(m
     }))
     assert legacy_call.status_code == 200
     assert _payload(legacy_call)["total"] == 0
+
+    arbitrary_session = _post(
+        _rpc("tools/list", "legacy-arbitrary-session"),
+        headers={"Mcp-Session-Id": "untrusted-session"},
+    )
+    assert arbitrary_session.status_code == 200
+    assert "mcp-session-id" not in arbitrary_session.headers
 
     monkeypatch.setenv("ALLOWED_EMAIL", "allowed@example.test")
     unauthorized_legacy_call = _post(_rpc("tools/call", "protected-sync-status", {
@@ -195,6 +210,63 @@ def test_rotated_access_token_for_same_verified_principal_keeps_session(monkeypa
     })
     assert continued.status_code == 200
     assert continued.headers["mcp-session-id"] == session_id
+
+
+def test_protected_session_binding_uses_verified_email_client_and_resource(firestore_fake, monkeypatch):
+    monkeypatch.setenv("ALLOWED_EMAIL", "allowed@example.test,other@example.test")
+    _seed_token("synthetic-owner-token", "Allowed@Example.Test", client_id="client-one")
+    _seed_token("synthetic-same-token", "allowed@example.test", client_id="client-one")
+    _seed_token("synthetic-other-client", "allowed@example.test", client_id="client-two")
+    _seed_token("synthetic-other-user", "other@example.test", client_id="client-one")
+
+    initialized = _post(_rpc("initialize", "identity-init"), headers={
+        "Authorization": "Bearer synthetic-owner-token",
+    })
+    assert initialized.status_code == 200
+    session_id = initialized.headers["mcp-session-id"]
+    key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    stored = firestore_fake.client_class().collection("mcp_sessions").document(key).get().to_dict()
+    expected = "oauth:" + hashlib.sha256(
+        "allowed@example.test\0client-one\0http://mcp.test/mcp".encode("utf-8")
+    ).hexdigest()
+    assert stored["caller_binding"] == expected
+    assert "synthetic-owner-token" not in json.dumps(stored, default=str)
+
+    same_caller = _post(_rpc("tools/list", "same-identity"), headers={
+        "Authorization": "Bearer synthetic-same-token", "Mcp-Session-Id": session_id,
+    })
+    other_client = _post(_rpc("tools/list", "other-client"), headers={
+        "Authorization": "Bearer synthetic-other-client", "Mcp-Session-Id": session_id,
+    })
+    other_user = _post(_rpc("tools/list", "other-user"), headers={
+        "Authorization": "Bearer synthetic-other-user", "Mcp-Session-Id": session_id,
+    })
+    assert same_caller.headers["mcp-session-id"] == session_id
+    assert "mcp-session-id" not in other_client.headers
+    assert "mcp-session-id" not in other_user.headers
+
+
+def test_cors_exposes_mcp_session_header():
+    initialized = _post(_rpc("initialize", "cors-init"), headers={"Origin": "https://client.test"})
+    assert initialized.status_code == 200
+    assert initialized.headers["access-control-expose-headers"] == "Mcp-Session-Id"
+
+
+def test_request_context_exposes_identity_and_invalid_session_then_resets(monkeypatch):
+    observed = []
+
+    async def inspect_context(body):
+        observed.append(get_request_context())
+        return {"jsonrpc": "2.0", "id": body["id"], "result": {}}
+
+    monkeypatch.setattr(main, "handle_mcp_request", inspect_context)
+    response = _post(_rpc("tools/list", "context-invalid"), headers={
+        "Mcp-Session-Id": "untrusted-session",
+    })
+    assert response.status_code == 200
+    assert observed[0].identity.caller_binding == "anonymous:installation"
+    assert observed[0].session_state == "invalid"
+    assert get_request_context() is None
 
 
 def test_same_key_and_arguments_replay_one_operation_and_result(monkeypatch, sdk_fakes):

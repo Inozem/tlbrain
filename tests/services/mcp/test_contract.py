@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import httpx
@@ -121,7 +120,9 @@ def test_json_and_sse_envelopes():
     assert response.media_type == "text/event-stream"
     assert response.headers["cache-control"] == "no-cache"
     assert response.headers["x-accel-buffering"] == "no"
-    assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", response.headers["mcp-session-id"])
+    session_id = response.headers.get("mcp-session-id")
+    assert session_id
+    assert session_id != body["id"]
     event = _run(response.body_iterator.__anext__())
     assert event == f"data: {json.dumps(expected)}\n\n"
 
