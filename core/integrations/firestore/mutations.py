@@ -120,6 +120,99 @@ def get_resource_guard(client: Any | None, resource: str) -> ResourceGuard:
     return _guard_from(snapshot.to_dict() if snapshot.exists else None, resource)
 
 
+def _active_completion_guard(data: dict[str, Any] | None, now: datetime) -> bool:
+    data = data or {}
+    expiry = data.get("finalization_expires_at")
+    return bool(data.get("finalization_reservation_id")
+                and isinstance(expiry, datetime) and expiry > now)
+
+
+def _clear_completion_guard(data: dict[str, Any], now: datetime) -> dict[str, Any]:
+    updated = dict(data)
+    expiry = updated.get("finalization_expires_at")
+    if (updated.get("finalization_reservation_id")
+            and isinstance(expiry, datetime) and expiry <= now):
+        for field in ("finalization_reservation_id", "finalization_operation_id",
+                      "finalization_owner", "finalization_fence", "finalization_expires_at"):
+            updated.pop(field, None)
+    return updated
+
+
+def acquire_completion_guard(
+    client: Any | None, *, operation_id: str, owner: str, fence: int,
+    resource: str, now: datetime, clock: Callable[[], datetime] | None = None,
+) -> tuple[int, str] | None:
+    """Reserve a stable resource snapshot until guarded save completion commits."""
+    now = _aware(now)
+    clock = clock or (lambda: datetime.now(timezone.utc))
+    db = _db(client)
+    operation_ref = db.collection(OPERATIONS_COLLECTION).document(operation_id)
+    guard_ref = _resource_ref(db, resource)
+    reservation_id = f"completion:{operation_id}:{fence}"
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> tuple[int, str] | None:
+        commit_now = _aware(clock())
+        operation_snapshot = operation_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
+        if not operation_snapshot.exists or not _valid_lease(
+            operation_snapshot.to_dict() or {}, owner, fence, commit_now,
+        ):
+            return None
+        guard = guard_snapshot.to_dict() if guard_snapshot.exists else {}
+        if (_locked_guard(guard) or _active_completion_guard(guard, commit_now)
+                or _active_index_guard(guard, commit_now)
+                or (guard.get("owner_operation_id")
+                    and isinstance(guard.get("expires_at"), datetime)
+                    and guard["expires_at"] > commit_now)):
+            return None
+        epoch = int(guard.get("resource_epoch", 0))
+        guard = _clear_completion_guard(guard, commit_now)
+        guard.update({
+            "resource": resource,
+            "finalization_operation_id": operation_id,
+            "finalization_reservation_id": reservation_id,
+            "finalization_owner": owner, "finalization_fence": fence,
+            "finalization_expires_at": (operation_snapshot.to_dict() or {}).get("lease_expires_at"),
+            "resource_epoch": epoch, "mutation_state": "finalizing", "updated_at": commit_now,
+        })
+        transaction.set(guard_ref, guard)
+        return epoch, reservation_id
+
+    return _txn(db.transaction())
+
+
+def release_completion_guard(
+    client: Any | None, *, resource: str, operation_id: str, owner: str,
+    fence: int, reservation_id: str, now: datetime,
+) -> bool:
+    """Release a finalization reservation when validation cannot complete."""
+    now = _aware(now)
+    guard_ref = _resource_ref(_db(client), resource)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        snapshot = guard_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return False
+        guard = snapshot.to_dict() or {}
+        if (guard.get("finalization_operation_id") != operation_id
+                or guard.get("finalization_reservation_id") != reservation_id
+                or guard.get("finalization_owner") != owner
+                or guard.get("finalization_fence") != fence):
+            return False
+        for field in ("finalization_reservation_id", "finalization_operation_id",
+                      "finalization_owner", "finalization_fence", "finalization_expires_at"):
+            guard.pop(field, None)
+        if guard.get("mutation_state") == "finalizing":
+            guard["mutation_state"] = "idle"
+        guard["updated_at"] = now
+        transaction.set(guard_ref, guard)
+        return True
+
+    return _txn(_db(client).transaction())
+
+
 def acquire_index_guard(
     client: Any | None, *, doc_id: str, owner: str, now: datetime, lease_seconds: int | float,
     root_folder_id: str | None = None, operation_fence: int = 0,
@@ -171,7 +264,8 @@ def acquire_index_guard(
             and guard.get("index_owner")
             and (not isinstance(index_expiry, datetime) or index_expiry <= now)
         )
-        if (_locked_guard(guard) and not can_reconcile_index_effects) or (
+        if ((_locked_guard(guard) or _active_completion_guard(guard, now))
+                and not can_reconcile_index_effects) or (
             isinstance(index_expiry, datetime) and index_expiry > now
             and guard.get("index_owner") != owner
         ):
@@ -184,6 +278,7 @@ def acquire_index_guard(
                            "status_changed_at": now})
         if root_folder_id is not None:
             transcript["root_folder_id"] = root_folder_id
+        guard = _clear_completion_guard(guard, now)
         guard.update({
             "resource": resource, "index_owner": owner, "index_fence": fence,
             "index_expires_at": expires_at, "resource_epoch": resource_epoch,
@@ -273,7 +368,8 @@ def renew_index_guard(
         )
         if (transcript.get("index_fence") != fence or guard.get("index_fence") != fence
                 or guard.get("index_owner") != owner or not isinstance(expiry, datetime) or expiry <= now
-                or (_locked_guard(guard) and not may_hold_unknown_index_effects)):
+                or ((_locked_guard(guard) or _active_completion_guard(guard, now))
+                    and not may_hold_unknown_index_effects)):
             return False
         guard.update({"index_expires_at": now + timedelta(seconds=lease_seconds), "updated_at": now})
         transaction.set(guard_ref, guard)
@@ -303,7 +399,7 @@ def begin_index_effect(
         expiry = guard.get("index_expires_at")
         if (transcript.get("index_fence") != fence or guard.get("index_fence") != fence
                 or guard.get("index_owner") != owner or not isinstance(expiry, datetime) or expiry <= now
-                or _locked_guard(guard)):
+                or _locked_guard(guard) or _active_completion_guard(guard, now)):
             return False
         unsettled = list(guard.get("unsettled_effect_ids", ()))
         unsettled.append(effect_id)
@@ -379,7 +475,8 @@ def release_index_guard(
         transcript = transcript_snapshot.to_dict() or {}
         guard = guard_snapshot.to_dict() or {}
         if (transcript.get("index_fence") != fence or guard.get("index_fence") != fence
-                or guard.get("index_owner") != owner or _locked_guard(guard)):
+                or guard.get("index_owner") != owner or _locked_guard(guard)
+                or _active_completion_guard(guard, now)):
             return False
         guard.update({"index_owner": None, "index_expires_at": None,
                       "mutation_state": "idle", "updated_at": now})
@@ -474,11 +571,12 @@ def dispatch_mutation(
             if state == EffectState.FAILED:
                 return "closed", None
         guards = [(resource, ref, snap.to_dict() if snap.exists else {}) for resource, ref, snap in guard_snapshots]
-        if any(_locked_guard(data) or _active_index_guard(data, commit_now) for _, _, data in guards):
+        if any(_locked_guard(data) or _active_completion_guard(data, commit_now)
+               or _active_index_guard(data, commit_now) for _, _, data in guards):
             return "blocked", None
         for resource, ref, data in guards:
             unsettled = tuple(data.get("unsettled_effect_ids", ()))
-            updated = dict(data)
+            updated = _clear_completion_guard(data, commit_now)
             updated.update({
                 "resource": resource, "owner_operation_id": operation_id,
                 "owner_effect_id": effect_id, "owner": owner, "fence": fence,
@@ -728,7 +826,8 @@ def _lease_transaction(client: Any, operation_id: str, owner: str, fence: int, n
             (resource, ref, snap.to_dict() if snap.exists else {})
             for resource, ref, snap in guard_snapshots
         ]
-        if any(_locked_guard(data) or _active_index_guard(data, now) for _, _, data in guard_data):
+        if any(_locked_guard(data) or _active_completion_guard(data, now)
+               or _active_index_guard(data, now) for _, _, data in guard_data):
             return False
         if action == "checkpoint":
             refs = list(op_data.get("checkpoint_refs", ()))
@@ -742,6 +841,7 @@ def _lease_transaction(client: Any, operation_id: str, owner: str, fence: int, n
         elif resources:
             expiry = op_data.get("lease_expires_at")
             for resource, ref, data in guard_data:
+                data = _clear_completion_guard(data, now)
                 data.update({
                     "resource": resource, "owner_operation_id": operation_id,
                     "owner_effect_id": None, "owner": owner, "fence": fence,

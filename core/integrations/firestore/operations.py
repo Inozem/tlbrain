@@ -75,7 +75,10 @@ def _operation_data(record: OperationRecord) -> dict[str, Any]:
 def _result_data(result: OperationResult | None) -> dict[str, Any] | None:
     if result is None:
         return None
-    return {"document_id": result.document_id, "title": result.title, "resource_url": result.resource_url}
+    data = {"document_id": result.document_id, "title": result.title, "resource_url": result.resource_url}
+    if result.skipped_utterances is not None:
+        data["skipped_utterances"] = list(result.skipped_utterances)
+    return data
 
 
 def _result_from(data: dict[str, Any] | None) -> OperationResult | None:
@@ -83,6 +86,8 @@ def _result_from(data: dict[str, Any] | None) -> OperationResult | None:
         return None
     return OperationResult(
         document_id=data.get("document_id"), title=data.get("title"), resource_url=data.get("resource_url"),
+        skipped_utterances=(tuple(data["skipped_utterances"])
+                            if data.get("skipped_utterances") is not None else None),
     )
 
 

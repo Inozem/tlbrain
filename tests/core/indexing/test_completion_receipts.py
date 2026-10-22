@@ -70,7 +70,8 @@ def _assert_user_fact_excluded(delete_events):
 
 
 def _save_fixture(
-    client, sdk_fakes, *, operation_id=OPERATION_ID, owner=OWNER, now=NOW, lease_seconds=30,
+    client, sdk_fakes, *, operation_id=OPERATION_ID, owner=OWNER, now=NOW,
+    lease_seconds=30, skipped_utterances=(),
 ):
     from core.integrations.firestore.operations import claim_operation, create_operation
     from core.integrations.firestore.save_intents import (
@@ -123,7 +124,8 @@ def _save_fixture(
     receipt = {
         "doc_id": DOC_ID, "content_hash": content_hash, "version": content_hash,
         "provider": "tldv", "parent_id": PARENT_ID, "parent_id_hash": parent_hash,
-        "root_folder_id": ROOT_ID, "status": "completed", "skipped_utterances": [],
+        "root_folder_id": ROOT_ID, "status": "completed",
+        "skipped_utterances": list(skipped_utterances),
         "completed_at": now, "error": None, "owner": owner, "fence": lease.fence,
         "index_fence": 1, "resource_epoch": 0,
         "work_manifest_ref": "synthetic-work-manifest",
@@ -136,7 +138,9 @@ def _save_fixture(
     return lease, save_intent_id, receipt, content
 
 
-def _finalize(client, *, operation_id=OPERATION_ID, save_intent_id=None, owner=OWNER, fence=1, now=NOW):
+def _finalize(client, *, operation_id=OPERATION_ID, save_intent_id=None, owner=OWNER,
+              fence=1, now=NOW, clock=None):
+    clock = clock or (lambda: now)
     return _completion_module().finalize_save(
         client, operation_id=operation_id,
         save_intent_id=save_intent_id or f"{operation_id}-save",
@@ -146,7 +150,14 @@ def _finalize(client, *, operation_id=OPERATION_ID, save_intent_id=None, owner=O
             "manifest_digest": "sha256:synthetic-manifest",
         },
         now=now,
+        clock=clock,
     )
+
+
+def _synthetic_google_oauth(monkeypatch):
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-synthetic-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-synthetic-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-synthetic-secret")
 
 
 def test_process_one_hashes_the_google_docs_reader_projection_and_publishes_after_all_writes(
@@ -518,6 +529,7 @@ def test_mutation_between_final_read_and_completion_commit_is_serialized_or_reje
 
     client = firestore_fake.client_class()
     lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
     original_verify = processor.verify_current_generation
     mutation_operation_id = "completion-racing-mutation"
     mutation_lease = _lease(client, operation_id=mutation_operation_id, owner="mutation-worker")
@@ -612,6 +624,104 @@ def test_expired_finalization_fence_cannot_commit_result_or_cleanup_authorizatio
     assert operation.get("cleanup_authorization") is None
     assert intent.get("completion_certificate") is None
     assert intent.get("cleanup_authorization") is None
+
+
+def test_abandoned_finalization_guard_is_reclaimed_after_lease_expiry(
+    firestore_fake, fake_clock, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.mutations import acquire_completion_guard, get_resource_guard
+    from core.integrations.firestore.operations import claim_operation
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    old, save_intent_id, _receipt, _content = _save_fixture(
+        client, sdk_fakes, now=fake_clock.now(), lease_seconds=5,
+    )
+    reservation = acquire_completion_guard(
+        client, operation_id=OPERATION_ID, owner=OWNER, fence=old.fence,
+        resource=RESOURCE, now=fake_clock.now(), clock=fake_clock.now,
+    )
+    assert reservation is not None
+    # Model process death: deliberately leave the completion reservation in place.
+    fake_clock.advance(seconds=6)
+    current = claim_operation(
+        client, OPERATION_ID, owner="restarted-worker", now=fake_clock.now(), lease_seconds=30,
+    )
+    assert current is not None and current.fence > old.fence
+    assert not get_resource_guard(client, RESOURCE).unsettled_effect_ids
+
+    _synthetic_google_oauth(monkeypatch)
+    result = _finalize(
+        client, save_intent_id=save_intent_id, owner="restarted-worker",
+        fence=current.fence, now=fake_clock.now(), clock=fake_clock.now,
+    )
+    assert result is not None
+    assert firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]["state"] == "completed"
+    assert firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]["completion_certificate"]
+
+
+def test_finalization_checks_lease_again_after_slow_external_read(
+    firestore_fake, fake_clock, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    lease, save_intent_id, _receipt, _content = _save_fixture(
+        client, sdk_fakes, now=fake_clock.now(), lease_seconds=5,
+    )
+    _synthetic_google_oauth(monkeypatch)
+    original_verify = processor.verify_current_generation
+
+    def expire_lease_during_read(*args, **kwargs):
+        verified = original_verify(*args, **kwargs)
+        fake_clock.advance(seconds=6)
+        return verified
+
+    monkeypatch.setattr(processor, "verify_current_generation", expire_lease_during_read)
+    assert _finalize(
+        client, save_intent_id=save_intent_id, fence=lease.fence,
+        now=fake_clock.now(), clock=fake_clock.now,
+    ) is None
+    operation = firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]
+    intent = firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]
+    assert operation.get("state") != "completed"
+    assert operation.get("result") is None
+    assert intent.get("completion_certificate") is None
+    assert intent.get("cleanup_authorization") is None
+
+
+def test_provider_mismatch_cannot_finalize(firestore_fake, sdk_fakes, monkeypatch):
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    operation_ref = client.collection("dialog_operations").document(OPERATION_ID)
+    operation_ref.update({"provider": "fireflies"})
+
+    assert _finalize(client, save_intent_id=save_intent_id, fence=lease.fence) is None
+    operation = firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]
+    intent = firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]
+    assert operation.get("state") != "completed"
+    assert intent.get("completion_certificate") is None
+    assert intent.get("cleanup_authorization") is None
+
+
+@pytest.mark.parametrize("certificate_field", ["operation_id", "save_intent_id", "doc_id"])
+def test_misbound_completion_certificate_does_not_replay(
+    firestore_fake, sdk_fakes, monkeypatch, certificate_field,
+):
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    assert _finalize(client, save_intent_id=save_intent_id, fence=lease.fence) is not None
+    intent_ref = client.collection("dialog_save_intents").document(save_intent_id)
+    intent = intent_ref.get().to_dict()
+    intent["completion_certificate"][certificate_field] = f"misbound-{certificate_field}"
+    intent_ref.set(intent)
+    trace_length = len(sdk_fakes.trace)
+
+    assert _finalize(client, save_intent_id=save_intent_id, fence=lease.fence) is None
+    assert len(sdk_fakes.trace) == trace_length
 
 
 def test_new_fence_cannot_finalize_or_redispatch_while_old_qdrant_batch_is_unknown(
@@ -728,10 +838,13 @@ def test_index_claim_waits_for_active_regular_resource_owner(firestore_fake):
 
 
 def test_operation_result_and_immutable_completion_certificate_commit_atomically_and_replay(
-    firestore_fake, sdk_fakes,
+    firestore_fake, sdk_fakes, monkeypatch,
 ):
     client = firestore_fake.client_class()
-    lease, save_intent_id, receipt, _content = _save_fixture(client, sdk_fakes)
+    lease, save_intent_id, receipt, _content = _save_fixture(
+        client, sdk_fakes, skipped_utterances=(2, 7),
+    )
+    _synthetic_google_oauth(monkeypatch)
     operation_path = f"dialog_operations/{OPERATION_ID}"
     intent_path = f"dialog_save_intents/{save_intent_id}"
     firestore_fake.fail_next(
@@ -744,6 +857,19 @@ def test_operation_result_and_immutable_completion_certificate_commit_atomically
     assert firestore_fake.documents[operation_path].get("state") != "completed"
     assert firestore_fake.documents[intent_path].get("completion_certificate") is None
 
+    content = "DATE: 2026-03-04\nPROVIDER: tldv\n---\nSpeaker A :: Completed synthetic transcript."
+    sdk_fakes.docs.queue("documents.get", response={
+        "revisionId": "synthetic-revision",
+        "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
+            for line in content.splitlines()
+        ]},
+    })
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document", "parents": [PARENT_ID], "trashed": False,
+    })
+
     firestore_fake.fail_next(
         "commit", path=intent_path, phase="after",
         exception=RuntimeError("synthetic response lost after commit"),
@@ -755,6 +881,7 @@ def test_operation_result_and_immutable_completion_certificate_commit_atomically
     certificate = first_intent["completion_certificate"]
     assert first_operation["state"] == "completed"
     assert first_operation["result"]["document_id"] == DOC_ID
+    assert first_operation["result"]["skipped_utterances"] == [2, 7]
     assert certificate["save_intent_id"] == save_intent_id
     assert certificate["operation_id"] == OPERATION_ID
     assert certificate["doc_id"] == DOC_ID
@@ -766,18 +893,31 @@ def test_operation_result_and_immutable_completion_certificate_commit_atomically
     assert first_operation["result"]["document_id"] == certificate["doc_id"]
     trace_after_commit = len(sdk_fakes.trace)
 
-    _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    replayed_result = _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
 
     assert firestore_fake.documents[operation_path] == first_operation
     assert firestore_fake.documents[intent_path] == first_intent
     assert len(sdk_fakes.trace) == trace_after_commit
+    assert replayed_result.skipped_utterances == (2, 7)
 
 
-def test_independent_edit_after_commit_does_not_revoke_certificate(firestore_fake, sdk_fakes):
+def test_legacy_operation_results_without_skips_keep_their_serialized_shape():
+    from core.integrations.firestore.operations import _result_data, _result_from
+    from core.operations.models import OperationResult
+
+    legacy_data = {"document_id": DOC_ID, "title": "Legacy", "resource_url": None}
+    restored = _result_from(legacy_data)
+    assert restored == OperationResult(document_id=DOC_ID, title="Legacy")
+    assert restored.skipped_utterances is None
+    assert _result_data(restored) == legacy_data
+
+
+def test_independent_edit_after_commit_does_not_revoke_certificate(firestore_fake, sdk_fakes, monkeypatch):
     from core.integrations.firestore.mutations import dispatch_mutation
 
     client = firestore_fake.client_class()
     lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
     _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
     intent_path = f"dialog_save_intents/{save_intent_id}"
     certificate = firestore_fake.documents[intent_path]["completion_certificate"]

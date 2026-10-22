@@ -62,6 +62,7 @@ class OperationResult:
     document_id: str | None = None
     title: str | None = None
     resource_url: str | None = None
+    skipped_utterances: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)

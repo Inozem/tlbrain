@@ -14,6 +14,7 @@ from google.cloud import firestore
 from core.integrations.firestore.client import get_client
 from core.integrations.firestore.operations import _result_data, _result_from, _valid_lease
 from core.operations.models import OperationResult
+from core.integrations.firestore.mutations import _resource_ref
 
 
 SAVE_INTENTS_COLLECTION = "dialog_save_intents"
@@ -472,5 +473,300 @@ def update_save_intent_checkpoints(
         data["updated_at"] = now
         transaction.set(intent_ref, data)
         return _from(data)
+
+    return _txn(db.transaction())
+
+
+def _completion_document_refs(
+    db: Any,
+    intent_ref: Any,
+    verified_content_hash: str,
+) -> tuple[Any, Any, Any, Any] | None:
+    """Resolve the intent's document and prepare the related completion references."""
+    intent_snapshot = intent_ref.get()
+    if not intent_snapshot.exists:
+        return None
+    doc_id = (intent_snapshot.to_dict() or {}).get("doc_id")
+    if not doc_id:
+        return None
+    transcript_ref = db.collection("transcript_index").document(doc_id)
+    receipt_ref = (db.collection("index_completions").document(doc_id)
+                   .collection("generations").document(verified_content_hash))
+    guard_ref = _resource_ref(db, f"document:{doc_id}")
+    return doc_id, transcript_ref, receipt_ref, guard_ref
+
+
+def _completion_replay_result(
+    operation: dict[str, Any],
+    intent: dict[str, Any],
+    *,
+    operation_id: str,
+    save_intent_id: str,
+    doc_id: str,
+    origin_binding: dict[str, str],
+) -> tuple[bool, OperationResult | None]:
+    """Recognize a lost-response replay and return its exact durable result."""
+    if operation.get("state") != "completed":
+        return False, None
+    certificate = intent.get("completion_certificate") or {}
+    stored_result = _result_from(operation.get("result"))
+    if (operation.get("save_intent_id") == save_intent_id
+            and intent.get("save_intent_id") == save_intent_id
+            and intent.get("dispatch_operation_id") == operation_id
+            and intent.get("doc_id") == doc_id
+            and certificate.get("operation_id") == operation_id
+            and certificate.get("save_intent_id") == save_intent_id
+            and certificate.get("doc_id") == doc_id
+            and certificate.get("origin_binding") == origin_binding
+            and stored_result is not None and stored_result.document_id == doc_id):
+        return True, stored_result
+    return True, None
+
+
+def _completion_inputs_valid(
+    operation: dict[str, Any],
+    intent: dict[str, Any],
+    transcript: dict[str, Any],
+    receipt: dict[str, Any],
+    guard: dict[str, Any],
+    *,
+    operation_id: str,
+    save_intent_id: str,
+    owner: str,
+    fence: int,
+    doc_id: str,
+    origin_binding: dict[str, str],
+    verified_content_hash: str,
+    verified_parent_id: str,
+    verified_provider: str,
+    resource_epoch: int,
+    guard_reservation_id: str,
+    commit_now: datetime,
+) -> bool:
+    """Validate operation bindings, indexing evidence, and the active guard reservation."""
+    if (not _valid_lease(operation, owner, fence, commit_now)
+            or operation.get("save_intent_id") != save_intent_id
+            or intent.get("save_intent_id") != save_intent_id
+            or intent.get("dispatch_operation_id") != operation_id
+            or intent.get("state") != SaveIntentState.CONFIRMED.value
+            or intent.get("doc_id") != doc_id
+            or not intent.get("confirmed_result")
+            or not origin_binding
+            or origin_binding.get("context_id") != operation.get("origin_operation_ref")
+            or origin_binding.get("manifest_digest") != operation.get("immutable_input_digest")
+            or not isinstance(origin_binding.get("draft_id"), str)
+            or not origin_binding.get("draft_id")):
+        return False
+    bound_parent_id = (intent.get("desired_parent_id")
+                       or operation.get("selected_folder_id")
+                       or operation.get("explicit_folder_id"))
+    expected_provider = operation.get("expected_provider") or operation.get("provider")
+    if (operation.get("doc_id") not in (None, doc_id)
+            or operation.get("desired_content_hash") != verified_content_hash
+            or intent.get("desired_content_hash") != verified_content_hash
+            or bound_parent_id != verified_parent_id
+            or intent.get("desired_parent_id_hash") != _digest(verified_parent_id)
+            or operation.get("desired_parent_id_hash") != _digest(verified_parent_id)
+            or (expected_provider is not None and verified_provider != expected_provider)
+            or (intent.get("immutable_provider_digest") is not None
+                and intent.get("immutable_provider_digest") != _digest(verified_provider))):
+        return False
+    if (receipt.get("doc_id") != doc_id
+            or receipt.get("content_hash") != verified_content_hash
+            or receipt.get("version") != verified_content_hash
+            or receipt.get("status") != "completed"
+            or receipt.get("provider") != verified_provider
+            or receipt.get("parent_id") != verified_parent_id
+            or receipt.get("parent_id_hash") != _digest(verified_parent_id)
+            or transcript.get("status") != "synced"):
+        return False
+    generation_fields = (
+        "doc_id", "root_folder_id", "content_hash", "version", "parent_id",
+        "parent_id_hash", "provider", "fence", "index_fence", "resource_epoch",
+    )
+    if any(transcript.get(field) != receipt.get(field) for field in generation_fields):
+        return False
+    if (guard.get("finalization_operation_id") != operation_id
+            or guard.get("finalization_reservation_id") != guard_reservation_id
+            or guard.get("finalization_owner") != owner
+            or guard.get("finalization_fence") != fence
+            or guard.get("resource_epoch", 0) != resource_epoch
+            or guard.get("finalization_expires_at") is None
+            or guard.get("finalization_expires_at") <= commit_now):
+        return False
+    return (receipt.get("resource_epoch") == resource_epoch
+            and receipt.get("index_fence") == transcript.get("index_fence"))
+
+
+def _create_completion_artifacts(
+    intent: dict[str, Any],
+    receipt: dict[str, Any],
+    *,
+    operation_id: str,
+    save_intent_id: str,
+    doc_id: str,
+    origin_binding: dict[str, str],
+    verified_content_hash: str,
+    verified_parent_id: str,
+    verified_provider: str,
+    resource_epoch: int,
+    fence: int,
+    certificate_id: str,
+    verified_at: datetime,
+    commit_now: datetime,
+) -> tuple[OperationResult, dict[str, Any], dict[str, Any]] | None:
+    """Build the confirmed result, completion certificate, and cleanup authorization."""
+    confirmed_result = _result_from(intent.get("confirmed_result"))
+    skipped_utterances = receipt.get("skipped_utterances")
+    if (confirmed_result is None or confirmed_result.document_id != doc_id
+            or not isinstance(skipped_utterances, list)
+            or any(isinstance(item, bool) or not isinstance(item, int) for item in skipped_utterances)):
+        return None
+    result = OperationResult(
+        document_id=confirmed_result.document_id,
+        title=confirmed_result.title,
+        resource_url=confirmed_result.resource_url,
+        skipped_utterances=tuple(skipped_utterances),
+    )
+    certificate = {
+        "certificate_id": certificate_id,
+        "save_intent_id": save_intent_id,
+        "operation_id": operation_id,
+        "doc_id": doc_id,
+        "origin_binding": dict(origin_binding),
+        "content_hash": verified_content_hash,
+        "parent_id_hash": _digest(verified_parent_id),
+        "provider": verified_provider,
+        "receipt_ref": f"index_completions/{doc_id}/generations/{verified_content_hash}",
+        "receipt_version": receipt.get("version"),
+        "index_fence": receipt.get("index_fence"),
+        "resource_epoch": resource_epoch,
+        "fence": fence,
+        "verified_at": verified_at,
+        "completed_at": commit_now,
+    }
+    cleanup_authorization = {
+        "certificate_id": certificate_id,
+        "save_intent_id": save_intent_id,
+        "operation_id": operation_id,
+        "origin_binding": dict(origin_binding),
+    }
+    return result, certificate, cleanup_authorization
+
+
+def _write_completed_save(
+    transaction: firestore.Transaction,
+    intent_ref: Any,
+    operation_ref: Any,
+    guard_ref: Any,
+    intent: dict[str, Any],
+    operation: dict[str, Any],
+    guard: dict[str, Any],
+    *,
+    result: OperationResult,
+    certificate: dict[str, Any],
+    cleanup_authorization: dict[str, Any],
+    verified_parent_id: str,
+    commit_now: datetime,
+) -> OperationResult:
+    """Persist completion evidence and release the matching guard atomically."""
+    intent.update({"desired_parent_id": verified_parent_id,
+                   "completion_certificate": certificate,
+                   "cleanup_authorization": cleanup_authorization,
+                   "updated_at": commit_now})
+    operation.update({
+        "state": "completed", "doc_id": result.document_id, "result": _result_data(result),
+        "document_finalized": True, "cleanup_authorization": cleanup_authorization,
+        "finished_at": commit_now, "status_updated_at": commit_now, "updated_at": commit_now,
+    })
+    for field in ("finalization_reservation_id", "finalization_operation_id",
+                  "finalization_owner", "finalization_fence", "finalization_expires_at"):
+        guard.pop(field, None)
+    guard.update({"mutation_state": "idle", "updated_at": commit_now})
+    transaction.set(intent_ref, intent)
+    transaction.set(operation_ref, operation)
+    transaction.set(guard_ref, guard)
+    return result
+
+
+def finalize_save_completion(
+    client: Any | None,
+    *,
+    operation_id: str,
+    save_intent_id: str,
+    owner: str,
+    fence: int,
+    origin_binding: dict[str, str],
+    now: datetime,
+    verified_content_hash: str,
+    verified_parent_id: str,
+    verified_provider: str,
+    resource_epoch: int,
+    guard_reservation_id: str,
+    certificate_id: str,
+    verified_at: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> OperationResult | None:
+    """Atomically complete the operation and issue immutable cleanup evidence."""
+    now = _aware(now)
+    verified_at = _aware(verified_at or now)
+    clock = clock or (lambda: datetime.now(timezone.utc))
+    db = _db(client)
+    operation_ref = db.collection(OPERATIONS_COLLECTION).document(operation_id)
+    intent_ref = db.collection(SAVE_INTENTS_COLLECTION).document(save_intent_id)
+    references = _completion_document_refs(db, intent_ref, verified_content_hash)
+    if references is None:
+        return None
+    doc_id, transcript_ref, receipt_ref, guard_ref = references
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> OperationResult | None:
+        commit_now = _aware(clock())
+        op_snapshot = operation_ref.get(transaction=transaction)
+        intent_snapshot = intent_ref.get(transaction=transaction)
+        transcript_snapshot = transcript_ref.get(transaction=transaction)
+        receipt_snapshot = receipt_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
+        if not all((op_snapshot.exists, intent_snapshot.exists, transcript_snapshot.exists,
+                    receipt_snapshot.exists, guard_snapshot.exists)):
+            return None
+        operation = op_snapshot.to_dict() or {}
+        intent = intent_snapshot.to_dict() or {}
+        transcript = transcript_snapshot.to_dict() or {}
+        receipt = receipt_snapshot.to_dict() or {}
+        guard = guard_snapshot.to_dict() or {}
+
+        is_replay, replay_result = _completion_replay_result(
+            operation, intent, operation_id=operation_id, save_intent_id=save_intent_id,
+            doc_id=doc_id, origin_binding=origin_binding,
+        )
+        if is_replay:
+            return replay_result
+
+        if not _completion_inputs_valid(
+            operation, intent, transcript, receipt, guard,
+            operation_id=operation_id, save_intent_id=save_intent_id, owner=owner,
+            fence=fence, doc_id=doc_id, origin_binding=origin_binding,
+            verified_content_hash=verified_content_hash, verified_parent_id=verified_parent_id,
+            verified_provider=verified_provider, resource_epoch=resource_epoch,
+            guard_reservation_id=guard_reservation_id, commit_now=commit_now,
+        ):
+            return None
+
+        artifacts = _create_completion_artifacts(
+            intent, receipt, operation_id=operation_id, save_intent_id=save_intent_id,
+            doc_id=doc_id, origin_binding=origin_binding,
+            verified_content_hash=verified_content_hash, verified_parent_id=verified_parent_id,
+            verified_provider=verified_provider, resource_epoch=resource_epoch, fence=fence,
+            certificate_id=certificate_id, verified_at=verified_at, commit_now=commit_now,
+        )
+        if artifacts is None:
+            return None
+        result, certificate, cleanup_authorization = artifacts
+        return _write_completed_save(
+            transaction, intent_ref, operation_ref, guard_ref, intent, operation, guard,
+            result=result, certificate=certificate, cleanup_authorization=cleanup_authorization,
+            verified_parent_id=verified_parent_id, commit_now=commit_now,
+        )
 
     return _txn(db.transaction())
