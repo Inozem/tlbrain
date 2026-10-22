@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from google.genai import types
@@ -62,7 +63,7 @@ def _install_effect_recorder(monkeypatch):
     effects: list[tuple[str, object]] = []
     names = (
         "update_index", "upsert_utterances", "upsert_summaries", "upsert_facts",
-        "delete_old_versions", "update_skipped_utterances", "mark_synced",
+        "delete_old_versions", "update_skipped_utterances",
     )
     originals = {name: getattr(processor, name) for name in names}
 
@@ -113,7 +114,6 @@ def test_full_reindex_freezes_effect_order_and_persisted_checkpoints(
         "delete_old_versions",
         "update_skipped_utterances",
         "update_index",                 # parent/content hash/version checkpoint
-        "mark_synced",
         "update_index",                 # utterance_hashes checkpoint
         "update_index",                 # speakers checkpoint
     ]
@@ -124,7 +124,7 @@ def test_full_reindex_freezes_effect_order_and_persisted_checkpoints(
         "content_hash": version,
         "version": version,
     })
-    assert effects[11] == ("update_index", {"utterance_hashes": {
+    assert effects[10] == ("update_index", {"utterance_hashes": {
         "0": "52dc41703dbd24e6d7f4e65e5795fb6874c6fa0c4b9dbf7bab760d1bfbdf40cd",
         "1": "b6c81b7725e929a617d430e66180797f9c62f5a2676803406ca2431fbe45abe6",
         "2": "3d2f108a757a970ad55625ef47db4010c35ed230588e0fc833083b487f5e90dc",
@@ -136,7 +136,7 @@ def test_full_reindex_freezes_effect_order_and_persisted_checkpoints(
         "8": "4e600bdac560b43ce4c3daa775c33c5aa9dde8a39366d50edd54da6fc481f683",
         "9": "f4650c87d9f4f2e26d26ac56a0e5d7220ff56be6872182e2e956bafb5d094ef0",
     }})
-    assert effects[12] == ("update_index", {"speakers": ["Fixture Speaker A", "Fixture Speaker B"]})
+    assert effects[11] == ("update_index", {"speakers": ["Fixture Speaker A", "Fixture Speaker B"]})
 
     upsert_calls = _upsert_events(sdk_fakes)
     assert [[point.payload["type"] for point in call["points"]] for call in upsert_calls] == [
@@ -198,9 +198,31 @@ def test_full_reindex_freezes_effect_order_and_persisted_checkpoints(
     assert index["parent_id_hash"] == "0bcf77c60f7b290aad8540b7672b0288e91c6605aaa327fd31c2279da3c6f677"
     assert index["content_hash"] == version
     assert index["version"] == version
-    assert index["utterance_hashes"] == effects[11][1]["utterance_hashes"]
+    assert index["utterance_hashes"] == effects[10][1]["utterance_hashes"]
     assert index["speakers"] == ["Fixture Speaker A", "Fixture Speaker B"]
     assert index["skipped_utterances"] == []
+
+
+def test_expired_index_lease_recovers_recent_syncing_status(
+    app_root, sdk_fakes, firestore_fake,
+):
+    from core.integrations.firestore.mutations import _resource_ref
+
+    raw = _prepare_inputs(app_root, sdk_fakes, firestore_fake)
+    now = datetime.now(timezone.utc)
+    firestore_fake.client_class().collection("transcript_index").document(DOC_ID).update({
+        "status": "syncing", "status_changed_at": now, "index_fence": 4,
+    })
+    _resource_ref(firestore_fake.client_class(), f"document:{DOC_ID}").set({
+        "resource": f"document:{DOC_ID}", "index_owner": "expired-worker",
+        "index_fence": 4, "index_expires_at": now - timedelta(minutes=1),
+        "resource_epoch": 0, "unsettled_effect_ids": [],
+    })
+
+    assert processor.process_one(DOC_ID, PARENT_ID, ROOT_ID, raw) == "processed"
+    index = firestore_fake.documents[INDEX_PATH]
+    assert index["status"] == "synced"
+    assert index["index_fence"] == 5
 
 
 @pytest.mark.parametrize("failure_boundary", ["utterance_write", "content_checkpoint", "old_cleanup"])
@@ -210,6 +232,9 @@ def test_full_reindex_failure_is_marked_and_retry_recovers(
     raw = _prepare_inputs(app_root, sdk_fakes, firestore_fake)
     effects, originals = _install_effect_recorder(monkeypatch)
     failure = ValueError(f"synthetic {failure_boundary} failure")
+    if failure_boundary in {"utterance_write", "old_cleanup"}:
+        # The SDK fake rejects before applying the queued request.
+        failure.outcome = "rejected"
 
     if failure_boundary == "utterance_write":
         sdk_fakes.qdrant.queue("upsert", error=failure)

@@ -124,7 +124,6 @@ def _install_failure(monkeypatch, firestore_fake, boundary: str):
         "content": ("update_index", lambda fields: "content_hash" in fields, 1),
         "full_hash_map": ("update_index", lambda fields: "utterance_hashes" in fields, 1),
         "speakers": ("update_index", lambda fields: "speakers" in fields, 1),
-        "mark_synced": ("mark_synced", lambda _fields: True, 1),
         "skipped": ("update_skipped_utterances", lambda _fields: True, 1),
         "utterance_delete": ("delete_utterances_by_order_indexes", lambda _fields: True, 1),
         "summary_delete": ("delete_summaries_by_center_indexes", lambda _fields: True, 1),
@@ -136,6 +135,11 @@ def _install_failure(monkeypatch, firestore_fake, boundary: str):
     original = getattr(processor, name)
     calls = 0
     error = ValueError(f"synthetic {boundary} failure")
+    # This injector raises before invoking the Qdrant writer, so it proves no
+    # request was dispatched and may safely release the batch reservation.
+    if name in {"delete_utterances_by_order_indexes", "delete_summaries_by_center_indexes",
+                "upsert_utterances", "upsert_summaries", "upsert_facts"}:
+        error.outcome = "rejected"
 
     def injected(*args, **kwargs):
         nonlocal calls
@@ -165,7 +169,7 @@ def test_incremental_diff_scopes_checkpoints_and_write_order(app_root, sdk_fakes
     effects: list[tuple[str, object]] = []
     dotted_snapshots: list[dict] = []
     names = ("update_index", "delete_utterances_by_order_indexes", "delete_summaries_by_center_indexes",
-             "upsert_utterances", "upsert_summaries", "upsert_facts", "update_skipped_utterances", "mark_synced")
+              "upsert_utterances", "upsert_summaries", "upsert_facts", "update_skipped_utterances")
     for name in names:
         original = getattr(processor, name)
         def wrap(*args, _name=name, _original=original, **kwargs):
@@ -216,7 +220,7 @@ def test_incremental_diff_scopes_checkpoints_and_write_order(app_root, sdk_fakes
     assert [name for name, _ in effects] == [
         "update_index", "update_index", "delete_utterances_by_order_indexes", "delete_summaries_by_center_indexes",
         "upsert_utterances", "update_index", "update_index", "upsert_summaries", "upsert_facts",
-        "update_skipped_utterances", "update_index", "mark_synced", "update_index", "update_index", "update_index",
+        "update_skipped_utterances", "update_index", "update_index", "update_index", "update_index",
     ]
     assert effects[0][1] == {"pending_window_centers": [5, 6, 7, 8, 9, 10, 11]}
     assert set(effects[2][1]) == {7, 8, 9}
@@ -230,15 +234,14 @@ def test_incremental_diff_scopes_checkpoints_and_write_order(app_root, sdk_fakes
     assert dotted_snapshots[1]["7"] == new_hashes["7"]
     assert effects[9][1] == [0]
     assert effects[10][1]["content_hash"] == index["content_hash"]
-    assert effects[11][0] == "mark_synced"
-    assert effects[13][1] == {"speakers": index["speakers"]}
+    assert effects[12][1] == {"speakers": index["speakers"]}
     assert "pending_window_centers" in effects[-1][1]
     assert "pending_window_centers" not in index
 
 
 @pytest.mark.parametrize("boundary", [
     "marker_reserve", "metadata", "utterance_delete", "summary_delete", "utterance_upsert", "changed_hash_1", "changed_hash_2",
-    "summary_upsert", "fact_upsert", "skipped", "content", "mark_synced", "full_hash_map", "speakers",
+    "summary_upsert", "fact_upsert", "skipped", "content", "full_hash_map", "speakers",
     "marker_cleanup",
 ])
 def test_incremental_faults_recover_all_pending_windows_and_checkpoints(

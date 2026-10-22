@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from google.cloud import firestore
 
 from core.integrations.firestore.client import get_client
+from core.integrations.firestore.mutations import _resource_ref, _locked_guard
 
 
 COMPLETIONS_COLLECTION = "index_completions"
@@ -147,24 +148,70 @@ def publish_completion(
     db = _db(client)
     transcript_ref = db.collection(TRANSCRIPT_INDEX_COLLECTION).document(data["doc_id"])
     receipt_ref = _receipt_ref(db, data["doc_id"], data["content_hash"])
+    guard_ref = _resource_ref(db, f"document:{data['doc_id']}")
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction) -> bool:
+        commit_now = now or datetime.now(timezone.utc)
         transcript_snapshot = transcript_ref.get(transaction=transaction)
         receipt_snapshot = receipt_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
         if not transcript_snapshot.exists:
             return False
         transcript = transcript_snapshot.to_dict() or {}
         if not _is_current(transcript, data):
+            return False
+        guard = guard_snapshot.to_dict() if guard_snapshot.exists else {}
+        expiry = guard.get("index_expires_at")
+        if (not guard_snapshot.exists or
+            guard.get("index_fence") != data["index_fence"]
+            or guard.get("index_owner") != data["owner"]
+            or _locked_guard(guard)
+            or guard.get("resource_epoch", 0) != data["resource_epoch"]
+            or not isinstance(expiry, datetime) or expiry <= commit_now):
             return False
         if receipt_snapshot.exists:
             existing = _validated_stored(
                 receipt_snapshot.to_dict() or {}, doc_id=data["doc_id"], content_hash=data["content_hash"],
             )
             if existing != data:
+                stable_fields = (
+                    "doc_id", "root_folder_id", "content_hash", "version", "parent_id",
+                    "parent_id_hash", "provider", "status", "skipped_utterances", "work_manifest_ref",
+                )
+                same_checkpoints = (
+                    existing.get("checkpoint_refs", [])[:2] == data.get("checkpoint_refs", [])[:2]
+                    if not str(data.get("work_manifest_ref", "")).startswith("legacy-index/")
+                    else True
+                )
+                if (all(existing.get(field) == data.get(field) for field in stable_fields)
+                        and same_checkpoints
+                        and data.get("resource_epoch", 0) >= existing.get("resource_epoch", 0)
+                        and data.get("fence", 0) >= existing.get("fence", 0)
+                        and data.get("index_fence", 0) > existing.get("index_fence", 0)):
+                    # A takeover may republish a same-generation receipt with its
+                    # newer index fence, but cannot overwrite a changed generation.
+                    transaction.set(receipt_ref, data)
+                    transcript.update({
+                        "status": "synced", "error": None,
+                        "status_changed_at": commit_now,
+                    })
+                    transaction.set(transcript_ref, transcript)
+                    return True
                 raise ValueError("completion generation already has a different receipt")
+            else:
+                transcript.update({
+                    "status": "synced", "error": None,
+                    "status_changed_at": commit_now,
+                })
+                transaction.set(transcript_ref, transcript)
             return True
         transaction.set(receipt_ref, data)
+        transcript.update({
+            "status": "synced", "error": None,
+            "status_changed_at": commit_now,
+        })
+        transaction.set(transcript_ref, transcript)
         return True
 
     return _txn(db.transaction())

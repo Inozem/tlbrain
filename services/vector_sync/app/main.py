@@ -1,6 +1,7 @@
 import logging
+import json
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from googleapiclient.errors import HttpError
 
@@ -12,7 +13,7 @@ from core.integrations.firestore.transcripts import ensure_imported, load_index
 from core.documents import operations as document_operations
 from core.integrations.qdrant.setup import ensure_collection
 from core.utils.logging import configure_logging
-from core.indexing.processor import process_one
+from core.indexing.processor import process_one, process_managed_one
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -27,7 +28,23 @@ async def health():
 
 
 @app.post("/sync/doc/{doc_id}")
-async def sync_doc_endpoint(doc_id: str):
+async def sync_doc_endpoint(doc_id: str, request: Request):
+    raw_body = await request.body()
+    managed_reference = None
+    if raw_body:
+        try:
+            payload = json.loads(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            return JSONResponse(content={"status": "error", "details": "invalid JSON body"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse(content={"status": "error", "details": "request body must be an object"}, status_code=400)
+        if payload.get("target_kind") == "index_dispatch":
+            managed_reference = payload
+        elif payload.get("target_kind") is None:
+            if payload.get("doc_id", doc_id) != doc_id:
+                return JSONResponse(content={"status": "error", "details": "route document ID mismatch"}, status_code=400)
+        else:
+            return JSONResponse(content={"status": "error", "details": "unsupported managed target kind"}, status_code=400)
     root_folder_id = get_root_folder_id()
 
     existing = load_index(doc_id)
@@ -68,7 +85,12 @@ async def sync_doc_endpoint(doc_id: str):
     ensure_imported(doc_id, parent_id, source_file=file_name or "")
 
     try:
-        result = process_one(doc_id, parent_id, root_folder_id, raw_text=raw_text)
+        if managed_reference is not None:
+            result = process_managed_one(
+                doc_id, parent_id, root_folder_id, raw_text, managed_reference,
+            )
+        else:
+            result = process_one(doc_id, parent_id, root_folder_id, raw_text=raw_text)
         return JSONResponse(content={"status": "ok", "result": result})
     except Exception as e:
         return JSONResponse(

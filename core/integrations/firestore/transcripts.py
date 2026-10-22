@@ -222,12 +222,27 @@ def ensure_imported(doc_id: str, parent_id: str, source_file: str = "") -> bool:
     return result
 
 
-def mark_synced(doc_id: str) -> None:
-    get_client().collection(COLLECTION_NAME).document(doc_id).update({
-        "status": "synced",
-        "error": None,
-        "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
+def mark_synced(doc_id: str, index_fence: int | None = None) -> None:
+    client = get_client()
+    ref = client.collection(COLLECTION_NAME).document(doc_id)
+    if index_fence is None:
+        ref.update({
+            "status": "synced", "error": None,
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
+        })
+    else:
+        @firestore.transactional
+        def _txn(transaction: firestore.Transaction) -> bool:
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists or (snapshot.to_dict() or {}).get("index_fence") != index_fence:
+                return False
+            transaction.update(ref, {
+                "status": "synced", "error": None,
+                "status_changed_at": firestore.SERVER_TIMESTAMP,
+            })
+            return True
+        if not _txn(client.transaction()):
+            return
     logger.info("Marked synced: %s", doc_id)
 
 
@@ -239,6 +254,26 @@ def mark_error(doc_id: str, error: str, error_stage: str = "vector_sync") -> Non
         "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
     logger.info("Marked error: %s — %s (stage=%s)", doc_id, error, error_stage)
+
+
+def mark_error_if_index_fence(doc_id: str, error: str, index_fence: int,
+                              db: firestore.Client | None = None) -> bool:
+    """Record a sync error only if the transcript still belongs to this index worker."""
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(doc_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        snapshot = ref.get(transaction=transaction)
+        if not snapshot.exists or (snapshot.to_dict() or {}).get("index_fence") != index_fence:
+            return False
+        transaction.update(ref, {
+            "status": "error", "error": error, "error_stage": "vector_sync",
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
+        })
+        return True
+
+    return _txn(client.transaction())
 
 
 def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:

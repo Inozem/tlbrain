@@ -90,7 +90,7 @@ def test_repeated_unchanged_processing_only_marks_synced(app_root, sdk_fakes, fi
     assert final["content_hash"] == initial["content_hash"]
     assert final["parent_id"] == PARENT_ID
     assert final["parent_id_hash"] == sha256_text(PARENT_ID)
-    assert [name for name, _, _ in effects] == ["mark_synced", "mark_synced"]
+    assert effects == []  # the receipt transaction, not a branch-local helper, commits synced status
     assert len(_qdrant_events(sdk_fakes)) == 0
     assert _embedding_events(sdk_fakes) == []
 
@@ -110,7 +110,7 @@ def test_parent_only_change_updates_payload_and_parent_checkpoint_without_embedd
     assert final["parent_id"] == NEW_PARENT_ID
     assert final["parent_id_hash"] == sha256_text(NEW_PARENT_ID)
     assert final["content_hash"] == sha256_text(raw)
-    assert [name for name, _, _ in effects] == ["set_payload_parent_id", "update_index", "mark_synced"]
+    assert [name for name, _, _ in effects] == ["set_payload_parent_id", "update_index"]
     assert effects[0][1] == (DOC_ID, ROOT_ID, NEW_PARENT_ID)
     assert effects[1][1][1] == {"parent_id": NEW_PARENT_ID, "parent_id_hash": sha256_text(NEW_PARENT_ID)}
     payload_calls = _qdrant_events(sdk_fakes, "set_payload")
@@ -139,7 +139,7 @@ def test_date_only_change_updates_metadata_and_qdrant_date_without_embeddings(
     assert final["content_hash"] == sha256_text(new_raw)
     assert final["parent_id"] == PARENT_ID
     assert final["parent_id_hash"] == sha256_text(PARENT_ID)
-    assert [name for name, _, _ in effects] == ["set_payload_dialog_date", "update_index", "mark_synced"]
+    assert [name for name, _, _ in effects] == ["set_payload_dialog_date", "update_index"]
     assert effects[0][1] == (DOC_ID, ROOT_ID, "2026-01-13", 20260113)
     assert effects[1][1][1]["dialog_date"] == "2026-01-13"
     assert effects[1][1][1]["parent_id_hash"] == sha256_text(PARENT_ID)
@@ -166,7 +166,7 @@ def test_claim_fresh_stale_cutoff_and_missing_document_use_transactional_sdk(
     fresh_record = {
         "doc_id": DOC_ID,
         "status": "syncing",
-        "status_changed_at": NOW - timedelta(minutes=15) + timedelta(seconds=1),
+        "status_changed_at": datetime.now(timezone.utc) - timedelta(minutes=15) + timedelta(seconds=1),
     }
     ref.set(fresh_record)
     effects = []

@@ -27,11 +27,11 @@ def _run(coroutine):
     raise AssertionError("in-process ASGI coroutine unexpectedly suspended")
 
 
-def _request(app, doc_id="doc-1"):
+def _request(app, doc_id="doc-1", body=None):
     async def request():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://vector-sync.test") as client:
-            return await client.post(f"/sync/doc/{doc_id}")
+            return await client.post(f"/sync/doc/{doc_id}", json=body)
 
     return _run(request())
 
@@ -92,6 +92,24 @@ def test_process_one_exception_has_controlled_http_500(vector_main, monkeypatch)
     response = _request(vector_main.app)
     assert response.status_code == 500
     assert response.json() == {"status": "error", "details": "scripted processor failure"}
+
+
+def test_legacy_body_extras_are_ignored_but_route_id_is_checked(vector_main, monkeypatch):
+    calls = []
+    monkeypatch.setattr(vector_main, "load_index", lambda _doc_id: None)
+    monkeypatch.setattr(vector_main, "get_file_parent_folder_id", lambda _doc_id: ("folder-1", False, "sample.docx"))
+    monkeypatch.setattr(vector_main, "get_folder_by_id", lambda _folder_id: {"folder_id": "folder-1"})
+    monkeypatch.setattr(vector_main, "read_google_doc", lambda _doc_id: "synthetic transcript")
+    monkeypatch.setattr(document_operations, "validate_document_format", lambda *_args: True)
+    monkeypatch.setattr(vector_main, "ensure_imported", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(vector_main, "process_one", lambda *args, **kwargs: calls.append(args[0]) or "processed")
+
+    response = _request(vector_main.app, body={"doc_id": "doc-1", "parent_id": "old", "legacy_field": "ignored"})
+    assert response.status_code == 200
+    assert calls == ["doc-1"]
+    mismatch = _request(vector_main.app, body={"doc_id": "another-doc", "legacy_field": "ignored"})
+    assert mismatch.status_code == 400
+    assert calls == ["doc-1"]
 
 
 def _drive_missing(_doc_id):

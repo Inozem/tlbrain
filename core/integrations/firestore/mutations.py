@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
 from google.cloud import firestore
@@ -120,6 +120,275 @@ def get_resource_guard(client: Any | None, resource: str) -> ResourceGuard:
     return _guard_from(snapshot.to_dict() if snapshot.exists else None, resource)
 
 
+def acquire_index_guard(
+    client: Any | None, *, doc_id: str, owner: str, now: datetime, lease_seconds: int | float,
+    root_folder_id: str | None = None, operation_fence: int = 0,
+    allow_unsettled_index_effects: bool = False,
+) -> tuple[int, int] | None:
+    """Acquire the document resource guard with a transcript-local index fence."""
+    now = _aware(now)
+    if not doc_id or not owner or lease_seconds <= 0:
+        raise ValueError("doc_id, owner, and a positive lease_seconds are required")
+    db = _db(client)
+    transcript_ref = db.collection("transcript_index").document(doc_id)
+    resource = f"document:{doc_id}"
+    guard_ref = _resource_ref(db, resource)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> tuple[int, int] | None:
+        transcript_snapshot = transcript_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
+        transcript = transcript_snapshot.to_dict() if transcript_snapshot.exists else {}
+        guard = guard_snapshot.to_dict() if guard_snapshot.exists else {}
+        if transcript.get("status") == "syncing":
+            changed_at = transcript.get("status_changed_at")
+            cutoff = now - timedelta(minutes=15)
+            if isinstance(changed_at, datetime) and changed_at > cutoff:
+                previous_fence = transcript.get("index_fence")
+                tied_to_expired_index_claim = bool(
+                    isinstance(previous_fence, int) and not isinstance(previous_fence, bool)
+                    and previous_fence > 0
+                    and guard.get("index_fence") == previous_fence
+                    and guard.get("index_owner")
+                    and isinstance(guard.get("index_expires_at"), datetime)
+                    and guard.get("index_expires_at") <= now
+                )
+                if not tied_to_expired_index_claim:
+                    return None
+        expiry = guard.get("expires_at")
+        index_expiry = guard.get("index_expires_at")
+        active_regular_owner = bool(
+            guard.get("owner_operation_id")
+            and isinstance(expiry, datetime) and expiry > now
+        )
+        if active_regular_owner:
+            return None
+        index_intents = guard.get("index_effect_intents", {})
+        unsettled = set(guard.get("unsettled_effect_ids", ()))
+        can_reconcile_index_effects = bool(
+            allow_unsettled_index_effects and unsettled
+            and unsettled.issubset(index_intents)
+            and guard.get("index_owner")
+            and (not isinstance(index_expiry, datetime) or index_expiry <= now)
+        )
+        if (_locked_guard(guard) and not can_reconcile_index_effects) or (
+            isinstance(index_expiry, datetime) and index_expiry > now
+            and guard.get("index_owner") != owner
+        ):
+            return None
+        fence = max(int(transcript.get("index_fence", 0)), int(guard.get("index_fence", 0))) + 1
+        resource_epoch = max(int(transcript.get("resource_epoch", 0)), int(guard.get("resource_epoch", 0)))
+        expires_at = now + timedelta(seconds=lease_seconds)
+        transcript.update({"doc_id": doc_id, "index_fence": fence, "resource_epoch": resource_epoch,
+                           "fence": operation_fence, "status": "syncing",
+                           "status_changed_at": now})
+        if root_folder_id is not None:
+            transcript["root_folder_id"] = root_folder_id
+        guard.update({
+            "resource": resource, "index_owner": owner, "index_fence": fence,
+            "index_expires_at": expires_at, "resource_epoch": resource_epoch,
+            "mutation_state": "reconciling" if can_reconcile_index_effects else "indexing", "updated_at": now,
+        })
+        transaction.set(transcript_ref, transcript)
+        transaction.set(guard_ref, guard)
+        return fence, resource_epoch
+
+    return _txn(db.transaction())
+
+
+def get_unsettled_index_effects(client: Any | None, doc_id: str) -> dict[str, dict[str, Any]]:
+    """Return compact durable index intents that still block this document."""
+    snapshot = _resource_ref(_db(client), f"document:{doc_id}").get()
+    if not snapshot.exists:
+        return {}
+    data = snapshot.to_dict() or {}
+    unsettled = set(data.get("unsettled_effect_ids", ()))
+    intents = data.get("index_effect_intents", {})
+    return {effect_id: dict(intents[effect_id]) for effect_id in unsettled if effect_id in intents}
+
+
+def settle_reconciled_index_effect(
+    client: Any | None, *, doc_id: str, owner: str, fence: int,
+    effect_id: str, now: datetime,
+) -> bool:
+    """Settle an older unknown batch after caller read-back under a current claim."""
+    now = _aware(now)
+    db = _db(client)
+    transcript_ref = db.collection("transcript_index").document(doc_id)
+    guard_ref = _resource_ref(db, f"document:{doc_id}")
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        transcript_snapshot = transcript_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
+        if not transcript_snapshot.exists or not guard_snapshot.exists:
+            return False
+        transcript = transcript_snapshot.to_dict() or {}
+        guard = guard_snapshot.to_dict() or {}
+        expiry = guard.get("index_expires_at")
+        if (transcript.get("index_fence") != fence or guard.get("index_fence") != fence
+                or guard.get("index_owner") != owner or not isinstance(expiry, datetime) or expiry <= now):
+            return False
+        intent = dict((guard.get("index_effect_intents") or {}).get(effect_id) or {})
+        if intent.get("state") not in {"unknown", "dispatched"} or intent.get("fence", fence) >= fence:
+            return False
+        unsettled = list(guard.get("unsettled_effect_ids", ()))
+        if effect_id not in unsettled:
+            return False
+        unsettled.remove(effect_id)
+        intents = dict(guard.get("index_effect_intents") or {})
+        intents.pop(effect_id, None)
+        guard.update({"unsettled_effect_ids": unsettled, "index_effect_intents": intents,
+                      "mutation_state": "reconciling" if unsettled else "indexing", "updated_at": now})
+        transaction.set(guard_ref, guard)
+        return True
+
+    return _txn(db.transaction())
+
+
+def renew_index_guard(
+    client: Any | None, *, doc_id: str, owner: str, fence: int,
+    now: datetime, lease_seconds: int | float,
+    allow_unsettled_index_effects: bool = False,
+) -> bool:
+    """Renew an index resource guard only while its fence and lease are current."""
+    now = _aware(now)
+    db = _db(client)
+    transcript_ref = db.collection("transcript_index").document(doc_id)
+    guard_ref = _resource_ref(db, f"document:{doc_id}")
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        transcript_snapshot = transcript_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
+        if not transcript_snapshot.exists or not guard_snapshot.exists:
+            return False
+        transcript = transcript_snapshot.to_dict() or {}
+        guard = guard_snapshot.to_dict() or {}
+        expiry = guard.get("index_expires_at")
+        unsettled = set(guard.get("unsettled_effect_ids", ()))
+        intents = guard.get("index_effect_intents", {})
+        may_hold_unknown_index_effects = bool(
+            allow_unsettled_index_effects and unsettled and unsettled.issubset(intents)
+        )
+        if (transcript.get("index_fence") != fence or guard.get("index_fence") != fence
+                or guard.get("index_owner") != owner or not isinstance(expiry, datetime) or expiry <= now
+                or (_locked_guard(guard) and not may_hold_unknown_index_effects)):
+            return False
+        guard.update({"index_expires_at": now + timedelta(seconds=lease_seconds), "updated_at": now})
+        transaction.set(guard_ref, guard)
+        return True
+
+    return _txn(db.transaction())
+
+
+def begin_index_effect(
+    client: Any | None, *, doc_id: str, owner: str, fence: int, effect_id: str,
+    kind: str, payload_digest: str, now: datetime, readback: dict[str, Any] | None = None,
+) -> bool:
+    """Durably record one Qdrant batch intent before issuing its I/O."""
+    now = _aware(now)
+    db = _db(client)
+    transcript_ref = db.collection("transcript_index").document(doc_id)
+    guard_ref = _resource_ref(db, f"document:{doc_id}")
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        transcript_snapshot = transcript_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
+        if not transcript_snapshot.exists or not guard_snapshot.exists:
+            return False
+        transcript = transcript_snapshot.to_dict() or {}
+        guard = guard_snapshot.to_dict() or {}
+        expiry = guard.get("index_expires_at")
+        if (transcript.get("index_fence") != fence or guard.get("index_fence") != fence
+                or guard.get("index_owner") != owner or not isinstance(expiry, datetime) or expiry <= now
+                or _locked_guard(guard)):
+            return False
+        unsettled = list(guard.get("unsettled_effect_ids", ()))
+        unsettled.append(effect_id)
+        intents = dict(guard.get("index_effect_intents", {}))
+        intents[effect_id] = {"kind": kind, "payload_digest": payload_digest, "fence": fence,
+                              "state": "dispatched", "readback": dict(readback or {})}
+        guard.update({"unsettled_effect_ids": unsettled, "index_effect_intents": intents,
+                      "mutation_state": "dispatched", "updated_at": now})
+        transaction.set(guard_ref, guard)
+        return True
+
+    return _txn(db.transaction())
+
+
+def settle_index_effect(
+    client: Any | None, *, doc_id: str, owner: str, fence: int,
+    effect_id: str, now: datetime, confirmed: bool, known_not_applied: bool = False,
+) -> bool:
+    """Clear a batch reservation only after known success under its original fence."""
+    now = _aware(now)
+    db = _db(client)
+    transcript_ref = db.collection("transcript_index").document(doc_id)
+    guard_ref = _resource_ref(db, f"document:{doc_id}")
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        transcript_snapshot = transcript_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
+        if not transcript_snapshot.exists or not guard_snapshot.exists:
+            return False
+        transcript = transcript_snapshot.to_dict() or {}
+        guard = guard_snapshot.to_dict() or {}
+        expiry = guard.get("index_expires_at")
+        if (transcript.get("index_fence") != fence or guard.get("index_fence") != fence
+                or guard.get("index_owner") != owner or not isinstance(expiry, datetime) or expiry <= now):
+            return False
+        intents = dict(guard.get("index_effect_intents", {}))
+        intent = intents.get(effect_id)
+        if not intent or intent.get("fence") != fence:
+            return False
+        if not confirmed and not known_not_applied:
+            intent["state"] = "unknown"
+            intents[effect_id] = intent
+            guard.update({"index_effect_intents": intents, "mutation_state": "unknown", "updated_at": now})
+            transaction.set(guard_ref, guard)
+            return True
+        unsettled = [item for item in guard.get("unsettled_effect_ids", ()) if item != effect_id]
+        intents.pop(effect_id, None)
+        guard.update({"unsettled_effect_ids": unsettled, "index_effect_intents": intents,
+                      "mutation_state": "indexing" if not unsettled else guard.get("mutation_state"),
+                      "updated_at": now})
+        transaction.set(guard_ref, guard)
+        return True
+
+    return _txn(db.transaction())
+
+
+def release_index_guard(
+    client: Any | None, *, doc_id: str, owner: str, fence: int, now: datetime,
+) -> bool:
+    """Release a completed index claim while retaining guard epochs and effect history."""
+    now = _aware(now)
+    db = _db(client)
+    transcript_ref = db.collection("transcript_index").document(doc_id)
+    guard_ref = _resource_ref(db, f"document:{doc_id}")
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        transcript_snapshot = transcript_ref.get(transaction=transaction)
+        guard_snapshot = guard_ref.get(transaction=transaction)
+        if not transcript_snapshot.exists or not guard_snapshot.exists:
+            return False
+        transcript = transcript_snapshot.to_dict() or {}
+        guard = guard_snapshot.to_dict() or {}
+        if (transcript.get("index_fence") != fence or guard.get("index_fence") != fence
+                or guard.get("index_owner") != owner or _locked_guard(guard)):
+            return False
+        guard.update({"index_owner": None, "index_expires_at": None,
+                      "mutation_state": "idle", "updated_at": now})
+        transaction.set(guard_ref, guard)
+        return True
+
+    return _txn(db.transaction())
+
+
 def get_mutation_effect(client: Any | None, operation_id: str, effect_id: str) -> OperationEffect | None:
     """Read the durable typed identity and state for a mutation effect."""
     snapshot = _effect_ref(_db(client), operation_id, effect_id).get()
@@ -139,6 +408,12 @@ def get_mutation_result(client: Any | None, operation_id: str, effect_id: str) -
 
 def _locked_guard(data: dict[str, Any] | None) -> bool:
     return bool((data or {}).get("unsettled_effect_ids"))
+
+
+def _active_index_guard(data: dict[str, Any] | None, now: datetime) -> bool:
+    data = data or {}
+    expiry = data.get("index_expires_at")
+    return bool(data.get("index_owner") and isinstance(expiry, datetime) and expiry > now)
 
 
 def dispatch_mutation(
@@ -199,7 +474,7 @@ def dispatch_mutation(
             if state == EffectState.FAILED:
                 return "closed", None
         guards = [(resource, ref, snap.to_dict() if snap.exists else {}) for resource, ref, snap in guard_snapshots]
-        if any(_locked_guard(data) for _, _, data in guards):
+        if any(_locked_guard(data) or _active_index_guard(data, commit_now) for _, _, data in guards):
             return "blocked", None
         for resource, ref, data in guards:
             unsettled = tuple(data.get("unsettled_effect_ids", ()))
@@ -453,7 +728,7 @@ def _lease_transaction(client: Any, operation_id: str, owner: str, fence: int, n
             (resource, ref, snap.to_dict() if snap.exists else {})
             for resource, ref, snap in guard_snapshots
         ]
-        if any(_locked_guard(data) for _, _, data in guard_data):
+        if any(_locked_guard(data) or _active_index_guard(data, now) for _, _, data in guard_data):
             return False
         if action == "checkpoint":
             refs = list(op_data.get("checkpoint_refs", ()))

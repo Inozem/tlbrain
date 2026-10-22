@@ -177,7 +177,7 @@ def test_process_one_hashes_the_google_docs_reader_projection_and_publishes_afte
         ))
     effects = []
     for method_name in ("upsert_utterances", "upsert_summaries", "upsert_facts", "delete_old_versions",
-                        "update_skipped_utterances", "mark_synced", "update_index"):
+                        "update_skipped_utterances", "update_index"):
         original = getattr(processor, method_name)
         def record(*args, _name=method_name, _original=original, **kwargs):
             effects.append(_name)
@@ -207,14 +207,16 @@ def test_process_one_hashes_the_google_docs_reader_projection_and_publishes_afte
     final_checkpoint = max(i for i, effect in enumerate(effects) if effect == "update_index")
     assert qdrant_mutations <= set(effects)
     assert max(qdrant_positions) < final_checkpoint
-    assert effects.index("mark_synced") < final_checkpoint
+    assert "mark_synced" not in effects
     receipt_path = f"index_completions/{DOC_ID}/generations/{content_hash}"
     firestore_trace = firestore_fake.trace()
     receipt_commit = max(i for i, event in enumerate(firestore_trace)
                          if event["path"] == receipt_path and event["outcome"] == "committed")
     index_commits = [i for i, event in enumerate(firestore_trace)
                      if event["path"] == f"transcript_index/{DOC_ID}" and event["outcome"] == "committed"]
-    assert index_commits and receipt_commit > max(index_commits)
+    # Receipt plus transcript synced status are one fenced Firestore commit;
+    # the fake reports both document writes separately in that commit.
+    assert index_commits and receipt_commit >= max(index_commits) - 1
     deletes = [event["arguments"] for event in sdk_fakes.trace
                if event["boundary"] == "qdrant" and event["operation"] == "delete"]
     _assert_user_fact_excluded(deletes)
@@ -222,6 +224,191 @@ def test_process_one_hashes_the_google_docs_reader_projection_and_publishes_afte
         event["boundary"] == "qdrant" and event["operation"] == "upsert"
         for event in sdk_fakes.trace
     )
+
+
+def test_unknown_index_batch_keeps_common_guard_blocking_after_lease_expiry(
+    firestore_fake, fake_clock,
+):
+    from core.integrations.firestore.mutations import (
+        acquire_index_guard, begin_index_effect, get_resource_guard,
+        release_index_guard, settle_index_effect,
+    )
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    client.collection("transcript_index").document(DOC_ID).set({"doc_id": DOC_ID, "status": "syncing"})
+    owner = "synthetic-index-worker"
+    acquired = acquire_index_guard(
+        client, doc_id=DOC_ID, owner=owner, now=fake_clock.now(), lease_seconds=5,
+        root_folder_id=ROOT_ID,
+    )
+    assert acquired is not None
+    fence, _epoch = acquired
+    assert begin_index_effect(
+        client, doc_id=DOC_ID, owner=owner, fence=fence, effect_id="batch-1",
+        kind="upsert_utterances", payload_digest="sha256:batch", now=fake_clock.now(),
+    )
+    assert settle_index_effect(
+        client, doc_id=DOC_ID, owner=owner, fence=fence, effect_id="batch-1",
+        now=fake_clock.now(), confirmed=False,
+    )
+
+    fake_clock.advance(seconds=6)
+
+    assert acquire_index_guard(
+        client, doc_id=DOC_ID, owner="takeover", now=fake_clock.now(), lease_seconds=30,
+        root_folder_id=ROOT_ID,
+    ) is None
+    assert not settle_index_effect(
+        client, doc_id=DOC_ID, owner=owner, fence=fence, effect_id="batch-1",
+        now=fake_clock.now(), confirmed=True,
+    )
+    assert not release_index_guard(
+        client, doc_id=DOC_ID, owner=owner, fence=fence, now=fake_clock.now(),
+    )
+    assert get_resource_guard(client, f"document:{DOC_ID}").unsettled_effect_ids == ("batch-1",)
+
+
+def test_managed_index_reference_binds_route_operation_intent_and_outbox(
+    firestore_fake, sdk_fakes,
+):
+    from core.indexing.processor import _validate_managed_reference
+    from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record
+    from core.integrations.firestore.save_intents import update_save_intent_checkpoints
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    outbox_id = "index-dispatch-managed-reference"
+    create_outbox_record(
+        client, outbox_id, target_kind=OutboxTargetKind.INDEX_DISPATCH, generation=1,
+        schedule_at=NOW, now=NOW, operation_id=OPERATION_ID,
+        document_id=DOC_ID, save_intent_id=save_intent_id,
+    )
+    assert update_save_intent_checkpoints(
+        client, save_intent_id, operation_id=OPERATION_ID, owner=OWNER,
+        fence=lease.fence, now=NOW, index_checkpoint_ref=outbox_id,
+    ) is not None
+    reference = {
+        "schema_version": 1, "outbox_id": outbox_id, "target_kind": "index_dispatch",
+        "generation": 1, "operation_id": OPERATION_ID, "document_id": DOC_ID,
+        "save_intent_id": save_intent_id,
+    }
+
+    assert _validate_managed_reference(reference, DOC_ID, PARENT_ID) is not None
+    with pytest.raises(ValueError, match="invalid managed index reference"):
+        _validate_managed_reference(reference, "another-doc", PARENT_ID)
+
+
+def test_managed_index_stage_uses_durable_budget_and_completed_replay(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+    from core.integrations.firestore.operations import get_operation, release_operation
+    from core.integrations.firestore.save_intents import get_save_intent
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, content = _save_fixture(client, sdk_fakes)
+    assert release_operation(client, OPERATION_ID, owner=OWNER, fence=lease.fence, now=NOW)
+    monkeypatch.setattr(
+        processor, "_validate_managed_reference",
+        lambda _reference, _doc_id, _parent_id: (
+            get_operation(client, OPERATION_ID), get_save_intent(client, save_intent_id),
+        ),
+    )
+    calls = []
+
+    def attempt(*_args, **_kwargs):
+        calls.append("called")
+        if len(calls) == 1:
+            raise ValueError("synthetic retryable attempt")
+        return "processed"
+
+    monkeypatch.setattr(processor, "process_one", attempt)
+    reference = {"unused": "validation is patched in this unit"}
+    with pytest.raises(ValueError, match="synthetic retryable"):
+        processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference)
+    assert processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference) == "processed"
+    assert processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference) == "processed"
+    from core.operations.retries import RetryGovernor
+    assert RetryGovernor(client).get_stage(OPERATION_ID, "managed_index").state.value == "completed"
+    assert len(calls) == 2
+
+
+def test_three_managed_index_failures_are_terminal_and_duplicate_does_not_dispatch(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+    from core.integrations.firestore.operations import get_operation, release_operation
+    from core.integrations.firestore.save_intents import get_save_intent
+    from core.operations.retries import RetryGovernor
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, content = _save_fixture(client, sdk_fakes)
+    assert release_operation(client, OPERATION_ID, owner=OWNER, fence=lease.fence, now=NOW)
+    monkeypatch.setattr(
+        processor, "_validate_managed_reference",
+        lambda _reference, _doc_id, _parent_id: (
+            get_operation(client, OPERATION_ID), get_save_intent(client, save_intent_id),
+        ),
+    )
+    calls = []
+
+    def always_fail(*_args, **_kwargs):
+        calls.append("called")
+        raise ValueError("synthetic managed index failure")
+
+    monkeypatch.setattr(processor, "process_one", always_fail)
+    reference = {"unused": "validation is patched in this unit"}
+    for _ in range(3):
+        with pytest.raises(ValueError, match="synthetic managed index failure"):
+            processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference)
+
+    operation = get_operation(client, OPERATION_ID)
+    stage = RetryGovernor(client).get_stage(OPERATION_ID, "managed_index")
+    assert operation.state.value == "failed"
+    assert stage.state.value == "failed"
+    assert stage.failures == 3
+    assert len(calls) == 3
+    assert processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference) == "managed_terminal"
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("payload_matches", [True, False])
+def test_qdrant_upsert_readback_compares_stored_payload_digest(
+    monkeypatch, payload_matches,
+):
+    from types import SimpleNamespace
+    from core.indexing import processor
+    from core.integrations.qdrant import client as qdrant_client
+    from core.integrations.qdrant.schema import get_collection_name
+
+    expected_payload = {"doc_id": DOC_ID, "type": "utterance", "text": "synthetic transcript text"}
+    stored_payload = dict(expected_payload)
+    if not payload_matches:
+        stored_payload["text"] = "different synthetic text"
+    digest = hashlib.sha256(json.dumps(
+        expected_payload, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode()).hexdigest()
+
+    class RetrieveOnlyQdrant:
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, **kwargs):
+            self.calls.append(kwargs)
+            return [SimpleNamespace(id="expected-point-id", payload=stored_payload)]
+
+    fake = RetrieveOnlyQdrant()
+    monkeypatch.setattr(qdrant_client, "get_client", lambda: fake)
+    intent = {"readback": {"action": "upsert", "points": [
+        {"id": "expected-point-id", "payload_digest": digest},
+    ]}}
+
+    assert processor._readback_confirms(intent) is payload_matches
+    assert fake.calls == [{
+        "collection_name": get_collection_name(),
+        "ids": ["expected-point-id"], "with_payload": True, "with_vectors": False,
+    }]
 
 
 @pytest.mark.parametrize("stale_field", ["synced_status", "content_hash", "version", "provider", "parent_id"])
@@ -300,7 +487,9 @@ def test_dirty_incremental_window_is_retried_after_hash_checkpoint_and_user_fact
         nonlocal failed
         if not failed:
             failed = True
-            raise RuntimeError("synthetic summary write interruption")
+            error = RuntimeError("synthetic summary write interruption")
+            error.outcome = "rejected"
+            raise error
         return original(*args, **kwargs)
 
     monkeypatch.setattr(processor, "upsert_summaries", fail_after_hash_checkpoint)
@@ -471,6 +660,71 @@ def test_new_fence_cannot_finalize_or_redispatch_while_old_qdrant_batch_is_unkno
         mutation_callback=lambda: calls.append("conflicting-redispatch"),
     ) is None
     assert calls == ["old-qdrant-batch"]
+
+
+@pytest.mark.parametrize("readback_confirms", [True, False])
+def test_unknown_qdrant_effect_reconciliation_requires_readback(
+    firestore_fake, monkeypatch, readback_confirms,
+):
+    from core.indexing import processor
+    from core.indexing.processor import _IndexClaim
+    from core.integrations.firestore.mutations import (
+        acquire_index_guard, begin_index_effect, get_unsettled_index_effects,
+        settle_index_effect,
+    )
+
+    client = firestore_fake.client_class()
+    test_now = datetime.now(timezone.utc)
+    old_owner = "old-index-worker"
+    old_fence, _epoch = acquire_index_guard(
+        client, doc_id=DOC_ID, owner=old_owner, now=test_now, lease_seconds=5,
+        root_folder_id=ROOT_ID,
+    )
+    assert begin_index_effect(
+        client, doc_id=DOC_ID, owner=old_owner, fence=old_fence, effect_id="uncertain-upsert",
+        kind="upsert_utterances", payload_digest="sha256:batch", now=test_now,
+        readback={"action": "upsert", "points": [{"id": "point-1", "payload_digest": "sha256:payload"}]},
+    )
+    assert settle_index_effect(
+        client, doc_id=DOC_ID, owner=old_owner, fence=old_fence,
+        effect_id="uncertain-upsert", now=test_now, confirmed=False,
+    )
+    takeover_at = test_now + timedelta(seconds=6)
+    new_owner = "new-index-worker"
+    new_fence, epoch = acquire_index_guard(
+        client, doc_id=DOC_ID, owner=new_owner, now=takeover_at, lease_seconds=30,
+        root_folder_id=ROOT_ID, allow_unsettled_index_effects=True,
+    )
+    assert get_unsettled_index_effects(client, DOC_ID)["uncertain-upsert"]["state"] == "unknown"
+    assert get_unsettled_index_effects(client, DOC_ID)["uncertain-upsert"]["fence"] < new_fence
+    monkeypatch.setattr(processor, "_readback_confirms", lambda _intent: readback_confirms)
+    claim = _IndexClaim(DOC_ID, new_owner, new_fence, epoch, client)
+
+    confirmed = processor._reconcile_unknown_effects(claim)
+    assert confirmed is readback_confirms
+    unsettled = get_unsettled_index_effects(client, DOC_ID)
+    assert bool(unsettled) is (not readback_confirms)
+
+
+def test_index_claim_waits_for_active_regular_resource_owner(firestore_fake):
+    from core.integrations.firestore.mutations import _resource_ref, acquire_index_guard
+
+    client = firestore_fake.client_class()
+    guard = _resource_ref(client, RESOURCE)
+    guard.set({"resource": RESOURCE, "owner_operation_id": "active-agent-op",
+               "expires_at": NOW + timedelta(minutes=1), "resource_epoch": 3,
+               "unsettled_effect_ids": []})
+    assert acquire_index_guard(
+        client, doc_id=DOC_ID, owner="index-worker", now=NOW, lease_seconds=30,
+        root_folder_id=ROOT_ID,
+    ) is None
+    guard.set({"resource": RESOURCE, "owner_operation_id": "expired-agent-op",
+               "expires_at": NOW - timedelta(seconds=1), "resource_epoch": 3,
+               "unsettled_effect_ids": []})
+    assert acquire_index_guard(
+        client, doc_id=DOC_ID, owner="index-worker", now=NOW, lease_seconds=30,
+        root_folder_id=ROOT_ID,
+    ) is not None
 
 
 def test_operation_result_and_immutable_completion_certificate_commit_atomically_and_replay(

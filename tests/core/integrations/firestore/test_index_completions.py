@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -42,6 +42,16 @@ def _receipt(**overrides):
 def _path(receipt):
     return (f"{COMPLETIONS_COLLECTION}/{receipt['doc_id']}/generations/"
             f"{receipt['content_hash']}")
+
+
+def _guard(client, receipt, *, expiry=None):
+    from core.integrations.firestore.mutations import _resource_ref
+    _resource_ref(client, f"document:{receipt['doc_id']}").set({
+        "resource": f"document:{receipt['doc_id']}",
+        "index_owner": receipt["owner"], "index_fence": receipt["index_fence"],
+        "index_expires_at": expiry or NOW + timedelta(minutes=5),
+        "resource_epoch": receipt["resource_epoch"], "unsettled_effect_ids": [],
+    })
 
 
 def test_write_and_read_use_generation_document_path_and_round_trip_fields(firestore_fake):
@@ -104,6 +114,7 @@ def test_current_publication_is_idempotent(firestore_fake):
     client = firestore_fake.client_class()
     receipt = _receipt()
     client.collection("transcript_index").document("doc-1").set({**receipt, "status": "synced"})
+    _guard(client, receipt)
 
     assert publish_completion(client, receipt, now=NOW) is True
     assert publish_completion(client, receipt, now=NOW) is True
@@ -111,6 +122,30 @@ def test_current_publication_is_idempotent(firestore_fake):
     events = [event for event in firestore_fake.trace()
               if event["path"] == _path(receipt) and event["outcome"] == "committed"]
     assert len(events) == 1
+
+
+def test_takeover_refreshes_same_generation_receipt_to_current_fence(firestore_fake):
+    client = firestore_fake.client_class()
+    old = _receipt()
+    client.collection("transcript_index").document("doc-1").set({**old, "status": "synced"})
+    _guard(client, old)
+    assert publish_completion(client, old, now=NOW) is True
+
+    current = {**old, "owner": "worker-2", "index_fence": old["index_fence"] + 1,
+               "completed_at": NOW + timedelta(seconds=1)}
+    client.collection("transcript_index").document("doc-1").set({**current, "status": "syncing"})
+    _guard(client, current)
+    assert publish_completion(client, current, now=NOW + timedelta(seconds=1)) is True
+    assert get_completion(client, "doc-1", old["content_hash"]) == current
+
+
+def test_publish_requires_live_matching_index_guard(firestore_fake):
+    client = firestore_fake.client_class()
+    receipt = _receipt()
+    client.collection("transcript_index").document("doc-1").set({**receipt, "status": "syncing"})
+    _guard(client, receipt, expiry=NOW)
+    assert publish_completion(client, receipt, now=NOW) is False
+    assert _path(receipt) not in firestore_fake.documents
 
 
 def test_receipt_preserves_parent_id_and_integer_skipped_utterances(firestore_fake):
