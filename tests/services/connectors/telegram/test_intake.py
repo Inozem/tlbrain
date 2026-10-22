@@ -179,6 +179,28 @@ def test_distinct_forwards_reuse_the_unique_collecting_draft_and_dialog_number(
     assert _read_doc(client, _message_path(context_id, draft_id, 103))["message_id"] == 103
 
 
+def test_channel_forward_persists_original_channel_metadata(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    intake = _intake(repository, _Publisher(), _Classifier(), _Classifier())
+    update = _forward(4)
+    update["message"]["forward_origin"] = {
+        "type": "channel",
+        "chat": {"id": -1001234567890, "title": "Original channel"},
+        "message_id": 765,
+        "date": 1_798_000_000,
+    }
+
+    accepted = intake.handle_update(update)
+
+    context_id = _value(accepted, "context_id")
+    draft_id = _value(accepted, "draft_id")
+    message = _read_doc(client, _message_path(context_id, draft_id, 104))
+    assert message["source_chat_id"] == -1001234567890
+    assert message["source_message_id"] == 765
+    assert message["reliable_author_key"] == "telegram-chat:-1001234567890"
+    assert message["display_speaker"] == "Original channel"
+
+
 def test_duplicate_update_reuses_all_records_and_repairs_same_outbox_after_gap(
     firestore_fake,
 ):
@@ -277,6 +299,67 @@ def test_invalid_webhook_secret_is_rejected_before_intake_or_persistence(
     assert response.status_code == 403
     assert publisher.outbox_ids == []
     assert firestore_fake.documents == {}
+
+
+def test_malformed_json_is_rejected(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    intake = _intake(repository, _Publisher(), _Classifier(), _Classifier())
+    app_module = importlib.import_module("services.connectors.telegram.app.main")
+    app = app_module.create_app(intake=intake, webhook_secret="synthetic-webhook-secret")
+
+    async def request():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            return await client.post(
+                "/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"},
+                content="{invalid",
+            )
+
+    response = asyncio.run(request())
+    assert response.status_code == 400
+    assert firestore_fake.documents == {}
+
+
+def test_publisher_failure_returns_service_unavailable(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    publisher = _Publisher()
+    publisher.failures = 1
+    intake = _intake(repository, publisher, _Classifier(), _Classifier())
+    app_module = importlib.import_module("services.connectors.telegram.app.main")
+    app = app_module.create_app(intake=intake, webhook_secret="synthetic-webhook-secret")
+
+    async def request():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            return await client.post(
+                "/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"},
+                json=_forward(11),
+            )
+
+    response = asyncio.run(request())
+    assert response.status_code == 503
+    assert len(publisher.outbox_ids) == 1
+    assert any(path.endswith("/updates/11") for path in firestore_fake.documents)
+
+
+def test_health_returns_only_safe_capability_status(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "secret-token-value")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "7")
+    app_module = importlib.import_module("services.connectors.telegram.app.main")
+    app = app_module.create_app(webhook_secret="synthetic-webhook-secret")
+
+    async def request():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            return await client.get("/")
+
+    response = asyncio.run(request())
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "telegram_enabled": True}
+    assert "secret-token-value" not in response.text
+    assert "synthetic-webhook-secret" not in response.text
 
 
 def test_command_reservation_blocks_forwards_until_all_fifo_heads_finish(

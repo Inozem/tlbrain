@@ -787,7 +787,10 @@ class TelegramRepository:
         original_date = message.get("original_date")
         if original_date is not None:
             original_date = _aware(original_date, "original_date")  # type: ignore[arg-type]
-        for field_name in ("source_chat_id", "source_message_id", "source_user_id", "audio_file_size"):
+        source_chat_id = message.get("source_chat_id")
+        if source_chat_id is not None and (type(source_chat_id) is not int or source_chat_id == 0):
+            raise ValueError("source_chat_id must be a non-zero integer")
+        for field_name in ("source_message_id", "source_user_id", "audio_file_size"):
             value = message.get(field_name)
             if value is not None:
                 _integer(value, field_name, minimum=0 if field_name == "audio_file_size" else 1)
