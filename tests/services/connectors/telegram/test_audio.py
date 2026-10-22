@@ -82,9 +82,11 @@ def _wire_value(value):
 
 
 def _wire_request(call):
+    from google.genai import types
+
     return {
         "model": call["model"],
-        "contents": _wire_value(call["contents"]),
+        "contents": _wire_value(types.UserContent(parts=[call["contents"]])),
         "generationConfig": _wire_value(call["config"]),
     }
 
@@ -489,3 +491,110 @@ def test_transcript_text_is_passed_through_unchanged(audio, expected):
 
     assert repository.checkpoints[1] == expected
     assert _field(analyzed[0], "transcription") == expected
+
+
+@pytest.mark.parametrize(
+    "mime_type",
+    ["audio/aiff", "audio/aac", "audio/opus", "audio/l16", "audio/alaw", "audio/mulaw"],
+)
+def test_alternate_gemini_supported_mime_types_are_accepted(mime_type):
+    models = _Models({AUDIO_BYTES: "ok"})
+    telegram = _Telegram({"file-1": _download(mime_type=mime_type)})
+    _run(_service(telegram, _Repository(), _GeminiFactory(models)).process_messages(
+        [_message(1)], draft_id="draft-mime", analyze=lambda rows: rows,
+    ))
+    assert len(models.calls) == 1
+
+
+def test_default_audio_size_limit_matches_telegram_download_ceiling():
+    too_large = b"x" * (20 * 1024 * 1024 + 1)
+    telegram = _Telegram({"file-1": _download(too_large)})
+    models = _Models()
+    with pytest.raises(ValueError, match="size"):
+        _run(_service(telegram, _Repository(), _GeminiFactory(models)).process_messages(
+            [_message(1)], draft_id="draft-size", analyze=lambda rows: rows,
+        ))
+    assert models.calls == []
+
+
+def test_completed_transcription_resumes_without_redownloading_or_regenerating():
+    message = {
+        **_message(1),
+        "transcription_state": "completed",
+        "transcription_text": "already checkpointed verbatim",
+    }
+    telegram = _Telegram({})
+    models = _Models()
+    repository = _Repository()
+    analyzed = []
+
+    result = _run(_service(telegram, repository, _GeminiFactory(models)).process_messages(
+        [message], draft_id="draft-resume",
+        analyze=lambda rows: (analyzed.extend(rows), rows)[1],
+    ))
+
+    assert telegram.requested == []
+    assert models.calls == []
+    assert repository.checkpoints == {}
+    assert _field(analyzed[0], "transcription") == "already checkpointed verbatim"
+    assert result is not None
+
+
+def test_malformed_gemini_file_reference_fails_and_deletes_known_resource():
+    class MalformedFiles(_Files):
+        async def upload(self, *, file, config=None):
+            self.uploaded.append((b"synthetic", "audio/ogg", SimpleNamespace(name="files/known", uri=None)))
+            return self.uploaded[-1][2]
+
+    files = MalformedFiles()
+    models = _Models()
+    service = _service(
+        _Telegram({"file-1": _download()}), _Repository(), _GeminiFactory(models, files),
+        inline_request_limit_bytes=1,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid resource"):
+        _run(service.process_messages(
+            [_message(1)], draft_id="draft-malformed-ref", analyze=lambda rows: rows,
+        ))
+
+    assert files.deleted == ["files/known"]
+    assert models.calls == []
+
+
+def test_context_checkpoint_supports_synchronous_repository_success_and_failure():
+    class SyncRepository(_Repository):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def checkpoint_transcription(self, context_id, draft_id, message_id, text):
+            self.calls.append(("completed", context_id, draft_id, message_id, text))
+
+        def checkpoint_transcription_failure(self, context_id, draft_id, message_id, error_code):
+            self.calls.append(("failed", context_id, draft_id, message_id, error_code))
+
+    repository = SyncRepository()
+    models = _Models({AUDIO_BYTES: "verbatim"})
+    success = _service(
+        _Telegram({"file-1": _download()}), repository, _GeminiFactory(models),
+        context_id="42_5",
+    )
+    _run(success.process_messages(
+        [_message(1)], draft_id="draft-context", analyze=lambda rows: rows,
+    ))
+
+    failure = _service(
+        _Telegram({"file-2": FileNotFoundError("private provider detail")}),
+        repository, _GeminiFactory(_Models()), context_id="42_5",
+    )
+    with pytest.raises(FileNotFoundError):
+        _run(failure.process_messages(
+            [_message(2, file_id="file-2")], draft_id="draft-context",
+            analyze=lambda rows: rows,
+        ))
+
+    assert repository.calls == [
+        ("completed", "42_5", "draft-context", 1, "verbatim"),
+        ("failed", "42_5", "draft-context", 2, "download_failed"),
+    ]

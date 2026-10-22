@@ -126,6 +126,14 @@ def test_gemini_consumers_use_scripted_real_response_models(sdk_fakes):
     assert generated["arguments"]["config"].response_mime_type == "application/json"
 
 
+def test_gemini_sdk_exposes_verbatim_audio_transcription_config():
+    audio_config = types.AudioTranscriptionConfig(mode="VERBATIM", language_codes=[])
+    config = types.GenerateContentConfig(audio_transcription_config=audio_config)
+
+    assert config.audio_transcription_config.mode == "VERBATIM"
+    assert config.audio_transcription_config.language_codes == []
+
+
 def test_gemini_empty_and_error_responses_remain_observable(sdk_fakes):
     sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
         candidates=[types.Candidate(finish_reason=types.FinishReason.SAFETY)]
@@ -300,13 +308,15 @@ def test_gemini_audio_files_and_function_call_signatures_are_preserved(sdk_fakes
     assert traced_contents[2].parts[0].function_response.id == "call-synthetic-1"
 
 
-def test_google_genai_229_sdk_capabilities_are_available():
+def test_google_genai_232_sdk_capabilities_are_available():
     from google.genai import types
 
     assert "thinking_level" in types.ThinkingConfig.model_fields
     assert "id" in types.FunctionResponse.model_fields
     assert "retry_options" in types.HttpOptions.model_fields
     assert "attempts" in types.HttpRetryOptions.model_fields
+    assert {"mode", "language_codes"} <= types.AudioTranscriptionConfig.model_fields.keys()
+    assert "audio_transcription_config" in types.GenerateContentConfig.model_fields
 
 
 def test_cloud_tasks_task_schedule_deadline_and_oidc_fields_are_traced(sdk_fakes):

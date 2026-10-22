@@ -229,3 +229,57 @@ def test_forward_rejects_raw_or_unknown_message_fields(firestore_fake):
             1, chat_id=42, message={**_message(), "raw_update": {"text": "private"}}, now=NOW
         )
     assert firestore_fake.documents == {}
+
+
+def test_transcription_checkpoint_is_message_scoped_idempotent_and_preserves_source_and_manifest(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    first = _accept(repo, update_id=1, message_id=101)
+    _accept(repo, update_id=2, message_id=102)
+    manifest_ref = client.collection("telegram_sessions").document(first.context_id)
+    manifest_ref = manifest_ref.collection("drafts").document(first.draft_id)
+    manifest_ref.collection("save_manifests").document("manifest-1").set({
+        "ordered_message_ids": [101, 102], "manifest_digest": "sealed-digest",
+    })
+    original = repo.list_messages(first.context_id, first.draft_id)
+
+    repo.checkpoint_transcription(first.context_id, first.draft_id, 101, "verbatim transcript")
+    after_first = repo.list_messages(first.context_id, first.draft_id)
+    repo.checkpoint_transcription(first.context_id, first.draft_id, 101, "verbatim transcript")
+
+    assert repo.list_messages(first.context_id, first.draft_id) == after_first
+    assert after_first[0]["message_id"] == 101
+    assert after_first[0]["transcription_state"] == "completed"
+    assert after_first[0]["transcription_text"] == "verbatim transcript"
+    assert after_first[0]["text"] == original[0]["text"]
+    assert after_first[0]["audio_file_id"] == original[0]["audio_file_id"]
+    assert after_first[1] == original[1]
+    assert _read(
+        client,
+        f"telegram_sessions/{first.context_id}/drafts/{first.draft_id}/save_manifests/manifest-1",
+    ) == {"ordered_message_ids": [101, 102], "manifest_digest": "sealed-digest"}
+
+
+def test_transcription_failure_checkpoint_stores_only_safe_bounded_category(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accept(repo)
+    before = repo.list_messages(accepted.context_id, accepted.draft_id)[0]
+
+    repo.checkpoint_transcription_failure(
+        accepted.context_id, accepted.draft_id, 101, "transcription_failed",
+    )
+
+    after = repo.list_messages(accepted.context_id, accepted.draft_id)[0]
+    assert after["transcription_state"] == "failed"
+    assert after["transcription_error"] == "transcription_failed"
+    assert after["transcription_text"] is None
+    assert after["text"] == before["text"]
+    assert after["audio_file_id"] == before["audio_file_id"]
+    with pytest.raises(ValueError, match="error code"):
+        repo.checkpoint_transcription_failure(
+            accepted.context_id, accepted.draft_id, 101,
+            "provider exception with sensitive details",
+        )

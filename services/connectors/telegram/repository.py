@@ -1316,6 +1316,81 @@ class TelegramRepository:
         result.sort(key=lambda row: (row["intake_sequence"], row["message_id"]))
         return result
 
+    def checkpoint_transcription(
+        self,
+        context_id: str,
+        draft_id: str,
+        message_id: int,
+        text: str,
+    ) -> None:
+        """Persist one completed transcription without changing its source record."""
+        context_id = _identifier(context_id, "context_id")
+        draft_id = _identifier(draft_id, "draft_id")
+        message_id = _integer(message_id, "message_id", minimum=1)
+        if not isinstance(text, str) or not text:
+            raise ValueError("transcription text must be non-empty text")
+        message_ref = _document_ref(
+            self.client,
+            f"{SESSIONS}/{context_id}/drafts/{draft_id}/messages/{message_id}",
+        )
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> None:
+            snapshot = message_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise ValueError("source message does not exist")
+            source = snapshot.to_dict() or {}
+            if _integer(source.get("message_id"), "stored message_id", minimum=1) != message_id:
+                raise ValueError("source message association does not match")
+            if source.get("transcription_state") == TelegramTranscriptionState.COMPLETED.value:
+                if source.get("transcription_text") != text:
+                    raise ValueError("completed transcription cannot be replaced")
+                return
+            transaction.update(message_ref, {
+                "transcription_state": TelegramTranscriptionState.COMPLETED.value,
+                "transcription_text": text,
+                "transcription_error": None,
+            })
+
+        _txn(self.client.transaction(max_attempts=5))
+
+    def checkpoint_transcription_failure(
+        self,
+        context_id: str,
+        draft_id: str,
+        message_id: int,
+        error_code: str,
+    ) -> None:
+        """Persist a bounded safe transcription failure category for one source."""
+        context_id = _identifier(context_id, "context_id")
+        draft_id = _identifier(draft_id, "draft_id")
+        message_id = _integer(message_id, "message_id", minimum=1)
+        allowed_errors = {"unsupported_audio", "download_failed", "transcription_failed"}
+        if error_code not in allowed_errors or len(error_code) > 48:
+            raise ValueError("transcription error code is invalid")
+        message_ref = _document_ref(
+            self.client,
+            f"{SESSIONS}/{context_id}/drafts/{draft_id}/messages/{message_id}",
+        )
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> None:
+            snapshot = message_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise ValueError("source message does not exist")
+            source = snapshot.to_dict() or {}
+            if _integer(source.get("message_id"), "stored message_id", minimum=1) != message_id:
+                raise ValueError("source message association does not match")
+            if source.get("transcription_state") == TelegramTranscriptionState.COMPLETED.value:
+                return
+            transaction.update(message_ref, {
+                "transcription_state": TelegramTranscriptionState.FAILED.value,
+                "transcription_text": None,
+                "transcription_error": error_code[:48],
+            })
+
+        _txn(self.client.transaction(max_attempts=5))
+
     def list_failed_drafts(self, context_id: str) -> list[dict[str, Any]]:
         context_id = _identifier(context_id, "context_id")
         collection = self.client.collection(SESSIONS).document(context_id).collection("drafts")

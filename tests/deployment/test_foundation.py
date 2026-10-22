@@ -158,7 +158,7 @@ def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
         "google_docs": "google-api-python-client",
         "firestore": "google-cloud-firestore",
         "qdrant": "qdrant-client>=1.9",
-        "gemini": "google-genai>=2.29.0",
+        "gemini": "google-genai>=2.32.0",
         "fastembed": "fastembed",
         "cloud_tasks": "google-cloud-tasks>=2.0.0",
     }
