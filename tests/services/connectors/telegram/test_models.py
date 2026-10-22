@@ -81,23 +81,27 @@ def test_draft_schema_nullable_doc_and_immutable_ordered_ids():
         "draft_id", "dialog_number", "state", "conversation_id", "created_at", "sealed_at",
         "ordered_message_ids", "manifest_ref", "manifest_digest", "input_revision",
         "active_save_operation_id", "immutable_save_intent_id", "doc_id",
-        "completion_certificate_ref", "cleanup_state",
+        "completion_certificate_ref", "cleanup_state", "required_audio_count",
+        "completed_audio_ids", "prepared_count", "context_capacity", "preparation_digest",
     )
     assert _field_names(TelegramDraft) == expected
     ids = [12, 9]
     timestamp = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    audio_ids = [101]
     draft = TelegramDraft(
-        draft_id="draft-1",
-        dialog_number=3,
-        state=TelegramDraftState.COLLECTING,
-        conversation_id="conversation-1",
-        created_at=timestamp,
-        ordered_message_ids=ids,
-        immutable_save_intent_id=None,
-        doc_id=None,
+        draft_id="draft-1", dialog_number=3, state=TelegramDraftState.COLLECTING,
+        conversation_id="conversation-1", created_at=timestamp,
+        ordered_message_ids=ids, immutable_save_intent_id=None, doc_id=None,
+        completed_audio_ids=audio_ids,
     )
     ids.append(15)
+    audio_ids.append(102)
     assert draft.ordered_message_ids == (12, 9)
+    assert draft.completed_audio_ids == (101,)
+    assert draft.required_audio_count == 0
+    assert draft.prepared_count == 0
+    assert draft.context_capacity is None
+    assert draft.preparation_digest is None
     assert isinstance(draft.ordered_message_ids, tuple)
     assert draft.immutable_save_intent_id is None
     assert draft.doc_id is None

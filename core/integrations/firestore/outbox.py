@@ -32,7 +32,7 @@ class OutboxState(StrEnum):
 
 
 UNDELIVERED_STATES = (OutboxState.PENDING, OutboxState.RETRY)
-_REFERENCE_FIELDS = ("operation_id", "context_id", "document_id", "save_intent_id")
+_REFERENCE_FIELDS = ("operation_id", "context_id", "document_id", "save_intent_id", "notification_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +46,7 @@ class OutboxRecord:
     context_id: str | None = None
     document_id: str | None = None
     save_intent_id: str | None = None
+    notification_id: str | None = None
     state: OutboxState = OutboxState.PENDING
     delivery_attempts: int = 0
     last_error: str | None = None
@@ -72,6 +73,7 @@ def _from(data: dict[str, Any]) -> OutboxRecord:
         generation=int(data["generation"]), schedule_at=data["schedule_at"], task_name=data["task_name"],
         operation_id=data.get("operation_id"), context_id=data.get("context_id"),
         document_id=data.get("document_id"), save_intent_id=data.get("save_intent_id"),
+        notification_id=data.get("notification_id"),
         state=OutboxState(data["state"]), delivery_attempts=int(data.get("delivery_attempts", 0)),
         last_error=data.get("last_error"), created_at=data.get("created_at"),
         updated_at=data.get("updated_at"), last_attempt_at=data.get("last_attempt_at"),
@@ -82,6 +84,11 @@ def _identity(data: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(data.get(key) for key in (
         "target_kind", "generation", "schedule_at", *_REFERENCE_FIELDS,
     ))
+
+
+def _task_name(outbox_id: str, generation: int) -> str:
+    """Build a deterministic task name without incorporating caller content."""
+    return f"task-{outbox_id}-g{generation}"
 
 
 def create_outbox_record(
@@ -96,8 +103,37 @@ def create_outbox_record(
     context_id: str | None = None,
     document_id: str | None = None,
     save_intent_id: str | None = None,
+    notification_id: str | None = None,
 ) -> OutboxRecord:
     """Create a durable task request or return an exact identity replay."""
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> OutboxRecord:
+        return create_outbox_record_in_transaction(
+            client, transaction, outbox_id,
+            target_kind=target_kind, generation=generation, schedule_at=schedule_at, now=now,
+            operation_id=operation_id, context_id=context_id, document_id=document_id,
+            save_intent_id=save_intent_id, notification_id=notification_id,
+        )
+
+    return _txn(client.transaction(max_attempts=5))
+
+
+def create_outbox_record_in_transaction(
+    client: Any,
+    transaction: Any,
+    outbox_id: str,
+    *,
+    target_kind: OutboxTargetKind | str,
+    generation: int,
+    schedule_at: datetime,
+    now: datetime,
+    operation_id: str | None = None,
+    context_id: str | None = None,
+    document_id: str | None = None,
+    save_intent_id: str | None = None,
+    notification_id: str | None = None,
+) -> OutboxRecord:
+    """Create/replay an outbox record inside a caller-owned transaction."""
     outbox_id = _id(outbox_id, "outbox_id")
     try:
         target = OutboxTargetKind(target_kind)
@@ -110,6 +146,7 @@ def create_outbox_record(
     refs = {
         "operation_id": operation_id, "context_id": context_id,
         "document_id": document_id, "save_intent_id": save_intent_id,
+        "notification_id": notification_id,
     }
     for name, value in tuple(refs.items()):
         if value is not None:
@@ -117,32 +154,27 @@ def create_outbox_record(
     if not any(refs.values()):
         raise ValueError("at least one operation, context, document, or save intent reference is required")
 
-    # Cloud Tasks names are deterministic across retries and do not contain caller content.
-    task_name = f"task-{outbox_id}-g{generation}"
+    task_name = _task_name(outbox_id, generation)
     ref = client.collection(OUTBOX_COLLECTION).document(outbox_id)
     identity_data = {
         "outbox_id": outbox_id, "target_kind": target.value, "generation": generation,
         "schedule_at": schedule_at, **refs,
     }
 
-    @firestore.transactional
-    def _txn(transaction: firestore.Transaction) -> OutboxRecord:
-        snapshot = ref.get(transaction=transaction)
-        if snapshot.exists:
-            stored = snapshot.to_dict() or {}
-            if _identity(stored) != _identity(identity_data):
-                raise ValueError("outbox ID already belongs to a different target identity")
-            return _from(stored)
-        data = {
-            **identity_data, "task_name": task_name,
-            "state": OutboxState.PENDING.value, "delivery_attempts": 0,
-            "last_error": None, "created_at": now, "updated_at": now,
-            "last_attempt_at": None,
-        }
-        transaction.set(ref, data)
-        return _from(data)
-
-    return _txn(client.transaction(max_attempts=5))
+    snapshot = ref.get(transaction=transaction)
+    if snapshot.exists:
+        stored = snapshot.to_dict() or {}
+        if _identity(stored) != _identity(identity_data):
+            raise ValueError("outbox ID already belongs to a different target identity")
+        return _from(stored)
+    data = {
+        **identity_data, "task_name": task_name,
+        "state": OutboxState.PENDING.value, "delivery_attempts": 0,
+        "last_error": None, "created_at": now, "updated_at": now,
+        "last_attempt_at": None,
+    }
+    transaction.set(ref, data)
+    return _from(data)
 
 
 def get_outbox_record(client: Any, outbox_id: str) -> OutboxRecord | None:
@@ -301,5 +333,6 @@ __all__ = [
     "MAX_DUE_LIMIT", "OUTBOX_COLLECTION", "OutboxRecord", "OutboxState",
     "OutboxTargetKind", "PAYLOAD_SCHEMA_VERSION", "UNDELIVERED_STATES",
     "create_outbox_record", "get_outbox_record", "list_due_outbox_records", "task_payload",
+    "create_outbox_record_in_transaction",
     "record_outbox_delivery_result",
 ]

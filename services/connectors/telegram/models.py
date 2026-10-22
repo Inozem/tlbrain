@@ -95,9 +95,15 @@ class TelegramDraft:
     doc_id: str | None = None
     completion_certificate_ref: str | None = None
     cleanup_state: str | None = None
+    required_audio_count: int = 0
+    completed_audio_ids: tuple[int, ...] = ()
+    prepared_count: int = 0
+    context_capacity: int | None = None
+    preparation_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ordered_message_ids", tuple(self.ordered_message_ids))
+        object.__setattr__(self, "completed_audio_ids", tuple(self.completed_audio_ids))
 
 
 @dataclass(frozen=True, slots=True)

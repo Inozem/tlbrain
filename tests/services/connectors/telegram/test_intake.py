@@ -148,7 +148,7 @@ def test_forward_atomically_persists_collecting_draft_message_and_draft_ack(
     notification = _read_doc(client, f"notification_outbox/{_value(accepted, 'notification_id')}")
     outbox = _read_doc(client, f"task_outbox/{_value(accepted, 'outbox_id')}")
     assert update_record is not None
-    assert draft["status"] == "collecting"
+    assert draft["state"] == "collecting"
     assert draft["dialog_number"] == _value(accepted, "dialog_number")
     assert message["message_id"] == 101
     assert message["text"] == "synthetic forwarded message 1"

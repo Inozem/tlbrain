@@ -11,6 +11,7 @@ from core.integrations.firestore.outbox import (
     OutboxState,
     OutboxTargetKind,
     create_outbox_record,
+    create_outbox_record_in_transaction,
     get_outbox_record,
     list_due_outbox_records,
     record_outbox_delivery_result,
@@ -209,6 +210,25 @@ def test_task_payload_contains_only_schema_and_identifier_fields(firestore_fake)
         "save_intent_id": "save-1",
     }
     assert not {"text", "command", "notification", "token", "payload"} & payload.keys()
+
+
+def test_transaction_composable_creation_and_notification_reference(firestore_fake):
+    from google.cloud import firestore
+
+    client = firestore_fake.client_class()
+
+    @firestore.transactional
+    def create(transaction):
+        return create_outbox_record_in_transaction(
+            client, transaction, "outbox-ack", target_kind=OutboxTargetKind.TELEGRAM_DISPATCH,
+            generation=1, schedule_at=NOW, now=NOW, context_id="context-1",
+            notification_id="notification-1",
+        )
+
+    record = create(client.transaction())
+    assert record.notification_id == "notification-1"
+    assert task_payload(record)["notification_id"] == "notification-1"
+    assert create(client.transaction()) == record
 
 
 def test_firestore_indexes_are_valid_and_match_schema_collection_groups():
