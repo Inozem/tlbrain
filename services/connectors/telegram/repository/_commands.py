@@ -23,6 +23,7 @@ from services.connectors.telegram.repository._common import (
     _integer,
     _receipt_result,
     _aware,
+    _context_defaults,
 )
 
 @dataclass(slots=True)
