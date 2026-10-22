@@ -1,5 +1,7 @@
 import logging
 import os
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import functions_framework
 from google.cloud import firestore
@@ -26,6 +28,12 @@ from core.integrations.firestore.transcripts import (
 )
 from core.integrations.firestore.sync_state import get_drive_sync_token, set_drive_sync_token
 from core.integrations.cloud_tasks.client import enqueue_task
+from core.integrations.firestore.outbox import OutboxTargetKind
+from core.operations.outbox import (
+    TaskTargetConfig,
+    enqueue_stale_mcp_save_recoveries,
+    publish_due_outbox_records,
+)
 
 from core.utils.logging import configure_logging
 
@@ -34,6 +42,64 @@ logger = logging.getLogger(__name__)
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
+MCP_RECOVERY_SWEEP_LIMIT = 50
+
+
+def _mcp_recovery_target() -> TaskTargetConfig | None:
+    """Build the recovery target only from complete, verifier-matched config."""
+    callback_url = os.environ.get("INTERNAL_DIALOG_OPERATIONS_URL")
+    queue_name = os.environ.get("DIALOG_OPERATIONS_QUEUE")
+    audience = os.environ.get("CLOUD_TASKS_OIDC_AUDIENCE") or os.environ.get("TASK_OIDC_AUDIENCE")
+    service_account = (
+        os.environ.get("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("TASK_OIDC_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("TASK_SERVICE_ACCOUNT_EMAIL")
+    )
+    expected_audience = os.environ.get("OIDC_AUDIENCE")
+    expected_account = os.environ.get("OIDC_SERVICE_ACCOUNT_EMAIL")
+    try:
+        parsed = urlsplit(callback_url or "")
+        valid_url = (
+            parsed.scheme == "https" and bool(parsed.hostname)
+            and parsed.username is None and parsed.password is None
+            and parsed.path == "/internal/dialog-operations"
+            and not parsed.query and not parsed.fragment
+        )
+        if not (
+            valid_url and queue_name and queue_name.strip()
+            and audience and audience.strip() and audience == expected_audience
+            and service_account and service_account.strip()
+            and service_account == expected_account
+        ):
+            return None
+        return TaskTargetConfig(
+            queue_name=queue_name,
+            url=callback_url,
+            service_account_email=service_account,
+            audience=audience,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_mcp_recovery_sweep(db: firestore.Client) -> None:
+    target = _mcp_recovery_target()
+    if target is None:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        enqueue_stale_mcp_save_recoveries(db, now=now, limit=MCP_RECOVERY_SWEEP_LIMIT)
+        result = publish_due_outbox_records(
+            db,
+            {OutboxTargetKind.MCP_SAVE_RECOVERY: target},
+            now=now,
+            limit=MCP_RECOVERY_SWEEP_LIMIT,
+        )
+        logger.info("MCP recovery sweep: selected=%d failed=%d", result.selected, result.failed)
+    except Exception:
+        # Keep additive recovery failures from interrupting scheduled Drive reconciliation.
+        logger.warning("MCP recovery sweep failed; Checker will continue")
 
 
 @functions_framework.http
@@ -50,6 +116,8 @@ def checker(request):
         enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
         logger.info("Targeted resync: doc_id=%s", doc_id)
         return {"mode": "doc", "doc_id": doc_id, "queued": 1}, 200
+
+    _run_mcp_recovery_sweep(db)
 
     stale_syncing = get_stale_syncing(db=db)
     for doc_id in stale_syncing:

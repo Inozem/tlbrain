@@ -21,6 +21,7 @@ from core.operations.models import (
 
 
 OPERATIONS_COLLECTION = "dialog_operations"
+MAX_STALE_OPERATION_LIMIT = 500
 
 
 def _db(client: Any | None) -> Any:
@@ -258,6 +259,50 @@ def create_operation(
 def get_operation(client: Any | None, operation_id: str) -> OperationRecord | None:
     snapshot = _db(client).collection(OPERATIONS_COLLECTION).document(operation_id).get()
     return _record_from(snapshot.to_dict() or {}) if snapshot.exists else None
+
+
+def _list_stale_operations_for_state(
+    collection: Any,
+    *,
+    origin: OperationOrigin,
+    state: OperationState,
+    cutoff: datetime,
+    limit: int,
+) -> list[OperationRecord]:
+    """Fetch one bounded state slice so pending and running backlogs get separate quotas."""
+    query = collection.where("origin", "==", origin.value)
+    query = query.where("state", "==", state.value)
+    query = query.where("updated_at", "<=", cutoff).limit(limit)
+    return [_record_from(snapshot.to_dict() or {}) for snapshot in query.stream()]
+
+
+def list_stale_operations(
+    client: Any | None,
+    *,
+    cutoff: datetime,
+    limit: int,
+    origin: OperationOrigin = OperationOrigin.MCP,
+) -> list[OperationRecord]:
+    """Return a bounded set of pending/running operations older than ``cutoff``."""
+    cutoff = _aware(cutoff)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_STALE_OPERATION_LIMIT:
+        raise ValueError(f"limit must be an integer from 1 to {MAX_STALE_OPERATION_LIMIT}")
+    origin = OperationOrigin(origin)
+    collection = _db(client).collection(OPERATIONS_COLLECTION)
+    records: list[OperationRecord] = []
+    pending_limit = (limit + 1) // 2
+    state_limits = (
+        (OperationState.PENDING, pending_limit),
+        (OperationState.RUNNING, limit - pending_limit),
+    )
+    for state, state_limit in state_limits:
+        if state_limit == 0:
+            continue
+        records.extend(_list_stale_operations_for_state(
+            collection, origin=origin, state=state, cutoff=cutoff, limit=state_limit,
+        ))
+    records.sort(key=lambda record: (record.updated_at or cutoff, record.operation_id))
+    return records[:limit]
 
 
 def validate_operation_lease(

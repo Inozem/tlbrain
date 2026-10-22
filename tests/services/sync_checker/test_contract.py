@@ -41,6 +41,7 @@ def test_targeted_doc_queues_anonymous_task_and_skips_checker_queries(
     for name in (
         "get_stale_syncing", "get_error_docs", "get_drive_sync_token",
         "get_drive_changes", "get_start_page_token", "scan_root_folder",
+        "enqueue_stale_mcp_save_recoveries", "publish_due_outbox_records",
     ):
         monkeypatch.setattr(checker_main, name, lambda *args, _name=name, **kwargs: pytest.fail(
             f"targeted request must skip {_name}"
@@ -112,6 +113,59 @@ def test_stale_and_error_retries_are_queued_in_order_before_changes(
         "https://sync.synthetic.test/sync/doc/error-a",
     ]
     assert all("name" not in event["arguments"]["task"] for event in _task_events(sdk_fakes))
+
+
+def test_scheduled_checker_runs_configured_mcp_recovery_sweep(checker_main, monkeypatch):
+    monkeypatch.setenv("INTERNAL_DIALOG_OPERATIONS_URL", "https://callback.synthetic.test/internal/dialog-operations")
+    monkeypatch.setenv("DIALOG_OPERATIONS_QUEUE", "dialog-recovery")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://callback.synthetic.test/internal/dialog-operations")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://callback.synthetic.test/internal/dialog-operations")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "worker@synthetic.test")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "worker@synthetic.test")
+    monkeypatch.setenv("VECTOR_SYNC_URL", "https://sync.synthetic.test")
+    calls = []
+    monkeypatch.setattr(checker_main, "enqueue_stale_mcp_save_recoveries", lambda db, **kwargs: calls.append(("recover", kwargs)))
+    monkeypatch.setattr(checker_main, "publish_due_outbox_records", lambda db, targets, **kwargs: (
+        calls.append(("publish", targets, kwargs)) or SimpleNamespace(selected=0, failed=0)
+    ))
+    monkeypatch.setattr(checker_main, "get_stale_syncing", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_error_docs", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_drive_sync_token", lambda: "page-token")
+    monkeypatch.setattr(checker_main, "get_drive_changes", lambda token: ([], "next-token"))
+    monkeypatch.setattr(checker_main, "set_drive_sync_token", lambda token: None)
+
+    response = checker_main.checker(_request())
+
+    assert response == ({"queued": 0, "stale_syncing": 0, "error_docs": 0}, 200)
+    assert [call[0] for call in calls] == ["recover", "publish"]
+    assert calls[1][1][checker_main.OutboxTargetKind.MCP_SAVE_RECOVERY].url == (
+        "https://callback.synthetic.test/internal/dialog-operations"
+    )
+    assert calls[1][1][checker_main.OutboxTargetKind.MCP_SAVE_RECOVERY].audience == (
+        "https://callback.synthetic.test/internal/dialog-operations"
+    )
+
+
+def test_missing_or_mismatched_recovery_config_skips_sweep_and_keeps_checker_running(
+    checker_main, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_SYNC_URL", "https://sync.synthetic.test")
+    monkeypatch.delenv("INTERNAL_DIALOG_OPERATIONS_URL", raising=False)
+    monkeypatch.setattr(checker_main, "enqueue_stale_mcp_save_recoveries", lambda *args, **kwargs: pytest.fail(
+        "missing callback must skip MCP recovery"
+    ))
+    monkeypatch.setattr(checker_main, "publish_due_outbox_records", lambda *args, **kwargs: pytest.fail(
+        "missing callback must skip MCP recovery"
+    ))
+    monkeypatch.setattr(checker_main, "get_stale_syncing", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_error_docs", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_drive_sync_token", lambda: "page-token")
+    monkeypatch.setattr(checker_main, "get_drive_changes", lambda token: ([], "next-token"))
+    monkeypatch.setattr(checker_main, "set_drive_sync_token", lambda token: None)
+
+    assert checker_main.checker(_request()) == (
+        {"queued": 0, "stale_syncing": 0, "error_docs": 0}, 200
+    )
 
 
 def test_nonexpired_drive_provider_error_propagates(checker_main, monkeypatch):

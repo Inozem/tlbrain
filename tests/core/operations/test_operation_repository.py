@@ -16,6 +16,7 @@ from core.integrations.firestore.operations import (
     fail_stage_attempt,
     get_operation,
     get_stage,
+    list_stale_operations,
     release_operation,
     renew_operation_lease,
     reserve_stage_attempt,
@@ -66,6 +67,28 @@ def test_create_replay_requires_same_immutable_identity(firestore_fake):
     for changed in ({"title": "different"}, {"provider": "other"}, {"save_intent_id": "other-intent"}):
         with pytest.raises(ValueError, match="different immutable identity"):
             _create(client, **changed)
+
+
+def test_stale_query_returns_only_bounded_old_pending_and_running_mcp_operations(firestore_fake):
+    client = firestore_fake.client_class()
+    old = NOW - timedelta(minutes=10)
+    _create(client, operation_id="stale-pending", origin_operation_ref="ref-pending", now=old)
+    _create(client, operation_id="fresh-pending", origin_operation_ref="ref-fresh", now=NOW)
+    _create(client, operation_id="stale-telegram", origin=OperationOrigin.TELEGRAM,
+            origin_operation_ref="ref-telegram", now=old)
+    _create(client, operation_id="stale-running", origin_operation_ref="ref-running", now=old)
+    running = claim_operation(client, "stale-running", owner="worker", now=old, lease_seconds=2)
+    assert running is not None
+    client.collection("dialog_operations").document("stale-running").update({"updated_at": old})
+
+    records = list_stale_operations(client, cutoff=NOW - timedelta(minutes=5), limit=10)
+
+    assert {record.operation_id for record in records} == {"stale-pending", "stale-running"}
+    assert list_stale_operations(
+        client, cutoff=NOW - timedelta(minutes=5), limit=1
+    )[0].operation_id == "stale-pending"
+    with pytest.raises(ValueError, match="limit"):
+        list_stale_operations(client, cutoff=NOW, limit=501)
 
 
 def test_claim_reclaim_fence_renew_and_terminal_state(firestore_fake):

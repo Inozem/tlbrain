@@ -8,8 +8,14 @@ from core.integrations.firestore.outbox import (
     create_outbox_record,
     get_outbox_record,
 )
+from core.integrations.firestore.operations import claim_operation, create_operation
 from core.operations import outbox as publisher
-from core.operations.outbox import TaskTargetConfig, publish_due_outbox_records
+from core.operations.models import OperationOrigin
+from core.operations.outbox import (
+    TaskTargetConfig,
+    enqueue_stale_mcp_save_recoveries,
+    publish_due_outbox_records,
+)
 
 
 NOW = datetime(2026, 4, 1, tzinfo=timezone.utc)
@@ -32,6 +38,21 @@ def _create(client, outbox_id, *, kind=OutboxTargetKind.TELEGRAM_DISPATCH):
         now=NOW,
         operation_id=f"operation-{outbox_id}",
     )
+
+
+def _create_operation(client, operation_id, *, now=None, **kwargs):
+    values = {
+        "operation_id": operation_id,
+        "origin": OperationOrigin.MCP,
+        "origin_operation_ref": f"request-{operation_id}",
+        "caller_binding": "caller-1",
+        "immutable_input_digest": "sha256:synthetic",
+        "immutable_input_ref": "input-ref-1",
+        "save_intent_id": f"save-{operation_id}",
+        "now": now or NOW - timedelta(minutes=10),
+    }
+    values.update(kwargs)
+    return create_operation(client, **values)
 
 
 def test_publisher_uses_trusted_target_and_ids_only_body(firestore_fake, monkeypatch):
@@ -142,9 +163,88 @@ def test_missing_target_stays_pending_and_sweep_continues_after_enqueue_error(
         now=NOW,
         limit=10,
     )
-    assert skipped.selected == skipped.skipped == 2
+    assert skipped.selected == skipped.skipped == 0
     assert get_outbox_record(client, "one").state is OutboxState.RETRY
     assert get_outbox_record(client, "unconfigured").state is OutboxState.PENDING
+
+
+def test_publisher_filters_disabled_target_records_before_bounded_selection(firestore_fake, monkeypatch):
+    client = firestore_fake.client_class()
+    _create(client, "disabled", kind=OutboxTargetKind.INDEX_DISPATCH)
+    _create(client, "enabled")
+    calls = []
+    monkeypatch.setattr(publisher, "enqueue_task", lambda **kwargs: calls.append(kwargs) or True)
+
+    result = publish_due_outbox_records(
+        client,
+        {
+            OutboxTargetKind.INDEX_DISPATCH: None,
+            OutboxTargetKind.TELEGRAM_DISPATCH: TARGET,
+        },
+        now=NOW,
+        limit=1,
+    )
+
+    assert result.selected == result.published == 1
+    assert [call["task_id"] for call in calls] == ["task-enabled-g1"]
+    assert get_outbox_record(client, "disabled").state is OutboxState.PENDING
+
+
+def test_stale_mcp_recovery_filters_eligibility_and_reuses_fence_identity(firestore_fake):
+    client = firestore_fake.client_class()
+    old = NOW - timedelta(minutes=10)
+    _create_operation(client, "pending", now=old)
+    _create_operation(client, "no-save", now=old, save_intent_id=None)
+    _create_operation(client, "legacy", now=old, origin_operation_ref=None)
+    _create_operation(client, "telegram", now=old, origin=OperationOrigin.TELEGRAM)
+    _create_operation(client, "terminal", now=old)
+    client.collection("dialog_operations").document("terminal").update({"state": "failed"})
+    _create_operation(client, "live", now=old)
+    claim_operation(client, "live", owner="live-worker", now=NOW, lease_seconds=300)
+    client.collection("dialog_operations").document("live").update({"updated_at": old})
+    _create_operation(client, "expired", now=old)
+    claim_operation(client, "expired", owner="expired-worker", now=old, lease_seconds=1)
+    client.collection("dialog_operations").document("expired").update({"updated_at": old})
+    _create_operation(client, "lease-less", now=old)
+    client.collection("dialog_operations").document("lease-less").update({
+        "state": "running", "updated_at": old, "lease_owner": None, "lease_expires_at": None,
+    })
+
+    first = enqueue_stale_mcp_save_recoveries(client, now=NOW, limit=50)
+    second = enqueue_stale_mcp_save_recoveries(client, now=NOW + timedelta(seconds=30), limit=50)
+    records = [
+        data for path, data in firestore_fake.documents.items()
+        if path.startswith("task_outbox/")
+    ]
+
+    assert first == 3
+    assert second == 3
+    assert {record["operation_id"] for record in records} == {"pending", "expired", "lease-less"}
+    assert len(records) == 3
+    assert {record["operation_id"]: record["generation"] for record in records} == {
+        "pending": 1,
+        "expired": 2,
+        "lease-less": 1,
+    }
+    assert all(record["save_intent_id"] and "text" not in record for record in records)
+
+
+def test_stale_mcp_recovery_advances_generation_only_with_fence(firestore_fake):
+    client = firestore_fake.client_class()
+    old = NOW - timedelta(minutes=10)
+    _create_operation(client, "fenced", now=old)
+    assert enqueue_stale_mcp_save_recoveries(client, now=NOW, limit=10) == 1
+    first = next(data for path, data in firestore_fake.documents.items() if path.startswith("task_outbox/"))
+
+    lease = claim_operation(client, "fenced", owner="worker", now=old, lease_seconds=1)
+    assert lease is not None and lease.fence == 1
+    client.collection("dialog_operations").document("fenced").update({"updated_at": old})
+    assert enqueue_stale_mcp_save_recoveries(client, now=NOW, limit=10) == 1
+    records = [data for path, data in firestore_fake.documents.items() if path.startswith("task_outbox/")]
+
+    assert len(records) == 2
+    assert {record["generation"] for record in records} == {1, 2}
+    assert first["outbox_id"] != next(record["outbox_id"] for record in records if record["generation"] == 2)
 
 
 def test_target_config_rejects_untrusted_or_malformed_url():

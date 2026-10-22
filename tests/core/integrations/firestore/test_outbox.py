@@ -134,6 +134,19 @@ def test_due_query_never_returns_more_than_requested_limit(firestore_fake):
     assert len(list_due_outbox_records(client, now=NOW, limit=2)) == 2
 
 
+def test_due_query_filters_enabled_target_kinds_before_applying_bound(firestore_fake):
+    client = firestore_fake.client_class()
+    _create(client, outbox_id="disabled", target_kind=OutboxTargetKind.INDEX_DISPATCH)
+    _create(client, outbox_id="enabled", target_kind=OutboxTargetKind.MCP_SAVE_RECOVERY)
+
+    due = list_due_outbox_records(
+        client, now=NOW, limit=1, target_kinds=[OutboxTargetKind.MCP_SAVE_RECOVERY]
+    )
+
+    assert [record.outbox_id for record in due] == ["enabled"]
+    assert list_due_outbox_records(client, now=NOW, limit=1, target_kinds=[]) == []
+
+
 def test_delivery_results_are_transactional_and_delivered_state_is_monotonic(firestore_fake):
     client = firestore_fake.client_class()
     _create(client)
@@ -202,14 +215,34 @@ def test_firestore_indexes_are_valid_and_match_schema_collection_groups():
     config_path = Path(__file__).resolve().parents[4] / "infra" / "firestore" / "indexes.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
-    assert config["indexes"] == [{
-        "collectionGroup": "task_outbox",
-        "queryScope": "COLLECTION",
-        "fields": [
-            {"fieldPath": "state", "order": "ASCENDING"},
-            {"fieldPath": "schedule_at", "order": "ASCENDING"},
-        ],
-    }]
+    assert config["indexes"] == [
+        {
+            "collectionGroup": "task_outbox",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "state", "order": "ASCENDING"},
+                {"fieldPath": "schedule_at", "order": "ASCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "task_outbox",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "state", "order": "ASCENDING"},
+                {"fieldPath": "target_kind", "order": "ASCENDING"},
+                {"fieldPath": "schedule_at", "order": "ASCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "dialog_operations",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "origin", "order": "ASCENDING"},
+                {"fieldPath": "state", "order": "ASCENDING"},
+                {"fieldPath": "updated_at", "order": "ASCENDING"},
+            ],
+        },
+    ]
     overrides = {(item["collectionGroup"], item["fieldPath"]): item["indexes"]
                  for item in config["fieldOverrides"]}
     assert overrides == {

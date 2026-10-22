@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, Iterable
 
 from google.cloud import firestore
 
@@ -152,25 +152,78 @@ def get_outbox_record(client: Any, outbox_id: str) -> OutboxRecord | None:
     return _from(snapshot.to_dict() or {}) if snapshot.exists else None
 
 
+def _list_due_outbox_records_for_all_targets(
+    collection: Any,
+    *,
+    now: datetime,
+    limit: int,
+) -> list[OutboxRecord]:
+    """Query all targets, using RETRY records to fill space left by PENDING ones."""
+    pending = collection.where("state", "==", OutboxState.PENDING.value)
+    pending = pending.where("schedule_at", "<=", now).limit(limit)
+    snapshots = list(pending.stream())
+    if len(snapshots) < limit:
+        retries = collection.where("state", "==", OutboxState.RETRY.value)
+        retries = retries.where("schedule_at", "<=", now).limit(limit - len(snapshots))
+        snapshots.extend(retries.stream())
+    return [_from(snapshot.to_dict() or {}) for snapshot in snapshots]
+
+
+def _list_due_outbox_records_for_targets(
+    collection: Any,
+    *,
+    now: datetime,
+    limit: int,
+    target_kinds: tuple[str, ...],
+) -> list[OutboxRecord]:
+    """Query selected targets independently with a fair share of the total limit."""
+    base_limit, extra = divmod(limit, len(target_kinds))
+    records: list[OutboxRecord] = []
+    for index, target_kind in enumerate(target_kinds):
+        per_kind_limit = base_limit + int(index < extra)
+        if per_kind_limit == 0:
+            break
+        pending = collection.where("target_kind", "==", target_kind)
+        pending = pending.where("state", "==", OutboxState.PENDING.value)
+        pending = pending.where("schedule_at", "<=", now).limit(per_kind_limit)
+        selected = list(pending.stream())
+        if len(selected) < per_kind_limit:
+            retries = collection.where("target_kind", "==", target_kind)
+            retries = retries.where("state", "==", OutboxState.RETRY.value)
+            retries = retries.where("schedule_at", "<=", now).limit(per_kind_limit - len(selected))
+            selected.extend(retries.stream())
+        records.extend(_from(snapshot.to_dict() or {}) for snapshot in selected)
+    return records
+
+
 def list_due_outbox_records(
     client: Any,
     *,
     now: datetime,
     limit: int,
+    target_kinds: Iterable[OutboxTargetKind | str] | None = None,
 ) -> list[OutboxRecord]:
-    """Return at most ``limit`` due records in undelivered states."""
+    """Return at most ``limit`` due records in undelivered states and targets."""
     now = _aware(now, "now")
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_DUE_LIMIT:
         raise ValueError(f"limit must be an integer from 1 to {MAX_DUE_LIMIT}")
+    kinds = None
+    if target_kinds is not None:
+        try:
+            kinds = tuple(dict.fromkeys(OutboxTargetKind(kind).value for kind in target_kinds))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target_kinds contains an unsupported outbox target") from exc
+        if not kinds:
+            return []
     collection = client.collection(OUTBOX_COLLECTION)
-    query = collection.where("state", "==", OutboxState.PENDING.value)
-    query = query.where("schedule_at", "<=", now).limit(limit)
-    due = list(query.stream())
-    if len(due) < limit:
-        query = collection.where("state", "==", OutboxState.RETRY.value)
-        query = query.where("schedule_at", "<=", now).limit(limit - len(due))
-        due.extend(query.stream())
-    return [_from(snapshot.to_dict() or {}) for snapshot in due]
+    if kinds is None:
+        records = _list_due_outbox_records_for_all_targets(collection, now=now, limit=limit)
+    else:
+        records = _list_due_outbox_records_for_targets(
+            collection, now=now, limit=limit, target_kinds=kinds
+        )
+    records.sort(key=lambda record: (record.schedule_at, record.created_at or record.schedule_at, record.outbox_id))
+    return records[:limit]
 
 
 def record_outbox_delivery_result(

@@ -7,6 +7,24 @@
         { "fieldPath": "state", "order": "ASCENDING" },
         { "fieldPath": "schedule_at", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "task_outbox",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "state", "order": "ASCENDING" },
+        { "fieldPath": "target_kind", "order": "ASCENDING" },
+        { "fieldPath": "schedule_at", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dialog_operations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "origin", "order": "ASCENDING" },
+        { "fieldPath": "state", "order": "ASCENDING" },
+        { "fieldPath": "updated_at", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": [

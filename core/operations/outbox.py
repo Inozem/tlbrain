@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Mapping
 from urllib.parse import urlsplit
@@ -12,10 +14,18 @@ from core.integrations.cloud_tasks.client import enqueue_task
 from core.integrations.firestore.outbox import (
     OutboxRecord,
     OutboxTargetKind,
+    create_outbox_record,
     list_due_outbox_records,
     record_outbox_delivery_result,
     task_payload,
 )
+from core.integrations.firestore.operations import list_stale_operations
+from core.operations.models import OperationOrigin, OperationState
+
+
+MCP_RECOVERY_STALE_AGE = timedelta(minutes=5)
+MCP_RECOVERY_SWEEP_LIMIT = 50
+_SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,480}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +169,10 @@ def publish_due_outbox_records(
     outcomes confirm dispatch only; this function never changes domain operations.
     """
     configured = _targets_by_kind(targets)
-    records = list_due_outbox_records(client, now=now, limit=limit)
+    enabled_kinds = [kind for kind, target in configured.items() if target is not None]
+    records = list_due_outbox_records(
+        client, now=now, limit=limit, target_kinds=enabled_kinds
+    )
     totals = {outcome: 0 for outcome in _PublicationOutcome}
     for record in records:
         outcome = _publish_record(
@@ -176,8 +189,63 @@ def publish_due_outbox_records(
     )
 
 
+def enqueue_stale_mcp_save_recoveries(
+    client: object,
+    *,
+    now: datetime,
+    limit: int = MCP_RECOVERY_SWEEP_LIMIT,
+) -> int:
+    """Create stable recovery outbox records for eligible stale MCP saves."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    now = now.astimezone(timezone.utc)
+    stale = list_stale_operations(
+        client, cutoff=now - MCP_RECOVERY_STALE_AGE, limit=limit,
+        origin=OperationOrigin.MCP,
+    )
+    enqueued = 0
+    for operation in stale:
+        lease_expiry = operation.lease_expires_at
+        lease_expired = lease_expiry is None or (
+            isinstance(lease_expiry, datetime)
+            and lease_expiry.tzinfo is not None
+            and lease_expiry.astimezone(now.tzinfo) <= now
+        )
+        if (
+            operation.origin is not OperationOrigin.MCP
+            or operation.state not in (OperationState.PENDING, OperationState.RUNNING)
+            or not operation.save_intent_id
+            or not operation.origin_operation_ref
+            or (operation.state is OperationState.RUNNING and not lease_expired)
+            or not _SAFE_TASK_ID.fullmatch(operation.operation_id)
+            or not _SAFE_TASK_ID.fullmatch(operation.save_intent_id)
+        ):
+            continue
+
+        generation = max(1, operation.fence + 1)
+        identity = f"{operation.operation_id}\0{operation.save_intent_id}\0{operation.fence}"
+        outbox_id = "mcp-save-recovery-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        try:
+            create_outbox_record(
+                client,
+                outbox_id,
+                target_kind=OutboxTargetKind.MCP_SAVE_RECOVERY,
+                generation=generation,
+                schedule_at=operation.created_at or operation.updated_at or now,
+                now=now,
+                operation_id=operation.operation_id,
+                save_intent_id=operation.save_intent_id,
+            )
+        except (TypeError, ValueError):
+            # Malformed legacy identifiers are not dispatchable task references.
+            continue
+        enqueued += 1
+    return enqueued
+
+
 __all__ = [
     "OutboxSweepResult",
     "TaskTargetConfig",
+    "enqueue_stale_mcp_save_recoveries",
     "publish_due_outbox_records",
 ]
