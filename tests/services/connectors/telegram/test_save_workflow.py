@@ -106,6 +106,7 @@ class _Repository:
         }}
         self.guard = {"resource_version": 7, "current": True}
         self.certificate = None
+        self.cleanup_authorization = None
         self.checkpoints = {}
         self.deleted = []
         self.deleted_pages = []
@@ -159,6 +160,27 @@ class _Repository:
     async def load_completion_certificate(self, context_id):
         return copy.deepcopy(self.certificate)
 
+    async def authorize_cleanup(self, context_id, certificate):
+        draft = self.drafts.get(_value(certificate, "draft_id"))
+        if (draft is None or _value(certificate, "context_id") != context_id
+                or _value(certificate, "draft_id") != draft["draft_id"]
+                or _value(certificate, "manifest_digest") != draft["manifest_digest"]
+                or self.certificate != certificate):
+            return False
+        if self.cleanup_authorization is None:
+            self.cleanup_authorization = copy.deepcopy(certificate)
+        return self.cleanup_authorization == certificate
+
+    async def finalize_cleanup(self, context_id, certificate):
+        if self.cleanup_authorization != certificate:
+            return False
+        draft = self.drafts.get(_value(certificate, "draft_id"))
+        if draft is not None:
+            draft["cleanup_state"] = "cleaned"
+        if self.active_draft_id == _value(certificate, "draft_id"):
+            self.active_draft_id = None
+        return True
+
     async def load_draft(self, context_id, draft_id):
         draft = self.drafts.get(draft_id)
         return copy.deepcopy(draft) if draft is not None else None
@@ -182,6 +204,12 @@ class _Repository:
             draft["messages"] = [
                 row for row in draft["messages"] if row["message_id"] not in removed
             ]
+
+    async def list_prepared_pages(self, context_id, draft_id, *, limit):
+        return []
+
+    async def delete_prepared_page(self, context_id, draft_id, page):
+        return None
 
 
 class _Audio:
@@ -265,6 +293,7 @@ def _committed_certificate(repository, *, draft_id=None, manifest_digest=None):
     draft_id = draft_id or repository.draft["draft_id"]
     manifest_digest = manifest_digest or repository.draft["manifest_digest"]
     return {
+        "context_id": "context-1",
         "certificate_id": "certificate-1",
         "draft_id": draft_id,
         "manifest_digest": manifest_digest,
@@ -279,6 +308,7 @@ def _committed_certificate(repository, *, draft_id=None, manifest_digest=None):
         "index_fence": 11,
         "resource_epoch": "epoch-1",
         "fence": 7,
+        "origin_binding": ("context-1", draft_id, manifest_digest),
         "verified_at": "2026-10-22T10:00:00Z",
         "completed_at": "2026-10-22T10:00:01Z",
     }
@@ -472,6 +502,34 @@ def test_cleanup_without_exact_authoritative_certificate_deletes_nothing(certifi
     assert repository.draft["messages"]
 
 
+def test_cleanup_returns_false_when_finalization_rejects_certificate():
+    repository = _Repository()
+    certificate = _committed_certificate(repository)
+    repository.certificate = certificate
+
+    async def reject_finalization(_context_id, _certificate):
+        return False
+
+    repository.finalize_cleanup = reject_finalization
+    cleanup = _cleanup_type()(repository=repository, page_size=1)
+
+    assert _run(cleanup.cleanup(context_id="context-1")) is False
+    assert repository.deleted == [("draft-original", 1)]
+
+
+def test_cleanup_missing_prepared_page_methods_cannot_finalize():
+    repository = _Repository()
+    repository.certificate = _committed_certificate(repository)
+    repository.list_prepared_pages = None
+    cleanup = _cleanup_type()(repository=repository, page_size=1)
+
+    with pytest.raises(RuntimeError, match="prepared-page cleanup"):
+        _run(cleanup.cleanup(context_id="context-1"))
+
+    assert repository.deleted == []
+    assert repository.draft.get("cleanup_state") is None
+
+
 def test_restartable_paged_cleanup_only_removes_certified_draft_and_preserves_new_draft():
     messages = [_message(index, f"source {index}") for index in range(1, 5)]
     repository = _Repository(messages=messages)
@@ -495,13 +553,13 @@ def test_restartable_paged_cleanup_only_removes_certified_draft_and_preserves_ne
     # The first call models a process stopping after its first durable page.
     repository.delete_draft_page = _partial_delete(repository, stop_after=2)
     with pytest.raises(RuntimeError, match="synthetic cleanup crash"):
-        _run(cleanup.cleanup(context_id="context-1"))
+        _run(cleanup.cleanup(context_id="telegram-context-1"))
     repository.delete_draft_page = _Repository.delete_draft_page.__get__(repository)
     assert repository.certificate == committed_certificate
 
-    _run(cleanup.cleanup(context_id="context-1"))
+    _run(cleanup.cleanup(context_id="telegram-context-1"))
     first_cleanup_deletes = list(repository.deleted)
-    _run(cleanup.cleanup(context_id="context-1"))
+    _run(cleanup.cleanup(context_id="telegram-context-1"))
 
     assert set(repository.deleted) == {("draft-original", item) for item in (1, 2, 3, 4)}
     assert len(repository.deleted) == len(set(repository.deleted))
@@ -543,7 +601,7 @@ def test_cleanup_does_not_rewrite_or_erase_independent_saved_doc_edit():
     repository.doc_text = "independent user edit after save commit"
     cleanup = _cleanup_type()(repository=repository, page_size=1)
 
-    _run(cleanup.cleanup(context_id="context-1"))
+    _run(cleanup.cleanup(context_id="telegram-context-1"))
 
     assert repository.doc_text == "independent user edit after save commit"
     assert repository.doc_writes == []

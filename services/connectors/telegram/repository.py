@@ -17,6 +17,8 @@ from core.integrations.firestore.outbox import (
     create_outbox_record_in_transaction,
 )
 from core.integrations.firestore.operation_queue import register_operation_in_transaction
+from core.integrations.firestore.operations import OPERATIONS_COLLECTION
+from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION
 from services.connectors.telegram.models import (
     PreparedUtterance,
     TelegramContext,
@@ -70,6 +72,139 @@ def _document_ref(client: Any, path: str) -> Any:
 
 def _enum_value(value: Any) -> Any:
     return value.value if hasattr(value, "value") else value
+
+
+def _completion_records_match(
+    *, context_id: str, draft_id: str, intent_id: str, operation_id: str,
+    manifest_digest: str, telegram_certificate: Mapping[str, Any],
+    draft: Mapping[str, Any], manifest: Mapping[str, Any],
+    intent: Mapping[str, Any], operation: Mapping[str, Any],
+) -> bool:
+    """Check shared completion authority against the sealed Telegram draft."""
+    binding = {"context_id": context_id, "draft_id": draft_id,
+               "manifest_digest": manifest_digest}
+    shared = intent.get("completion_certificate") or {}
+    authorization = intent.get("cleanup_authorization") or {}
+    return (
+        draft.get("state") in {TelegramDraftState.PROCESSING.value,
+                                TelegramDraftState.COMPLETED.value}
+        and draft.get("manifest_digest") == manifest_digest
+        and draft.get("manifest_ref") == f"{SESSIONS}/{context_id}/drafts/{draft_id}/save_manifests/{operation_id}"
+        and draft.get("active_save_operation_id") == operation_id
+        and draft.get("immutable_save_intent_id") == intent_id
+        and (draft.get("completion_certificate") is None
+             or _telegram_certificate_matches(
+                 draft.get("completion_certificate"), telegram_certificate,
+             ))
+        and manifest.get("draft_id") == draft_id
+        and manifest.get("save_operation_id") == operation_id
+        and manifest.get("manifest_digest") == manifest_digest
+        and manifest.get("ordered_message_ids") == draft.get("ordered_message_ids")
+        and intent.get("save_intent_id") == intent_id
+        and intent.get("operation_id") == operation_id
+        and shared.get("save_intent_id") == intent_id
+        and shared.get("operation_id") == operation_id
+        and shared.get("origin_binding") == binding
+        and operation.get("operation_id") == operation_id
+        and operation.get("save_intent_id") == intent_id
+        and operation.get("state") == "completed"
+        and operation.get("doc_id") == shared.get("doc_id")
+        and bool(shared.get("certificate_id"))
+        and bool(shared.get("doc_id"))
+        and authorization == {
+            "certificate_id": shared.get("certificate_id"),
+            "save_intent_id": intent_id,
+            "operation_id": operation_id,
+            "origin_binding": binding,
+        }
+        and operation.get("cleanup_authorization") == authorization
+    )
+
+
+def _cleanup_authority_matches(
+    *, context_id: str, draft_id: str, intent_id: str, operation_id: str,
+    manifest_digest: str, telegram_certificate: Mapping[str, Any],
+    context: Mapping[str, Any], draft: Mapping[str, Any],
+    manifest: Mapping[str, Any], intent: Mapping[str, Any],
+    operation: Mapping[str, Any],
+) -> bool:
+    """Check that every authoritative record still identifies this draft save."""
+    if not _completion_records_match(
+        context_id=context_id, draft_id=draft_id, intent_id=intent_id,
+        operation_id=operation_id, manifest_digest=manifest_digest,
+        telegram_certificate=telegram_certificate, draft=draft, manifest=manifest,
+        intent=intent, operation=operation,
+    ):
+        return False
+    shared = intent.get("completion_certificate") or {}
+    return (
+        draft.get("state") == TelegramDraftState.COMPLETED.value
+        and draft.get("doc_id") == shared.get("doc_id")
+        and draft.get("completion_certificate_ref") == f"{SAVE_INTENTS_COLLECTION}/{intent_id}"
+        and context.get("last_completion_draft_id") == draft_id
+        and _telegram_certificate_matches(
+            draft.get("completion_certificate"), telegram_certificate,
+        )
+    )
+
+
+def _telegram_certificate_matches(left: Any, right: Mapping[str, Any]) -> bool:
+    """Compare local certificates across Firestore's tuple-to-list conversion."""
+    if not isinstance(left, Mapping):
+        return False
+    left_data, right_data = dict(left), dict(right)
+    for record in (left_data, right_data):
+        binding = record.get("origin_binding")
+        if isinstance(binding, (list, tuple)):
+            record["origin_binding"] = tuple(binding)
+    return left_data == right_data
+
+
+def _persisted_cleanup_binding_matches(
+    *, context_id: str, draft_id: str, intent_id: str, operation_id: str,
+    manifest_digest: str, telegram_certificate: Mapping[str, Any],
+    authorization: Mapping[str, Any], draft: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> bool:
+    """Validate durable cleanup authority against the saved local certificate and manifest."""
+    binding = {"context_id": context_id, "draft_id": draft_id,
+               "manifest_digest": manifest_digest}
+    stored_certificate = authorization.get("telegram_certificate")
+    certificate_id = authorization.get("certificate_id")
+    expected_authorization = {
+        "certificate_id": certificate_id,
+        "save_intent_id": intent_id,
+        "operation_id": operation_id,
+        "origin_binding": binding,
+        "telegram_certificate": stored_certificate,
+    }
+    return (
+        isinstance(certificate_id, str) and bool(certificate_id)
+        and dict(authorization) == expected_authorization
+        and _telegram_certificate_matches(stored_certificate, telegram_certificate)
+        and telegram_certificate.get("context_id") == context_id
+        and telegram_certificate.get("draft_id") == draft_id
+        and telegram_certificate.get("save_intent_id") == intent_id
+        and telegram_certificate.get("operation_id") == operation_id
+        and telegram_certificate.get("manifest_digest") == manifest_digest
+        and tuple(telegram_certificate.get("origin_binding", ()))
+        == (context_id, draft_id, manifest_digest)
+        and draft.get("draft_id") == draft_id
+        and draft.get("state") in {TelegramDraftState.COMPLETED.value,
+                                    TelegramDraftState.CLEANED.value}
+        and _telegram_certificate_matches(
+            draft.get("completion_certificate"), telegram_certificate,
+        )
+        and draft.get("completion_certificate_ref") == f"{SAVE_INTENTS_COLLECTION}/{intent_id}"
+        and draft.get("immutable_save_intent_id") == intent_id
+        and draft.get("active_save_operation_id") == operation_id
+        and draft.get("manifest_digest") == manifest_digest
+        and draft.get("manifest_ref") == f"{SESSIONS}/{context_id}/drafts/{draft_id}/save_manifests/{operation_id}"
+        and manifest.get("draft_id") == draft_id
+        and manifest.get("save_operation_id") == operation_id
+        and manifest.get("manifest_digest") == manifest_digest
+        and manifest.get("ordered_message_ids") == draft.get("ordered_message_ids")
+    )
 
 
 def _draft_data(draft: TelegramDraft) -> dict[str, Any]:
@@ -1302,6 +1437,259 @@ class TelegramRepository:
         context_id = _identifier(context_id, "context_id")
         snapshot = self.client.collection(SESSIONS).document(context_id).get()
         return snapshot.to_dict() if snapshot.exists else None
+
+    def commit_completion(self, certificate: Any) -> bool:
+        """Link an immutable save certificate to its Telegram draft transactionally."""
+        data = asdict(certificate) if hasattr(certificate, "__dataclass_fields__") else dict(certificate)
+        context_id = _identifier(data.get("context_id"), "context_id")
+        draft_id = _identifier(data.get("draft_id"), "draft_id")
+        operation_id = _identifier(data.get("operation_id"), "operation_id")
+        intent_id = _identifier(data.get("save_intent_id"), "save_intent_id")
+        manifest_digest = data.get("manifest_digest")
+        if not isinstance(manifest_digest, str) or not manifest_digest:
+            raise ValueError("manifest_digest is required")
+        if tuple(data.get("origin_binding", ())) != (context_id, draft_id, manifest_digest):
+            raise ValueError("completion certificate origin binding does not match Telegram draft")
+        draft_ref = _document_ref(self.client, f"{SESSIONS}/{context_id}/drafts/{draft_id}")
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        manifest_ref = _document_ref(
+            self.client,
+            f"{SESSIONS}/{context_id}/drafts/{draft_id}/save_manifests/{operation_id}",
+        )
+        intent_ref = self.client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+        operation_ref = self.client.collection(OPERATIONS_COLLECTION).document(operation_id)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> bool:
+            draft_snapshot = draft_ref.get(transaction=transaction)
+            context_snapshot = context_ref.get(transaction=transaction)
+            manifest_snapshot = manifest_ref.get(transaction=transaction)
+            intent_snapshot = intent_ref.get(transaction=transaction)
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            if not all((draft_snapshot.exists, context_snapshot.exists, manifest_snapshot.exists,
+                        intent_snapshot.exists, operation_snapshot.exists)):
+                return False
+            draft = draft_snapshot.to_dict() or {}
+            context = context_snapshot.to_dict() or {}
+            manifest = manifest_snapshot.to_dict() or {}
+            intent = intent_snapshot.to_dict() or {}
+            operation = operation_snapshot.to_dict() or {}
+            if not _completion_records_match(
+                context_id=context_id, draft_id=draft_id, intent_id=intent_id,
+                operation_id=operation_id, manifest_digest=manifest_digest,
+                telegram_certificate=data, draft=draft, manifest=manifest,
+                intent=intent, operation=operation,
+            ):
+                return False
+            shared_certificate = intent["completion_certificate"]
+            draft.update({
+                "state": TelegramDraftState.COMPLETED.value,
+                "completion_certificate": data,
+                "completion_certificate_ref": f"{SAVE_INTENTS_COLLECTION}/{intent_id}",
+                "doc_id": shared_certificate.get("doc_id"),
+            })
+            context["last_completion_draft_id"] = draft_id
+            context["last_doc_id"] = shared_certificate.get("doc_id")
+            transaction.set(draft_ref, draft)
+            transaction.set(context_ref, context)
+            return True
+
+        return _txn(self.client.transaction(max_attempts=5))
+
+    def load_completion_certificate(self, context_id: str) -> dict[str, Any] | None:
+        """Load the locally linked certificate for the context's latest completed draft."""
+        context_id = _identifier(context_id, "context_id")
+        context = self.get_context(context_id) or {}
+        draft_id = context.get("last_completion_draft_id")
+        if not draft_id:
+            return None
+        draft = self.get_draft(context_id, _identifier(draft_id, "draft_id")) or {}
+        certificate = draft.get("completion_certificate")
+        return dict(certificate) if isinstance(certificate, Mapping) else None
+
+    def authorize_cleanup(self, context_id: str, certificate: Any) -> bool:
+        """Validate shared completion evidence and durably authorize child deletion."""
+        data = asdict(certificate) if hasattr(certificate, "__dataclass_fields__") else dict(certificate)
+        context_id = _identifier(context_id, "context_id")
+        if data.get("context_id") != context_id:
+            return False
+        draft_id = _identifier(data.get("draft_id"), "draft_id")
+        intent_id = _identifier(data.get("save_intent_id"), "save_intent_id")
+        operation_id = _identifier(data.get("operation_id"), "operation_id")
+        manifest_digest = data.get("manifest_digest")
+        if (not isinstance(manifest_digest, str) or not manifest_digest
+                or tuple(data.get("origin_binding", ())) != (context_id, draft_id, manifest_digest)):
+            return False
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        draft_ref = _document_ref(self.client, f"{SESSIONS}/{context_id}/drafts/{draft_id}")
+        manifest_ref = _document_ref(
+            self.client,
+            f"{SESSIONS}/{context_id}/drafts/{draft_id}/save_manifests/{operation_id}",
+        )
+        intent_ref = self.client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+        operation_ref = self.client.collection(OPERATIONS_COLLECTION).document(operation_id)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> bool:
+            context_snapshot = context_ref.get(transaction=transaction)
+            draft_snapshot = draft_ref.get(transaction=transaction)
+            manifest_snapshot = manifest_ref.get(transaction=transaction)
+            if not (context_snapshot.exists and draft_snapshot.exists and manifest_snapshot.exists):
+                return False
+            context = context_snapshot.to_dict() or {}
+            draft = draft_snapshot.to_dict() or {}
+            manifest = manifest_snapshot.to_dict() or {}
+            if draft.get("cleanup_state") in {"authorized", "cleaned"}:
+                return _persisted_cleanup_binding_matches(
+                    context_id=context_id, draft_id=draft_id, intent_id=intent_id,
+                    operation_id=operation_id, manifest_digest=manifest_digest,
+                    telegram_certificate=data,
+                    authorization=draft.get("cleanup_authorization") or {},
+                    draft=draft, manifest=manifest,
+                )
+            intent_snapshot = intent_ref.get(transaction=transaction)
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            if not (intent_snapshot.exists and operation_snapshot.exists):
+                return False
+            intent = intent_snapshot.to_dict() or {}
+            operation = operation_snapshot.to_dict() or {}
+            if not _cleanup_authority_matches(
+                context_id=context_id, draft_id=draft_id, intent_id=intent_id,
+                operation_id=operation_id, manifest_digest=manifest_digest,
+                telegram_certificate=data, context=context, draft=draft,
+                manifest=manifest, intent=intent, operation=operation,
+            ):
+                return False
+            shared_certificate = intent["completion_certificate"]
+            cert_id = shared_certificate["certificate_id"]
+            expected_binding = {"context_id": context_id, "draft_id": draft_id,
+                                "manifest_digest": manifest_digest}
+            persisted_authorization = {
+                "certificate_id": cert_id,
+                "save_intent_id": intent_id,
+                "operation_id": operation_id,
+                "origin_binding": expected_binding,
+                "telegram_certificate": data,
+            }
+            draft["cleanup_state"] = "authorized"
+            draft["cleanup_authorization"] = persisted_authorization
+            transaction.set(draft_ref, draft)
+            return True
+
+        return _txn(self.client.transaction(max_attempts=5))
+
+    def list_manifest_pages(
+        self, draft_id: str, *, cursor: Any = None, limit: int = 200,
+        context_id: str | None = None,
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Read one bounded source-message page for authorized cleanup."""
+        if context_id is None:
+            raise ValueError("context_id is required for source page listing")
+        context_id, draft_id = _identifier(context_id, "context_id"), _identifier(draft_id, "draft_id")
+        limit = min(_integer(limit, "limit", minimum=1), 400)
+        collection = _document_ref(
+            self.client, f"{SESSIONS}/{context_id}/drafts/{draft_id}"
+        ).collection("messages")
+        query = collection.limit(limit)
+        page = list(query.stream())
+        rows = [snapshot.to_dict() or {} for snapshot in page]
+        next_cursor = page[-1] if len(page) == limit else None
+        return rows, next_cursor
+
+    def delete_draft_page(self, draft_id: str, messages: Sequence[Mapping[str, Any]], *, context_id: str) -> None:
+        """Delete at most 400 message checkpoints from the authorized draft."""
+        context_id, draft_id = _identifier(context_id, "context_id"), _identifier(draft_id, "draft_id")
+        if len(messages) > 400:
+            raise ValueError("cleanup page exceeds the safe write limit")
+        draft = self.get_draft(context_id, draft_id)
+        if draft is None or draft.get("cleanup_state") != "authorized":
+            raise ValueError("draft cleanup has not been authorized")
+        batch = self.client.batch()
+        for row in messages:
+            message_id = _integer(row.get("message_id"), "message_id", minimum=1)
+            batch.delete(_document_ref(
+                self.client, f"{SESSIONS}/{context_id}/drafts/{draft_id}/messages/{message_id}"
+            ))
+        batch.commit()
+
+    def list_prepared_pages(self, context_id: str, draft_id: str, *, limit: int = 200) -> list[Any]:
+        """Read the first bounded page of prepared utterance documents."""
+        context_id, draft_id = _identifier(context_id, "context_id"), _identifier(draft_id, "draft_id")
+        limit = min(_integer(limit, "limit", minimum=1), 400)
+        return list(_document_ref(
+            self.client, f"{SESSIONS}/{context_id}/drafts/{draft_id}"
+        ).collection("prepared").limit(limit).stream())
+
+    def delete_prepared_page(self, context_id: str, draft_id: str, page: Sequence[Any]) -> None:
+        """Delete one bounded prepared utterance page idempotently."""
+        context_id, draft_id = _identifier(context_id, "context_id"), _identifier(draft_id, "draft_id")
+        if len(page) > 400:
+            raise ValueError("cleanup page exceeds the safe write limit")
+        draft = self.get_draft(context_id, draft_id)
+        if draft is None or draft.get("cleanup_state") != "authorized":
+            raise ValueError("draft cleanup has not been authorized")
+        expected_prefix = f"{SESSIONS}/{context_id}/drafts/{draft_id}/prepared/"
+        batch = self.client.batch()
+        for snapshot in page:
+            path = getattr(getattr(snapshot, "reference", None), "path", "")
+            if not isinstance(path, str) or not path.startswith(expected_prefix):
+                raise ValueError("prepared cleanup page contains a foreign document")
+            batch.delete(snapshot.reference)
+        batch.commit()
+
+    def finalize_cleanup(self, context_id: str, certificate: Any) -> bool:
+        """Mark the authorized draft cleaned while preserving newer context state."""
+        data = asdict(certificate) if hasattr(certificate, "__dataclass_fields__") else dict(certificate)
+        context_id = _identifier(context_id, "context_id")
+        if data.get("context_id") != context_id:
+            return False
+        draft_id = _identifier(data.get("draft_id"), "draft_id")
+        intent_id = _identifier(data.get("save_intent_id"), "save_intent_id")
+        operation_id = _identifier(data.get("operation_id"), "operation_id")
+        manifest_digest = data.get("manifest_digest")
+        if not isinstance(manifest_digest, str) or not manifest_digest:
+            return False
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        draft_ref = _document_ref(self.client, f"{SESSIONS}/{context_id}/drafts/{draft_id}")
+        manifest_ref = _document_ref(
+            self.client,
+            f"{SESSIONS}/{context_id}/drafts/{draft_id}/save_manifests/{operation_id}",
+        )
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> bool:
+            context_snapshot = context_ref.get(transaction=transaction)
+            draft_snapshot = draft_ref.get(transaction=transaction)
+            manifest_snapshot = manifest_ref.get(transaction=transaction)
+            if not (context_snapshot.exists and draft_snapshot.exists and manifest_snapshot.exists):
+                return False
+            context = context_snapshot.to_dict() or {}
+            draft = draft_snapshot.to_dict() or {}
+            authorization = draft.get("cleanup_authorization") or {}
+            manifest = manifest_snapshot.to_dict() or {}
+            if not _persisted_cleanup_binding_matches(
+                context_id=context_id, draft_id=draft_id, intent_id=intent_id,
+                operation_id=operation_id, manifest_digest=manifest_digest,
+                telegram_certificate=data, authorization=authorization,
+                draft=draft, manifest=manifest,
+            ):
+                return False
+            if draft.get("cleanup_state") == "cleaned":
+                return True
+            if draft.get("cleanup_state") != "authorized":
+                return False
+            draft["cleanup_state"] = "cleaned"
+            draft["state"] = TelegramDraftState.CLEANED.value
+            if context.get("last_completion_draft_id") == draft_id:
+                context["last_doc_id"] = draft.get("doc_id")
+            if context.get("active_draft_id") == draft_id:
+                context["active_draft_id"] = None
+                context["draft_status"] = None
+            transaction.set(draft_ref, draft)
+            transaction.set(context_ref, context)
+            return True
+
+        return _txn(self.client.transaction(max_attempts=5))
 
     def get_draft(self, context_id: str, draft_id: str) -> dict[str, Any] | None:
         context_id, draft_id = _identifier(context_id, "context_id"), _identifier(draft_id, "draft_id")

@@ -4,6 +4,7 @@ import pytest
 
 from services.connectors.telegram.models import PreparedUtterance
 from services.connectors.telegram.repository import TelegramRepository
+from services.connectors.telegram.save import TelegramCompletionCertificate
 
 
 NOW = datetime(2026, 10, 22, tzinfo=timezone.utc)
@@ -283,3 +284,206 @@ def test_transcription_failure_checkpoint_stores_only_safe_bounded_category(fire
             accepted.context_id, accepted.draft_id, 101,
             "provider exception with sensitive details",
         )
+
+
+def _seed_completion_records(client, *, mismatch=None):
+    context_id, draft_id = "42_5", "draft-save"
+    intent_id, operation_id, digest, doc_id = "intent-save", "operation-save", "manifest-digest", "doc-save"
+    binding = {"context_id": context_id, "draft_id": draft_id, "manifest_digest": digest}
+    certificate_id = "certificate-save"
+    authorization = {
+        "certificate_id": certificate_id,
+        "save_intent_id": intent_id,
+        "operation_id": operation_id,
+        "origin_binding": binding,
+    }
+    shared_certificate = {
+        "certificate_id": certificate_id,
+        "save_intent_id": intent_id,
+        "operation_id": operation_id,
+        "doc_id": doc_id,
+        "origin_binding": binding,
+        "receipt_ref": "index_completions/doc-save",
+        "receipt_version": 4,
+    }
+    operation_authorization = dict(authorization)
+    intent_data = {
+        "save_intent_id": intent_id,
+        "operation_id": operation_id,
+        "completion_certificate": shared_certificate,
+        "cleanup_authorization": authorization,
+    }
+    operation_data = {
+        "operation_id": operation_id,
+        "save_intent_id": intent_id,
+        "state": "completed",
+        "doc_id": doc_id,
+        "cleanup_authorization": operation_authorization,
+    }
+    if mismatch == "foreign_origin":
+        intent_data["completion_certificate"]["origin_binding"] = {
+            **binding, "draft_id": "draft-foreign",
+        }
+    elif mismatch == "foreign_operation_intent":
+        operation_data["save_intent_id"] = "intent-foreign"
+    elif mismatch == "foreign_document":
+        operation_data["doc_id"] = "doc-foreign"
+    client.collection("dialog_save_intents").document(intent_id).set(intent_data)
+    client.collection("dialog_operations").document(operation_id).set(operation_data)
+    client.collection("telegram_sessions").document(context_id).set({
+        "last_completion_draft_id": draft_id,
+        "active_draft_id": "draft-newer",
+        "draft_status": "collecting",
+        "active_conversation_id": "conversation-current",
+        "selected_dialog_number": 3,
+        "last_doc_id": doc_id,
+    })
+    draft_ref = client.collection("telegram_sessions").document(context_id).collection("drafts").document(draft_id)
+    draft_ref.set({
+        "draft_id": draft_id,
+        "dialog_number": 2,
+        "state": "processing",
+        "active_save_operation_id": operation_id,
+        "immutable_save_intent_id": intent_id,
+        "manifest_ref": f"telegram_sessions/{context_id}/drafts/{draft_id}/save_manifests/{operation_id}",
+        "manifest_digest": digest,
+        "ordered_message_ids": [101, 102],
+        "doc_id": doc_id,
+    })
+    draft_ref.collection("save_manifests").document(operation_id).set({
+        "draft_id": draft_id,
+        "save_operation_id": operation_id,
+        "manifest_digest": digest,
+        "ordered_message_ids": [101, 102],
+    })
+    client.collection("telegram_sessions").document(context_id).collection("drafts").document("draft-newer").set({
+        "draft_id": "draft-newer", "state": "collecting", "private_source": "keep untouched",
+    })
+    telegram_certificate = {
+        "context_id": context_id,
+        "draft_id": draft_id,
+        "manifest_digest": digest,
+        "save_intent_id": intent_id,
+        "operation_id": operation_id,
+        "receipt_ref": "index_completions/doc-save",
+        "receipt_version": 4,
+        "receipt_digest": "local-receipt-digest",
+        "origin_binding": (context_id, draft_id, digest),
+    }
+    return context_id, draft_id, operation_id, telegram_certificate
+
+
+def test_completion_cleanup_authorization_requires_exact_shared_bindings(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, operation_id, certificate = _seed_completion_records(client)
+
+    assert repo.commit_completion(certificate) is True
+    assert repo.authorize_cleanup(context_id, certificate) is True
+    draft = repo.get_draft(context_id, draft_id)
+    assert draft["cleanup_state"] == "authorized"
+    assert draft["cleanup_authorization"]["telegram_certificate"] == certificate
+    assert draft["completion_certificate_ref"] == "dialog_save_intents/intent-save"
+    assert draft["doc_id"] == "doc-save"
+    client.collection("dialog_save_intents").document("intent-save").set({"changed_after_authorization": True})
+    assert repo.authorize_cleanup(context_id, certificate) is True
+    client.collection("telegram_sessions").document(context_id).update({
+        "last_completion_draft_id": "draft-latest",
+        "last_doc_id": "doc-newer",
+    })
+    assert repo.finalize_cleanup(context_id, certificate) is True
+    context = repo.get_context(context_id)
+    assert context["active_draft_id"] == "draft-newer"
+    assert context["draft_status"] == "collecting"
+    assert context["active_conversation_id"] == "conversation-current"
+    assert context["selected_dialog_number"] == 3
+    assert context["last_completion_draft_id"] == "draft-latest"
+    assert context["last_doc_id"] == "doc-newer"
+    assert repo.get_draft(context_id, "draft-newer") == {
+        "draft_id": "draft-newer", "state": "collecting", "private_source": "keep untouched",
+        "ordered_message_ids": [], "completed_audio_ids": [], "required_audio_count": 0,
+        "prepared_count": 0, "context_capacity": None, "preparation_digest": None,
+    }
+    foreign_certificate = {**certificate, "receipt_digest": "foreign-receipt"}
+    assert repo.finalize_cleanup(context_id, foreign_certificate) is False
+    assert repo.finalize_cleanup(context_id, certificate) is True
+
+
+def test_commit_completion_replay_accepts_firestore_list_origin_binding(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, _operation_id, certificate_data = _seed_completion_records(client)
+    certificate = TelegramCompletionCertificate(**certificate_data)
+
+    assert repo.commit_completion(certificate) is True
+    draft_ref = client.collection("telegram_sessions").document(context_id).collection("drafts").document(draft_id)
+    draft = draft_ref.get().to_dict()
+    draft["completion_certificate"]["origin_binding"] = list(
+        draft["completion_certificate"]["origin_binding"]
+    )
+    draft_ref.set(draft)
+
+    assert repo.commit_completion(certificate) is True
+
+
+@pytest.mark.parametrize("tamper", ["authorization", "manifest"])
+def test_durable_cleanup_resume_rejects_local_binding_tampering(firestore_fake, tamper):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, operation_id, certificate = _seed_completion_records(client)
+    assert repo.commit_completion(certificate) is True
+    assert repo.authorize_cleanup(context_id, certificate) is True
+
+    draft_ref = client.collection("telegram_sessions").document(context_id).collection("drafts").document(draft_id)
+    manifest_ref = draft_ref.collection("save_manifests").document(operation_id)
+    if tamper == "authorization":
+        draft = draft_ref.get().to_dict()
+        draft["cleanup_authorization"]["operation_id"] = "operation-foreign"
+        draft_ref.set(draft)
+    else:
+        manifest = manifest_ref.get().to_dict()
+        manifest["ordered_message_ids"] = [101, 999]
+        manifest_ref.set(manifest)
+    client.collection("dialog_save_intents").document("intent-save").set({"changed_after_authorization": True})
+
+    assert repo.authorize_cleanup(context_id, certificate) is False
+    assert repo.finalize_cleanup(context_id, certificate) is False
+
+
+@pytest.mark.parametrize("mismatch", ["foreign_origin", "foreign_operation_intent", "foreign_document"])
+def test_completion_cleanup_authorization_rejects_foreign_shared_evidence(firestore_fake, mismatch):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, _operation_id, certificate = _seed_completion_records(
+        client, mismatch=mismatch,
+    )
+
+    assert repo.commit_completion(certificate) is False
+    assert repo.authorize_cleanup(context_id, certificate) is False
+    draft = repo.get_draft(context_id, draft_id)
+    assert draft["state"] == "processing"
+    assert draft.get("cleanup_authorization") is None
+
+
+def test_cleanup_child_page_methods_cap_reads_and_writes_at_four_hundred(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, _operation_id, certificate = _seed_completion_records(client)
+    assert repo.commit_completion(certificate) is True
+    assert repo.authorize_cleanup(context_id, certificate) is True
+    draft_ref = client.collection("telegram_sessions").document(context_id).collection("drafts").document(draft_id)
+    for index in range(405):
+        draft_ref.collection("messages").document(str(index + 1)).set({
+            "message_id": index + 1, "intake_sequence": index + 1,
+        })
+    for index in range(405):
+        draft_ref.collection("prepared").document(str(index)).set({"order_index": index})
+
+    source_page, _ = repo.list_manifest_pages(draft_id, context_id=context_id, limit=999)
+    prepared_page = repo.list_prepared_pages(context_id, draft_id, limit=999)
+    assert len(source_page) == len(prepared_page) == 400
+    repo.delete_draft_page(draft_id, source_page, context_id=context_id)
+    repo.delete_prepared_page(context_id, draft_id, prepared_page)
+    remaining_source, _ = repo.list_manifest_pages(draft_id, context_id=context_id, limit=999)
+    remaining_prepared = repo.list_prepared_pages(context_id, draft_id, limit=999)
+    assert len(remaining_source) == len(remaining_prepared) == 5
