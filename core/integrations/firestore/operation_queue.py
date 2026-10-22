@@ -53,58 +53,79 @@ def register_operation(
     now = _aware(now)
     if not identity_digest or not input_ref:
         raise ValueError("identity_digest and input_ref are required")
-    operation_ref = _operation_ref(context_ref, operation_id)
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction) -> QueuedOperation:
-        context_snapshot = context_ref.get(transaction=transaction)
-        operation_snapshot = operation_ref.get(transaction=transaction)
-        if operation_snapshot.exists:
-            data = operation_snapshot.to_dict() or {}
-            if data.get("identity_digest") != identity_digest or data.get("input_ref") != input_ref:
-                raise ValueError("operation ID already belongs to a different immutable identity")
-            return _operation_from(data)
-
-        context = context_snapshot.to_dict() or {}
-        sequence = int(context.get("next_operation_sequence", 1))
-        tail_id = context.get("queue_tail_operation_id")
-        tail_ref = _operation_ref(context_ref, tail_id) if tail_id else None
-        tail_data: dict[str, Any] | None = None
-        if tail_ref is not None:
-            tail_snapshot = tail_ref.get(transaction=transaction)
-            if not tail_snapshot.exists:
-                raise RuntimeError("queue tail record is missing")
-            tail_data = tail_snapshot.to_dict() or {}
-            if tail_data.get("next_operation_id") is not None:
-                raise RuntimeError("queue tail is already linked")
-
-        data = {
-            "operation_id": operation_id,
-            "sequence": sequence,
-            "state": QueueOperationState.PENDING.value,
-            "identity_digest": identity_digest,
-            "input_ref": input_ref,
-            "created_at": now,
-            "finished_at": None,
-            "next_operation_id": None,
-        }
-        if tail_ref is not None and tail_data is not None:
-            tail_data["next_operation_id"] = operation_id
-            transaction.set(tail_ref, tail_data)
-        transaction.set(operation_ref, data)
-        context_update: dict[str, Any] = {
-            "next_operation_sequence": sequence + 1,
-            "queue_tail_operation_id": operation_id,
-        }
-        if not context.get("reserved_operation_id"):
-            context_update.update({
-                "head_sequence": sequence,
-                "reserved_operation_id": operation_id,
-            })
-        transaction.set(context_ref, {**context, **context_update})
-        return _operation_from(data)
+        return register_operation_in_transaction(
+            client, transaction, context_ref, operation_id,
+            identity_digest=identity_digest, input_ref=input_ref, now=now,
+        )
 
     return _txn(client.transaction())
+
+
+def register_operation_in_transaction(
+    client: Any,
+    transaction: Any,
+    context_ref: Any,
+    operation_id: str,
+    *,
+    identity_digest: str,
+    input_ref: str,
+    now: datetime,
+    before_write: Any = None,
+) -> QueuedOperation:
+    """Append an operation using a transaction owned by a larger workflow."""
+    now = _aware(now)
+    if not identity_digest or not input_ref:
+        raise ValueError("identity_digest and input_ref are required")
+    operation_ref = _operation_ref(context_ref, operation_id)
+    context_snapshot = context_ref.get(transaction=transaction)
+    operation_snapshot = operation_ref.get(transaction=transaction)
+    if operation_snapshot.exists:
+        data = operation_snapshot.to_dict() or {}
+        if data.get("identity_digest") != identity_digest or data.get("input_ref") != input_ref:
+            raise ValueError("operation ID already belongs to a different immutable identity")
+        return _operation_from(data)
+
+    context = context_snapshot.to_dict() or {}
+    sequence = int(context.get("next_operation_sequence", 1))
+    tail_id = context.get("queue_tail_operation_id")
+    tail_ref = _operation_ref(context_ref, tail_id) if tail_id else None
+    tail_data: dict[str, Any] | None = None
+    if tail_ref is not None:
+        tail_snapshot = tail_ref.get(transaction=transaction)
+        if not tail_snapshot.exists:
+            raise RuntimeError("queue tail record is missing")
+        tail_data = tail_snapshot.to_dict() or {}
+        if tail_data.get("next_operation_id") is not None:
+            raise RuntimeError("queue tail is already linked")
+
+    if before_write is not None:
+        before_write()
+
+    data = {
+        "operation_id": operation_id,
+        "sequence": sequence,
+        "state": QueueOperationState.PENDING.value,
+        "identity_digest": identity_digest,
+        "input_ref": input_ref,
+        "created_at": now,
+        "finished_at": None,
+        "next_operation_id": None,
+    }
+    if tail_ref is not None and tail_data is not None:
+        tail_data["next_operation_id"] = operation_id
+        transaction.set(tail_ref, tail_data)
+    transaction.set(operation_ref, data)
+    context_update: dict[str, Any] = {
+        "next_operation_sequence": sequence + 1,
+        "queue_tail_operation_id": operation_id,
+    }
+    if not context.get("reserved_operation_id"):
+        context_update.update({"head_sequence": sequence, "reserved_operation_id": operation_id})
+    transaction.set(context_ref, {**context, **context_update})
+    return _operation_from(data)
 
 
 def get_operation(context_ref: Any, operation_id: str) -> QueuedOperation | None:
@@ -301,5 +322,6 @@ def _valid_lease(
 
 __all__ = [
     "HEARTBEAT_INTERVAL_SECONDS", "LEASE_SECONDS", "claim_head", "complete_head",
-    "fail_head", "get_operation", "heartbeat", "register_operation", "release_head",
+    "fail_head", "get_operation", "heartbeat", "register_operation",
+    "register_operation_in_transaction", "release_head",
 ]

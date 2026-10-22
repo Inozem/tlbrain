@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from services.connectors.telegram.commands import parse_command
 from services.connectors.telegram.repository import TelegramRepository
 
 
@@ -114,8 +115,33 @@ class TelegramIntake:
         if (chat.get("type") != "private" or chat_id is None or user_id is None
                 or (self.allowed_user_ids is not None and user_id not in self.allowed_user_ids)):
             return None
-        if update_id is None or not isinstance(message.get("forward_origin"), Mapping):
+        if update_id is None:
             return None
+
+        if "forward_origin" in message and not isinstance(message.get("forward_origin"), Mapping):
+            return None
+        if "forward_origin" not in message:
+            text = message.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return None
+            thread_id = _integer(message.get("message_thread_id"))
+            topic_name = message.get("forum_topic_created", {}).get("name") if isinstance(
+                message.get("forum_topic_created"), Mapping
+            ) else None
+            accepted = self.repository.accept_command(
+                update_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                topic_name=topic_name if isinstance(topic_name, str) else None,
+                command=parse_command(text),
+                now=self.clock(),
+            )
+            outbox_id = accepted.outbox_id if hasattr(accepted, "outbox_id") else accepted.get("outbox_id")
+            is_accepted = accepted.accepted if hasattr(accepted, "accepted") else accepted.get("accepted")
+            if is_accepted and outbox_id:
+                self.publisher.publish(outbox_id)
+            return accepted
 
         normalized = normalize_forward(message)
         if normalized["message_id"] is None:

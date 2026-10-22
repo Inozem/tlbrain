@@ -17,12 +17,29 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 from core.integrations.firestore.operation_queue import claim_head, complete_head
+from services.connectors.telegram.commands import parse_command
 
 
 pytestmark = pytest.mark.offline
 
 
 NOW = datetime(2026, 10, 22, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("command", ["Сохрани", "Сохранить", "save"])
+def test_save_aliases_are_recognized(command):
+    parsed = parse_command(command)
+
+    assert parsed.kind == "save"
+    assert parsed.is_save is True
+
+
+@pytest.mark.parametrize("command", ["Сохрани это!", "Сохранить это", "save?"])
+def test_save_aliases_recognize_command_prefixes_with_punctuation(command):
+    parsed = parse_command(command)
+
+    assert parsed.kind == "save"
+    assert parsed.is_save is True
 
 
 def _repository(firestore_fake):
@@ -457,3 +474,97 @@ def test_concurrent_forward_and_save_are_snapshot_included_or_rejected(
             for path in firestore_fake.documents
             if path.startswith(f"telegram_sessions/{context_id}/drafts/")
         )
+
+
+def test_command_replay_reuses_receipt_and_queue_operation(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    publisher = _Publisher()
+    intake = _intake(repository, publisher, _Classifier(), _Classifier())
+    update = _command(50, "Расскажи подробнее")
+
+    first = intake.handle_update(update)
+    replay = intake.handle_update(update)
+
+    assert _value(first, "operation_id") == _value(replay, "operation_id")
+    assert _value(first, "queue_position") == _value(replay, "queue_position") == 1
+    assert _value(first, "outbox_id") == _value(replay, "outbox_id")
+    assert publisher.outbox_ids == [_value(first, "outbox_id")] * 2
+    context_id = _value(first, "context_id")
+    assert len(_direct_child_paths(firestore_fake, f"telegram_sessions/{context_id}/operations")) == 1
+    assert len(_direct_child_paths(firestore_fake, f"telegram_sessions/{context_id}/commands")) == 1
+    outbox = _read_doc(client, f"task_outbox/{_value(first, 'outbox_id')}")
+    assert outbox["target_kind"] == "telegram_dispatch"
+    assert outbox["operation_id"] == _value(first, "operation_id")
+    assert outbox["context_id"] == context_id
+
+
+def test_save_seals_ordered_snapshot_and_rejects_later_forward(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    publisher = _Publisher()
+    intake = _intake(repository, publisher, _Classifier(), _Classifier())
+    first = intake.handle_update(_forward(51))
+    second = intake.handle_update(_forward(52))
+    save = intake.handle_update(_command(53, "Сохрани"))
+    save_replay = intake.handle_update(_command(53, "Сохрани"))
+
+    assert _value(save, "snapshot_message_ids") == (151, 152)
+    assert _value(save_replay, "operation_id") == _value(save, "operation_id")
+    assert _value(save_replay, "outbox_id") == _value(save, "outbox_id")
+    assert publisher.outbox_ids[-2:] == [_value(save, "outbox_id")] * 2
+    context_id = _value(save, "context_id")
+    draft_id = _value(first, "draft_id")
+    draft = _read_doc(client, f"telegram_sessions/{context_id}/drafts/{draft_id}")
+    assert draft["state"] == "processing"
+    assert draft["sealed_at"] is not None
+    assert draft["ordered_message_ids"] == [151, 152]
+    assert draft["active_save_operation_id"] == _value(save, "operation_id")
+    assert draft["manifest_ref"]
+    assert draft["manifest_digest"]
+    assert len(_direct_child_paths(firestore_fake, f"telegram_sessions/{context_id}/operations")) == 1
+    assert len(_direct_child_paths(
+        firestore_fake, f"telegram_sessions/{context_id}/drafts/{draft_id}/save_manifests"
+    )) == 1
+    assert _value(intake.handle_update(_forward(54)), "accepted") is False
+    assert draft["manifest_digest"] == _read_doc(
+        client, f"telegram_sessions/{context_id}/drafts/{draft_id}"
+    )["manifest_digest"]
+
+
+def test_empty_save_reserves_without_creating_draft_or_doc(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    publisher = _Publisher()
+    intake = _intake(repository, publisher, _Classifier(), _Classifier())
+
+    result = intake.handle_update(_command(55, "Сохрани"))
+
+    context_id = _value(result, "context_id")
+    assert _value(result, "accepted") is True
+    assert _value(result, "snapshot_message_ids") == ()
+    assert not _direct_child_paths(firestore_fake, f"telegram_sessions/{context_id}/drafts")
+    assert _value(result, "operation_id")
+    assert publisher.outbox_ids == [_value(result, "outbox_id")]
+    assert _read_doc(client, f"task_outbox/{_value(result, 'outbox_id')}")["target_kind"] == "telegram_dispatch"
+
+
+def test_freeform_command_candidate_contains_no_draft_source_text(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    intake = _intake(repository, _Publisher(), _Classifier(), _Classifier())
+    intake.handle_update(_forward(56))
+    result = intake.handle_update(_command(57, "Суммируй это"))
+    context_id = _value(result, "context_id")
+    stored = _read_doc(client, f"telegram_sessions/{context_id}/commands/57")
+
+    assert stored["candidate"] == "Суммируй это"
+    assert stored["cutoff_message_ids"] == [156]
+    assert "synthetic forwarded message 56" not in str(stored)
+    assert "text" not in stored and "audio_file_id" not in stored
+
+
+def test_malformed_forward_origin_is_not_intaken_as_a_command(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    intake = _intake(repository, _Publisher(), _Classifier(), _Classifier())
+    update = _command(58, "Сохрани")
+    update["message"]["forward_origin"] = "malformed-forward-metadata"
+
+    assert intake.handle_update(update) is None
+    assert firestore_fake.documents == {}
