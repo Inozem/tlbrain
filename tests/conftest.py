@@ -42,7 +42,7 @@ _SYNTHETIC_ENV = {
     "TASK_OIDC_SERVICE_ACCOUNT_EMAIL": "pytest-task-worker@synthetic-project.invalid",
     "CLOUD_TASKS_OIDC_AUDIENCE": "https://task-worker.pytest.invalid",
     "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL": "pytest-task-worker@synthetic-project.invalid",
-    "INTERNAL_DIALOG_OPERATIONS_URL": "https://dialog-operations.pytest.invalid",
+    "INTERNAL_DIALOG_OPERATIONS_URL": "https://dialog-operations.pytest.invalid/internal/dialog-operations",
     "DIALOG_OPERATIONS_QUEUE": "pytest-dialog-operations-queue",
     "TELEGRAM_CONTROL_QUEUE": "pytest-telegram-control-queue",
     "CLOUD_TASKS_QUEUE": "pytest-cloud-tasks-queue",

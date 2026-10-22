@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -162,6 +163,44 @@ def _request_id_hash(request_id: str | int) -> str:
     typed_id = ["string", request_id] if isinstance(request_id, str) else ["integer", request_id]
     encoded = json.dumps(typed_id, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def request_recovery_ref(session_id: str, request_id: str | int) -> str:
+    """Return the durable, opaque Firestore path for one MCP request mapping."""
+    return f"{MCP_SESSIONS_COLLECTION}/{_session_hash(session_id)}/requests/{_request_id_hash(request_id)}"
+
+
+def get_recovery_binding(
+    client: Any | None,
+    origin_operation_ref: str,
+    *,
+    operation_id: str,
+    immutable_input_digest: str,
+) -> dict[str, str] | None:
+    """Load certificate binding material only from the mapping for this operation."""
+    if not isinstance(origin_operation_ref, str):
+        return None
+    parts = origin_operation_ref.split("/")
+    if (len(parts) != 4 or parts[0] != MCP_SESSIONS_COLLECTION or parts[2] != "requests"
+            or not re.fullmatch(r"[a-f0-9]{64}", parts[1])
+            or not re.fullmatch(r"[a-f0-9]{64}", parts[3])):
+        return None
+    request_snapshot = (
+        _db(client).collection(parts[0]).document(parts[1])
+        .collection(parts[2]).document(parts[3]).get()
+    )
+    if not request_snapshot.exists:
+        return None
+    mapping = request_snapshot.to_dict() or {}
+    if (mapping.get("operation_id") != operation_id
+            or not isinstance(immutable_input_digest, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", immutable_input_digest)):
+        return None
+    return {
+        "context_id": origin_operation_ref,
+        "draft_id": parts[3],
+        "manifest_digest": immutable_input_digest,
+    }
 
 
 def resolve_or_reserve_request(

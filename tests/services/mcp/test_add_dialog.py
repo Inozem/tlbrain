@@ -896,7 +896,10 @@ def test_add_dialog_missing_operation_after_publish_returns_in_progress(monkeypa
     prepared = (context, {"provider": "google"}, object(), None, {}, None, reservation)
     monkeypatch.setattr(handler, "_prepare_add_dialog", lambda *_args: (prepared, None))
 
-    saving_operation = SimpleNamespace(state=SimpleNamespace(value="saving"))
+    saving_operation = SimpleNamespace(
+        state=SimpleNamespace(value="saving"), stage="saving",
+        origin_operation_ref="mcp_sessions/session/requests/request",
+    )
     operation_results = iter((saving_operation, None))
     monkeypatch.setattr(handler, "get_operation", lambda *_args: next(operation_results))
     monkeypatch.setattr(handler, "claim_operation", lambda *_args, **_kwargs: SimpleNamespace(fence=1))

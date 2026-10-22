@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.integrations.firestore import mcp_sessions
+from core.integrations.firestore import operations as operation_repository
+from core.operations.models import OperationOrigin
 
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
@@ -116,6 +118,72 @@ def test_read_only_request_lookup_returns_persisted_acceptance_time(firestore_fa
     assert mcp_sessions.lookup_request_replay(
         client, initialized.session_id, caller_binding="principal:alice", request_id="fresh",
         arguments={"value": 1}, now=NOW,
+    ) is None
+
+
+def test_recovery_binding_uses_only_matching_durable_request_reference(firestore_fake):
+    client = firestore_fake.client_class()
+    initialized = mcp_sessions.create_session(
+        client, caller_binding="principal:alice", protocol_version="v1", now=NOW,
+    )
+    reservation = mcp_sessions.resolve_or_reserve_request(
+        client, initialized.session_id, caller_binding="principal:alice", request_id=5,
+        arguments={"title": "private title"}, now=NOW,
+    )
+    ref = mcp_sessions.request_recovery_ref(initialized.session_id, 5)
+    immutable_digest = "a" * 64
+    operation_repository.create_operation(
+        client, operation_id=reservation.operation_id, origin=OperationOrigin.MCP,
+        origin_operation_ref=ref, caller_binding="principal:alice",
+        immutable_input_digest=immutable_digest,
+        immutable_input_ref=f"dialog_operations/{reservation.operation_id}/input_parts/manifest",
+        now=NOW,
+    )
+    operation = operation_repository.get_operation(client, reservation.operation_id)
+
+    assert mcp_sessions.get_recovery_binding(
+        client, ref, operation_id=reservation.operation_id,
+        immutable_input_digest=operation.immutable_input_digest,
+    ) == {
+        "context_id": operation.origin_operation_ref,
+        "draft_id": mcp_sessions._request_id_hash(5),
+        "manifest_digest": operation.immutable_input_digest,
+    }
+    assert mcp_sessions.get_recovery_binding(
+        client, ref, operation_id="other-operation", immutable_input_digest=immutable_digest,
+    ) is None
+
+
+@pytest.mark.parametrize("ref", [
+    "mcp_sessions/session/requests/request",
+    "mcp_sessions/" + "a" * 64 + "/requests/" + "b" * 64 + "/extra",
+    "mcp_sessions/" + "A" * 64 + "/requests/" + "b" * 64,
+])
+def test_recovery_binding_rejects_malformed_reference(firestore_fake, ref):
+    client = firestore_fake.client_class()
+    assert mcp_sessions.get_recovery_binding(
+        client, ref, operation_id="operation", immutable_input_digest="a" * 64,
+    ) is None
+
+
+def test_recovery_binding_rejects_missing_mapping_and_malformed_operation_digest(firestore_fake):
+    client = firestore_fake.client_class()
+    initialized = mcp_sessions.create_session(
+        client, caller_binding="principal:alice", protocol_version="v1", now=NOW,
+    )
+    reservation = mcp_sessions.resolve_or_reserve_request(
+        client, initialized.session_id, caller_binding="principal:alice", request_id=6,
+        arguments={"title": "private title"}, now=NOW,
+    )
+    ref = mcp_sessions.request_recovery_ref(initialized.session_id, 6)
+    assert mcp_sessions.get_recovery_binding(
+        client, mcp_sessions.request_recovery_ref(initialized.session_id, 7),
+        operation_id=reservation.operation_id,
+        immutable_input_digest="a" * 64,
+    ) is None
+    assert mcp_sessions.get_recovery_binding(
+        client, ref, operation_id=reservation.operation_id,
+        immutable_input_digest="not-a-sha256-digest",
     ) is None
 
 

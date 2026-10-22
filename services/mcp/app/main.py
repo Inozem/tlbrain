@@ -1,5 +1,7 @@
 import json
+import os
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +19,16 @@ from core.integrations.firestore.mcp_sessions import (
     SessionUnavailableError,
     create_session,
     get_session,
+)
+from core.integrations.firestore.client import get_client
+from core.integrations.google_auth.oidc import (
+    OIDCConfigurationError,
+    verify_google_id_token,
+)
+from services.mcp.app.dialog_worker import (
+    InvalidTask,
+    RecoveryBindingUnavailable,
+    process_dialog_operation,
 )
 
 configure_logging()
@@ -38,6 +50,77 @@ async def health():
     return {"status": "ok"}
 
 
+def _dialog_recovery_ready() -> bool:
+    """Require a deploy-configured HTTPS callback and matching dispatch identity."""
+    callback_url = os.environ.get("INTERNAL_DIALOG_OPERATIONS_URL")
+    queue = os.environ.get("DIALOG_OPERATIONS_QUEUE")
+    audience = (os.environ.get("CLOUD_TASKS_OIDC_AUDIENCE")
+                or os.environ.get("TASK_OIDC_AUDIENCE"))
+    service_account = (os.environ.get("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL")
+                       or os.environ.get("TASK_OIDC_SERVICE_ACCOUNT_EMAIL")
+                       or os.environ.get("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL")
+                       or os.environ.get("TASK_SERVICE_ACCOUNT_EMAIL"))
+    expected_audience = os.environ.get("OIDC_AUDIENCE")
+    expected_account = os.environ.get("OIDC_SERVICE_ACCOUNT_EMAIL")
+    try:
+        parsed = urlsplit(callback_url or "")
+        valid_url = (
+            parsed.scheme == "https" and bool(parsed.hostname)
+            and parsed.username is None and parsed.password is None
+            and parsed.path == "/internal/dialog-operations"
+            and not parsed.query and not parsed.fragment
+        )
+    except ValueError:
+        valid_url = False
+    return bool(
+        valid_url and queue and queue.strip() and audience and audience.strip()
+        and service_account and service_account.strip()
+        and expected_audience and audience == expected_audience
+        and expected_account and service_account == expected_account
+    )
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+@app.post("/internal/dialog-operations")
+async def dialog_operations_endpoint(request: Request):
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not separator or not token.strip():
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        identity = verify_google_id_token(token.strip())
+    except OIDCConfigurationError:
+        return JSONResponse({"error": "Recovery authentication unavailable"}, status_code=503)
+    if identity is None:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not identity.authorized:
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+    try:
+        payload = json.loads(
+            (await request.body()).decode("utf-8"), object_pairs_hook=_unique_json_object,
+        )
+    except Exception:
+        return JSONResponse({"error": "Invalid task"}, status_code=400)
+    try:
+        result = process_dialog_operation(get_client(), payload)
+    except InvalidTask:
+        return JSONResponse({"error": "Invalid task"}, status_code=400)
+    except RecoveryBindingUnavailable:
+        return JSONResponse({"error": "Recovery unavailable"}, status_code=503)
+    except Exception:
+        return JSONResponse({"error": "Recovery unavailable"}, status_code=503)
+    return JSONResponse({"status": result.status}, status_code=200)
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
     identity = oauth.request_identity(request)
@@ -52,6 +135,16 @@ async def mcp_endpoint(request: Request):
         return JSONResponse(
             content={"error": "Invalid JSON body"},
             status_code=400,
+        )
+
+    params = body.get("params") if isinstance(body, dict) else None
+    is_add_dialog = (
+        body.get("method") == "tools/call" and isinstance(params, dict)
+        and params.get("name") == "add_dialog"
+    )
+    if is_add_dialog and not _dialog_recovery_ready():
+        return JSONResponse(
+            content={"error": "Dialog recovery is not configured"}, status_code=503,
         )
 
     if "id" not in body:
@@ -88,11 +181,6 @@ async def mcp_endpoint(request: Request):
     finally:
         reset_request_context(context_token)
 
-    params = body.get("params") if isinstance(body, dict) else None
-    is_add_dialog = (
-        body.get("method") == "tools/call" and isinstance(params, dict)
-        and params.get("name") == "add_dialog"
-    )
     if is_add_dialog and session_state == "absent":
         return JSONResponse(content={"error": "An initialized MCP session is required"}, status_code=400)
     if is_add_dialog and session_state == "invalid":

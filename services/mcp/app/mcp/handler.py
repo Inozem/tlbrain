@@ -813,18 +813,12 @@ def _finalize_add_dialog_save(request, context, validated, client, operation_id,
     if operation is None:
         return None, None, None, None
 
-    binding_material = json.dumps(
-        ["string", context.session_id, type(request.id).__name__, request.id],
-        separators=(",", ":"), ensure_ascii=False,
+    origin_binding = mcp_sessions.get_recovery_binding(
+        client, operation.origin_operation_ref or "", operation_id=operation_id,
+        immutable_input_digest=operation.immutable_input_digest,
     )
-    import hashlib
-    origin_binding = {
-        "context_id": hashlib.sha256(context.session_id.encode("utf-8")).hexdigest(),
-        "draft_id": hashlib.sha256(binding_material.encode("utf-8")).hexdigest(),
-        "manifest_digest": hashlib.sha256(json.dumps(
-            validated, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-        ).encode("utf-8")).hexdigest(),
-    }
+    if origin_binding is None:
+        raise ValueError("MCP completion binding is unavailable")
     try:
         completed = dialog_completion.finalize_save(
             client, operation_id=operation_id, save_intent_id=progress.save_intent_id,
@@ -867,6 +861,9 @@ def _accept_add_dialog_operation(request, context, validated, client, reservatio
             client, validated, operation_id=operation_id,
             caller_binding=context.identity.caller_binding, origin=OperationOrigin.MCP,
             now=reservation.accepted_at,
+            origin_operation_ref=mcp_sessions.request_recovery_ref(
+                context.session_id, request.id,
+            ),
         )
     except Exception:
         operation = get_operation(client, operation_id)
@@ -945,6 +942,11 @@ def _release_add_dialog_lease(client, operation_id, owner, lease):
         logger.error("add_dialog lease release failed; preserving the mapped operation result")
 
 
+def _has_add_dialog_recovery_binding(operation):
+    """Return whether this operation has the durable binding needed to finalize."""
+    return bool(operation is not None and getattr(operation, "origin_operation_ref", None))
+
+
 def _run_claimed_add_dialog(request, context, validated, client, root_folder_id,
                             folders, operation_id, owner, lease, now):
     """Advance a leased save and always release its lease after response mapping."""
@@ -981,6 +983,9 @@ def _process_add_dialog(request: JSONRPCRequest, arguments: dict) -> dict:
     )
     if response is not None:
         return response
+
+    if not _has_add_dialog_recovery_binding(operation):
+        return _add_dialog_in_progress(request, operation_id, operation)
 
     owner, lease = _claim_add_dialog_lease(client, operation_id, now)
     if lease is None:

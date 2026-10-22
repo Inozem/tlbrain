@@ -416,7 +416,7 @@ def test_synthetic_environment_replaces_external_and_derived_settings(monkeypatc
     assert "TLDV_RECONCILIATION_URL" not in os.environ
     assert all(os.environ[name] == value for name, value in conftest._SYNTHETIC_ENV.items())
     assert os.environ["TZ"] == "UTC"
-    assert os.environ["INTERNAL_DIALOG_OPERATIONS_URL"] == "https://dialog-operations.pytest.invalid"
+    assert os.environ["INTERNAL_DIALOG_OPERATIONS_URL"] == "https://dialog-operations.pytest.invalid/internal/dialog-operations"
     assert os.environ["DIALOG_OPERATIONS_QUEUE"] == "pytest-dialog-operations-queue"
     assert os.environ["TELEGRAM_CONTROL_QUEUE"] == "pytest-telegram-control-queue"
     assert os.environ["CLOUD_TASKS_QUEUE"] == "pytest-cloud-tasks-queue"
