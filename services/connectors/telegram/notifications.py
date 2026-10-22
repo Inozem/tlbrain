@@ -2,12 +2,69 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
 
 from services.connectors.telegram.client import TelegramAPIError
 from services.connectors.telegram.repository import TelegramRepository
+
+
+_SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-notification")
+_SYNC_WAIT_SECONDS = 15.0
+_SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
+
+
+async def _offload_repository_call(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    future = _SYNC_POOL.submit(function, *args, **kwargs)
+    deadline = time.monotonic() + _SYNC_WAIT_SECONDS
+    while not future.done():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Telegram notification storage timed out")
+        await asyncio.sleep(0.01)
+    return future.result()
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedTelegramLifecycle:
+    """Server-derived terminal status; callers cannot supply a proof-shaped mapping."""
+
+    dialog_number: int
+    operation_id: str
+    service: str
+    stage: str
+    reason: str
+    folder_path: str | None = None
+    completion_confirmed: bool = False
+
+
+def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
+    """Format a previously verified server result without accepting task content."""
+    if not isinstance(lifecycle, _VerifiedTelegramLifecycle):
+        raise TypeError("lifecycle must be a verified server result")
+    if type(lifecycle.dialog_number) is not int or lifecycle.dialog_number < 1:
+        raise ValueError("dialog_number must be positive")
+    if not isinstance(lifecycle.operation_id, str) or not _SAFE_ID.fullmatch(lifecycle.operation_id):
+        raise ValueError("operation_id is invalid")
+    for name in ("service", "stage", "reason"):
+        if not isinstance(getattr(lifecycle, name), str) or not _SAFE_CODE.fullmatch(getattr(lifecycle, name)):
+            raise ValueError(f"{name} is invalid")
+    prefix = f"Диалог №{lifecycle.dialog_number}"
+    if lifecycle.completion_confirmed:
+        path = " ".join(lifecycle.folder_path.split()) if lifecycle.folder_path else ""
+        if path and len(path) <= 512 and not any(ord(char) < 32 for char in path):
+            return f"{prefix}: сохранён, индекс подтверждён. Папка: {path}."[:4096]
+        return f"{prefix}: сохранён, индекс подтверждён."
+    if lifecycle.reason in {"in_progress", "index_pending"}:
+        return f"{prefix}: обработка или индексация продолжается."
+    return (f"{prefix}: ошибка {lifecycle.service}/{lifecycle.stage} "
+            f"({lifecycle.reason}); operation_id={lifecycle.operation_id}.")
 
 
 class TelegramNotificationPublisher:
@@ -25,7 +82,8 @@ class TelegramNotificationPublisher:
         """Deliver one notification attempt and return its durable disposition."""
         now = self.clock()
         attempt_id = "tgnotify-" + uuid4().hex
-        reservation = self.repository.reserve_notification_attempt(
+        reservation = await _offload_repository_call(
+            self.repository.reserve_notification_attempt,
             notification_id, attempt_id=attempt_id, now=now,
         )
         if reservation is None:
@@ -60,7 +118,8 @@ class TelegramNotificationPublisher:
             # A timeout or connection drop does not prove whether Telegram accepted the send.
             outcome, message_id = "unknown", None
 
-        settled = self.repository.settle_notification_attempt(
+        settled = await _offload_repository_call(
+            self.repository.settle_notification_attempt,
             notification_id, attempt_id=attempt_id, revision=revision,
             outcome=outcome, message_id=message_id, now=self.clock(),
         )
@@ -70,5 +129,4 @@ class TelegramNotificationPublisher:
             return "stale"
         return str(settled["state"])
 
-
-__all__ = ["TelegramNotificationPublisher"]
+__all__ = ["TelegramNotificationPublisher", "build_lifecycle_body"]

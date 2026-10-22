@@ -1,8 +1,15 @@
+import asyncio
+import os
+import socket
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from services.connectors.telegram.notifications import TelegramNotificationPublisher
+from services.connectors.telegram.notifications import (
+    _VerifiedTelegramLifecycle, TelegramNotificationPublisher, build_lifecycle_body,
+)
 from services.connectors.telegram.client import TelegramAPIError
 from services.connectors.telegram.repository import TelegramRepository
 
@@ -52,6 +59,78 @@ class _Telegram:
 def _run(awaitable):
     import asyncio
     return asyncio.run(awaitable)
+
+
+def test_lifecycle_body_accepts_only_server_result_and_omits_unrequested_link():
+    common = dict(dialog_number=12, operation_id="op-1", service="save", stage="verification",
+                  reason="completion_unverified")
+    without_proof = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(**common))
+    assert "индекс подтверждён" not in without_proof
+    assert "обработка или индексация продолжается" not in without_proof
+    assert "operation_id=op-1" in without_proof
+    assert "Notes/2026" not in without_proof
+    hidden_link = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(
+        **{**common, "reason": "completed"}, folder_path="Notes/2026", completion_confirmed=True,
+    ))
+    assert "Notes/2026" in hidden_link and "индекс подтверждён" in hidden_link
+    no_path = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(
+        **{**common, "reason": "completed"}, folder_path=None, completion_confirmed=True,
+    ))
+    assert "сохранён, индекс подтверждён" in no_path
+    assert "Папка:" not in no_path
+    assert "http" not in no_path
+    with pytest.raises(TypeError):
+        build_lifecycle_body(lifecycle={**common, "current_generation_proof": {"current": True}})
+
+
+def test_slow_sync_reservation_does_not_block_event_loop_heartbeat():
+    started = threading.Event()
+
+    class SlowRepository:
+        def reserve_notification_attempt(self, *args, **kwargs):
+            started.set()
+            time.sleep(0.12)
+            return {"reserved": False, "state": "busy"}
+
+    publisher = TelegramNotificationPublisher(SlowRepository(), _Telegram())
+    beats = []
+
+    async def run():
+        async def beat():
+            await asyncio.sleep(0.02)
+            beats.append("alive")
+
+        delivery = asyncio.create_task(publisher.publish("notify"))
+        heartbeat = asyncio.create_task(beat())
+        assert await delivery == "busy"
+        await heartbeat
+
+    if os.name == "nt":
+        old_pair = socket.socketpair
+        pairs = []
+
+        def datagram_pair(*_args, **_kwargs):
+            reader = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            writer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            reader.bind(("127.0.0.1", 0))
+            writer.bind(("127.0.0.1", 0))
+            writer.connect(reader.getsockname())
+            reader.connect(writer.getsockname())
+            pairs.append((reader, writer))
+            return reader, writer
+
+        socket.socketpair = datagram_pair
+        try:
+            asyncio.run(run(), loop_factory=asyncio.SelectorEventLoop)
+        finally:
+            socket.socketpair = old_pair
+            for reader, writer in pairs:
+                reader.close()
+                writer.close()
+    else:
+        asyncio.run(run())
+    assert started.is_set()
+    assert beats == ["alive"]
 
 
 def test_ack_is_immutable_and_progress_send_then_edit_adds_no_conversation_turn(firestore_fake):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -33,6 +34,15 @@ from services.connectors.telegram.repository import SESSIONS
 
 Processor = Callable[[str, Any, OperationLease], Awaitable[QueueOperationState]]
 Clock = Callable[[], datetime]
+_SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-firestore")
+
+
+async def _offload_sync(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Run blocking SDK work off-loop while polling so Windows selector loops wake reliably."""
+    future = _SYNC_POOL.submit(function, *args, **kwargs)
+    while not future.done():
+        await asyncio.sleep(0.01)
+    return future.result()
 
 
 def _utc_now() -> datetime:
@@ -178,7 +188,7 @@ class TelegramQueueWorker:
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
             raise ValueError("generation must be a positive integer")
 
-        record = get_outbox_record(self.client, outbox_id)
+        record = await _offload_sync(get_outbox_record, self.client, outbox_id)
         if record is None:
             return False
         context_id = record.context_id
@@ -193,32 +203,32 @@ class TelegramQueueWorker:
         )
         if not valid_delivery:
             if context_id:
-                _ensure_head_wakeup(self.client, context_id, now=now)
+                await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=now)
             return False
 
         context_ref = self.client.collection(SESSIONS).document(context_id)
-        context_snapshot = context_ref.get()
+        context_snapshot = await _offload_sync(context_ref.get)
         context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
         if context.get("reserved_operation_id") != record.operation_id:
-            _ensure_head_wakeup(self.client, context_id, now=now)
+            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=now)
             return False
-        operation = get_operation(context_ref, record.operation_id)
+        operation = await _offload_sync(get_operation, context_ref, record.operation_id)
         if operation is None or operation.state.is_terminal:
-            _ensure_head_wakeup(self.client, context_id, now=now)
+            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=now)
             return False
 
-        lease = claim_head(
-            self.client, context_ref, owner=self.owner_factory(), now=now,
+        lease = await _offload_sync(
+            claim_head, self.client, context_ref, owner=self.owner_factory(), now=now,
         )
         if lease is None:
-            _ensure_head_wakeup(self.client, context_id, now=self.clock())
+            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=self.clock())
             return False
         if lease.operation_id != record.operation_id:
-            release_head(
+            await _offload_sync(release_head,
                 self.client, context_ref, operation_id=lease.operation_id,
                 owner=lease.owner, fence=lease.fence, now=self.clock(),
             )
-            _ensure_head_wakeup(self.client, context_id, now=self.clock())
+            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=self.clock())
             return False
 
         result = await self._run_with_heartbeat(context_id, operation, lease, context_ref)
@@ -237,7 +247,7 @@ class TelegramQueueWorker:
                 )
 
         settle = complete_head if result is QueueOperationState.COMPLETED else fail_head
-        settled = settle(
+        settled = await _offload_sync(settle,
             self.client, context_ref, operation_id=lease.operation_id,
             owner=lease.owner, fence=lease.fence, now=settle_now,
             after_advance=wake_next,
@@ -254,7 +264,7 @@ class TelegramQueueWorker:
         async def beat() -> bool:
             while True:
                 await asyncio.sleep(self.heartbeat_interval_seconds)
-                renewed = heartbeat(
+                renewed = await _offload_sync(heartbeat,
                     self.client, context_ref, operation_id=lease.operation_id,
                     owner=lease.owner, fence=lease.fence, now=self.clock(),
                 )
@@ -284,7 +294,7 @@ class TelegramQueueWorker:
             if release_lease:
                 # Release only while this exact lease is still current. If it was
                 # fenced out, release_head safely returns False.
-                release_head(
+                await _offload_sync(release_head,
                     self.client, context_ref, operation_id=lease.operation_id,
                     owner=lease.owner, fence=lease.fence, now=self.clock(),
                 )
