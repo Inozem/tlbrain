@@ -851,3 +851,75 @@ def test_new_draft_analysis_context_excludes_previous_saved_draft_content():
     assert [row["text"] for row in context["messages"]] == ["new draft only"]
     assert repository.active_draft_id == "draft-new"
     assert repository.drafts["draft-original"]["messages"] == [prior_message]
+
+
+def test_new_draft_classification_uses_only_its_source_after_prior_doc_move_and_rename():
+    from services.connectors.telegram.save import TelegramClassifiedDialog
+    from core.dialogs.classification import FolderSelectionResult
+
+    repository = _Repository(messages=[_message(1, "prior private source")])
+    repository.context_id = "telegram-context-1"
+    repository.get_context = lambda _context_id: {"topic_name": "Current topic"}
+    repository.last_doc_id = "doc-old"
+    repository.last_saved_document = {
+        "title": "renamed prior title", "folder_path": ["old", "folder"],
+    }
+    repository.previous_dialogue_context = [
+        {"role": "user", "content": "prior private source"},
+    ]
+    repository.add_draft({
+        "draft_id": "draft-new", "status": "sealed",
+        "messages": [_message(2, "new source only")],
+        "source_manifest": [_message(2, "new source only")],
+        "manifest_digest": "manifest:draft-new:v1",
+    })
+    seen = []
+
+    async def classify(result, *, draft_id, topic_hint=None, folder_path=None):
+        seen.append((draft_id, copy.deepcopy(result), topic_hint, folder_path))
+        return TelegramClassifiedDialog(
+            payload={"title": result["title"], "utterances": []},
+            selection=FolderSelectionResult(folder_id=f"folder-{draft_id}"),
+        )
+
+    async def save(result, *, draft_id, manifest_digest, intent_id, operation_id):
+        return {
+            "verified": True, "draft_id": draft_id, "manifest_digest": manifest_digest,
+            "save_intent_id": intent_id, "operation_id": operation_id,
+            "receipt_ref": f"receipt-{draft_id}", "receipt_version": 1,
+        }
+
+    def workflow_for(draft_id):
+        events = []
+        return _save_type()(
+            repository=repository,
+            audio_transcriber=_Audio(repository, events),
+            context_id="telegram-context-1",
+            preprocess=lambda messages: list(messages),
+            analyze=lambda messages, *, context: {
+                "title": f"title-{draft_id}",
+                "source": [row["text"] for row in messages],
+                "folder_path": ["fresh", draft_id],
+            },
+            classify=classify,
+            save=save,
+        )
+
+    _run(workflow_for("draft-original").save(
+        draft_id="draft-original", intent_id="intent-old", operation_id="op-old",
+    ))
+    _run(workflow_for("draft-new").save(
+        draft_id="draft-new", intent_id="intent-new", operation_id="op-new",
+    ))
+
+    assert seen[0][1]["source"] == ["prior private source"]
+    assert seen[1] == (
+        "draft-new",
+        {"title": "title-draft-new", "source": ["new source only"],
+         "folder_path": ["fresh", "draft-new"]},
+        "Current topic",
+        ["fresh", "draft-new"],
+    )
+    assert "prior private source" not in repr(seen[1])
+    assert "renamed prior title" not in repr(seen[1])
+    assert "old" not in repr(seen[1][3])

@@ -91,6 +91,55 @@ def test_move_transcript_uses_real_guard_and_replays_without_resolving_path(
     assert len(writes) == 1
 
 
+def test_folder_only_transcript_move_updates_selected_doc_payload_without_embedding(
+    monkeypatch, firestore_fake, fake_clock,
+):
+    client = _configure_firestore(monkeypatch, firestore_fake, fake_clock)
+    context = _context(client, fake_clock)
+    state = {
+        "drive": {"doc-selected": {"id": "doc-selected", "name": "title", "parents": ["old"]}},
+        "records": {"doc-selected": {"status": "synced", "parent_id": "old"}},
+        "parents": {"doc-selected": ["old"]},
+    }
+    state["drive"]["doc-next"] = {"id": "doc-next", "name": "next title", "parents": ["next-old"]}
+    state["records"]["doc-next"] = {"status": "synced", "parent_id": "next-old"}
+    state["parents"]["doc-next"] = ["next-old"]
+    payload_updates = []
+    monkeypatch.setattr(document_operations, "resolve_move_target", lambda *_args: "folder-new")
+    monkeypatch.setattr(write.drive_files, "get_file_metadata",
+                        lambda doc_id: state["drive"][doc_id])
+    monkeypatch.setattr(write.transcripts, "get_transcript_record",
+                        lambda doc_id, _db=None: state["records"][doc_id])
+    monkeypatch.setattr(write.qdrant_reader, "get_parent_ids_by_doc_ids",
+                        lambda doc_ids, _root: {doc_id: state["parents"][doc_id] for doc_id in doc_ids})
+
+    def set_payload_parent_id(doc_id, root_id, folder_id, **_kwargs):
+        payload_updates.append((doc_id, root_id, folder_id))
+        state["parents"][doc_id] = [folder_id]
+
+    monkeypatch.setattr(document_operations, "move_file_to_folder",
+                        lambda doc_id, folder_id: state["drive"][doc_id].update(parents=[folder_id]))
+    monkeypatch.setattr(document_operations.transcripts, "move_transcript_record",
+                        lambda doc_id, folder_id, _db=None: state["records"][doc_id].update(
+                            parent_id=folder_id, status="imported"))
+    monkeypatch.setattr(document_operations, "set_payload_parent_id", set_payload_parent_id)
+    monkeypatch.setattr(document_operations.folders, "get_folder_id_by_name", lambda *_args: None)
+
+    from core.integrations.gemini import embeddings
+    monkeypatch.setattr(embeddings, "embed", lambda *_args, **_kwargs: pytest.fail(
+        "folder-only move must not regenerate embeddings"))
+
+    result = write.move_transcript("doc-selected", ["new-folder"], context=context)
+
+    assert result.unassigned_count == 0
+    assert payload_updates == [("doc-selected", "root-id", "folder-new")]
+    assert state["records"]["doc-selected"]["parent_id"] == "folder-new"
+    assert state["parents"]["doc-selected"] == ["folder-new"]
+    assert state["drive"]["doc-next"]["parents"] == ["next-old"]
+    assert state["records"]["doc-next"]["parent_id"] == "next-old"
+    assert state["parents"]["doc-next"] == ["next-old"]
+
+
 def test_rename_transcript_partial_cross_store_failure_remains_unknown(
     monkeypatch, firestore_fake, fake_clock,
 ):
