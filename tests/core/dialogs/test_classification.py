@@ -35,7 +35,7 @@ def test_explicit_path_wins_without_callbacks():
         pytest.fail("automatic classification callback should not run")
 
     result = classify_dialog_folder(
-        _request(folder_path=("Alpha", "Nested")), FOLDERS, ROOT,
+        _request(folder_path=("Alpha", "Nested"), topic_hint="Beta"), FOLDERS, ROOT,
         speaker_index_lookup=forbidden, suggestion=forbidden,
     )
 
