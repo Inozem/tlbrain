@@ -307,6 +307,65 @@ def _persist_accepted_forward(
 class _TelegramIntakeMixin:
     """Persist forwarded source messages and read intake state."""
 
+    def record_topic_event(
+        self,
+        update_id: int,
+        *,
+        chat_id: int,
+        thread_id: int | None,
+        event_kind: str,
+        topic_name: str | None,
+        now: datetime,
+    ) -> TelegramIntakeResult:
+        """Persist topic metadata and a minimal idempotency receipt only."""
+        update_id = _integer(update_id, "update_id")
+        chat_id = _integer(chat_id, "chat_id")
+        if thread_id is not None:
+            thread_id = _integer(thread_id, "thread_id", minimum=1)
+        if event_kind not in {"forum_topic_created", "forum_topic_edited"}:
+            raise ValueError("event_kind must identify a Telegram topic event")
+        if topic_name is not None and not isinstance(topic_name, str):
+            raise ValueError("topic_name must be a string or None")
+        now = _aware(now, "now")
+        context_id = build_context_id(chat_id, thread_id)
+        receipt_ref = _document_ref(self.client, f"{SESSIONS}/{context_id}/updates/{update_id}")
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+
+        @firestore.transactional
+        def _txn(transaction: firestore.Transaction) -> TelegramIntakeResult:
+            receipt_snap = receipt_ref.get(transaction=transaction)
+            if receipt_snap.exists:
+                return _receipt_result(receipt_snap.to_dict() or {}, context_id)
+
+            context_snap = context_ref.get(transaction=transaction)
+            context = context_snap.to_dict() or {}
+            defaults = _context_defaults(chat_id, thread_id, None, now)
+            for field_name, value in defaults.items():
+                context.setdefault(field_name, value)
+            context.update({"chat_id": chat_id, "thread_id": thread_id, "updated_at": now})
+            if topic_name is not None:
+                context["topic_name"] = topic_name
+
+            receipt = {
+                "update_id": update_id,
+                "context_id": context_id,
+                "accepted": False,
+                "draft_id": None,
+                "dialog_number": None,
+                "message_id": None,
+                "intake_sequence": None,
+                "notification_id": None,
+                "outbox_id": None,
+                "event_kind": event_kind,
+                "outcome": "topic_metadata_updated" if topic_name is not None else "topic_metadata_preserved",
+                "created_at": now,
+            }
+            transaction.set(receipt_ref, receipt)
+            transaction.set(context_ref, context)
+            return TelegramIntakeResult(False, context_id)
+
+        return _txn(self.client.transaction(max_attempts=5))
+
     def accept_forward(
         self,
         update_id: int,

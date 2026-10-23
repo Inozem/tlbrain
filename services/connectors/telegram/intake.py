@@ -6,6 +6,11 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from services.connectors.telegram.commands import parse_command
+from services.connectors.telegram.contexts import (
+    message_topic_name,
+    normalize_thread_id,
+    topic_service_event,
+)
 from services.connectors.telegram.repository import TelegramRepository
 
 
@@ -100,6 +105,34 @@ class TelegramIntake:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def handle_update(self, update: Mapping[str, Any]) -> Any:
+        context = self._validated_update_context(update)
+        if context is None:
+            return None
+        message, update_id, chat_id, user_id, thread_id = context
+
+        handled, result = self._route_topic_event(
+            message, update_id=update_id, chat_id=chat_id, thread_id=thread_id
+        )
+        if handled:
+            return result
+
+        if "forward_origin" in message and not isinstance(message.get("forward_origin"), Mapping):
+            return None
+        if "forward_origin" not in message:
+            return self._handle_command(
+                message,
+                update_id=update_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                thread_id=thread_id,
+            )
+        return self._handle_forward(
+            message, update_id=update_id, chat_id=chat_id, thread_id=thread_id
+        )
+
+    def _validated_update_context(
+        self, update: Mapping[str, Any]
+    ) -> tuple[Mapping[str, Any], int, int, int, int | None] | None:
         if not isinstance(update, Mapping):
             return None
         message = update.get("message")
@@ -118,51 +151,89 @@ class TelegramIntake:
         if update_id is None:
             return None
 
-        if "forward_origin" in message and not isinstance(message.get("forward_origin"), Mapping):
+        raw_thread_id = message.get("message_thread_id")
+        thread_id = normalize_thread_id(raw_thread_id)
+        # Missing and explicit null both describe a chat's default context.
+        # Any other unusable supplied value must not fall through to it.
+        if raw_thread_id is not None and thread_id is None:
             return None
-        if "forward_origin" not in message:
-            text = message.get("text")
-            if not isinstance(text, str) or not text.strip():
-                return None
-            thread_id = _integer(message.get("message_thread_id"))
-            topic_name = message.get("forum_topic_created", {}).get("name") if isinstance(
-                message.get("forum_topic_created"), Mapping
-            ) else None
-            accepted = self.repository.accept_command(
+
+        return message, update_id, chat_id, user_id, thread_id
+
+    def _route_topic_event(
+        self,
+        message: Mapping[str, Any],
+        *,
+        update_id: int,
+        chat_id: int,
+        thread_id: int | None,
+    ) -> tuple[bool, Any]:
+        topic_event = topic_service_event(message)
+        if topic_event is not None:
+            if thread_id is None:
+                return True, None
+            event_kind, topic_name = topic_event
+            return True, self.repository.record_topic_event(
                 update_id,
                 chat_id=chat_id,
-                user_id=user_id,
                 thread_id=thread_id,
-                topic_name=topic_name if isinstance(topic_name, str) else None,
-                command=parse_command(text),
+                event_kind=event_kind,
+                topic_name=topic_name,
                 now=self.clock(),
             )
-            outbox_id = accepted.outbox_id if hasattr(accepted, "outbox_id") else accepted.get("outbox_id")
-            is_accepted = accepted.accepted if hasattr(accepted, "accepted") else accepted.get("accepted")
-            if is_accepted and outbox_id:
-                self.publisher.publish(outbox_id)
-            return accepted
+        return False, None
 
+    def _handle_command(
+        self,
+        message: Mapping[str, Any],
+        *,
+        update_id: int,
+        chat_id: int,
+        user_id: int,
+        thread_id: int | None,
+    ) -> Any:
+        text = message.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        accepted = self.repository.accept_command(
+            update_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            topic_name=message_topic_name(message),
+            command=parse_command(text),
+            now=self.clock(),
+        )
+        self._publish_if_accepted(accepted)
+        return accepted
+
+    def _handle_forward(
+        self,
+        message: Mapping[str, Any],
+        *,
+        update_id: int,
+        chat_id: int,
+        thread_id: int | None,
+    ) -> Any:
         normalized = normalize_forward(message)
         if normalized["message_id"] is None:
             return None
-        thread_id = _integer(message.get("message_thread_id"))
-        topic_name = message.get("forum_topic_created", {}).get("name") if isinstance(
-            message.get("forum_topic_created"), Mapping
-        ) else None
         accepted = self.repository.accept_forward(
             update_id,
             chat_id=chat_id,
             thread_id=thread_id,
-            topic_name=topic_name if isinstance(topic_name, str) else None,
+            topic_name=message_topic_name(message),
             message=normalized,
             now=self.clock(),
         )
-        outbox_id = accepted.outbox_id if hasattr(accepted, "outbox_id") else accepted.get("outbox_id")
-        if accepted.accepted if hasattr(accepted, "accepted") else accepted.get("accepted"):
-            if outbox_id:
-                self.publisher.publish(outbox_id)
+        self._publish_if_accepted(accepted)
         return accepted
+
+    def _publish_if_accepted(self, result: Any) -> None:
+        outbox_id = result.outbox_id if hasattr(result, "outbox_id") else result.get("outbox_id")
+        is_accepted = result.accepted if hasattr(result, "accepted") else result.get("accepted")
+        if is_accepted and outbox_id:
+            self.publisher.publish(outbox_id)
 
 
 __all__ = ["TelegramIntake", "normalize_forward"]

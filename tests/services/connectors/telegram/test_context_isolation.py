@@ -68,7 +68,7 @@ def _intake(repository):
     return intake_type(repository=repository, publisher=_Publisher(), clock=lambda: NOW)
 
 
-def _update(update_id, *, thread_id=None, topic_name=None, text=None, forward=True):
+def _update(update_id, *, thread_id=None, text=None, forward=True):
     message = {
         "message_id": update_id + 100,
         "date": 1_798_000_000,
@@ -77,8 +77,6 @@ def _update(update_id, *, thread_id=None, topic_name=None, text=None, forward=Tr
     }
     if thread_id is not None:
         message["message_thread_id"] = thread_id
-    if topic_name is not None:
-        message["forum_topic_created"] = {"name": topic_name}
     if forward:
         message.update({
             "forward_origin": {"type": "user", "sender_user": {"id": 91}},
@@ -86,6 +84,16 @@ def _update(update_id, *, thread_id=None, topic_name=None, text=None, forward=Tr
         })
     else:
         message["text"] = text if text is not None else "Сохрани"
+    return {"update_id": update_id, "message": message}
+
+
+def _topic_event(update_id, *, thread_id, event="forum_topic_created", name=None):
+    message = {
+        "chat": {"id": 42, "type": "private"},
+        "from": {"id": 7},
+        "message_thread_id": thread_id,
+        event: ({"name": name} if name is not None else {}),
+    }
     return {"update_id": update_id, "message": message}
 
 
@@ -100,10 +108,11 @@ def test_default_and_thread_contexts_keep_drafts_sequences_and_queues_independen
     intake = _intake(repository)
 
     accepted = {}
+    intake.handle_update(_topic_event(100, thread_id=11, name="Shared name"))
+    intake.handle_update(_topic_event(101, thread_id=22, name="Shared name"))
     for update_id, thread_id in ((1, None), (2, 11), (3, 22)):
         accepted[thread_id] = intake.handle_update(_update(
             update_id, thread_id=thread_id,
-            topic_name="Shared name" if thread_id is not None else None,
         ))
     for update_id, thread_id in ((4, None), (5, 11), (6, 22)):
         accepted[(thread_id, "second")] = intake.handle_update(_update(
@@ -170,9 +179,12 @@ def test_same_topic_name_does_not_merge_threads_and_rename_only_updates_its_hint
     repository, _ = _repository(firestore_fake)
     intake = _intake(repository)
 
-    left = intake.handle_update(_update(20, thread_id=11, topic_name="Planning"))
-    right = intake.handle_update(_update(21, thread_id=22, topic_name="Planning"))
-    renamed = intake.handle_update(_update(22, thread_id=11, topic_name="Renamed"))
+    intake.handle_update(_topic_event(102, thread_id=11, name="Planning"))
+    intake.handle_update(_topic_event(103, thread_id=22, name="Planning"))
+    left = intake.handle_update(_update(20, thread_id=11))
+    right = intake.handle_update(_update(21, thread_id=22))
+    intake.handle_update(_topic_event(104, thread_id=11, event="forum_topic_edited", name="Renamed"))
+    renamed = intake.handle_update(_update(22, thread_id=11))
 
     assert _value(left, "context_id") == "42_11"
     assert _value(right, "context_id") == "42_22"
@@ -292,6 +304,43 @@ def test_private_default_intake_needs_no_forum_or_getme_capability_flags(firesto
     assert repository.get_context("42_default")["thread_id"] is None
 
 
+@pytest.mark.parametrize("invalid_thread_id", [0, -1, "11", True, False, 1.5])
+@pytest.mark.parametrize("forward", [True, False])
+def test_invalid_explicit_thread_id_is_ignored_without_default_context_writes(
+    firestore_fake, invalid_thread_id, forward,
+):
+    repository, client = _repository(firestore_fake)
+    intake = _intake(repository)
+    event = _update(41, forward=forward)
+    event["message"]["message_thread_id"] = invalid_thread_id
+
+    assert intake.handle_update(event) is None
+    assert repository.get_context("42_default") is None
+    assert not any("42_default" in path for path in firestore_fake.documents)
+
+
+def test_missing_thread_id_on_topic_service_event_does_not_update_default(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    intake = _intake(repository)
+    event = _topic_event(42, thread_id=None, name="Orphan topic")
+    del event["message"]["message_thread_id"]
+
+    assert intake.handle_update(event) is None
+    assert repository.get_context("42_default") is None
+
+
+def test_explicit_null_thread_id_routes_ordinary_update_to_default(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    intake = _intake(repository)
+    event = _update(43)
+    event["message"]["message_thread_id"] = None
+
+    accepted = intake.handle_update(event)
+
+    assert _value(accepted, "accepted") is True
+    assert _value(accepted, "context_id") == "42_default"
+
+
 @pytest.mark.parametrize(
     ("update_id", "topic_field", "topic_payload"),
     [
@@ -304,7 +353,8 @@ def test_topic_service_events_update_metadata_without_becoming_source_or_command
 ):
     repository, client = _repository(firestore_fake)
     intake = _intake(repository)
-    seed = intake.handle_update(_update(49, thread_id=11, topic_name="Original topic"))
+    intake.handle_update(_topic_event(48, thread_id=11, name="Original topic"))
+    seed = intake.handle_update(_update(49, thread_id=11))
     context_id = _value(seed, "context_id")
     draft_id = _value(seed, "draft_id")
     before_messages = repository.list_messages(context_id, draft_id)
@@ -356,3 +406,51 @@ def test_topic_service_events_update_metadata_without_becoming_source_or_command
     assert after_side_effect_paths <= before_side_effect_paths
     assert client.collection("telegram_sessions").document("42_11").get().exists
     assert context["topic_name"] == topic_payload["name"]
+
+
+@pytest.mark.parametrize("value, expected", [(True, True), (False, False), (None, None), ("true", None), (1, None)])
+def test_optional_getme_topic_capability_is_pure_informational_normalization(value, expected):
+    contexts = importlib.import_module("services.connectors.telegram.contexts")
+
+    assert contexts.normalize_has_topics_enabled(value) is expected
+
+
+def test_topic_event_before_first_forward_is_durable_and_replay_is_idempotent(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    publisher = _Publisher()
+    intake = importlib.import_module("services.connectors.telegram.intake").TelegramIntake(
+        repository=repository, publisher=publisher, allowed_user_ids={7}, clock=lambda: NOW,
+    )
+    event = _topic_event(60, thread_id=33, name="Early topic")
+
+    first = intake.handle_update(event)
+    replay = intake.handle_update(event)
+
+    assert _value(first, "accepted") is False
+    assert _value(replay, "accepted") is False
+    assert _value(first, "context_id") == _value(replay, "context_id") == "42_33"
+    receipt = repository.get_update_receipt("42_33", 60)
+    assert receipt["event_kind"] == "forum_topic_created"
+    assert receipt["outcome"] == "topic_metadata_updated"
+    assert receipt["intake_sequence"] is None
+    assert repository.get_context("42_33")["topic_name"] == "Early topic"
+    assert publisher.outbox_ids == []
+    assert not any("/drafts/" in path or "/operations/" in path or "/commands/" in path
+                   for path in firestore_fake.documents)
+
+    first_forward = intake.handle_update(_update(61, thread_id=33))
+    assert _value(first_forward, "accepted") is True
+    assert repository.get_context("42_33")["topic_name"] == "Early topic"
+    assert repository.get_context("42_33")["next_intake_sequence"] == 2
+
+
+def test_topic_edit_without_name_preserves_hint(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    intake = _intake(repository)
+    intake.handle_update(_topic_event(62, thread_id=34, name="Known"))
+
+    intake.handle_update(_topic_event(63, thread_id=34, event="forum_topic_edited"))
+
+    assert repository.get_context("42_34")["topic_name"] == "Known"
+    receipt = repository.get_update_receipt("42_34", 63)
+    assert receipt["outcome"] == "topic_metadata_preserved"
