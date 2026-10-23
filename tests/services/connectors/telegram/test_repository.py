@@ -48,9 +48,9 @@ def test_forward_transaction_persists_receipt_draft_dialog_message_and_ack(fires
         "topic_name": None,
         "active_draft_id": result.draft_id,
         "draft_status": "collecting",
-        "active_conversation_id": None,
-        "selected_dialog_number": None,
-        "selection_sequence": 0,
+        "active_conversation_id": f"{context_id}-1",
+        "selected_dialog_number": 1,
+        "selection_sequence": 1,
         "last_doc_id": None,
         "next_dialog_number": 2,
         "next_operation_sequence": 1,
@@ -135,12 +135,13 @@ def test_forward_fills_missing_context_defaults_without_resetting_existing_value
     assert context["topic_name"] == "New topic"
     assert context["next_dialog_number"] == 8
     assert context["next_intake_sequence"] == 12
-    assert context["selection_sequence"] == 4
+    assert context["selection_sequence"] == 5
     assert context["next_operation_sequence"] == 8
     assert context["head_sequence"] == 6
     assert context["lock_owner"] == "worker-1"
     assert context["fence"] == 3
-    assert context["active_conversation_id"] is None
+    assert context["active_conversation_id"] == f"{context_id}-7"
+    assert context["selected_dialog_number"] == 7
     assert context["status_revision"] == 0
     assert context["created_at"] == NOW
 

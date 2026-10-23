@@ -204,6 +204,11 @@ def test_save_rollover_allocates_fresh_draft_and_second_processing_context_is_cu
     first = intake.handle_update(_update(30, thread_id=11, text="old private source"))
     first_context = _value(first, "context_id")
     first_draft = _value(first, "draft_id")
+    focused = repository.get_context(first_context)
+    assert focused["active_conversation_id"] == f"{first_context}-1"
+    assert focused["selected_dialog_number"] == 1
+    assert focused["selection_sequence"] == 1
+    repository.checkpoint_transcription(first_context, first_draft, 130, "old transcription")
     repository.save_prepared_utterances(
         first_context, first_draft,
         [PreparedUtterance(0, "speaker", None, "old prepared content", 3, (130,))],
@@ -225,11 +230,18 @@ def test_save_rollover_allocates_fresh_draft_and_second_processing_context_is_cu
     assert second_draft != first_draft
     assert _value(second, "dialog_number") == 2
     assert _value(second, "intake_sequence") == 2
+    focused = repository.get_context(first_context)
+    assert focused["active_conversation_id"] == f"{first_context}-2"
+    assert focused["selected_dialog_number"] == 2
+    assert focused["selection_sequence"] == 2
     save_second = intake.handle_update(_update(33, thread_id=11, forward=False))
     assert _value(save_second, "snapshot_message_ids") == (132,)
     assert repository.get_draft(first_context, first_draft)["ordered_message_ids"] == [130]
+    assert repository.list_messages(first_context, first_draft)[0]["transcription_text"] == "old transcription"
     assert repository.get_draft(first_context, second_draft)["ordered_message_ids"] == [132]
     assert repository.get_draft(first_context, second_draft)["prepared_count"] == 0
+    assert [row["message_id"] for row in repository.list_messages(first_context, second_draft)] == [132]
+    assert repository.list_messages(first_context, second_draft)[0]["transcription_text"] is None
 
     # Run the public save workflow against only the second sealed manifest. Any
     # accidental previous-draft lookup is represented by a conspicuous legacy
@@ -291,6 +303,48 @@ def test_save_rollover_allocates_fresh_draft_and_second_processing_context_is_cu
     assert [row["text"] for row in context["messages"]] == ["new private source"]
     assert "old private source" not in repr(context)
     assert "old prepared content" not in repr(context)
+
+
+def test_failed_draft_retains_progress_while_new_forward_gets_clean_next_dialog(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    first = repository.accept_forward(
+        40, chat_id=42, thread_id=11,
+        message={"message_id": 140, "text": "failed raw source", "transcription_state": "pending"},
+        now=NOW,
+    )
+    repository.checkpoint_transcription(first.context_id, first.draft_id, 140, "failed transcription")
+    repository.save_prepared_utterances(
+        first.context_id, first.draft_id,
+        [PreparedUtterance(0, "speaker", None, "failed prepared content", 3, (140,))],
+        required_audio_count=1, completed_audio_ids=(140,), context_capacity=30,
+        preparation_digest="failed-preparation", now=NOW,
+    )
+    first_ref = client.collection("telegram_sessions").document(first.context_id).collection("drafts").document(first.draft_id)
+    first_ref.update({"state": "failed", "failure_code": "synthetic_failure"})
+    context_ref = client.collection("telegram_sessions").document(first.context_id)
+    context_ref.update({"active_draft_id": None, "draft_status": None})
+
+    second = repository.accept_forward(
+        41, chat_id=42, thread_id=11,
+        message={"message_id": 141, "text": "new raw source"}, now=NOW,
+    )
+
+    assert second.accepted is True
+    assert second.draft_id != first.draft_id
+    assert second.dialog_number == first.dialog_number + 1 == 2
+    focused = repository.get_context(first.context_id)
+    assert focused["active_conversation_id"] == f"{first.context_id}-2"
+    assert focused["selected_dialog_number"] == 2
+    assert focused["selection_sequence"] == 2
+    assert repository.list_failed_drafts(first.context_id)[0]["draft_id"] == first.draft_id
+    assert repository.get_draft(first.context_id, first.draft_id)["prepared_count"] == 1
+    old_message = repository.list_messages(first.context_id, first.draft_id)[0]
+    assert old_message["text"] == "failed raw source"
+    assert old_message["transcription_text"] == "failed transcription"
+    new_messages = repository.list_messages(first.context_id, second.draft_id)
+    assert [row["message_id"] for row in new_messages] == [141]
+    assert new_messages[0]["transcription_text"] is None
+    assert repository.get_draft(first.context_id, second.draft_id)["prepared_count"] == 0
 
 
 def test_private_default_intake_needs_no_forum_or_getme_capability_flags(firestore_fake):

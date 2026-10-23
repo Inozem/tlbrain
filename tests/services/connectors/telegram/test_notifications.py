@@ -357,6 +357,8 @@ def test_sealed_ack_failure_preserves_newer_collecting_pointer_without_exact_par
     draft_ref.set(draft)
     context_ref = client.collection("telegram_sessions").document(accepted.context_id)
     context_ref.update({"active_draft_id": "newer-draft", "draft_status": "collecting",
+                        "active_conversation_id": f"{accepted.context_id}-2",
+                        "selected_dialog_number": 2, "selection_sequence": 2,
                         "reserved_operation_id": "unrelated-parent", "head_sequence": 8})
     client.collection("telegram_sessions").document(accepted.context_id).collection("drafts").document("newer-draft").set(
         {"draft_id": "newer-draft", "state": "collecting"}
@@ -371,5 +373,8 @@ def test_sealed_ack_failure_preserves_newer_collecting_pointer_without_exact_par
     assert result["ack_failure_action"]["queue_release_required"] is True
     assert state["active_draft_id"] == "newer-draft"
     assert state["draft_status"] == "collecting"
+    assert state["active_conversation_id"] == f"{accepted.context_id}-2"
+    assert state["selected_dialog_number"] == 2
+    assert state["selection_sequence"] == 2
     assert state["reserved_operation_id"] == "unrelated-parent"
     assert repo.get_draft(accepted.context_id, accepted.draft_id)["manifest_digest"] == "old-digest"

@@ -173,6 +173,10 @@ def test_forward_atomically_persists_collecting_draft_message_and_draft_ack(
     assert str(_value(accepted, "dialog_number")) in str(notification["body"])
     assert outbox["notification_id"] == _value(accepted, "notification_id")
     assert publisher.outbox_ids == [_value(accepted, "outbox_id")]
+    context = repository.get_context(context_id)
+    assert context["active_conversation_id"] == f"{context_id}-{_value(accepted, 'dialog_number')}"
+    assert context["selected_dialog_number"] == _value(accepted, "dialog_number")
+    assert context["selection_sequence"] == 1
     assert classifier.calls == []
     assert semantic_router.calls == []
     assert not any(event["boundary"] == "gemini" for event in sdk_fakes.trace)
@@ -190,6 +194,10 @@ def test_distinct_forwards_reuse_the_unique_collecting_draft_and_dialog_number(
 
     assert _value(first, "draft_id") == _value(second, "draft_id")
     assert _value(first, "dialog_number") == _value(second, "dialog_number")
+    context = repository.get_context(context_id)
+    assert context["active_conversation_id"] == f"{context_id}-{_value(first, 'dialog_number')}"
+    assert context["selected_dialog_number"] == _value(first, "dialog_number")
+    assert context["selection_sequence"] == 1
     assert len(_direct_child_paths(firestore_fake, f"telegram_sessions/{context_id}/drafts")) == 1
     draft_id = _value(first, "draft_id")
     assert _read_doc(client, _message_path(context_id, draft_id, 102))["message_id"] == 102
@@ -234,6 +242,10 @@ def test_duplicate_update_reuses_all_records_and_repairs_same_outbox_after_gap(
     draft_id = _value(replay, "draft_id")
     notification_id = _value(replay, "notification_id")
     outbox_id = _value(replay, "outbox_id")
+    context = repository.get_context(context_id)
+    assert context["active_conversation_id"] == f"{context_id}-{_value(replay, 'dialog_number')}"
+    assert context["selected_dialog_number"] == _value(replay, "dialog_number")
+    assert context["selection_sequence"] == 1
     draft = _read_doc(client, f"telegram_sessions/{context_id}/drafts/{draft_id}")
     update_record = _read_doc(client, f"telegram_sessions/{context_id}/updates/8")
     notification = _read_doc(client, f"notification_outbox/{notification_id}")
@@ -414,6 +426,29 @@ def test_command_reservation_blocks_forwards_until_all_fifo_heads_finish(
     assert context.get().to_dict()["reserved_operation_id"] is None
     accepted = intake.handle_update(_forward(23))
     assert _value(accepted, "accepted") is True
+
+
+def test_busy_rejected_forward_does_not_change_focus_or_selection_sequence(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    accepted = repository.accept_forward(
+        1, chat_id=42,
+        message={"message_id": 101, "text": "first"}, now=NOW,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    context_ref.update({"reserved_operation_id": "busy-operation"})
+    before = repository.get_context(accepted.context_id)
+
+    rejected = repository.accept_forward(
+        2, chat_id=42,
+        message={"message_id": 102, "text": "rejected"}, now=NOW,
+    )
+
+    after = repository.get_context(accepted.context_id)
+    assert rejected.accepted is False
+    assert after["active_draft_id"] == before["active_draft_id"] == accepted.draft_id
+    assert after["active_conversation_id"] == before["active_conversation_id"]
+    assert after["selected_dialog_number"] == before["selected_dialog_number"]
+    assert after["selection_sequence"] == before["selection_sequence"] == 1
 
 
 def test_concurrent_command_and_forward_are_decided_by_repository_transaction(

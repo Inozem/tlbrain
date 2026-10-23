@@ -288,6 +288,12 @@ def _persist_accepted_forward(
     context.update({"chat_id": chat_id, "thread_id": thread_id,
                     "active_draft_id": draft.draft_id, "draft_status": "collecting",
                     "next_intake_sequence": intake_sequence + 1, "updated_at": now})
+    selected_target = (draft.conversation_id, draft.dialog_number)
+    current_target = (context.get("active_conversation_id"), context.get("selected_dialog_number"))
+    context["active_conversation_id"], context["selected_dialog_number"] = selected_target
+    if current_target != selected_target:
+        selection_sequence = _integer(context.get("selection_sequence", 0), "selection_sequence")
+        context["selection_sequence"] = selection_sequence + 1
     if topic_name is not None:
         context["topic_name"] = topic_name
     transaction.set(context_ref, context)
