@@ -35,6 +35,7 @@ from services.connectors.telegram.repository import SESSIONS
 Processor = Callable[[str, Any, OperationLease], Awaitable[QueueOperationState]]
 Clock = Callable[[], datetime]
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-firestore")
+MAX_EXECUTION_SLICE_SECONDS = 480.0
 
 
 async def _offload_sync(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
@@ -165,16 +166,20 @@ class TelegramQueueWorker:
         clock: Clock = _utc_now,
         owner_factory: Callable[[], str] | None = None,
         heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+        max_slice_seconds: float = MAX_EXECUTION_SLICE_SECONDS,
     ) -> None:
         if not callable(processor) or not callable(clock):
             raise TypeError("processor and clock must be callable")
         if heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat_interval_seconds must be positive")
+        if max_slice_seconds <= 0 or max_slice_seconds > MAX_EXECUTION_SLICE_SECONDS:
+            raise ValueError("max_slice_seconds must be positive and at most 480 seconds")
         self.client = client
         self.processor = processor
         self.clock = clock
         self.owner_factory = owner_factory or (lambda: uuid.uuid4().hex)
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.max_slice_seconds = max_slice_seconds
 
     async def handle_task(self, payload: Mapping[str, Any]) -> bool:
         """Handle a schema-versioned task body; return whether processing settled."""
@@ -234,6 +239,23 @@ class TelegramQueueWorker:
         result = await self._run_with_heartbeat(context_id, operation, lease, context_ref)
         if result is None:
             return False
+        if result is QueueOperationState.RUNNING:
+            yielded_at = self.clock()
+
+            def wake_same_head(transaction: Any, updated_context: dict[str, Any]) -> None:
+                _ensure_wakeup_in_transaction(
+                    self.client, transaction, updated_context,
+                    context_id=context_id, operation_id=lease.operation_id,
+                    schedule_at=yielded_at, now=yielded_at,
+                )
+
+            await _offload_sync(
+                release_head, self.client, context_ref,
+                operation_id=lease.operation_id, owner=lease.owner,
+                fence=lease.fence, now=yielded_at,
+                after_release=wake_same_head,
+            )
+            return False
 
         settle_now = self.clock()
 
@@ -277,13 +299,20 @@ class TelegramQueueWorker:
         release_lease = False
         try:
             done, _ = await asyncio.wait(
-                {processor_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED,
+                {processor_task, heartbeat_task}, timeout=self.max_slice_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done:
+                processor_task.cancel()
+                await asyncio.gather(processor_task, return_exceptions=True)
+                return QueueOperationState.RUNNING
             if heartbeat_task in done and not heartbeat_task.result():
                 return None
             result = await processor_task
+            if result is QueueOperationState.RUNNING:
+                return QueueOperationState.RUNNING
             if not isinstance(result, QueueOperationState) or not result.is_terminal:
-                raise ValueError("processor must return a terminal QueueOperationState")
+                raise ValueError("processor must return a terminal or RUNNING QueueOperationState")
             return result
         except BaseException:
             release_lease = True

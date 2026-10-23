@@ -225,8 +225,14 @@ def heartbeat(
 def release_head(
     client: Any,
     context_ref: Any, *, operation_id: str, owner: str, fence: int, now: datetime,
+    after_release: Any = None,
 ) -> bool:
-    """Yield the current lease while preserving the same queue head."""
+    """Yield the current lease while preserving the same queue head.
+
+    ``after_release`` can add provider-neutral transaction writes after the
+    lease has been validated and before the context is persisted. This lets a
+    caller atomically schedule a continuation alongside the lease release.
+    """
     now = _aware(now)
 
     @firestore.transactional
@@ -244,6 +250,8 @@ def release_head(
             return False
         operation = operation_snapshot.to_dict() or {}
         context.update({"active_operation_id": None, "lock_owner": None, "lock_expires_at": None})
+        if after_release is not None:
+            after_release(transaction, context)
         transaction.set(context_ref, context)
         return True
 

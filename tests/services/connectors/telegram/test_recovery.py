@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.integrations.firestore.outbox import (
+    OUTBOX_COLLECTION,
     OutboxState,
     OutboxTargetKind,
     get_outbox_record,
@@ -208,6 +209,56 @@ def test_nonterminal_slice_yield_keeps_same_head_for_next_delivery(firestore_fak
     assert after_yield["lock_owner"] is None
 
     assert _run(worker.handle_task(payload)) is True
+    assert context_ref.get().to_dict()["reserved_operation_id"] is None
+
+
+def test_timed_slice_cancels_processor_and_persists_same_head_wakeup(firestore_fake):
+    client = firestore_fake.client_class()
+    accepted = _accepted_save(client, update_id=705)
+    payload = task_payload(get_outbox_record(client, accepted.outbox_id))
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    cancelled = []
+
+    async def slow_processor(context_id, operation, lease):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append((context_id, operation.operation_id))
+
+    worker = TelegramQueueWorker(
+        client, slow_processor, clock=lambda: NOW,
+        heartbeat_interval_seconds=0.005, max_slice_seconds=0.02,
+    )
+
+    assert _run(worker.handle_task(payload)) is False
+    context = context_ref.get().to_dict()
+    assert context["reserved_operation_id"] == accepted.operation_id
+    assert context["active_operation_id"] is None
+    assert context["lock_owner"] is None
+    assert cancelled == [(accepted.context_id, accepted.operation_id)]
+    assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+
+    continuations = [
+        (path.rsplit("/", 1)[-1], data) for path, data in firestore_fake.documents.items()
+        if path.startswith(f"{OUTBOX_COLLECTION}/")
+        and data.get("context_id") == accepted.context_id
+        and data.get("operation_id") == accepted.operation_id
+        and path.rsplit("/", 1)[-1] != accepted.outbox_id
+    ]
+    assert len(continuations) == 1
+    continuation_id, continuation_data = continuations[0]
+    assert continuation_data["target_kind"] == OutboxTargetKind.TELEGRAM_DISPATCH.value
+    assert continuation_data["generation"] == context["telegram_dispatch_wake_generation"]
+    assert continuation_data["state"] == OutboxState.PENDING.value
+    continuation_payload = task_payload(get_outbox_record(client, continuation_id))
+
+    async def complete(context_id, operation, lease):
+        assert operation.operation_id == accepted.operation_id
+        return QueueOperationState.COMPLETED
+
+    assert _run(
+        TelegramQueueWorker(client, complete, clock=lambda: NOW).handle_task(continuation_payload)
+    )
     assert context_ref.get().to_dict()["reserved_operation_id"] is None
 
 

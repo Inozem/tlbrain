@@ -164,10 +164,13 @@ def test_stale_fence_cannot_release_successor_lease(firestore_fake):
     assert successor is not None
     assert successor.fence > stale.fence
 
+    continuation_callbacks = []
     assert release_head(
         client, context_ref, operation_id=stale.operation_id,
         owner=stale.owner, fence=stale.fence, now=successor_now,
+        after_release=lambda transaction, context: continuation_callbacks.append(True),
     ) is False
+    assert continuation_callbacks == []
     context = context_ref.get().to_dict()
     assert context["active_operation_id"] == successor.operation_id
     assert context["lock_owner"] == successor.owner
