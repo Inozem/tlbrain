@@ -12,10 +12,25 @@ from core.integrations.firestore.outbox import (
     get_outbox_record,
     task_payload,
 )
-from core.integrations.firestore.operation_queue import register_operation
+from core.integrations.firestore.operation_queue import (
+    claim_head,
+    fail_head,
+    get_operation,
+    register_operation,
+    release_head,
+)
+from core.integrations.firestore.operations import (
+    claim_operation,
+    complete_stage_attempt,
+    create_operation,
+    get_stage,
+    reserve_stage_attempt,
+)
 from core.operations.queue import QueueOperationState
+from core.operations.models import OperationOrigin
+from services.connectors.telegram.commands import parse_command
 from services.connectors.telegram.queue import TelegramQueueWorker
-from services.connectors.telegram.repository import SESSIONS
+from services.connectors.telegram.repository import SESSIONS, TelegramRepository
 
 
 NOW = datetime(2026, 5, 1, tzinfo=timezone.utc)
@@ -114,6 +129,131 @@ def test_out_of_order_delivery_wakes_actual_head_and_does_not_process_tail(fires
     context = context_ref.get().to_dict()
     assert context["reserved_operation_id"] == "op-b"
     assert any(row.get("operation_id") == "op-b" for row in _rows(firestore_fake).values())
+
+
+def test_registration_assigns_contiguous_sequences_and_reserves_only_the_head(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, _ = _setup(client, operation_ids=("op-a", "op-b", "op-c"))
+
+    context = context_ref.get().to_dict()
+    operations = [get_operation(context_ref, operation_id) for operation_id in ("op-a", "op-b", "op-c")]
+
+    assert [operation.sequence for operation in operations] == [1, 2, 3]
+    assert context["next_operation_sequence"] == 4
+    assert context["head_sequence"] == 1
+    assert context["reserved_operation_id"] == "op-a"
+    assert context["queue_tail_operation_id"] == "op-c"
+    assert [
+        firestore_fake.documents[
+            f"telegram_sessions/ctx/operations/{operation_id}"
+        ]["next_operation_id"]
+        for operation_id in ("op-a", "op-b", "op-c")
+    ] == ["op-b", "op-c", None]
+
+
+def test_stale_fence_cannot_release_successor_lease(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, _ = _setup(client)
+    stale = claim_head(client, context_ref, owner="old-worker", now=NOW)
+    assert stale is not None
+
+    successor_now = NOW + timedelta(seconds=121)
+    successor = claim_head(client, context_ref, owner="new-worker", now=successor_now)
+    assert successor is not None
+    assert successor.fence > stale.fence
+
+    assert release_head(
+        client, context_ref, operation_id=stale.operation_id,
+        owner=stale.owner, fence=stale.fence, now=successor_now,
+    ) is False
+    context = context_ref.get().to_dict()
+    assert context["active_operation_id"] == successor.operation_id
+    assert context["lock_owner"] == successor.owner
+    assert context["fence"] == successor.fence
+
+
+def test_stale_fence_cannot_write_stage_checkpoint_after_reclaim(firestore_fake):
+    client = firestore_fake.client_class()
+    operation_id = "telegram-checkpoint-fence"
+    create_operation(
+        client,
+        operation_id=operation_id,
+        origin=OperationOrigin.TELEGRAM,
+        caller_binding="telegram:ctx",
+        immutable_input_digest="digest:telegram-checkpoint-fence",
+        immutable_input_ref="telegram_sessions/ctx/commands/1",
+        now=NOW,
+    )
+    old_lease = claim_operation(
+        client, operation_id, owner="old-worker", now=NOW, lease_seconds=5,
+    )
+    assert old_lease is not None
+    stage_key = "save/index"
+    reserved = reserve_stage_attempt(
+        client, operation_id, stage_key, owner="old-worker",
+        fence=old_lease.fence, attempt_id="old-attempt", now=NOW,
+    )
+    assert reserved is not None
+
+    takeover_time = NOW + timedelta(seconds=6)
+    successor = claim_operation(
+        client, operation_id, owner="new-worker", now=takeover_time, lease_seconds=30,
+    )
+    assert successor is not None and successor.fence > old_lease.fence
+
+    assert complete_stage_attempt(
+        client, operation_id, stage_key, owner="old-worker",
+        fence=old_lease.fence, attempt_id="old-attempt",
+        result={"document_id": "stale-doc"}, checkpoint_refs=("stale-ref",),
+        now=takeover_time,
+    ) is False
+    stage = get_stage(client, operation_id, stage_key)
+    assert stage.result is None
+    assert stage.checkpoint_refs == ()
+
+
+def test_dependent_command_acceptance_persists_exact_preceding_save_dependency(firestore_fake):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id = "42_default"
+    context_ref = client.collection(SESSIONS).document(context_id)
+    context_ref.set({"last_doc_id": "old-doc"})
+
+    save = repository.accept_command(
+        100,
+        chat_id=42,
+        user_id=7,
+        command=parse_command("save"),
+        now=NOW,
+    )
+    dependent = repository.accept_command(
+        101,
+        chat_id=42,
+        user_id=7,
+        command=parse_command("move last"),
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert save.operation_id is not None
+    assert dependent.operation_id is not None
+    save_lease = claim_head(
+        client, context_ref, owner="save-worker", now=NOW + timedelta(seconds=1),
+    )
+    assert save_lease is not None
+    assert save_lease.operation_id == save.operation_id
+    assert fail_head(
+        client, context_ref, operation_id=save_lease.operation_id,
+        owner=save_lease.owner, fence=save_lease.fence,
+        now=NOW + timedelta(seconds=2),
+    ) is True
+    assert context_ref.get().to_dict()["reserved_operation_id"] == dependent.operation_id
+    assert get_operation(context_ref, save.operation_id).state is QueueOperationState.FAILED
+
+    dependent_operation = firestore_fake.documents[
+        f"{SESSIONS}/{context_id}/operations/{dependent.operation_id}"
+    ]
+    assert dependent_operation.get("dependency_operation_id") == save.operation_id
+    assert dependent_operation.get("target_doc_id") is None
 
 
 def test_stale_generation_and_terminal_replay_do_not_call_processor(firestore_fake):
