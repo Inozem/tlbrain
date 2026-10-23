@@ -97,27 +97,74 @@ def test_unique_speaker_candidate_returns_without_suggestion():
     assert not result.speaker_candidates_ambiguous
 
 
+def test_only_reliable_speakers_are_queried_and_display_only_authors_are_ignored():
+    queried = []
+    utterances = (
+        DialogUtterance("Alex", "reliable author"),
+        DialogUtterance("Speaker 1", "display label"),
+        DialogUtterance("Unknown author", "unverified author"),
+    )
+
+    def lookup(speaker):
+        queried.append(speaker)
+        return ["alpha"]
+
+    result = classify_dialog_folder(
+        _request(utterances=utterances, reliable_speakers=("Alex",)),
+        FOLDERS,
+        ROOT,
+        speaker_index_lookup=lookup,
+        suggestion=lambda *_args: pytest.fail("unique speaker match should bypass suggestions"),
+    )
+
+    assert queried == ["Alex"]
+    assert result.folder_id == "alpha"
+
+
 def test_multiple_speaker_candidates_try_title_then_transcript_and_keep_ambiguity():
     utterances = tuple(DialogUtterance("Alex", f"line-{i}") for i in range(18))
     calls = []
+    trace = []
 
     def suggest(stage, candidate_ids, title, excerpt, topic_hint):
+        trace.append(stage)
         calls.append((stage, candidate_ids, title, excerpt, topic_hint))
         if stage == "title":
             return "Alpha", 0.79
         return "Beta", 0.8
 
+    def lookup(speaker):
+        trace.append(f"speaker:{speaker}")
+        return ["alpha", "beta"]
+
     result = classify_dialog_folder(
         _request(utterances=utterances), FOLDERS, ROOT,
-        speaker_index_lookup=lambda _speaker: ["alpha", "beta"], suggestion=suggest,
+        speaker_index_lookup=lookup, suggestion=suggest,
     )
 
     assert result.folder_id == "beta"
     assert result.speaker_candidate_ids == ("alpha", "beta")
     assert result.speaker_candidates_ambiguous
     assert [call[0] for call in calls] == ["title", "transcript"]
+    assert trace == ["speaker:Alex", "title", "transcript"]
     assert calls[0][2] == "Planning"
+    assert calls[0][3] == utterances[:15]
     assert calls[1][3] == utterances[:15]
+
+
+def test_duplicate_candidate_names_resolve_to_first_candidate_id():
+    duplicate_folders = dict(FOLDERS)
+    duplicate_folders["alpha-copy"] = {"name": "Alpha", "parent_id": ROOT}
+    result = classify_dialog_folder(
+        _request(),
+        duplicate_folders,
+        ROOT,
+        speaker_index_lookup=lambda _speaker: ["alpha-copy", "alpha"],
+        suggestion=lambda *_args: ("Alpha", 0.8),
+    )
+
+    assert result.folder_id == "alpha"
+    assert result.speaker_candidate_ids == ("alpha", "alpha-copy")
 
 
 def test_topic_hint_is_passed_to_suggestion_unchanged():
@@ -135,6 +182,30 @@ def test_topic_hint_is_passed_to_suggestion_unchanged():
 
     assert result.folder_id == "alpha"
     assert received_hints == [topic_hint]
+
+
+def test_topic_hint_is_advisory_and_does_not_persist_a_folder_mapping():
+    topic_hint = "Finance"
+    suggestion_responses = iter([("Alpha", 0.8), ("Beta", 0.8)])
+    received_hints = []
+
+    def classify_with_topic(speaker_candidates):
+        return classify_dialog_folder(
+            _request(topic_hint=topic_hint),
+            FOLDERS,
+            ROOT,
+            speaker_index_lookup=lambda _speaker: speaker_candidates,
+            suggestion=lambda _stage, _ids, _title, _excerpt, hint: (
+                received_hints.append(hint) or next(suggestion_responses)
+            ),
+        )
+
+    first = classify_with_topic(["alpha", "beta"])
+    second = classify_with_topic(["alpha", "beta"])
+
+    assert first.folder_id == "alpha"
+    assert second.folder_id == "beta"
+    assert received_hints == [topic_hint, topic_hint]
 
 
 def test_suggestion_requires_exact_name_and_confidence_at_least_point_eight():
@@ -182,3 +253,41 @@ def test_no_valid_suggestion_returns_terminal_unassigned_result():
 
     assert result.folder_id is None
     assert result.requires_unassigned
+
+
+def test_ambiguous_speaker_candidates_remain_visible_on_unassigned_fallback():
+    result = classify_dialog_folder(
+        _request(),
+        FOLDERS,
+        ROOT,
+        speaker_index_lookup=lambda _speaker: ["beta", "alpha"],
+        suggestion=lambda *_args: ("Unknown client", 1.0),
+    )
+
+    assert result.folder_id is None
+    assert result.requires_unassigned
+    assert result.speaker_candidate_ids == ("alpha", "beta")
+    assert result.speaker_candidates_ambiguous
+
+
+def test_unknown_suggested_client_is_not_created_and_requires_unassigned():
+    folder_snapshot = dict(FOLDERS)
+    suggestions = []
+
+    def suggest(stage, *_args):
+        suggestions.append(stage)
+        return "New client", 1.0
+
+    result = classify_dialog_folder(
+        _request(),
+        folder_snapshot,
+        ROOT,
+        speaker_index_lookup=lambda _speaker: [],
+        suggestion=suggest,
+    )
+
+    assert result.folder_id is None
+    assert result.requires_unassigned
+    assert "New client" not in {folder["name"] for folder in folder_snapshot.values()}
+    assert "new-client" not in folder_snapshot
+    assert suggestions == ["title", "transcript"]
