@@ -5,6 +5,8 @@ import os
 import socket
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from core.integrations.firestore.outbox import (
     OUTBOX_COLLECTION,
     OutboxTargetKind,
@@ -212,7 +214,7 @@ def test_stale_fence_cannot_write_stage_checkpoint_after_reclaim(firestore_fake)
     assert stage.checkpoint_refs == ()
 
 
-def test_dependent_command_acceptance_persists_exact_preceding_save_dependency(firestore_fake):
+def test_command_acceptance_persists_pending_save_candidate(firestore_fake):
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
     context_id = "42_default"
@@ -252,8 +254,170 @@ def test_dependent_command_acceptance_persists_exact_preceding_save_dependency(f
     dependent_operation = firestore_fake.documents[
         f"{SESSIONS}/{context_id}/operations/{dependent.operation_id}"
     ]
-    assert dependent_operation.get("dependency_operation_id") == save.operation_id
+    assert dependent_operation.get("pending_save_candidate_operation_id") == save.operation_id
+    assert "dependency_operation_id" not in dependent_operation
     assert dependent_operation.get("target_doc_id") is None
+
+
+@pytest.mark.parametrize("candidate", ["move last", "Перенеси последний", "enlace por favor"])
+def test_arbitrary_command_text_preserves_pending_save_candidate_without_classifying_intent(
+    firestore_fake, candidate,
+):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id = "42_default"
+    context_ref = client.collection(SESSIONS).document(context_id)
+    context_ref.set({"last_doc_id": "old-doc"})
+
+    save = repository.accept_command(
+        110, chat_id=42, user_id=7, command=parse_command("save"), now=NOW,
+    )
+    accepted = repository.accept_command(
+        111, chat_id=42, user_id=7, command=parse_command(candidate),
+        now=NOW + timedelta(seconds=1),
+    )
+
+    commands = client.collection(SESSIONS).document(context_id).collection("commands")
+    command_data = commands.document("111").get().to_dict()
+    operation = client.collection(SESSIONS).document(context_id).collection(
+        "operations"
+    ).document(accepted.operation_id).get().to_dict()
+    assert command_data["candidate"] == candidate
+    assert command_data["pending_save_candidate_operation_id"] == save.operation_id
+    assert operation["pending_save_candidate_operation_id"] == save.operation_id
+    assert "dependency_operation_id" not in operation
+    assert operation.get("target_doc_id") is None
+
+
+def test_predecessor_is_persisted_when_save_candidate_is_unrecognized(firestore_fake):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id = "42_default"
+
+    unrecognized_save = repository.accept_command(
+        125, chat_id=42, user_id=7, command=parse_command("guardar"), now=NOW,
+    )
+    following = repository.accept_command(
+        126, chat_id=42, user_id=7, command=parse_command("move last"),
+        now=NOW + timedelta(seconds=1),
+    )
+
+    context_ref = client.collection(SESSIONS).document(context_id)
+    operation = context_ref.collection("operations").document(
+        following.operation_id
+    ).get().to_dict()
+    save_candidate_command = context_ref.collection("commands").document(
+        "125"
+    ).get().to_dict()
+    command = context_ref.collection("commands").document("126").get().to_dict()
+    assert unrecognized_save.operation_id is not None
+    assert save_candidate_command["kind"] == "freeform"
+    assert command["kind"] == "freeform"
+    assert operation["predecessor_operation_id"] == unrecognized_save.operation_id
+    assert command["predecessor_operation_id"] == unrecognized_save.operation_id
+    assert "pending_save_candidate_operation_id" not in operation
+    assert "dependency_operation_id" not in operation
+
+
+def test_independent_command_keeps_candidate_without_dependency(firestore_fake):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id = "42_default"
+
+    save = repository.accept_command(
+        130, chat_id=42, user_id=7, command=parse_command("save"), now=NOW,
+    )
+    unrelated = repository.accept_command(
+        131, chat_id=42, user_id=7, command=parse_command("summarize this"),
+        now=NOW + timedelta(seconds=1),
+    )
+    later = repository.accept_command(
+        132, chat_id=42, user_id=7, command=parse_command("enlace please"),
+        now=NOW + timedelta(seconds=2),
+    )
+
+    context_ref = client.collection(SESSIONS).document(context_id)
+    operation = context_ref.collection(
+        "operations"
+    ).document(unrelated.operation_id).get().to_dict()
+    later_operation = context_ref.collection("operations").document(
+        later.operation_id
+    ).get().to_dict()
+    later_command = context_ref.collection("commands").document("132").get().to_dict()
+    assert operation["pending_save_candidate_operation_id"] == save.operation_id
+    assert "dependency_operation_id" not in operation
+    assert "target_doc_id" not in operation
+    assert later_command["candidate"] == "enlace please"
+    assert later_command["pending_save_candidate_operation_id"] == save.operation_id
+    assert later_command["predecessor_operation_id"] == unrelated.operation_id
+    assert later_operation["pending_save_candidate_operation_id"] == save.operation_id
+    assert later_operation["predecessor_operation_id"] == unrelated.operation_id
+    assert "dependency_operation_id" not in later_operation
+    assert "target_doc_id" not in later_operation
+
+
+def test_settling_save_clears_pending_pointer_atomically_and_keeps_accepted_candidate(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id = "42_default"
+    context_ref = client.collection(SESSIONS).document(context_id)
+    context_ref.set({"last_doc_id": "old-doc"})
+    save = repository.accept_command(
+        140, chat_id=42, user_id=7, command=parse_command("save"), now=NOW,
+    )
+    dependent = repository.accept_command(
+        141, chat_id=42, user_id=7, command=parse_command("Перенеси последний"),
+        now=NOW + timedelta(seconds=1),
+    )
+
+    async def fail_save(context_id, operation, lease):
+        return QueueOperationState.FAILED
+
+    worker = TelegramQueueWorker(
+        client, fail_save, clock=lambda: NOW + timedelta(seconds=2),
+        owner_factory=lambda: "save-worker",
+    )
+    save_payload = task_payload(get_outbox_record(client, save.outbox_id))
+    assert _run(worker.handle_task(save_payload)) is True
+
+    settled_context = context_ref.get().to_dict()
+    assert "pending_save_operation_id" not in settled_context
+    assert settled_context["last_doc_id"] == "old-doc"
+    assert settled_context["reserved_operation_id"] == dependent.operation_id
+    dependent_operation = client.collection(SESSIONS).document(context_id).collection(
+        "operations"
+    ).document(dependent.operation_id).get().to_dict()
+    assert dependent_operation["pending_save_candidate_operation_id"] == save.operation_id
+    assert "dependency_operation_id" not in dependent_operation
+    assert dependent_operation.get("target_doc_id") is None
+    accepted_command = client.collection(SESSIONS).document(context_id).collection(
+        "commands"
+    ).document("141").get().to_dict()
+    assert accepted_command["pending_save_candidate_operation_id"] == save.operation_id
+    assert any(
+        row.get("operation_id") == dependent.operation_id
+        and outbox_id != dependent.outbox_id
+        for outbox_id, row in _rows(firestore_fake).items()
+    )
+
+    later = repository.accept_command(
+        142, chat_id=42, user_id=7, command=parse_command("Перенеси последний"),
+        now=NOW + timedelta(seconds=3),
+    )
+    later_operation = client.collection(SESSIONS).document(context_id).collection(
+        "operations"
+    ).document(later.operation_id).get().to_dict()
+    assert "pending_save_candidate_operation_id" not in later_operation
+    assert "dependency_operation_id" not in later_operation
+
+
+def test_command_parser_preserves_arbitrary_text_without_reference_classification():
+    for text in ("move last", "Перенеси последний", "enlace por favor"):
+        command = parse_command(text)
+        assert command.kind == "freeform"
+        assert command.text == text
 
 
 def test_stale_generation_and_terminal_replay_do_not_call_processor(firestore_fake):

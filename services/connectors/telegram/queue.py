@@ -239,6 +239,8 @@ class TelegramQueueWorker:
 
         def wake_next(transaction: Any, next_id: str | None, next_data: dict[str, Any] | None,
                       updated_context: dict[str, Any]) -> None:
+            if updated_context.get("pending_save_operation_id") == lease.operation_id:
+                updated_context.pop("pending_save_operation_id", None)
             if next_id and next_data is not None:
                 _ensure_wakeup_in_transaction(
                     self.client, transaction, updated_context,

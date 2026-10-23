@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from google.cloud import firestore
 
@@ -74,6 +74,7 @@ def register_operation_in_transaction(
     input_ref: str,
     now: datetime,
     before_write: Any = None,
+    operation_fields: Mapping[str, Any] | None = None,
 ) -> QueuedOperation:
     """Append an operation using a transaction owned by a larger workflow."""
     now = _aware(now)
@@ -114,6 +115,11 @@ def register_operation_in_transaction(
         "finished_at": None,
         "next_operation_id": None,
     }
+    if operation_fields:
+        reserved = set(data).intersection(operation_fields)
+        if reserved:
+            raise ValueError(f"operation_fields cannot replace queue fields: {sorted(reserved)}")
+        data.update(operation_fields)
     if tail_ref is not None and tail_data is not None:
         tail_data["next_operation_id"] = operation_id
         transaction.set(tail_ref, tail_data)

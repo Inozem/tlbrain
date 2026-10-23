@@ -48,6 +48,8 @@ class _CommandSnapshot:
     manifest_ref: str | None
     manifest_doc_ref: Any | None
     manifest_digest: str | None
+    predecessor_operation_id: str | None
+    pending_save_candidate_operation_id: str | None
 
 
 @dataclass(slots=True)
@@ -129,6 +131,18 @@ def _load_command_snapshot(
         manifest_doc_ref = _document_ref(client, manifest_ref)
         if manifest_doc_ref.get(transaction=transaction).exists:
             raise RuntimeError("save manifest already exists without its update receipt")
+    predecessor_id = context.get("queue_tail_operation_id")
+    predecessor_operation_id = predecessor_id if isinstance(predecessor_id, str) and predecessor_id else None
+    pending_save_candidate_operation_id = None
+    pending_save_id = context.get("pending_save_operation_id")
+    if isinstance(pending_save_id, str) and pending_save_id:
+        pending_save_ref = _document_ref(
+            client, f"{SESSIONS}/{context_id}/operations/{pending_save_id}"
+        )
+        pending_save_snapshot = pending_save_ref.get(transaction=transaction)
+        pending_save_data = pending_save_snapshot.to_dict() or {} if pending_save_snapshot.exists else {}
+        if pending_save_data.get("state") in {"pending", "running"}:
+            pending_save_candidate_operation_id = pending_save_id
     return _CommandSnapshot(
         draft_id=draft_id,
         draft_ref=draft_ref,
@@ -138,7 +152,21 @@ def _load_command_snapshot(
         manifest_ref=manifest_ref,
         manifest_doc_ref=manifest_doc_ref,
         manifest_digest=manifest_digest,
+        predecessor_operation_id=predecessor_operation_id,
+        pending_save_candidate_operation_id=pending_save_candidate_operation_id,
     )
+
+
+def _command_link_metadata(snapshot: _CommandSnapshot) -> dict[str, str]:
+    """Return immutable predecessor and pending-save candidate metadata."""
+    metadata = {}
+    if snapshot.predecessor_operation_id is not None:
+        metadata["predecessor_operation_id"] = snapshot.predecessor_operation_id
+    if snapshot.pending_save_candidate_operation_id is not None:
+        metadata["pending_save_candidate_operation_id"] = (
+            snapshot.pending_save_candidate_operation_id
+        )
+    return metadata
 
 
 def _command_data(
@@ -163,6 +191,7 @@ def _command_data(
         "cutoff_intake_sequence": snapshot.cutoff_sequence,
         "operation_id": operation_id,
         "created_at": now,
+        **_command_link_metadata(snapshot),
     }
 
 
@@ -214,6 +243,7 @@ def _register_command_operation(
     context_ref: Any,
     identity: _CommandIdentity,
     now: datetime,
+    snapshot: _CommandSnapshot,
 ) -> Any:
     """Reserve the FIFO operation and create its outbox before queue writes begin."""
     def create_command_outbox() -> None:
@@ -238,6 +268,7 @@ def _register_command_operation(
         input_ref=identity.input_ref,
         now=now,
         before_write=create_command_outbox,
+        operation_fields=_command_link_metadata(snapshot),
     )
 
 
@@ -378,6 +409,7 @@ class _TelegramCommandMixin:
             context_ref=identity.context_ref,
             identity=identity,
             now=now,
+            snapshot=state.snapshot,
         )
         _update_command_context(
             state.context,
@@ -389,6 +421,7 @@ class _TelegramCommandMixin:
             now=now,
         )
         if command.is_save:
+            state.context["pending_save_operation_id"] = identity.operation_id
             _seal_command_draft(
                 transaction,
                 snapshot=state.snapshot,
