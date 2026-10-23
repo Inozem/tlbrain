@@ -11,6 +11,7 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 from core.config import get_default_dialog_date
+from core.dialogs.classification import FolderSelectionResult
 from services.connectors.telegram.preprocessing import (
     context_word_capacity,
     preprocess_messages,
@@ -109,6 +110,15 @@ class TelegramCompletionCertificate:
     origin_binding: tuple[str, str, str]
     provider: str = "telegram"
     dialog_date: str = ""
+    classification_outcome: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramClassifiedDialog:
+    """Normalized save payload paired with transient provider-neutral outcome."""
+
+    payload: Any
+    selection: FolderSelectionResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,7 +238,7 @@ class TelegramSaveWorkflow:
     async def _transcribe_analyze_and_classify(
         self,
         sealed: _SealedInput,
-    ) -> tuple[Any, Any]:
+    ) -> tuple[Any, Any, str | None]:
         self._stage("transcription")
         guard_before = await _await(
             self.repository.load_current_guard(sealed.draft_id)
@@ -250,8 +260,38 @@ class TelegramSaveWorkflow:
             analyze=analyze_after_transcription,
         ))
         self._stage("classification")
-        classified = await _await(self.classify(result, draft_id=sealed.draft_id))
-        return classified, guard_before
+        topic_hint = None
+        load_context = getattr(self.repository, "get_context", None)
+        if callable(load_context):
+            context = await _await(load_context(sealed.context_id))
+            topic_hint = _get(context, "topic_name")
+        folder_path = _get(result, "folder_path")
+        folder_id = _get(result, "folder_id")
+        if folder_path is not None and folder_id is not None:
+            raise ValueError("specify either folder_path or folder_id, not both")
+        classify_args = {"draft_id": sealed.draft_id}
+        if folder_path is not None and not _call_supports(self.classify, "folder_path"):
+            raise TypeError("classify callback does not support explicit folder_path")
+        if folder_id is not None and not _call_supports(self.classify, "folder_id"):
+            raise TypeError("classify callback does not support explicit folder_id")
+        for name, value in (
+            ("topic_hint", topic_hint),
+            ("folder_path", folder_path),
+            ("folder_id", folder_id),
+        ):
+            if value is not None and _call_supports(self.classify, name):
+                classify_args[name] = value
+        classified = await _await(self.classify(result, **classify_args))
+        outcome = None
+        if isinstance(classified, TelegramClassifiedDialog):
+            selection = classified.selection
+            outcome = (
+                "unassigned" if selection.requires_unassigned
+                else "ambiguous" if selection.speaker_candidates_ambiguous
+                else None
+            )
+            classified = classified.payload
+        return classified, guard_before, outcome
 
     async def _save_and_complete(
         self,
@@ -261,6 +301,7 @@ class TelegramSaveWorkflow:
         intent_id: str,
         operation_id: str,
         guard_before: Any,
+        classification_outcome: str | None = None,
     ) -> TelegramCompletionCertificate:
         self._stage("save")
         save_args = {
@@ -314,6 +355,7 @@ class TelegramSaveWorkflow:
             receipt_digest=hashlib.sha256(receipt_payload).hexdigest(),
             origin_binding=(sealed.context_id, sealed.draft_id, sealed.manifest_digest),
             dialog_date=sealed.dialog_date,
+            classification_outcome=classification_outcome,
         )
         committed = await _await(self.repository.commit_completion(certificate))
         if committed is False:
@@ -330,13 +372,14 @@ class TelegramSaveWorkflow:
         self._stage("load")
         try:
             sealed = await self._load_sealed_input(draft_id)
-            classified, guard_before = await self._transcribe_analyze_and_classify(sealed)
+            classified, guard_before, classification_outcome = await self._transcribe_analyze_and_classify(sealed)
             certificate = await self._save_and_complete(
                 classified,
                 sealed,
                 intent_id=intent_id,
                 operation_id=operation_id,
                 guard_before=guard_before,
+                classification_outcome=classification_outcome,
             )
             self.status = {"stage": "complete", "state": "completed", "error_code": None}
             return certificate

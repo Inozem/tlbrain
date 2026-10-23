@@ -1,9 +1,11 @@
 import asyncio
+import importlib
 import os
 import socket
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -81,6 +83,67 @@ def test_lifecycle_body_accepts_only_server_result_and_omits_unrequested_link():
     assert "http" not in no_path
     with pytest.raises(TypeError):
         build_lifecycle_body(lifecycle={**common, "current_generation_proof": {"current": True}})
+
+
+def test_verified_classification_outcome_is_bounded_and_user_visible():
+    common = dict(dialog_number=4, operation_id="op-4", service="save", stage="complete",
+                  reason="completed", folder_path="Clients/Alpha", completion_confirmed=True)
+    ambiguous = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(
+        **common, classification_outcome="ambiguous",
+    ))
+    unassigned = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(
+        **{**common, "folder_path": "_unassigned"}, classification_outcome="unassigned",
+    ))
+    old_certificate = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(**common))
+    invalid = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(
+        **common, classification_outcome="raw user content",
+    ))
+
+    assert "\u0412\u044b\u0431\u0440\u0430\u043d \u043d\u0430\u0438\u0431\u043e\u043b\u0435\u0435 \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0438\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442." in ambiguous
+    assert "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0443\u0432\u0435\u0440\u0435\u043d\u043d\u043e \u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0438\u0442\u044c \u043f\u0430\u043f\u043a\u0443; \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e \u0432 _unassigned." in unassigned
+    assert "\u0412\u044b\u0431\u0440\u0430\u043d \u043d\u0430\u0438\u0431\u043e\u043b\u0435\u0435 \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0438\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442." not in old_certificate
+    assert "raw user content" not in invalid
+
+
+@pytest.mark.parametrize(
+    "outcome,folder_path,proof_ok,expected_confirmed,expected_outcome",
+    [
+        ("ambiguous", ("Clients", "Alpha"), True, True, "ambiguous"),
+        ("unassigned", ("_unassigned",), True, True, "unassigned"),
+        ("unassigned", ("Clients", "Alpha"), True, True, None),
+        (None, ("Clients", "Alpha"), True, True, None),
+        ("ambiguous", ("Clients", "Alpha"), False, False, None),
+    ],
+)
+def test_terminal_helper_extracts_only_verified_path_consistent_outcome(
+    monkeypatch, outcome, folder_path, proof_ok, expected_confirmed, expected_outcome,
+):
+    terminal = importlib.import_module(
+        "services.connectors.telegram.app.terminal_notifications"
+    )
+    operation = SimpleNamespace(
+        state=SimpleNamespace(value="completed"), selected_folder_path=folder_path,
+    )
+    draft = {"completion_certificate": {"classification_outcome": outcome}}
+    monkeypatch.setattr(
+        terminal, "_load_completion_certificate",
+        lambda client, operation, operation_id, draft: {"verified": True},
+    )
+    monkeypatch.setattr(
+        terminal, "_completion_receipt_matches_index",
+        lambda client, certificate: proof_ok,
+    )
+
+    confirmed, selected_path, extracted_outcome = terminal._verified_completion_details(
+        object(), operation, "operation-1", draft,
+    )
+
+    assert confirmed is expected_confirmed
+    if expected_confirmed:
+        assert selected_path == "/".join(folder_path)
+    else:
+        assert selected_path is None
+    assert extracted_outcome == expected_outcome
 
 
 def test_slow_sync_reservation_does_not_block_event_loop_heartbeat():

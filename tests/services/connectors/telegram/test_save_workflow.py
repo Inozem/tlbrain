@@ -335,6 +335,179 @@ def test_audio_barrier_precedes_ordered_preprocessing_analysis_and_classificatio
     assert repository.draft["source_manifest"] == original_manifest
 
 
+def test_topic_hint_and_explicit_folder_reach_classifier_without_changing_save_payload():
+    from core.dialogs.classification import FolderSelectionResult
+    from services.connectors.telegram.save import TelegramClassifiedDialog
+
+    repository = _Repository()
+    repository.context_id = "telegram-context-1"
+    repository.get_context = lambda _context_id: {"topic_name": "Planning"}
+    events = []
+    pipeline = _Pipeline(events)
+    calls = []
+
+    async def classify(result, *, draft_id, topic_hint=None, folder_path=None, folder_id=None):
+        calls.append((result, draft_id, topic_hint, folder_path, folder_id))
+        return TelegramClassifiedDialog(
+            payload={"title": "Planning", "utterances": []},
+            selection=FolderSelectionResult(folder_id="folder-7"),
+        )
+
+    async def analyze(messages, *, context):
+        return {"title": "Planning", "folder_path": ["Clients", "Planning"], "utterances": []}
+
+    async def save(result, *, draft_id, manifest_digest, intent_id, operation_id):
+        pipeline.saved_inputs.append(copy.deepcopy(result))
+        return {
+            "verified": True, "draft_id": draft_id, "manifest_digest": manifest_digest,
+            "save_intent_id": intent_id, "operation_id": operation_id,
+            "receipt_ref": "receipt-ref", "receipt_version": 1,
+        }
+
+    workflow = _save_type()(
+        repository=repository,
+        audio_transcriber=_Audio(repository, events),
+        context_id="telegram-context-1",
+        preprocess=pipeline.preprocess,
+        analyze=analyze,
+        classify=classify,
+        save=save,
+    )
+    result = _run(workflow.save(
+        draft_id="draft-original", intent_id="intent-1", operation_id="operation-1",
+    ))
+
+    assert calls[0][2:] == ("Planning", ["Clients", "Planning"], None)
+    assert pipeline.saved_inputs[0]["title"] == "Planning"
+    assert "classification_outcome" not in pipeline.saved_inputs[0]
+    assert _value(result, "classification_outcome") is None
+
+
+def test_topic_hint_is_advisory_and_fallback_outcome_survives_completion():
+    from core.dialogs.classification import FolderSelectionResult
+    from services.connectors.telegram.save import TelegramClassifiedDialog
+
+    repository = _Repository()
+    repository.context_id = "telegram-context-1"
+    repository.get_context = lambda _context_id: {"topic_name": "Shared topic"}
+    second = copy.deepcopy(repository.draft)
+    second.update({"draft_id": "draft-second", "manifest_digest": "manifest:draft-second:v1"})
+    repository.add_draft(second, make_active=False)
+    events = []
+    pipeline = _Pipeline(events)
+    seen = []
+
+    async def classify(result, *, draft_id, topic_hint=None):
+        seen.append((draft_id, topic_hint, result))
+        return TelegramClassifiedDialog(
+            payload={"title": result["title"], "utterances": []},
+            selection=FolderSelectionResult(folder_id=None, requires_unassigned=True),
+        )
+
+    async def save(result, *, draft_id, manifest_digest, intent_id, operation_id):
+        pipeline.saved_inputs.append(copy.deepcopy(result))
+        return {
+            "verified": True, "draft_id": draft_id, "manifest_digest": manifest_digest,
+            "save_intent_id": intent_id, "operation_id": operation_id,
+            "receipt_ref": "receipt-ref", "receipt_version": 1,
+        }
+
+    workflow = _save_type()(
+        repository=repository,
+        audio_transcriber=_Audio(repository, events),
+        context_id="telegram-context-1",
+        preprocess=pipeline.preprocess,
+        analyze=lambda messages, *, context: {"title": context["draft_id"]},
+        classify=classify,
+        save=save,
+    )
+    first_certificate = _run(workflow.save(
+        draft_id="draft-original", intent_id="intent-1", operation_id="operation-1",
+    ))
+    second_certificate = _run(workflow.save(
+        draft_id="draft-second", intent_id="intent-2", operation_id="operation-2",
+    ))
+
+    assert [(row[0], row[1]) for row in seen] == [
+        ("draft-original", "Shared topic"), ("draft-second", "Shared topic"),
+    ]
+    assert [row[2]["title"] for row in seen] == ["draft-original", "draft-second"]
+    assert _value(first_certificate, "classification_outcome") == "unassigned"
+    assert _value(second_certificate, "classification_outcome") == "unassigned"
+
+
+def test_ambiguous_selection_saves_only_payload_and_commits_bounded_outcome():
+    from core.dialogs.classification import FolderSelectionResult
+    from services.connectors.telegram.save import TelegramClassifiedDialog
+
+    repository = _Repository()
+    events = []
+    pipeline = _Pipeline(events)
+
+    async def classify(result, *, draft_id):
+        return TelegramClassifiedDialog(
+            payload={"title": "Planning", "utterances": []},
+            selection=FolderSelectionResult(
+                folder_id="folder-7", speaker_candidate_ids=("speaker-1", "speaker-2"),
+            ),
+        )
+
+    async def save(result, *, draft_id, manifest_digest, intent_id, operation_id):
+        pipeline.saved_inputs.append(copy.deepcopy(result))
+        return {
+            "verified": True, "draft_id": draft_id, "manifest_digest": manifest_digest,
+            "save_intent_id": intent_id, "operation_id": operation_id,
+            "receipt_ref": "receipt-ref", "receipt_version": 1,
+        }
+
+    workflow = _save_type()(
+        repository=repository,
+        audio_transcriber=_Audio(repository, events),
+        context_id="telegram-context-1",
+        preprocess=pipeline.preprocess,
+        analyze=lambda messages, *, context: {"title": "Planning", "utterances": []},
+        classify=classify,
+        save=save,
+    )
+    certificate = _run(workflow.save(
+        draft_id="draft-original", intent_id="intent-1", operation_id="operation-1",
+    ))
+
+    saved_payload = pipeline.saved_inputs[0]
+    assert saved_payload["title"] == "Planning"
+    assert saved_payload["utterances"] == []
+    assert "classification_outcome" not in saved_payload
+    assert len(saved_payload) == 4  # Payload plus the workflow's provider/date fields.
+    assert _value(certificate, "classification_outcome") == "ambiguous"
+    assert _value(repository.certificate, "classification_outcome") == "ambiguous"
+
+
+def test_explicit_folder_id_requires_classifier_support():
+    from services.connectors.telegram.save import TelegramSaveError
+
+    repository = _Repository()
+    events = []
+    pipeline = _Pipeline(events)
+
+    async def classify(result, *, draft_id):
+        return result
+
+    workflow = _save_type()(
+        repository=repository,
+        audio_transcriber=_Audio(repository, events),
+        context_id="telegram-context-1",
+        preprocess=pipeline.preprocess,
+        analyze=lambda messages, *, context: {"title": "Planning", "folder_id": "folder-7"},
+        classify=classify,
+        save=pipeline.save,
+    )
+
+    with pytest.raises(TelegramSaveError, match="Telegram save failed during classification"):
+        _run(workflow.save(
+            draft_id="draft-original", intent_id="intent-1", operation_id="operation-1",
+        ))
+
+
 @pytest.mark.parametrize("failure", ["transcription", "save", "completion"])
 def test_failure_preserves_raw_manifest_and_never_authorizes_cleanup(failure):
     repository = _Repository()

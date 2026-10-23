@@ -122,20 +122,26 @@ def _completion_receipt_matches_index(client: Any, certificate: dict[str, Any]) 
 
 def _verified_completion_details(
     client: Any, operation: Any, operation_id: str, draft: dict[str, Any],
-) -> tuple[bool, str | None]:
-    """Return completion proof and folder path only when all persisted evidence agrees."""
+) -> tuple[bool, str | None, str | None]:
+    """Return verified folder details and a bounded Telegram classification outcome."""
     if operation.state.value != "completed":
-        return False, None
+        return False, None, None
     certificate = _load_completion_certificate(client, operation, operation_id, draft)
     if certificate is None or not _completion_receipt_matches_index(client, certificate):
-        return False, None
+        return False, None, None
     path_parts = operation.selected_folder_path
     folder_path = (
         "/".join(path_parts)
         if path_parts and all(isinstance(part, str) for part in path_parts)
         else None
     )
-    return True, folder_path
+    local_certificate = draft.get("completion_certificate") or {}
+    classification_outcome = local_certificate.get("classification_outcome")
+    if classification_outcome not in {"ambiguous", "unassigned"}:
+        classification_outcome = None
+    elif classification_outcome == "unassigned" and path_parts != ("_unassigned",):
+        classification_outcome = None
+    return True, folder_path, classification_outcome
 
 
 def _safe_lifecycle_code(value: Any, fallback: str) -> str:
@@ -166,6 +172,7 @@ def _terminal_notification_status(operation: Any, completion_confirmed: bool) ->
 def _persist_terminal_notification(
     client: Any, record: Any, dialog_number: int, operation: Any,
     completion_confirmed: bool, folder_path: str | None,
+    classification_outcome: str | None = None,
 ) -> str:
     """Build the terminal message and create its idempotent notification ledger entry."""
     from services.connectors.telegram.notifications import (
@@ -178,6 +185,7 @@ def _persist_terminal_notification(
         dialog_number=dialog_number, operation_id=record.operation_id,
         service=service, stage=stage, reason=reason, folder_path=folder_path,
         completion_confirmed=completion_confirmed,
+        classification_outcome=classification_outcome,
     )
     body = build_lifecycle_body(lifecycle=lifecycle)
     notification_id = "tg" + kind + "-" + hashlib.sha256(record.operation_id.encode("utf-8")).hexdigest()
@@ -206,9 +214,10 @@ def update_terminal_notification(record: Any) -> str | None:
     if draft_details is None:
         return None
     draft, dialog_number = draft_details
-    completion_confirmed, folder_path = _verified_completion_details(
+    completion_confirmed, folder_path, classification_outcome = _verified_completion_details(
         client, operation, record.operation_id, draft,
     )
     return _persist_terminal_notification(
         client, record, dialog_number, operation, completion_confirmed, folder_path,
+        classification_outcome,
     )
