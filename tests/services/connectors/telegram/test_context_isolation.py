@@ -220,11 +220,13 @@ def test_save_rollover_allocates_fresh_draft_and_second_processing_context_is_cu
     context_ref = repository.client.collection("telegram_sessions").document(first_context)
     lease = claim_head(repository.client, context_ref, owner="save-worker", now=NOW)
     assert lease is not None
+    assert repository.confirm_save_command(
+        first_context, lease.operation_id, owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is True
     assert complete_head(
         repository.client, context_ref, operation_id=lease.operation_id,
         owner=lease.owner, fence=lease.fence, now=NOW,
     ) is True
-
     second = intake.handle_update(_update(32, thread_id=11, text="new private source"))
     second_draft = _value(second, "draft_id")
     assert second_draft != first_draft
@@ -236,6 +238,11 @@ def test_save_rollover_allocates_fresh_draft_and_second_processing_context_is_cu
     assert focused["selection_sequence"] == 2
     save_second = intake.handle_update(_update(33, thread_id=11, forward=False))
     assert _value(save_second, "snapshot_message_ids") == (132,)
+    lease = claim_head(repository.client, context_ref, owner="save-worker-2", now=NOW)
+    assert lease is not None
+    assert repository.confirm_save_command(
+        first_context, lease.operation_id, owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is True
     assert repository.get_draft(first_context, first_draft)["ordered_message_ids"] == [130]
     assert repository.list_messages(first_context, first_draft)[0]["transcription_text"] == "old transcription"
     assert repository.get_draft(first_context, second_draft)["ordered_message_ids"] == [132]

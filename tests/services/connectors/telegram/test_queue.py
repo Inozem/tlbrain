@@ -214,7 +214,7 @@ def test_stale_fence_cannot_write_stage_checkpoint_after_reclaim(firestore_fake)
     assert stage.checkpoint_refs == ()
 
 
-def test_command_acceptance_persists_pending_save_candidate(firestore_fake):
+def test_command_acceptance_persists_predecessor_without_classifying_save_text(firestore_fake):
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
     context_id = "42_default"
@@ -254,13 +254,14 @@ def test_command_acceptance_persists_pending_save_candidate(firestore_fake):
     dependent_operation = firestore_fake.documents[
         f"{SESSIONS}/{context_id}/operations/{dependent.operation_id}"
     ]
-    assert dependent_operation.get("pending_save_candidate_operation_id") == save.operation_id
+    assert dependent_operation.get("predecessor_operation_id") == save.operation_id
+    assert "pending_save_candidate_operation_id" not in dependent_operation
     assert "dependency_operation_id" not in dependent_operation
     assert dependent_operation.get("target_doc_id") is None
 
 
 @pytest.mark.parametrize("candidate", ["move last", "Перенеси последний", "enlace por favor"])
-def test_arbitrary_command_text_preserves_pending_save_candidate_without_classifying_intent(
+def test_arbitrary_command_text_preserves_only_queue_lineage_without_classifying_intent(
     firestore_fake, candidate,
 ):
     client = firestore_fake.client_class()
@@ -283,18 +284,20 @@ def test_arbitrary_command_text_preserves_pending_save_candidate_without_classif
         "operations"
     ).document(accepted.operation_id).get().to_dict()
     assert command_data["candidate"] == candidate
-    assert command_data["pending_save_candidate_operation_id"] == save.operation_id
-    assert operation["pending_save_candidate_operation_id"] == save.operation_id
+    assert command_data["predecessor_operation_id"] == save.operation_id
+    assert operation["predecessor_operation_id"] == save.operation_id
+    assert "pending_save_candidate_operation_id" not in command_data
+    assert "pending_save_candidate_operation_id" not in operation
     assert "dependency_operation_id" not in operation
     assert operation.get("target_doc_id") is None
 
 
-def test_predecessor_is_persisted_when_save_candidate_is_unrecognized(firestore_fake):
+def test_all_command_candidates_persist_predecessor_without_save_classification(firestore_fake):
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
     context_id = "42_default"
 
-    unrecognized_save = repository.accept_command(
+    candidate = repository.accept_command(
         125, chat_id=42, user_id=7, command=parse_command("guardar"), now=NOW,
     )
     following = repository.accept_command(
@@ -310,11 +313,11 @@ def test_predecessor_is_persisted_when_save_candidate_is_unrecognized(firestore_
         "125"
     ).get().to_dict()
     command = context_ref.collection("commands").document("126").get().to_dict()
-    assert unrecognized_save.operation_id is not None
+    assert candidate.operation_id is not None
     assert save_candidate_command["kind"] == "freeform"
     assert command["kind"] == "freeform"
-    assert operation["predecessor_operation_id"] == unrecognized_save.operation_id
-    assert command["predecessor_operation_id"] == unrecognized_save.operation_id
+    assert operation["predecessor_operation_id"] == candidate.operation_id
+    assert command["predecessor_operation_id"] == candidate.operation_id
     assert "pending_save_candidate_operation_id" not in operation
     assert "dependency_operation_id" not in operation
 
@@ -344,39 +347,60 @@ def test_independent_command_keeps_candidate_without_dependency(firestore_fake):
         later.operation_id
     ).get().to_dict()
     later_command = context_ref.collection("commands").document("132").get().to_dict()
-    assert operation["pending_save_candidate_operation_id"] == save.operation_id
+    assert operation["predecessor_operation_id"] == save.operation_id
     assert "dependency_operation_id" not in operation
     assert "target_doc_id" not in operation
     assert later_command["candidate"] == "enlace please"
-    assert later_command["pending_save_candidate_operation_id"] == save.operation_id
+    assert "pending_save_candidate_operation_id" not in later_command
     assert later_command["predecessor_operation_id"] == unrelated.operation_id
-    assert later_operation["pending_save_candidate_operation_id"] == save.operation_id
+    assert "pending_save_candidate_operation_id" not in later_operation
     assert later_operation["predecessor_operation_id"] == unrelated.operation_id
     assert "dependency_operation_id" not in later_operation
     assert "target_doc_id" not in later_operation
 
 
-def test_settling_save_clears_pending_pointer_atomically_and_keeps_accepted_candidate(
-    firestore_fake,
-):
+def test_confirmed_save_settlement_clears_hint_and_keeps_child_snapshot(firestore_fake):
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
     context_id = "42_default"
     context_ref = client.collection(SESSIONS).document(context_id)
     context_ref.set({"last_doc_id": "old-doc"})
+    source = repository.accept_forward(
+        139, chat_id=42, message={"message_id": 239, "text": "saved source"}, now=NOW,
+    )
     save = repository.accept_command(
         140, chat_id=42, user_id=7, command=parse_command("save"), now=NOW,
     )
+    save_lease = claim_head(client, context_ref, owner="save-confirm", now=NOW)
+    assert save_lease is not None
+    assert repository.confirm_save_command(
+        context_id, save.operation_id, owner=save_lease.owner,
+        fence=save_lease.fence, now=NOW,
+    ) is True
     dependent = repository.accept_command(
         141, chat_id=42, user_id=7, command=parse_command("Перенеси последний"),
         now=NOW + timedelta(seconds=1),
     )
+    dependent_operation = context_ref.collection("operations").document(
+        dependent.operation_id
+    ).get().to_dict()
+    accepted_command = context_ref.collection("commands").document("141").get().to_dict()
+    assert dependent_operation["pending_save_candidate_operation_id"] == save.operation_id
+    assert accepted_command["pending_save_candidate_operation_id"] == save.operation_id
+    assert dependent_operation["predecessor_operation_id"] == save.operation_id
+    assert accepted_command["draft_id"] is None
+    assert accepted_command["cutoff_message_ids"] == []
+    assert source.draft_id == save.draft_id
+    assert release_head(
+        client, context_ref, operation_id=save_lease.operation_id,
+        owner=save_lease.owner, fence=save_lease.fence, now=NOW + timedelta(seconds=1),
+    ) is True
 
-    async def fail_save(context_id, operation, lease):
-        return QueueOperationState.FAILED
+    async def process_save(context_id, operation, lease):
+        return QueueOperationState.COMPLETED
 
     worker = TelegramQueueWorker(
-        client, fail_save, clock=lambda: NOW + timedelta(seconds=2),
+        client, process_save, clock=lambda: NOW + timedelta(seconds=2),
         owner_factory=lambda: "save-worker",
     )
     save_payload = task_payload(get_outbox_record(client, save.outbox_id))
@@ -386,16 +410,12 @@ def test_settling_save_clears_pending_pointer_atomically_and_keeps_accepted_cand
     assert "pending_save_operation_id" not in settled_context
     assert settled_context["last_doc_id"] == "old-doc"
     assert settled_context["reserved_operation_id"] == dependent.operation_id
-    dependent_operation = client.collection(SESSIONS).document(context_id).collection(
-        "operations"
-    ).document(dependent.operation_id).get().to_dict()
+    dependent_operation = context_ref.collection("operations").document(
+        dependent.operation_id
+    ).get().to_dict()
+    assert dependent_operation["predecessor_operation_id"] == save.operation_id
     assert dependent_operation["pending_save_candidate_operation_id"] == save.operation_id
-    assert "dependency_operation_id" not in dependent_operation
-    assert dependent_operation.get("target_doc_id") is None
-    accepted_command = client.collection(SESSIONS).document(context_id).collection(
-        "commands"
-    ).document("141").get().to_dict()
-    assert accepted_command["pending_save_candidate_operation_id"] == save.operation_id
+    assert context_ref.collection("commands").document("141").get().to_dict() == accepted_command
     assert any(
         row.get("operation_id") == dependent.operation_id
         and outbox_id != dependent.outbox_id

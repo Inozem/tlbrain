@@ -26,20 +26,15 @@ pytestmark = pytest.mark.offline
 NOW = datetime(2026, 10, 22, tzinfo=timezone.utc)
 
 
-@pytest.mark.parametrize("command", ["Сохрани", "Сохранить", "save"])
-def test_save_aliases_are_recognized(command):
+@pytest.mark.parametrize("command", [
+    "save", "Сохрани", "guardar", "please save this", "do not save this",
+    '"save"', "Сохрани это!", "保存してください",
+])
+def test_all_command_text_stays_freeform_for_structured_router(command):
     parsed = parse_command(command)
 
-    assert parsed.kind == "save"
-    assert parsed.is_save is True
-
-
-@pytest.mark.parametrize("command", ["Сохрани это!", "Сохранить это", "save?"])
-def test_save_aliases_recognize_command_prefixes_with_punctuation(command):
-    parsed = parse_command(command)
-
-    assert parsed.kind == "save"
-    assert parsed.is_save is True
+    assert parsed.kind == "freeform"
+    assert parsed.text == command
 
 
 def _repository(firestore_fake):
@@ -548,6 +543,16 @@ def test_save_seals_ordered_snapshot_and_rejects_later_forward(firestore_fake):
     assert publisher.outbox_ids[-2:] == [_value(save, "outbox_id")] * 2
     context_id = _value(save, "context_id")
     draft_id = _value(first, "draft_id")
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    assert repository.get_draft(context_id, draft_id)["state"] == "collecting"
+    lease = claim_head(client, context_ref, owner="save-confirm", now=NOW)
+    assert lease is not None
+    assert repository.confirm_save_command(
+        context_id, lease.operation_id, owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is True
+    assert repository.confirm_save_command(
+        context_id, lease.operation_id, owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is True
     draft = _read_doc(client, f"telegram_sessions/{context_id}/drafts/{draft_id}")
     assert draft["state"] == "processing"
     assert draft["sealed_at"] is not None
@@ -577,6 +582,12 @@ def test_empty_save_reserves_without_creating_draft_or_doc(firestore_fake):
     assert _value(result, "snapshot_message_ids") == ()
     assert not _direct_child_paths(firestore_fake, f"telegram_sessions/{context_id}/drafts")
     assert _value(result, "operation_id")
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    lease = claim_head(client, context_ref, owner="empty-save", now=NOW)
+    assert lease is not None
+    assert repository.confirm_save_command(
+        context_id, lease.operation_id, owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is False
     assert publisher.outbox_ids == [_value(result, "outbox_id")]
     assert _read_doc(client, f"task_outbox/{_value(result, 'outbox_id')}")["target_kind"] == "telegram_dispatch"
 

@@ -83,6 +83,12 @@ def _seed_failed_draft(firestore_fake, *, update_id=12):
     )
     assert accepted.draft_id == draft_id
     old_operation_id = accepted.operation_id
+    context_ref = client.collection(SESSIONS).document(context_id)
+    lease = claim_head(client, context_ref, owner="failed-draft-seal", now=NOW)
+    assert lease is not None
+    assert repository.confirm_save_command(
+        context_id, old_operation_id, owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is True
     draft_ref = (
         client.collection(SESSIONS).document(context_id)
         .collection("drafts").document(draft_id)

@@ -14,12 +14,9 @@ from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_r
 from core.integrations.firestore.operation_queue import register_operation_in_transaction
 from services.connectors.telegram.models import TelegramDraftState, build_context_id
 from services.connectors.telegram.repository._common import (
-    NOTIFICATIONS,
     SESSIONS,
     TelegramIntakeResult,
     _document_ref,
-    _draft_data,
-    _identifier,
     _integer,
     _receipt_result,
     _aware,
@@ -41,13 +38,9 @@ class _CommandIdentity:
 @dataclass(slots=True)
 class _CommandSnapshot:
     draft_id: str | None
-    draft_ref: Any | None
     draft_data: dict[str, Any]
     message_ids: tuple[int, ...]
     cutoff_sequence: int
-    manifest_ref: str | None
-    manifest_doc_ref: Any | None
-    manifest_digest: str | None
     predecessor_operation_id: str | None
     pending_save_candidate_operation_id: str | None
 
@@ -96,8 +89,6 @@ def _load_command_snapshot(
     *,
     context_id: str,
     context: Mapping[str, Any],
-    operation_id: str,
-    command: Any,
 ) -> _CommandSnapshot:
     """Read the collecting draft and immutable save cutoff before transaction writes."""
     draft_id = context.get("active_draft_id")
@@ -116,21 +107,6 @@ def _load_command_snapshot(
 
     message_ids = tuple(int(value) for value in draft_data.get("ordered_message_ids", ()))
     cutoff_sequence = int(context.get("next_intake_sequence", 1)) - 1
-    manifest_ref = (
-        f"{SESSIONS}/{context_id}/drafts/{draft_id}/save_manifests/{operation_id}"
-        if command.is_save and draft_id and message_ids else None
-    )
-    manifest_digest = None
-    manifest_doc_ref = None
-    if manifest_ref is not None:
-        manifest_digest = hashlib.sha256(json.dumps(
-            {"draft_id": draft_id, "message_ids": list(message_ids)},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")).hexdigest()
-        manifest_doc_ref = _document_ref(client, manifest_ref)
-        if manifest_doc_ref.get(transaction=transaction).exists:
-            raise RuntimeError("save manifest already exists without its update receipt")
     predecessor_id = context.get("queue_tail_operation_id")
     predecessor_operation_id = predecessor_id if isinstance(predecessor_id, str) and predecessor_id else None
     pending_save_candidate_operation_id = None
@@ -145,13 +121,9 @@ def _load_command_snapshot(
             pending_save_candidate_operation_id = pending_save_id
     return _CommandSnapshot(
         draft_id=draft_id,
-        draft_ref=draft_ref,
         draft_data=draft_data,
         message_ids=message_ids,
         cutoff_sequence=cutoff_sequence,
-        manifest_ref=manifest_ref,
-        manifest_doc_ref=manifest_doc_ref,
-        manifest_digest=manifest_digest,
         predecessor_operation_id=predecessor_operation_id,
         pending_save_candidate_operation_id=pending_save_candidate_operation_id,
     )
@@ -218,8 +190,6 @@ def _load_command_acceptance_state(
         transaction,
         context_id=identity.context_id,
         context=context,
-        operation_id=identity.operation_id,
-        command=command,
     )
     return _CommandAcceptanceState(
         context=context,
@@ -296,44 +266,11 @@ def _update_command_context(
         context["topic_name"] = topic_name
 
 
-def _seal_command_draft(
-    transaction: Any,
-    *,
-    snapshot: _CommandSnapshot,
-    context: dict[str, Any],
-    operation_id: str,
-    now: datetime,
-) -> None:
-    """Seal a recognized save's exact source set and detach its collecting pointer."""
-    if snapshot.draft_ref is None:
-        return
-    snapshot.draft_data.update({
-        "state": TelegramDraftState.PROCESSING.value,
-        "sealed_at": now,
-        "ordered_message_ids": list(snapshot.message_ids),
-        "manifest_ref": snapshot.manifest_ref,
-        "manifest_digest": snapshot.manifest_digest,
-        "active_save_operation_id": operation_id,
-        "immutable_save_intent_id": operation_id,
-    })
-    context.update({"active_draft_id": None, "draft_status": None})
-    if snapshot.manifest_doc_ref is not None:
-        transaction.set(snapshot.manifest_doc_ref, {
-            "draft_id": snapshot.draft_id,
-            "ordered_message_ids": list(snapshot.message_ids),
-            "manifest_digest": snapshot.manifest_digest,
-            "save_operation_id": operation_id,
-            "sealed_at": now,
-        })
-    transaction.set(snapshot.draft_ref, snapshot.draft_data)
-
-
 def _persist_command_acceptance(
     transaction: Any,
     *,
     identity: _CommandIdentity,
     update_id: int,
-    command: Any,
     state: _CommandAcceptanceState,
     operation: Any,
     now: datetime,
@@ -352,7 +289,7 @@ def _persist_command_acceptance(
         "outbox_id": identity.outbox_id,
         "operation_id": identity.operation_id,
         "queue_position": operation.sequence,
-        "snapshot_message_ids": list(snapshot.message_ids) if command.is_save else [],
+        "snapshot_message_ids": list(snapshot.message_ids),
         "created_at": now,
     }
     transaction.set(identity.command_ref, state.command_data)
@@ -366,7 +303,7 @@ def _persist_command_acceptance(
         outbox_id=identity.outbox_id,
         operation_id=identity.operation_id,
         queue_position=operation.sequence,
-        snapshot_message_ids=snapshot.message_ids if command.is_save else (),
+        snapshot_message_ids=snapshot.message_ids,
     )
 
 
@@ -386,7 +323,7 @@ class _TelegramCommandMixin:
         command: Any,
         now: datetime,
     ) -> TelegramIntakeResult:
-        """Coordinate the all-reads-first command reservation and optional save seal."""
+        """Coordinate the all-reads-first freeform command reservation."""
         receipt_snapshot = identity.receipt_ref.get(transaction=transaction)
         if receipt_snapshot.exists:
             return _receipt_result(receipt_snapshot.to_dict() or {}, identity.context_id)
@@ -420,20 +357,10 @@ class _TelegramCommandMixin:
             sequence=operation.sequence,
             now=now,
         )
-        if command.is_save:
-            state.context["pending_save_operation_id"] = identity.operation_id
-            _seal_command_draft(
-                transaction,
-                snapshot=state.snapshot,
-                context=state.context,
-                operation_id=identity.operation_id,
-                now=now,
-            )
         return _persist_command_acceptance(
             transaction,
             identity=identity,
             update_id=update_id,
-            command=command,
             state=state,
             operation=operation,
             now=now,
