@@ -253,13 +253,16 @@ def test_unknown_send_attempt_budget_survives_replay_and_becomes_delivery_unknow
     repo = TelegramRepository(firestore_fake.client_class())
     accepted = _accepted(repo)
     clock, telegram = _Clock(), _Telegram(failures=3)
-    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
-    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+
+    def publisher_after_restart():
+        return TelegramNotificationPublisher(repo, telegram, clock=clock)
+
+    assert _run(publisher_after_restart().publish(accepted.notification_id)) == "retry"
     clock.advance(1)
-    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+    assert _run(publisher_after_restart().publish(accepted.notification_id)) == "retry"
     clock.advance(2)
-    assert _run(publisher.publish(accepted.notification_id)) == "delivery_unknown"
-    assert _run(publisher.publish(accepted.notification_id)) == "delivery_unknown"
+    assert _run(publisher_after_restart().publish(accepted.notification_id)) == "delivery_unknown"
+    assert _run(publisher_after_restart().publish(accepted.notification_id)) == "delivery_unknown"
     row = repo.get_notification(accepted.notification_id)
     assert row["send_attempts_started"] == 3
     assert row["state"] == "delivery_unknown"
@@ -276,6 +279,23 @@ def test_telegram_timeout_error_is_unknown_and_consumes_send_budget(firestore_fa
     assert row["last_outcome"] == "unknown"
     assert row["unknown_send_outcome"] is True
     assert row["send_attempts_started"] == 1
+
+
+def test_definitive_send_rejection_fails_without_retrying(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    telegram = _Telegram(failures=1, failure_category="forbidden")
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=_Clock())
+
+    assert _run(publisher.publish(accepted.notification_id)) == "failed"
+    row = repo.get_notification(accepted.notification_id)
+    assert row["state"] == "failed"
+    assert row["send_attempts_started"] == 1
+    assert row["last_outcome"] == "rejected"
+    assert row["unknown_send_outcome"] is False
+
+    assert _run(publisher.publish(accepted.notification_id)) == "failed"
+    assert len(telegram.sent) == 1
 
 
 def test_default_thread_zero_is_persisted_as_no_thread_for_ack_and_new_notice(firestore_fake):
@@ -349,7 +369,10 @@ def test_terminal_ack_failure_keeps_collecting_draft_and_sealed_identity(firesto
     draft_ref.set(original)
     parent_ref = client.collection("telegram_sessions").document(sealed.context_id).collection("operations").document("fifo-parent")
     parent_ref.set({"operation_id": "fifo-parent", "sequence": 1, "state": "pending",
-                    "target_draft_id": sealed.draft_id, "save_operation_id": "save-child", "next_operation_id": None})
+                    "target_draft_id": sealed.draft_id, "save_operation_id": "save-child",
+                    "next_operation_id": "independent-successor"})
+    successor_ref = client.collection("telegram_sessions").document(sealed.context_id).collection("operations").document("independent-successor")
+    successor_ref.set({"operation_id": "independent-successor", "sequence": 2, "state": "pending"})
     save_ref = client.collection("dialog_operations").document("save-child")
     save_ref.set({"operation_id": "save-child", "state": "running",
                   "lease_owner": "worker-1", "lease_expires_at": NOW + timedelta(minutes=1)})
@@ -372,9 +395,17 @@ def test_terminal_ack_failure_keeps_collecting_draft_and_sealed_identity(firesto
     assert failed["manifest_ref"] == original["manifest_ref"]
     assert failed["manifest_digest"] == original["manifest_digest"]
     assert failed["ordered_message_ids"] == original["ordered_message_ids"]
-    assert repo.get_context(sealed.context_id)["reserved_operation_id"] is None
-    assert repo.get_context(sealed.context_id)["active_draft_id"] is None
-    assert parent_ref.get().to_dict()["failure_code"] == "ack_delivery_failed"
+    context = repo.get_context(sealed.context_id)
+    assert context["reserved_operation_id"] == "independent-successor"
+    assert context["head_sequence"] == 2
+    assert context["active_draft_id"] is None
+    parent = parent_ref.get().to_dict()
+    assert parent["state"] == "failed"
+    assert parent["failure_code"] == "ack_delivery_failed"
+    assert parent["next_operation_id"] == "independent-successor"
+    successor = successor_ref.get().to_dict()
+    assert successor["state"] == "pending"
+    assert successor["sequence"] == 2
     child = save_ref.get().to_dict()
     assert child["state"] == "failed"
     assert child["error"]["code"] == "ack_delivery_failed"
