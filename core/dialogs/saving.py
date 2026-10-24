@@ -201,6 +201,285 @@ def _store_created_doc(
     _txn(client.transaction())
 
 
+@dataclass(frozen=True, slots=True)
+class _SaveStageContext:
+    client: Any
+    operation_id: str
+    owner: str
+    fence: int
+    now: datetime
+    intent_id: str
+    folders: Mapping[str, Mapping[str, Any]]
+    root_folder_id: str
+    speaker_index_lookup: Callable[[str], Any]
+    suggestion: Callable[..., Any]
+    drive: Any
+    docs: Any
+    accepted: Mapping[str, Any]
+    content: str
+    ranges: list[tuple[Any, ...]]
+    ensure_unassigned: Callable[[str], str] | None
+
+
+def _validate_save_input(client: Any, operation_id: str, immutable_input_digest: str) -> dict[str, str]:
+    _load_accepted(client, operation_id)
+    return {"immutable_input_digest": immutable_input_digest}
+
+
+def _reconcile_save_input(client: Any, operation_id: str, immutable_input_digest: str) -> Any:
+    try:
+        _load_accepted(client, operation_id)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return {"immutable_input_digest": immutable_input_digest}
+
+
+def _classify_save_folder(
+    context: _SaveStageContext, intent: Any,
+) -> dict[str, Any]:
+    accepted = context.accepted
+    if intent.desired_parent_id is not None:
+        request = FolderSelectionRequest(
+            title=accepted["title"], utterances=(), folder_id=intent.desired_parent_id,
+        )
+        result = classify_dialog_folder(
+            request, context.folders, context.root_folder_id,
+            speaker_index_lookup=context.speaker_index_lookup, suggestion=context.suggestion,
+        )
+    else:
+        request = FolderSelectionRequest(
+            title=accepted["title"],
+            utterances=tuple(DialogUtterance(**row) for row in accepted["utterances"]),
+            reliable_speakers=tuple(dict.fromkeys(row["speaker"] for row in accepted["utterances"])),
+            folder_path=tuple(accepted["folder_path"]) if accepted["folder_path"] is not None else None,
+            folder_id=accepted.get("folder_id"),
+        )
+        result = classify_dialog_folder(
+            request, context.folders, context.root_folder_id,
+            speaker_index_lookup=context.speaker_index_lookup, suggestion=context.suggestion,
+        )
+    folder_snapshot = dict(context.folders)
+    folder_id = intent.desired_parent_id or result.folder_id
+    registered_unassigned = next((key for key, value in folder_snapshot.items()
+                                  if value.get("name") == "_unassigned"
+                                  and value.get("parent_id") == context.root_folder_id), None)
+    if folder_id is None and result.requires_unassigned:
+        folder_id = registered_unassigned
+        if folder_id is None:
+            if context.ensure_unassigned is None:
+                raise ValueError("classification requires a registered root _unassigned folder")
+            folder_id = context.ensure_unassigned(context.root_folder_id)
+            if not isinstance(folder_id, str) or not folder_id:
+                raise ValueError("ensure_unassigned did not return a folder ID")
+            existing = folder_snapshot.get(folder_id)
+            if existing is not None and (existing.get("name") != "_unassigned"
+                                         or existing.get("parent_id") != context.root_folder_id):
+                raise ValueError("ensure_unassigned returned a conflicting folder ID")
+            folder_snapshot[folder_id] = {"name": "_unassigned", "parent_id": context.root_folder_id}
+    if folder_id is None:
+        raise ValueError("classification did not resolve a folder")
+    path = _folder_path(folder_id, folder_snapshot, context.root_folder_id)
+    _store_selected_folder(
+        context.client, context.operation_id, folder_id, path,
+        owner=context.owner, fence=context.fence, now=context.now,
+    )
+    parent_hash = hashlib.sha256(folder_id.encode("utf-8")).hexdigest()
+    if bind_save_intent_parent(
+        context.client, context.intent_id, operation_id=context.operation_id,
+        desired_parent_id_hash=parent_hash, desired_parent_id=folder_id,
+        owner=context.owner, fence=context.fence, now=context.now,
+    ) is None:
+        raise RuntimeError("could not bind save intent parent")
+    return {"folder_id": folder_id, "folder_path": list(path)}
+
+
+def _reconcile_save_folder(context: _SaveStageContext) -> Any:
+    current = get_operation(context.client, context.operation_id)
+    current_intent = get_save_intent(context.client, context.intent_id)
+    if current is None or current_intent is None:
+        return None
+    selected_id = current.selected_folder_id
+    if current_intent.desired_parent_id is not None:
+        resolved = classify_dialog_folder(
+            FolderSelectionRequest(
+                title=context.accepted["title"], utterances=(), folder_id=current_intent.desired_parent_id,
+            ), context.folders, context.root_folder_id,
+            speaker_index_lookup=context.speaker_index_lookup, suggestion=context.suggestion,
+        )
+        if selected_id is not None and selected_id != resolved.folder_id:
+            raise ValueError("operation folder conflicts with immutable save-intent parent")
+        selected_id = resolved.folder_id
+        path = _folder_path(selected_id, context.folders, context.root_folder_id)
+        _store_selected_folder(
+            context.client, context.operation_id, selected_id, path,
+            owner=context.owner, fence=context.fence, now=context.now,
+        )
+        current = get_operation(context.client, context.operation_id)
+    if selected_id is None:
+        return None
+    if current_intent.desired_parent_id_hash is None:
+        bound = bind_save_intent_parent(
+            context.client, context.intent_id, operation_id=context.operation_id,
+            desired_parent_id_hash=hashlib.sha256(selected_id.encode("utf-8")).hexdigest(),
+            desired_parent_id=selected_id,
+            owner=context.owner, fence=context.fence, now=context.now,
+        )
+        if bound is None:
+            return None
+    return {
+        "folder_id": selected_id,
+        "folder_path": list(current.selected_folder_path or _folder_path(
+            selected_id, context.folders, context.root_folder_id,
+        )),
+    }
+
+
+def _reconcile_save_create(context: _SaveStageContext, parent_id: str) -> Any:
+    found = reconcile_google_doc_by_marker(
+        context.drive, save_intent_id=context.intent_id, expected_parent_id=parent_id,
+    )
+    if found.state != "confirmed":
+        return None
+    result = OperationResult(document_id=found.document_id, title=context.accepted["title"])
+    reconcile_save_intent(
+        context.client, context.intent_id, owner=context.owner, fence=context.fence,
+        now=context.now, external_result=result, operation_id=context.operation_id,
+    )
+    return {"document_id": result.document_id, "title": result.title}
+
+
+def _create_save_document(context: _SaveStageContext, parent_id: str) -> dict[str, Any]:
+    current = get_save_intent(context.client, context.intent_id)
+    if current is None:
+        raise ValueError("save intent is missing")
+    if current.state in {SaveIntentState.UNKNOWN, SaveIntentState.DISPATCHED}:
+        result = _reconcile_save_create(context, parent_id)
+        if result is None:
+            raise UnknownOutcome("document create outcome remains unresolved")
+        return result
+    result = dispatch_save_intent(
+        context.client, context.intent_id, operation_id=context.operation_id,
+        owner=context.owner, fence=context.fence, now=context.now,
+        create_callback=lambda: create_marked_google_doc(
+            context.drive, save_intent_id=context.intent_id,
+            parent_id=parent_id, title=context.accepted["title"],
+        ),
+    )
+    if result is None:
+        raise UnknownOutcome("document create is not currently dispatchable")
+    return {"document_id": result.document_id, "title": result.title}
+
+
+def _fill_save_document(context: _SaveStageContext, document_id: str) -> dict[str, Any]:
+    current_intent = get_save_intent(context.client, context.intent_id)
+    if current_intent is None:
+        raise ValueError("save intent is missing")
+    if current_intent.fill_checkpoint_ref:
+        checkpoint = json.loads(current_intent.fill_checkpoint_ref)
+        if checkpoint.get("document_id") != document_id:
+            raise ValueError("shared fill checkpoint belongs to a different document")
+        return checkpoint
+    document = context.docs.documents().get(documentId=document_id).execute()
+    revision = document.get("revisionId") if isinstance(document, dict) else None
+    if not isinstance(revision, str) or not revision:
+        raise RuntimeError("document revision is unavailable")
+    outcome = fill_google_doc_safely(
+        context.docs, drive=context.drive, document_id=document_id, text=context.content,
+        speaker_ranges=context.ranges, expected_revision_id=revision,
+    )
+    if outcome.state != "confirmed":
+        raise RuntimeError(f"document fill was not confirmed ({outcome.state})")
+    result = {"document_id": document_id, "revision_id": outcome.revision_id}
+    checkpoint_ref = json.dumps(result, separators=(",", ":"), sort_keys=True)
+    if update_save_intent_checkpoints(
+        context.client, context.intent_id, operation_id=context.operation_id,
+        owner=context.owner, fence=context.fence, now=context.now,
+        fill_checkpoint_ref=checkpoint_ref,
+    ) is None:
+        raise RuntimeError("could not persist shared fill checkpoint")
+    return result
+
+
+def _reconcile_save_fill(context: _SaveStageContext, document_id: str) -> Any:
+    try:
+        return _fill_save_document(context, document_id)
+    except Exception:
+        return None
+
+
+def _read_post_fill_metadata(context: _SaveStageContext, document_id: str, parent_id: str) -> dict[str, Any]:
+    """Read metadata after the fill checkpoint so modifiedTime reflects the final write."""
+    value = read_native_doc_metadata(context.drive, document_id)
+    if value.get("mimeType") != "application/vnd.google-apps.document" or not value.get("modifiedTime"):
+        raise RuntimeError("post-fill document metadata is unavailable")
+    return {"modified_time": value["modifiedTime"], "parent_id": parent_id}
+
+
+def _reconcile_post_fill_metadata(
+    context: _SaveStageContext, document_id: str, parent_id: str,
+) -> Any:
+    try:
+        return _read_post_fill_metadata(context, document_id, parent_id)
+    except Exception:
+        return None
+
+
+def _dispatch_save_index(
+    context: _SaveStageContext, document_id: str, parent_id: str, metadata: Mapping[str, Any],
+) -> dict[str, str]:
+    """Update import-owned index fields additively and persist the deterministic outbox checkpoint."""
+    fields = {
+        "doc_id": document_id, "parent_id": parent_id, "source_file": context.accepted["title"],
+        "dialog_date": context.accepted["date"], "provider": context.accepted["provider"],
+        "modified_time": metadata["modified_time"],
+    }
+    ref = context.client.collection("transcript_index").document(document_id)
+
+    from google.cloud import firestore
+
+    @firestore.transactional
+    def _upsert(transaction: Any) -> None:
+        snapshot = ref.get(transaction=transaction)
+        if snapshot.exists:
+            transaction.update(ref, fields)
+        else:
+            transaction.set(ref, {**fields, "status": "imported", "status_changed_at": context.now})
+
+    _upsert(context.client.transaction())
+    outbox_id = "index-dispatch-" + hashlib.sha256(
+        f"{context.intent_id}\0{document_id}\0{context.accepted['desired_content']}".encode("utf-8")
+    ).hexdigest()
+    existing_outbox = get_outbox_record(context.client, outbox_id)
+    if existing_outbox is not None:
+        if (existing_outbox.target_kind is not OutboxTargetKind.INDEX_DISPATCH
+                or existing_outbox.document_id != document_id
+                or existing_outbox.save_intent_id != context.intent_id
+                or existing_outbox.generation != 1):
+            raise ValueError("stable index outbox identity conflicts with this save")
+    else:
+        existing_outbox = create_outbox_record(
+            context.client, outbox_id, target_kind=OutboxTargetKind.INDEX_DISPATCH, generation=1,
+            schedule_at=context.now, now=context.now, operation_id=context.operation_id,
+            document_id=document_id, save_intent_id=context.intent_id,
+        )
+    if update_save_intent_checkpoints(
+        context.client, context.intent_id, operation_id=context.operation_id,
+        owner=context.owner, fence=context.fence, now=context.now,
+        index_checkpoint_ref=outbox_id,
+    ) is None:
+        raise RuntimeError("could not persist shared index checkpoint")
+    return {"outbox_id": outbox_id}
+
+
+def _reconcile_save_index_dispatch(
+    context: _SaveStageContext, document_id: str, parent_id: str, metadata: Mapping[str, Any],
+) -> Any:
+    try:
+        return _dispatch_save_index(context, document_id, parent_id, metadata)
+    except Exception:
+        return None
+
+
 def advance_save(
     client: Any,
     operation_id: str,
@@ -228,21 +507,11 @@ def advance_save(
     if not intent_id:
         raise ValueError("operation has no stable save intent ID")
     governor = governor or RetryGovernor(client)
-
-    def validate() -> dict[str, str]:
-        _load_accepted(client, operation_id)
-        return {"immutable_input_digest": operation.immutable_input_digest}
-
-    def reconcile_validate() -> Any:
-        try:
-            _load_accepted(client, operation_id)
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
-            return None
-        return {"immutable_input_digest": operation.immutable_input_digest}
-
     governor.run_stage(
-        operation_id, "validate", validate, now=now, owner=owner, fence=fence,
-        reconcile=reconcile_validate,
+        operation_id, "validate",
+        lambda: _validate_save_input(client, operation_id, operation.immutable_input_digest),
+        now=now, owner=owner, fence=fence,
+        reconcile=lambda: _reconcile_save_input(client, operation_id, operation.immutable_input_digest),
     )
     stages: list[str] = ["validate"]
     accepted = _load_accepted(client, operation_id)
@@ -251,249 +520,48 @@ def advance_save(
         raise ValueError("accepted save intent is missing")
     content = accepted["desired_content"]
     ranges = [tuple(row) for row in accepted["speaker_ranges"]]
-    def classify() -> dict[str, Any]:
-        if intent.desired_parent_id is not None:
-            request = FolderSelectionRequest(
-                title=accepted["title"], utterances=(), folder_id=intent.desired_parent_id,
-            )
-            result = classify_dialog_folder(
-                request, folders, root_folder_id,
-                speaker_index_lookup=speaker_index_lookup, suggestion=suggestion,
-            )
-        else:
-            request = FolderSelectionRequest(
-                title=accepted["title"],
-                utterances=tuple(DialogUtterance(**row) for row in accepted["utterances"]),
-                reliable_speakers=tuple(dict.fromkeys(row["speaker"] for row in accepted["utterances"])),
-                folder_path=tuple(accepted["folder_path"]) if accepted["folder_path"] is not None else None,
-                folder_id=accepted.get("folder_id"),
-            )
-            result = classify_dialog_folder(
-                request, folders, root_folder_id,
-                speaker_index_lookup=speaker_index_lookup, suggestion=suggestion,
-            )
-        folder_snapshot = dict(folders)
-        folder_id = intent.desired_parent_id or result.folder_id
-        registered_unassigned = next((key for key, value in folder_snapshot.items()
-                                      if value.get("name") == "_unassigned"
-                                      and value.get("parent_id") == root_folder_id), None)
-        if folder_id is None and result.requires_unassigned:
-            folder_id = registered_unassigned
-            if folder_id is None:
-                if ensure_unassigned is None:
-                    raise ValueError("classification requires a registered root _unassigned folder")
-                folder_id = ensure_unassigned(root_folder_id)
-                if not isinstance(folder_id, str) or not folder_id:
-                    raise ValueError("ensure_unassigned did not return a folder ID")
-                existing = folder_snapshot.get(folder_id)
-                if existing is not None and (existing.get("name") != "_unassigned"
-                                             or existing.get("parent_id") != root_folder_id):
-                    raise ValueError("ensure_unassigned returned a conflicting folder ID")
-                folder_snapshot[folder_id] = {"name": "_unassigned", "parent_id": root_folder_id}
-        if folder_id is None:
-            raise ValueError("classification did not resolve a folder")
-        path = _folder_path(folder_id, folder_snapshot, root_folder_id)
-        _store_selected_folder(client, operation_id, folder_id, path, owner=owner, fence=fence, now=now)
-        parent_hash = hashlib.sha256(folder_id.encode("utf-8")).hexdigest()
-        if bind_save_intent_parent(
-            client, intent_id, operation_id=operation_id, desired_parent_id_hash=parent_hash,
-            desired_parent_id=folder_id,
-            owner=owner, fence=fence, now=now,
-        ) is None:
-            raise RuntimeError("could not bind save intent parent")
-        return {"folder_id": folder_id, "folder_path": list(path)}
-
-    def reconcile_classification() -> Any:
-        current = get_operation(client, operation_id)
-        current_intent = get_save_intent(client, intent_id)
-        if current is None or current_intent is None:
-            return None
-        selected_id = current.selected_folder_id
-        if current_intent.desired_parent_id is not None:
-            resolved = classify_dialog_folder(
-                FolderSelectionRequest(
-                    title=accepted["title"], utterances=(), folder_id=current_intent.desired_parent_id,
-                ), folders, root_folder_id,
-                speaker_index_lookup=speaker_index_lookup, suggestion=suggestion,
-            )
-            if selected_id is not None and selected_id != resolved.folder_id:
-                raise ValueError("operation folder conflicts with immutable save-intent parent")
-            selected_id = resolved.folder_id
-            path = _folder_path(selected_id, folders, root_folder_id)
-            _store_selected_folder(client, operation_id, selected_id, path, owner=owner, fence=fence, now=now)
-            current = get_operation(client, operation_id)
-        if selected_id is None:
-            return None
-        if current_intent.desired_parent_id_hash is None:
-            bound = bind_save_intent_parent(
-                client, intent_id, operation_id=operation_id,
-                desired_parent_id_hash=hashlib.sha256(selected_id.encode("utf-8")).hexdigest(),
-                desired_parent_id=selected_id,
-                owner=owner, fence=fence, now=now,
-            )
-            if bound is None:
-                return None
-        return {
-            "folder_id": selected_id,
-            "folder_path": list(current.selected_folder_path or _folder_path(selected_id, folders, root_folder_id)),
-        }
-
+    context = _SaveStageContext(
+        client=client, operation_id=operation_id, owner=owner, fence=fence, now=now,
+        intent_id=intent_id, folders=folders, root_folder_id=root_folder_id,
+        speaker_index_lookup=speaker_index_lookup, suggestion=suggestion, drive=drive, docs=docs,
+        accepted=accepted, content=content, ranges=ranges,
+        ensure_unassigned=ensure_unassigned,
+    )
     selected = governor.run_stage(
-        operation_id, "classify", classify, now=now, owner=owner, fence=fence,
-        reconcile=reconcile_classification,
+        operation_id, "classify", lambda: _classify_save_folder(context, intent),
+        now=now, owner=owner, fence=fence,
+        reconcile=lambda: _reconcile_save_folder(context),
     )
     stages.append("classify")
     parent_id = selected["folder_id"]
-
-    def reconcile_create() -> Any:
-        found = reconcile_google_doc_by_marker(drive, save_intent_id=intent_id, expected_parent_id=parent_id)
-        if found.state != "confirmed":
-            return None
-        result = OperationResult(document_id=found.document_id, title=accepted["title"])
-        reconcile_save_intent(client, intent_id, owner=owner, fence=fence, now=now, external_result=result,
-                              operation_id=operation_id)
-        return {"document_id": result.document_id, "title": result.title}
-
-    def create() -> OperationResult:
-        current = get_save_intent(client, intent_id)
-        if current is None:
-            raise ValueError("save intent is missing")
-        if current.state in {SaveIntentState.UNKNOWN, SaveIntentState.DISPATCHED}:
-            result = reconcile_create()
-            if result is None:
-                raise UnknownOutcome("document create outcome remains unresolved")
-            return result
-        result = dispatch_save_intent(
-            client, intent_id, operation_id=operation_id, owner=owner, fence=fence, now=now,
-            create_callback=lambda: create_marked_google_doc(
-                drive, save_intent_id=intent_id, parent_id=parent_id, title=accepted["title"],
-            ),
-        )
-        if result is None:
-            raise UnknownOutcome("document create is not currently dispatchable")
-        return {"document_id": result.document_id, "title": result.title}
-
     created = governor.run_stage(
-        operation_id, "create", create, now=now, owner=owner, fence=fence,
-        reconcile=reconcile_create,
+        operation_id, "create", lambda: _create_save_document(context, parent_id),
+        now=now, owner=owner, fence=fence,
+        reconcile=lambda: _reconcile_save_create(context, parent_id),
     )
     stages.append("create")
     document_id = created.get("document_id")
     if not document_id:
         raise ValueError("create checkpoint has no document ID")
     _store_created_doc(client, operation_id, document_id, owner=owner, fence=fence, now=now)
-
-    def run_fill() -> dict[str, Any]:
-        current_intent = get_save_intent(client, intent_id)
-        if current_intent is None:
-            raise ValueError("save intent is missing")
-        if current_intent.fill_checkpoint_ref:
-            checkpoint = json.loads(current_intent.fill_checkpoint_ref)
-            if checkpoint.get("document_id") != document_id:
-                raise ValueError("shared fill checkpoint belongs to a different document")
-            return checkpoint
-        document = docs.documents().get(documentId=document_id).execute()
-        revision = document.get("revisionId") if isinstance(document, dict) else None
-        if not isinstance(revision, str) or not revision:
-            raise RuntimeError("document revision is unavailable")
-        outcome = fill_google_doc_safely(
-            docs, drive=drive, document_id=document_id, text=content,
-            speaker_ranges=ranges, expected_revision_id=revision,
-        )
-        if outcome.state != "confirmed":
-            raise RuntimeError(f"document fill was not confirmed ({outcome.state})")
-        result = {"document_id": document_id, "revision_id": outcome.revision_id}
-        checkpoint_ref = json.dumps(result, separators=(",", ":"), sort_keys=True)
-        if update_save_intent_checkpoints(
-            client, intent_id, operation_id=operation_id, owner=owner, fence=fence, now=now,
-            fill_checkpoint_ref=checkpoint_ref,
-        ) is None:
-            raise RuntimeError("could not persist shared fill checkpoint")
-        return result
-
-    def reconcile_fill() -> Any:
-        try:
-            return run_fill()
-        except Exception:
-            return None
-
     governor.run_stage(
-        operation_id, "fill", run_fill, now=now, owner=owner, fence=fence,
-        reconcile=reconcile_fill,
+        operation_id, "fill", lambda: _fill_save_document(context, document_id),
+        now=now, owner=owner, fence=fence,
+        reconcile=lambda: _reconcile_save_fill(context, document_id),
     )
     stages.append("fill")
-
-    def metadata() -> dict[str, Any]:
-        # Read after the fill checkpoint so modifiedTime reflects the final write.
-        value = read_native_doc_metadata(drive, document_id)
-        if value.get("mimeType") != "application/vnd.google-apps.document" or not value.get("modifiedTime"):
-            raise RuntimeError("post-fill document metadata is unavailable")
-        return {"modified_time": value["modifiedTime"], "parent_id": parent_id}
-
-    def reconcile_metadata() -> Any:
-        try:
-            return metadata()
-        except Exception:
-            return None
-
     meta = governor.run_stage(
-        operation_id, "metadata", metadata, now=now, owner=owner, fence=fence,
-        reconcile=reconcile_metadata,
+        operation_id, "metadata",
+        lambda: _read_post_fill_metadata(context, document_id, parent_id),
+        now=now, owner=owner, fence=fence,
+        reconcile=lambda: _reconcile_post_fill_metadata(context, document_id, parent_id),
     )
     stages.append("metadata")
-
-    def index_dispatch() -> dict[str, str]:
-        # Claim only fields owned by this import. Existing indexing/user fields survive.
-        fields = {
-            "doc_id": document_id, "parent_id": parent_id, "source_file": accepted["title"],
-            "dialog_date": accepted["date"], "provider": accepted["provider"],
-            "modified_time": meta["modified_time"],
-        }
-        ref = client.collection("transcript_index").document(document_id)
-
-        from google.cloud import firestore
-
-        @firestore.transactional
-        def _upsert(transaction: Any) -> None:
-            snapshot = ref.get(transaction=transaction)
-            if snapshot.exists:
-                transaction.update(ref, fields)
-            else:
-                transaction.set(ref, {**fields, "status": "imported", "status_changed_at": now})
-
-        _upsert(client.transaction())
-        outbox_id = "index-dispatch-" + hashlib.sha256(
-            f"{intent_id}\0{document_id}\0{accepted['desired_content']}".encode("utf-8")
-        ).hexdigest()
-        existing_outbox = get_outbox_record(client, outbox_id)
-        if existing_outbox is not None:
-            if (existing_outbox.target_kind is not OutboxTargetKind.INDEX_DISPATCH
-                    or existing_outbox.document_id != document_id
-                    or existing_outbox.save_intent_id != intent_id
-                    or existing_outbox.generation != 1):
-                raise ValueError("stable index outbox identity conflicts with this save")
-        else:
-            existing_outbox = create_outbox_record(
-                client, outbox_id, target_kind=OutboxTargetKind.INDEX_DISPATCH, generation=1,
-                schedule_at=now, now=now, operation_id=operation_id, document_id=document_id,
-                save_intent_id=intent_id,
-            )
-        if update_save_intent_checkpoints(
-            client, intent_id, operation_id=operation_id, owner=owner, fence=fence, now=now,
-            index_checkpoint_ref=outbox_id,
-        ) is None:
-            raise RuntimeError("could not persist shared index checkpoint")
-        return {"outbox_id": outbox_id}
-
-    def reconcile_index_dispatch() -> Any:
-        try:
-            return index_dispatch()
-        except Exception:
-            return None
-
     governor.run_stage(
-        operation_id, "index_dispatch", index_dispatch, now=now, owner=owner, fence=fence,
-        reconcile=reconcile_index_dispatch,
+        operation_id, "index_dispatch",
+        lambda: _dispatch_save_index(context, document_id, parent_id, meta),
+        now=now, owner=owner, fence=fence,
+        reconcile=lambda: _reconcile_save_index_dispatch(context, document_id, parent_id, meta),
     )
     stages.append("index_dispatch")
     return SaveProgress(operation_id, intent_id, document_id, tuple(stages))
