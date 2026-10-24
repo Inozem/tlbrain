@@ -14,9 +14,11 @@ from core.operations.queue import (
     QueueOperationState,
     QueuedOperation,
 )
+from core.operations.models import OperationError, OperationStageRecord, StageState
 
 
 OPERATIONS_SUBCOLLECTION = "operations"
+STAGES_SUBCOLLECTION = "stages"
 
 
 def _aware(value: datetime) -> datetime:
@@ -29,6 +31,132 @@ def _operation_ref(context_ref: Any, operation_id: str) -> Any:
     if not isinstance(operation_id, str) or not operation_id or "/" in operation_id:
         raise ValueError("operation_id must be a non-empty Firestore document ID")
     return context_ref.collection(OPERATIONS_SUBCOLLECTION).document(operation_id)
+
+
+def _stage_ref(context_ref: Any, operation_id: str, stage_key: str) -> Any:
+    if not isinstance(stage_key, str) or not stage_key or "/" in stage_key:
+        raise ValueError("stage_key must be a non-empty Firestore document ID")
+    return _operation_ref(context_ref, operation_id).collection(STAGES_SUBCOLLECTION).document(stage_key)
+
+
+def _stage_from(data: Mapping[str, Any]) -> OperationStageRecord:
+    error = data.get("last_error")
+    return OperationStageRecord(
+        stage_key=data["stage_key"], state=StageState(data.get("state", "pending")),
+        failures=int(data.get("failures", 0)), attempts_started=int(data.get("attempts_started", 0)),
+        in_flight_attempt_id=data.get("in_flight_attempt_id"),
+        retry_not_before=data.get("retry_not_before"),
+        last_error=OperationError(**error) if isinstance(error, Mapping) else None,
+        checkpoint_refs=tuple(data.get("checkpoint_refs", ())), updated_at=data.get("updated_at"),
+        result=data.get("result"),
+    )
+
+
+class QueueOperationRetryStore:
+    """RetryGovernor store backed by a context queue operation and its lease."""
+
+    def __init__(self, client: Any, context_ref: Any) -> None:
+        self.client = client
+        self.context_ref = context_ref
+
+    def _valid(self, transaction: Any, operation_id: str, owner: str, fence: int, now: datetime) -> bool:
+        snapshot = self.context_ref.get(transaction=transaction)
+        context = snapshot.to_dict() or {} if snapshot.exists else {}
+        return _valid_lease(context, operation_id, owner, fence, now, context.get("lock_expires_at"))
+
+    def validate_lease(self, *, operation_id: str, owner: str, fence: int, now: datetime) -> bool:
+        context = self.context_ref.get().to_dict() or {}
+        return _valid_lease(context, operation_id, owner, fence, _aware(now), context.get("lock_expires_at"))
+
+    def get_stage(self, *, operation_id: str, stage_key: str) -> OperationStageRecord | None:
+        snapshot = _stage_ref(self.context_ref, operation_id, stage_key).get()
+        return _stage_from(snapshot.to_dict() or {}) if snapshot.exists else None
+
+    def reserve_attempt(self, *, operation_id: str, stage_key: str, owner: str, fence: int,
+                        attempt_id: str, now: datetime) -> OperationStageRecord | None:
+        now = _aware(now)
+        stage_ref = _stage_ref(self.context_ref, operation_id, stage_key)
+        operation_ref = _operation_ref(self.context_ref, operation_id)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> OperationStageRecord | None:
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            stage_snapshot = stage_ref.get(transaction=transaction)
+            if (not operation_snapshot.exists or not self._valid(transaction, operation_id, owner, fence, now)):
+                return None
+            stage = _stage_from(stage_snapshot.to_dict() or {}) if stage_snapshot.exists else OperationStageRecord(stage_key, StageState.PENDING)
+            if stage.state == StageState.COMPLETED or stage.in_flight_attempt_id is not None:
+                return None
+            reserved = OperationStageRecord(stage_key, StageState.RUNNING, stage.failures,
+                stage.attempts_started + 1, attempt_id, stage.retry_not_before, stage.last_error,
+                stage.checkpoint_refs, now, stage.result)
+            transaction.set(stage_ref, _stage_data(reserved))
+            return reserved
+        return _txn(self.client.transaction())
+
+    def complete_attempt(self, *, operation_id: str, stage_key: str, owner: str, fence: int,
+                         attempt_id: str, result: Any, now: datetime,
+                         checkpoint_refs: tuple[str, ...] = ()) -> bool:
+        return self._finish_attempt(operation_id, stage_key, owner, fence, attempt_id, now,
+                                    result=result, checkpoint_refs=checkpoint_refs)
+
+    def fail_attempt(self, *, operation_id: str, stage_key: str, owner: str, fence: int,
+                     attempt_id: str, error: OperationError, now: datetime,
+                     retry_not_before: datetime | None = None) -> bool:
+        return self._finish_attempt(operation_id, stage_key, owner, fence, attempt_id, now,
+                                    error=error, retry_not_before=retry_not_before)
+
+    def _finish_attempt(self, operation_id: str, stage_key: str, owner: str, fence: int,
+                        attempt_id: str, now: datetime, *, result: Any = None,
+                        error: OperationError | None = None, retry_not_before: datetime | None = None,
+                        checkpoint_refs: tuple[str, ...] = ()) -> bool:
+        now = _aware(now)
+        stage_ref = _stage_ref(self.context_ref, operation_id, stage_key)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> bool:
+            stage_snapshot = stage_ref.get(transaction=transaction)
+            if (not stage_snapshot.exists or not self._valid(transaction, operation_id, owner, fence, now)):
+                return False
+            stage = _stage_from(stage_snapshot.to_dict() or {})
+            if stage.in_flight_attempt_id != attempt_id:
+                return False
+            if error is None:
+                updated = OperationStageRecord(stage_key, StageState.COMPLETED, stage.failures,
+                    stage.attempts_started, None, None, None,
+                    tuple(checkpoint_refs) or stage.checkpoint_refs, now, result)
+            else:
+                failures = stage.failures + 1
+                safe_error = OperationError(**{**error.__dict__, "failures": failures}) if hasattr(error, "__dict__") else OperationError(
+                    code=error.code, category=error.category, message=error.message,
+                    retryable=error.retryable, service=error.service, stage=error.stage,
+                    sanitized_message=error.sanitized_message, occurred_at=now, failures=failures,
+                    operation_id=operation_id)
+                updated = OperationStageRecord(stage_key, StageState.FAILED, failures,
+                    stage.attempts_started, None, retry_not_before, safe_error,
+                    stage.checkpoint_refs, now, None)
+            transaction.set(stage_ref, _stage_data(updated))
+            return True
+        return _txn(self.client.transaction())
+
+    def fail_operation(self, *, operation_id: str, owner: str, fence: int,
+                       error: OperationError, now: datetime) -> bool:
+        """Queue settlement belongs to TelegramQueueWorker; stage state is terminal."""
+        return self.validate_lease(operation_id=operation_id, owner=owner, fence=fence, now=now)
+
+
+def _stage_data(stage: OperationStageRecord) -> dict[str, Any]:
+    error = stage.last_error
+    return {
+        "stage_key": stage.stage_key, "state": stage.state.value, "failures": stage.failures,
+        "attempts_started": stage.attempts_started,
+        "in_flight_attempt_id": stage.in_flight_attempt_id,
+        "retry_not_before": stage.retry_not_before,
+        "last_error": ({name: getattr(error, name) for name in error.__dataclass_fields__}
+                       if error is not None else None),
+        "checkpoint_refs": list(stage.checkpoint_refs), "updated_at": stage.updated_at,
+        "result": stage.result,
+    }
 
 
 def _operation_from(data: dict[str, Any]) -> QueuedOperation:
@@ -341,5 +469,5 @@ def _valid_lease(
 __all__ = [
     "HEARTBEAT_INTERVAL_SECONDS", "LEASE_SECONDS", "claim_head", "complete_head",
     "fail_head", "get_operation", "heartbeat", "register_operation",
-    "register_operation_in_transaction", "release_head",
+    "register_operation_in_transaction", "release_head", "QueueOperationRetryStore",
 ]

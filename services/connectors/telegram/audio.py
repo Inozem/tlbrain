@@ -14,6 +14,12 @@ from google.genai import types
 
 from core.integrations.gemini.client import make_client
 from core.integrations.gemini.transcription import transcribe_part
+from core.operations.models import OperationError
+from core.operations.retries import (
+    ConfirmedStageFailure,
+    ConfirmedStageSuccess,
+    UnknownOutcome,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -111,6 +117,9 @@ class TelegramAudioTranscriber:
         *,
         draft_id: str,
         analyze: Callable[[list[Any]], Any],
+        retry_governor: Any = None,
+        operation_id: str | None = None,
+        operation_lease: Any = None,
     ) -> Any:
         ordered = sorted(messages, key=lambda item: _get(item, "intake_sequence", 0))
         semaphore = asyncio.Semaphore(_MAX_CONCURRENT_TRANSCRIPTIONS)
@@ -122,34 +131,30 @@ class TelegramAudioTranscriber:
                 state = getattr(state, "value", state)
                 saved_text = _get(message, "transcription_text")
                 if state == "completed" and isinstance(saved_text, str):
+                    saved_text = await self._reconcile_completed_transcript(
+                        message_id,
+                        saved_text,
+                        retry_governor=retry_governor,
+                        operation_id=operation_id,
+                        operation_lease=operation_lease,
+                    )
                     return message_id, _with_transcription(message, saved_text)
                 try:
-                    transcript = await self._transcribe_message(message)
-                    if self.context_id is None:
-                        await _await_if_needed(self.repository.checkpoint_transcription(
-                            draft_id, message_id, transcript,
-                        ))
-                    else:
-                        await _await_if_needed(self.repository.checkpoint_transcription(
-                            self.context_id, draft_id, message_id, transcript,
-                        ))
+                    transcript = await self._transcribe_with_checkpoint_policy(
+                        message,
+                        draft_id,
+                        message_id,
+                        retry_governor=retry_governor,
+                        operation_id=operation_id,
+                        operation_lease=operation_lease,
+                    )
                     return message_id, _with_transcription(message, transcript)
                 except Exception as error:
-                    failure_checkpoint = getattr(
-                        self.repository, "checkpoint_transcription_failure", None,
+                    await self._checkpoint_terminal_failure(
+                        draft_id,
+                        message_id,
+                        error,
                     )
-                    if self.context_id is not None and callable(failure_checkpoint):
-                        error_code = (
-                            "unsupported_audio" if isinstance(error, TelegramAudioInputError)
-                            else "download_failed" if isinstance(error, FileNotFoundError)
-                            else "transcription_failed"
-                        )
-                        try:
-                            await _await_if_needed(failure_checkpoint(
-                                self.context_id, draft_id, message_id, error_code,
-                            ))
-                        except Exception:
-                            logger.warning("Telegram transcription failure checkpoint failed")
                     raise
 
         outcomes = await asyncio.gather(*(run_one(message) for message in ordered), return_exceptions=True)
@@ -160,6 +165,153 @@ class TelegramAudioTranscriber:
         rows = [row for _message_id, row in outcomes]
         result = analyze(rows)
         return await result if hasattr(result, "__await__") else result
+
+    async def _reconcile_completed_transcript(
+        self,
+        message_id: int,
+        saved_text: str,
+        *,
+        retry_governor: Any,
+        operation_id: str | None,
+        operation_lease: Any,
+    ) -> str:
+        """Reuse a completed checkpoint and reconcile a matching in-flight stage."""
+        if retry_governor is not None and operation_id and operation_lease is not None:
+            stage_key = f"telegram.audio.{message_id}"
+            stage_record = retry_governor.get_stage(operation_id, stage_key)
+            if stage_record.in_flight_attempt_id is not None:
+                return await retry_governor.run_stage_async(
+                    operation_id, stage_key, lambda: saved_text,
+                    owner=operation_lease.owner, fence=operation_lease.fence,
+                    reconcile=lambda: ConfirmedStageSuccess(saved_text),
+                )
+        return saved_text
+
+    async def _transcribe_with_checkpoint_policy(
+        self,
+        message: Any,
+        draft_id: str,
+        message_id: int,
+        *,
+        retry_governor: Any,
+        operation_id: str | None,
+        operation_lease: Any,
+    ) -> str:
+        """Run transcription with governed retries when an operation lease exists."""
+        if retry_governor is not None and operation_id and operation_lease is not None:
+            return await self._transcribe_governed_stage(
+                message,
+                draft_id,
+                message_id,
+                retry_governor=retry_governor,
+                operation_id=operation_id,
+                operation_lease=operation_lease,
+            )
+        return await self._transcribe_and_checkpoint(message, draft_id, message_id)
+
+    async def _transcribe_and_checkpoint(
+        self,
+        message: Any,
+        draft_id: str,
+        message_id: int,
+    ) -> str:
+        """Transcribe one audio message and persist its transcript checkpoint."""
+        transcript = await self._transcribe_message(message)
+        if self.context_id is None:
+            await _await_if_needed(self.repository.checkpoint_transcription(
+                draft_id, message_id, transcript,
+            ))
+        else:
+            await _await_if_needed(self.repository.checkpoint_transcription(
+                self.context_id, draft_id, message_id, transcript,
+            ))
+        return transcript
+
+    async def _transcribe_governed_stage(
+        self,
+        message: Any,
+        draft_id: str,
+        message_id: int,
+        *,
+        retry_governor: Any,
+        operation_id: str,
+        operation_lease: Any,
+    ) -> str:
+        """Execute the transcription checkpoint as a retry-governed stage."""
+        stage_key = f"telegram.audio.{message_id}"
+        try:
+            return await retry_governor.run_stage_async(
+                operation_id,
+                stage_key,
+                lambda: self._transcribe_and_checkpoint(message, draft_id, message_id),
+                owner=operation_lease.owner,
+                fence=operation_lease.fence,
+                retryable=lambda error: not isinstance(error, (ValueError, TypeError, KeyError)),
+                reconcile=lambda: ConfirmedStageFailure(OperationError(
+                    code="unknown_outcome",
+                    category="execution",
+                    message="Transcription outcome was not checkpointed",
+                    retryable=True,
+                    stage=stage_key,
+                )),
+            )
+        except Exception as error:
+            self._mark_governed_error_retryability(
+                error,
+                retry_governor=retry_governor,
+                operation_id=operation_id,
+                stage_key=stage_key,
+            )
+            raise
+
+    @staticmethod
+    def _mark_governed_error_retryability(
+        error: Exception,
+        *,
+        retry_governor: Any,
+        operation_id: str,
+        stage_key: str,
+    ) -> None:
+        """Mark whether a governed failure can retry before terminal checkpointing."""
+        if isinstance(error, UnknownOutcome):
+            error.telegram_stage_retryable = True
+            return
+        try:
+            stage_record = retry_governor.get_stage(operation_id, stage_key)
+            last_error = stage_record.last_error
+            error.telegram_stage_retryable = (
+                True if last_error is None else bool(
+                    last_error.retryable
+                    and stage_record.failures < retry_governor.max_failures
+                )
+            )
+        except Exception:
+            error.telegram_stage_retryable = True
+
+    async def _checkpoint_terminal_failure(
+        self,
+        draft_id: str,
+        message_id: int,
+        error: Exception,
+    ) -> None:
+        """Persist a terminal transcription failure while suppressing retryable ones."""
+        failure_checkpoint = getattr(
+            self.repository, "checkpoint_transcription_failure", None,
+        )
+        if (self.context_id is None or not callable(failure_checkpoint)
+                or getattr(error, "telegram_stage_retryable", False)):
+            return
+        error_code = (
+            "unsupported_audio" if isinstance(error, TelegramAudioInputError)
+            else "download_failed" if isinstance(error, FileNotFoundError)
+            else "transcription_failed"
+        )
+        try:
+            await _await_if_needed(failure_checkpoint(
+                self.context_id, draft_id, message_id, error_code,
+            ))
+        except Exception:
+            logger.warning("Telegram transcription failure checkpoint failed")
 
     async def _transcribe_message(self, message: Any) -> str:
         file_id = _get(message, "audio_file_id")

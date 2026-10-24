@@ -16,12 +16,21 @@ import copy
 import importlib
 import json
 import logging
+import os
 import re
+import socket
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from core.integrations.firestore.operation_queue import (
+    QueueOperationRetryStore, claim_head, register_operation,
+)
+from core.operations.retries import RetryGovernor, UnknownOutcome, ReconciledStageFailure
+from services.connectors.telegram.repository import SESSIONS
 
 
 pytestmark = pytest.mark.offline
@@ -264,7 +273,36 @@ class _Files:
 
 
 def _run(awaitable):
-    return asyncio.run(awaitable)
+    return asyncio.run(awaitable, loop_factory=_selector_loop)
+
+
+def _selector_loop():
+    """Use loopback datagrams for Windows asyncio self-pipe creation in the sandbox."""
+    if os.name != "nt":
+        return asyncio.SelectorEventLoop()
+    old_socketpair = socket.socketpair
+    local_pairs = []
+
+    def local_datagram_pair(*_args, **_kwargs):
+        reader = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        writer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            reader.bind(("127.0.0.1", 0))
+            writer.bind(("127.0.0.1", 0))
+            writer.connect(reader.getsockname())
+            reader.connect(writer.getsockname())
+            local_pairs.append((reader, writer))
+            return reader, writer
+        except BaseException:
+            reader.close()
+            writer.close()
+            raise
+
+    socket.socketpair = local_datagram_pair
+    try:
+        return asyncio.SelectorEventLoop()
+    finally:
+        socket.socketpair = old_socketpair
 
 
 def _config_wire(config):
@@ -538,6 +576,213 @@ def test_completed_transcription_resumes_without_redownloading_or_regenerating()
     assert repository.checkpoints == {}
     assert _field(analyzed[0], "transcription") == "already checkpointed verbatim"
     assert result is not None
+
+
+def test_durable_audio_stage_reuses_completed_message_transcript_without_second_provider_call(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    context_ref = client.collection(SESSIONS).document("audio-context")
+    now = datetime.now(timezone.utc)
+    register_operation(client, context_ref, "audio-operation", identity_digest="d", input_ref="i", now=now)
+    lease = claim_head(client, context_ref, owner="audio-worker", now=now)
+    assert lease is not None
+
+    class Clock:
+        def now(self):
+            return now
+
+    governor = RetryGovernor(
+        client, clock=Clock(),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+    )
+    repository = _Repository()
+    models = _Models({AUDIO_BYTES: "durably checkpointed transcript"})
+    telegram = _Telegram({"file-1": _download()})
+    service = _service(telegram, repository, _GeminiFactory(models))
+    results = []
+
+    async def analyze(rows):
+        results.append(_field(rows[0], "transcription"))
+        return rows
+
+    def process():
+        return _run(service.process_messages(
+            [_message(1)], draft_id="draft-audio", analyze=analyze,
+            retry_governor=governor, operation_id="audio-operation", operation_lease=lease,
+        ))
+
+    process()
+    process()
+    assert len(models.calls) == 1
+    assert repository.checkpoints == {1: "durably checkpointed transcript"}
+    assert results == ["durably checkpointed transcript"] * 2
+
+
+def test_audio_transcript_checkpoint_reconciles_an_in_flight_stage_without_provider_call(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    context_ref = client.collection(SESSIONS).document("audio-context")
+    now = datetime.now(timezone.utc)
+    register_operation(client, context_ref, "audio-operation", identity_digest="d", input_ref="i", now=now)
+    lease = claim_head(client, context_ref, owner="audio-worker", now=now)
+    assert lease is not None
+
+    class Clock:
+        def now(self):
+            return now
+
+    governor = RetryGovernor(
+        client, clock=Clock(), retry_store=QueueOperationRetryStore(client, context_ref),
+    )
+    with pytest.raises(UnknownOutcome):
+        _run(governor.run_stage_async(
+            "audio-operation", "telegram.audio.1",
+            lambda: (_ for _ in ()).throw(UnknownOutcome("lost response")),
+            owner=lease.owner, fence=lease.fence,
+        ))
+
+    message = {
+        **_message(1),
+        "transcription_state": "completed",
+        "transcription_text": "checkpointed before worker loss",
+    }
+    models = _Models()
+    service = _service(_Telegram({}), _Repository(), _GeminiFactory(models))
+    analyzed = []
+    _run(service.process_messages(
+        [message], draft_id="draft-audio", analyze=lambda rows: analyzed.extend(rows),
+        retry_governor=governor, operation_id="audio-operation", operation_lease=lease,
+    ))
+
+    stage = governor.get_stage("audio-operation", "telegram.audio.1")
+    assert getattr(stage.state, "value", stage.state) == "completed"
+    assert models.calls == []
+    assert _field(analyzed[0], "transcription") == "checkpointed before worker loss"
+
+
+def test_unknown_audio_outcome_reconciles_as_retryable_failure_without_user_failure_checkpoint(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    context_ref = client.collection(SESSIONS).document("audio-context")
+    now = datetime.now(timezone.utc)
+    register_operation(client, context_ref, "audio-operation", identity_digest="d", input_ref="i", now=now)
+    lease = claim_head(client, context_ref, owner="audio-worker", now=now)
+    assert lease is not None
+
+    class Clock:
+        def now(self):
+            return now
+
+    class Repository(_Repository):
+        def __init__(self):
+            super().__init__()
+            self.failure_checkpoints = []
+            self.context_checkpoints = []
+
+        def checkpoint_transcription_failure(self, context_id, draft_id, message_id, error_code):
+            self.failure_checkpoints.append((context_id, draft_id, message_id, error_code))
+
+        async def checkpoint_transcription(self, context_id, draft_id, message_id, transcript):
+            self.context_checkpoints.append((context_id, draft_id, message_id, transcript))
+
+    repository = Repository()
+    governor = RetryGovernor(
+        client, clock=Clock(), retry_store=QueueOperationRetryStore(client, context_ref),
+    )
+    service = _service(_Telegram({}), repository, _GeminiFactory(_Models()), context_id="audio-context")
+    provider_calls = []
+
+    async def unknown(_message):
+        provider_calls.append("unknown")
+        raise UnknownOutcome("provider response was lost")
+
+    service._transcribe_message = unknown
+    with pytest.raises(UnknownOutcome):
+        _run(service.process_messages(
+            [_message(1)], draft_id="draft-audio", analyze=lambda rows: rows,
+            retry_governor=governor, operation_id="audio-operation", operation_lease=lease,
+        ))
+    assert repository.failure_checkpoints == []
+    assert repository.context_checkpoints == []
+
+    with pytest.raises(ReconciledStageFailure):
+        _run(service.process_messages(
+            [_message(1)], draft_id="draft-audio", analyze=lambda rows: rows,
+            retry_governor=governor, operation_id="audio-operation", operation_lease=lease,
+        ))
+    stage = governor.get_stage("audio-operation", "telegram.audio.1")
+    assert stage.in_flight_attempt_id is None
+    assert stage.failures == 1
+    assert stage.last_error.retryable is True
+    assert repository.failure_checkpoints == []
+
+    async def recovered(_message):
+        provider_calls.append("recovered")
+        return "recovered transcript"
+
+    service._transcribe_message = recovered
+    _run(service.process_messages(
+        [_message(1)], draft_id="draft-audio", analyze=lambda rows: rows,
+        retry_governor=governor, operation_id="audio-operation", operation_lease=lease,
+    ))
+    assert provider_calls == ["unknown", "recovered"]
+    assert repository.failure_checkpoints == []
+    assert repository.context_checkpoints == [
+        ("audio-context", "draft-audio", 1, "recovered transcript"),
+    ]
+    assert governor.get_stage("audio-operation", "telegram.audio.1").failures == 1
+
+
+def test_audio_persistence_error_preserves_checkpoint_without_failure_checkpoint():
+    class Repository(_Repository):
+        def __init__(self):
+            super().__init__()
+            self.failure_checkpoints = []
+            self.context_checkpoints = []
+
+        def checkpoint_transcription_failure(self, context_id, draft_id, message_id, error_code):
+            self.failure_checkpoints.append((context_id, draft_id, message_id, error_code))
+
+        async def checkpoint_transcription(self, context_id, draft_id, message_id, transcript):
+            self.context_checkpoints.append((context_id, draft_id, message_id, transcript))
+
+    repository = Repository()
+
+    class Governor:
+        max_failures = 3
+
+        async def run_stage_async(self, _operation_id, _stage_key, callback, **_kwargs):
+            await callback()
+            raise OSError("stage result persistence failed")
+
+        def get_stage(self, _operation_id, _stage_key):
+            return SimpleNamespace(last_error=None, failures=0, in_flight_attempt_id="attempt-1")
+
+    service = _service(
+        _Telegram({}), repository, _GeminiFactory(_Models()), context_id="audio-context",
+    )
+    provider_calls = []
+
+    async def transcribe(_message):
+        provider_calls.append(1)
+        return "transcript already checkpointed"
+
+    service._transcribe_message = transcribe
+    with pytest.raises(OSError):
+        _run(service.process_messages(
+            [_message(1)], draft_id="draft-audio", analyze=lambda rows: rows,
+            retry_governor=Governor(), operation_id="audio-operation",
+            operation_lease=SimpleNamespace(owner="audio-worker", fence=1),
+        ))
+
+    assert provider_calls == [1]
+    assert repository.context_checkpoints == [
+        ("audio-context", "draft-audio", 1, "transcript already checkpointed"),
+    ]
+    assert repository.failure_checkpoints == []
 
 
 def test_malformed_gemini_file_reference_fails_and_deletes_known_resource():

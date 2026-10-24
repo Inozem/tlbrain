@@ -476,6 +476,81 @@ def test_terminal_failure_advances_and_wakes_next_operation(firestore_fake):
     assert any(row.get("operation_id") == "op-b" for row in _rows(firestore_fake).values())
 
 
+def test_queue_injected_governor_caps_physical_stage_failures_and_advances_only_on_exhaustion(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-a", "op-b"))
+    physical_calls = []
+
+    async def processor(context_id, operation, lease, *, retry_governor):
+        assert context_id == "ctx"
+        assert operation.operation_id == lease.operation_id == "op-a"
+        try:
+            await retry_governor.run_stage_async(
+                "op-a", "telegram.analysis",
+                lambda: _fail_provider(physical_calls),
+                owner=lease.owner, fence=lease.fence,
+            )
+        except ConnectionError as error:
+            stage = retry_governor.get_stage("op-a", "telegram.analysis")
+            error.retryable_stage = stage.last_error.retryable and stage.failures < 3
+            raise
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-a"])) is False
+    assert context_ref.get().to_dict()["reserved_operation_id"] == "op-a"
+    assert _run(worker.handle_task(payloads["op-a"])) is False
+    assert context_ref.get().to_dict()["reserved_operation_id"] == "op-a"
+    assert _run(worker.handle_task(payloads["op-a"])) is True
+    assert physical_calls == ["provider"] * 3
+    stage_rows = [data for path, data in firestore_fake.documents.items()
+                  if path.endswith("/stages/telegram.analysis")]
+    assert stage_rows[0]["failures"] == 3
+    assert stage_rows[0]["attempts_started"] == 3
+    assert context_ref.get().to_dict()["reserved_operation_id"] == "op-b"
+
+
+async def _fail_provider(calls):
+    calls.append("provider")
+    raise ConnectionError("synthetic transient failure")
+
+
+def test_permanent_stage_error_terminalizes_only_current_queue_head(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-a", "op-b"))
+    physical_calls = []
+
+    async def processor(context_id, operation, lease, *, retry_governor):
+        try:
+            await retry_governor.run_stage_async(
+                "op-a", "telegram.classification",
+                lambda: _permanent_provider_failure(physical_calls),
+                owner=lease.owner, fence=lease.fence,
+                retryable=lambda error: not isinstance(error, ValueError),
+            )
+        except ValueError as error:
+            error.retryable_stage = False
+            raise
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-a"])) is True
+    assert physical_calls == ["provider"]
+    assert context_ref.get().to_dict()["reserved_operation_id"] == "op-b"
+    stage = next(data for path, data in firestore_fake.documents.items()
+                 if path.endswith("/stages/telegram.classification"))
+    assert stage["failures"] == 1
+    assert stage["attempts_started"] == 1
+    assert stage["last_error"]["retryable"] is False
+
+
+async def _permanent_provider_failure(calls):
+    calls.append("provider")
+    raise ValueError("synthetic invalid provider input")
+
+
 def test_same_context_contention_has_one_live_processor_and_expiry_wakeup(firestore_fake):
     client = firestore_fake.client_class()
     context_ref, payloads = _setup(client)

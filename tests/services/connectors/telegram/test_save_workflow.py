@@ -923,3 +923,319 @@ def test_new_draft_classification_uses_only_its_source_after_prior_doc_move_and_
     assert "prior private source" not in repr(seen[1])
     assert "renamed prior title" not in repr(seen[1])
     assert "old" not in repr(seen[1][3])
+
+
+def test_workflow_governs_and_reuses_firestore_safe_preparation_and_classification_results(
+    firestore_fake,
+):
+    from core.dialogs.classification import FolderSelectionResult
+    from core.integrations.firestore.operation_queue import (
+        QueueOperationRetryStore, claim_head, register_operation,
+    )
+    from core.operations.retries import RetryGovernor
+    from google.cloud.firestore_v1._helpers import encode_value
+    from services.connectors.telegram.models import PreparedUtterance
+    from services.connectors.telegram.save import TelegramClassifiedDialog
+    from services.connectors.telegram.repository import SESSIONS
+
+    now = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    client = firestore_fake.client_class()
+    context_ref = client.collection(SESSIONS).document("telegram-context-1")
+    register_operation(client, context_ref, "governed-save", identity_digest="d", input_ref="i", now=now)
+    lease = claim_head(client, context_ref, owner="save-worker", now=now)
+    assert lease is not None
+
+    class Clock:
+        def now(self):
+            return now
+
+    governor = RetryGovernor(
+        client, clock=Clock(), retry_store=QueueOperationRetryStore(client, context_ref),
+    )
+    repository = _Repository()
+    events = []
+    receipt = _receipt(repository)
+    receipt["operation_id"] = "governed-save"
+    pipeline = _Pipeline(events, receipt=receipt)
+    classified_calls = []
+
+    async def classify(result, *, draft_id):
+        classified_calls.append(draft_id)
+        return TelegramClassifiedDialog(
+            payload={"title": "Planning", "utterances": []},
+            selection=FolderSelectionResult(
+                folder_id="folder-1", speaker_candidate_ids=("speaker-1", "speaker-2"),
+            ),
+        )
+
+    class ForwardingAudio(_Audio):
+        async def process_messages(
+            self, messages, *, draft_id, analyze, retry_governor=None,
+            operation_id=None, operation_lease=None,
+        ):
+            self.received = (retry_governor, operation_id, operation_lease)
+            return await analyze(messages)
+
+    async def preprocess(_messages):
+        return [PreparedUtterance(
+            order_index=0, speaker="Speaker 1", reliable_author_key=None,
+            text="synthetic transcript", word_count=2, source_message_ids=(1,),
+        )]
+
+    audio = ForwardingAudio(repository, events)
+    workflow = _save_type()(
+        repository=repository,
+        audio_transcriber=audio,
+        context_id="telegram-context-1",
+        preprocess=preprocess,
+        analyze=pipeline.analyze,
+        classify=classify,
+        save=pipeline.save,
+    )
+    kwargs = {
+        "draft_id": "draft-original", "intent_id": "intent-1",
+        "operation_id": "governed-save", "retry_governor": governor,
+        "operation_lease": lease,
+    }
+
+    first = _run(workflow.save(**kwargs))
+    second = _run(workflow.save(**kwargs))
+
+    assert audio.received == (governor, "governed-save", lease)
+    assert classified_calls == ["draft-original"]
+    assert _value(first, "classification_outcome") == "ambiguous"
+    assert _value(second, "classification_outcome") == "ambiguous"
+    assert pipeline.saved_inputs[0]["title"] == "Planning"
+    assert pipeline.saved_inputs[1]["title"] == "Planning"
+    preparation = governor.get_stage("governed-save", "telegram.preparation")
+    analysis = governor.get_stage("governed-save", "telegram.analysis")
+    classification = governor.get_stage("governed-save", "telegram.classification")
+    assert preparation.attempts_started == analysis.attempts_started == classification.attempts_started == 1
+    assert isinstance(preparation.result, list)
+    assert all(isinstance(row, dict) for row in preparation.result)
+    assert isinstance(preparation.result[0]["source_message_ids"], list)
+    assert isinstance(classification.result, dict)
+    assert classification.result["__telegram_classified_dialog__"] is True
+    encode_value(preparation.result)
+    assert isinstance(analysis.result, dict)
+    encode_value(analysis.result)
+    encode_value(classification.result)
+
+
+@pytest.mark.parametrize(
+    "bad_stage,expected_stage",
+    [
+        ("classification", "telegram.classification"),
+        ("preparation", "telegram.preparation"),
+        ("preparation_opaque", "telegram.preparation"),
+    ],
+)
+def test_governed_malformed_stage_outputs_are_recorded_as_permanent_failures(
+    firestore_fake, bad_stage, expected_stage,
+):
+    from core.integrations.firestore.operation_queue import (
+        QueueOperationRetryStore, claim_head, register_operation,
+    )
+    from core.operations.retries import RetryGovernor
+    from services.connectors.telegram.repository import SESSIONS
+
+    now = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    client = firestore_fake.client_class()
+    context_ref = client.collection(SESSIONS).document("telegram-context-1")
+    register_operation(client, context_ref, "governed-invalid", identity_digest="d", input_ref="i", now=now)
+    lease = claim_head(client, context_ref, owner="save-worker", now=now)
+    assert lease is not None
+
+    class Clock:
+        def now(self):
+            return now
+
+    governor = RetryGovernor(
+        client, clock=Clock(), retry_store=QueueOperationRetryStore(client, context_ref),
+    )
+    repository = _Repository()
+    events = []
+    receipt = _receipt(repository)
+    receipt["operation_id"] = "governed-invalid"
+    pipeline = _Pipeline(events, receipt=receipt)
+    callback_calls = []
+
+    async def preprocess(messages):
+        callback_calls.append("preparation")
+        if bad_stage == "preparation":
+            return "malformed"
+        if bad_stage == "preparation_opaque":
+            return [{"nested": [object()]}]
+        return list(messages)
+
+    async def classify(result, *, draft_id):
+        callback_calls.append("classification")
+        return object()
+
+    class ForwardingAudio(_Audio):
+        async def process_messages(
+            self, messages, *, draft_id, analyze, retry_governor=None,
+            operation_id=None, operation_lease=None,
+        ):
+            return await analyze(messages)
+
+    workflow = _save_type()(
+        repository=repository,
+        audio_transcriber=ForwardingAudio(repository, events),
+        context_id="telegram-context-1",
+        preprocess=preprocess,
+        analyze=pipeline.analyze,
+        classify=classify,
+        save=pipeline.save,
+    )
+
+    with pytest.raises(Exception):
+        _run(workflow.save(
+            draft_id="draft-original", intent_id="intent-1",
+            operation_id="governed-invalid", retry_governor=governor,
+            operation_lease=lease,
+        ))
+
+    stage = governor.get_stage("governed-invalid", expected_stage)
+    assert stage.state.value == "failed"
+    assert stage.attempts_started == stage.failures == 1
+    assert stage.in_flight_attempt_id is None
+    assert stage.last_error is not None and stage.last_error.retryable is False
+    expected_calls = ["preparation"]
+    if bad_stage == "classification":
+        expected_calls.append("classification")
+    assert callback_calls == expected_calls
+
+
+@pytest.mark.parametrize(
+    "error_factory,expected_retryability",
+    [
+        (lambda: ConnectionError("temporary provider outage"), [True, True, False]),
+        (lambda: ValueError("permanent provider rejection"), [False]),
+    ],
+)
+def test_workflow_provider_failures_follow_shared_stage_budget_and_permanent_errors(
+    firestore_fake, error_factory, expected_retryability,
+):
+    from core.integrations.firestore.operation_queue import (
+        QueueOperationRetryStore, claim_head, register_operation,
+    )
+    from core.operations.retries import RetryGovernor
+    from services.connectors.telegram.repository import SESSIONS
+
+    now = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    client = firestore_fake.client_class()
+    context_ref = client.collection(SESSIONS).document("telegram-context-1")
+    register_operation(client, context_ref, "governed-failure", identity_digest="d", input_ref="i", now=now)
+    lease = claim_head(client, context_ref, owner="save-worker", now=now)
+    assert lease is not None
+
+    class Clock:
+        def now(self):
+            return now
+
+    governor = RetryGovernor(
+        client, clock=Clock(), retry_store=QueueOperationRetryStore(client, context_ref),
+    )
+    repository = _Repository()
+    events = []
+    receipt = _receipt(repository)
+    receipt["operation_id"] = "governed-failure"
+    pipeline = _Pipeline(events, receipt=receipt)
+    provider_calls = []
+
+    async def analyze(messages, *, context):
+        provider_calls.append(1)
+        raise error_factory()
+
+    class ForwardingAudio(_Audio):
+        async def process_messages(
+            self, messages, *, draft_id, analyze, retry_governor=None,
+            operation_id=None, operation_lease=None,
+        ):
+            self.received = (retry_governor, operation_id, operation_lease)
+            return await analyze(messages)
+
+    workflow = _save_type()(
+        repository=repository,
+        audio_transcriber=ForwardingAudio(repository, events),
+        context_id="telegram-context-1",
+        preprocess=pipeline.preprocess,
+        analyze=analyze,
+        classify=pipeline.classify,
+        save=pipeline.save,
+    )
+    kwargs = {
+        "draft_id": "draft-original", "intent_id": "intent-1",
+        "operation_id": "governed-failure", "retry_governor": governor,
+        "operation_lease": lease,
+    }
+    observed_retryability = []
+
+    for _ in expected_retryability:
+        with pytest.raises(Exception) as raised:
+            _run(workflow.save(**kwargs))
+        observed_retryability.append(raised.value.retryable_stage)
+
+    stage = governor.get_stage("governed-failure", "telegram.analysis")
+    assert observed_retryability == expected_retryability
+    assert stage.failures == len(expected_retryability)
+    assert stage.attempts_started == len(expected_retryability)
+    assert provider_calls == [1] * len(expected_retryability)
+
+
+@pytest.mark.parametrize(
+    "stage_factory,expected_retryable",
+    [
+        (lambda: type("Stage", (), {"last_error": None, "failures": 0})(), True),
+        (lambda: type("Stage", (), {"last_error": type("Failure", (), {"retryable": False})(), "failures": 1})(), False),
+        (lambda: type("Stage", (), {"last_error": type("Failure", (), {"retryable": True})(), "failures": 3})(), False),
+    ],
+)
+def test_governed_stage_retryability_uses_only_persisted_failure_state(stage_factory, expected_retryable):
+    from services.connectors.telegram.save import _run_telegram_stage
+
+    class Governor:
+        max_failures = 3
+
+        async def run_stage_async(self, *_args, **_kwargs):
+            raise OSError("stage result persistence failed")
+
+        def get_stage(self, *_args):
+            return stage_factory()
+
+    error = OSError("stage result persistence failed")
+    governor = Governor()
+    async def raise_stage_error(*_args, **_kwargs):
+        raise error
+
+    # Use the same error instance from run_stage_async so the workflow marker is observable.
+    governor.run_stage_async = raise_stage_error
+    with pytest.raises(OSError):
+        _run(_run_telegram_stage(
+            governor, "operation", type("Lease", (), {"owner": "worker", "fence": 1})(),
+            "telegram.analysis", lambda: None,
+        ))
+
+    assert error.telegram_stage_retryable is expected_retryable
+
+
+def test_governed_stage_state_read_error_remains_retryable():
+    from services.connectors.telegram.save import _run_telegram_stage
+
+    error = OSError("stage result persistence failed")
+
+    class Governor:
+        async def run_stage_async(self, *_args, **_kwargs):
+            raise error
+
+        def get_stage(self, *_args):
+            raise OSError("stage read failed")
+
+    with pytest.raises(OSError):
+        _run(_run_telegram_stage(
+            Governor(), "operation", type("Lease", (), {"owner": "worker", "fence": 1})(),
+            "telegram.analysis", lambda: None,
+        ))
+
+    assert error.telegram_stage_retryable is True

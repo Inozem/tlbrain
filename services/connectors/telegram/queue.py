@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import inspect
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from core.integrations.firestore.outbox import (
     get_outbox_record,
 )
 from core.operations.queue import OperationLease, QueueOperationState
+from core.operations.retries import RetryGovernor, RetryBudgetExceeded, UnknownOutcome
 from services.connectors.telegram.repository import SESSIONS
 
 
@@ -36,6 +38,14 @@ Processor = Callable[[str, Any, OperationLease], Awaitable[QueueOperationState]]
 Clock = Callable[[], datetime]
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-firestore")
 MAX_EXECUTION_SLICE_SECONDS = 480.0
+
+
+class _WorkerClock:
+    def __init__(self, worker: "TelegramQueueWorker") -> None:
+        self.worker = worker
+
+    def now(self) -> datetime:
+        return self.worker.clock()
 
 
 async def _offload_sync(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
@@ -181,8 +191,45 @@ class TelegramQueueWorker:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.max_slice_seconds = max_slice_seconds
 
+    def _retry_governor(self, context_ref: Any) -> RetryGovernor:
+        from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+
+        return RetryGovernor(
+            self.client, clock=_WorkerClock(self),
+            retry_store=QueueOperationRetryStore(self.client, context_ref),
+        )
+
+    async def _process(self, context_id: str, operation: Any, lease: OperationLease,
+                       retry_governor: RetryGovernor) -> QueueOperationState:
+        """Pass durable attempt context to processors that opt into the seam."""
+        try:
+            parameters = inspect.signature(self.processor).parameters.values()
+            supports_governor = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == "retry_governor"
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_governor = False
+        if supports_governor:
+            return await self.processor(context_id, operation, lease, retry_governor=retry_governor)
+        return await self.processor(context_id, operation, lease)
+
     async def handle_task(self, payload: Mapping[str, Any]) -> bool:
         """Handle a schema-versioned task body; return whether processing settled."""
+        delivery = await self._load_valid_delivery(payload)
+        if delivery is None:
+            return False
+        record, delivery_time = delivery
+
+        claim = await self._claim_delivery_head(record, delivery_time)
+        if claim is None:
+            return False
+        context_id, context_ref, operation, lease = claim
+
+        return await self._process_claimed_head(context_id, context_ref, operation, lease)
+
+    async def _load_valid_delivery(self, payload: Mapping[str, Any]) -> tuple[Any, datetime] | None:
+        """Validate the task envelope and stored outbox generation, repairing stale wakeups."""
         if not isinstance(payload, Mapping):
             raise ValueError("task payload must be a mapping")
         outbox_id = payload.get("outbox_id")
@@ -195,7 +242,7 @@ class TelegramQueueWorker:
 
         record = await _offload_sync(get_outbox_record, self.client, outbox_id)
         if record is None:
-            return False
+            return None
         context_id = record.context_id
         now = self.clock()
         valid_delivery = (
@@ -209,34 +256,103 @@ class TelegramQueueWorker:
         if not valid_delivery:
             if context_id:
                 await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=now)
-            return False
+            return None
+        return record, now
 
+    async def _claim_delivery_head(
+        self, record: Any, delivery_time: datetime,
+    ) -> tuple[str, Any, Any, OperationLease] | None:
+        """Confirm the delivered operation is the context head and claim its fenced lease."""
+        context_id = record.context_id
         context_ref = self.client.collection(SESSIONS).document(context_id)
         context_snapshot = await _offload_sync(context_ref.get)
         context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
         if context.get("reserved_operation_id") != record.operation_id:
-            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=now)
-            return False
+            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=delivery_time)
+            return None
         operation = await _offload_sync(get_operation, context_ref, record.operation_id)
         if operation is None or operation.state.is_terminal:
-            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=now)
-            return False
+            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=delivery_time)
+            return None
 
         lease = await _offload_sync(
-            claim_head, self.client, context_ref, owner=self.owner_factory(), now=now,
+            claim_head, self.client, context_ref, owner=self.owner_factory(), now=delivery_time,
         )
         if lease is None:
             await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=self.clock())
-            return False
+            return None
         if lease.operation_id != record.operation_id:
             await _offload_sync(release_head,
                 self.client, context_ref, operation_id=lease.operation_id,
                 owner=lease.owner, fence=lease.fence, now=self.clock(),
             )
             await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=self.clock())
-            return False
+            return None
+        return context_id, context_ref, operation, lease
 
-        result = await self._run_with_heartbeat(context_id, operation, lease, context_ref)
+    async def _process_claimed_head(
+        self, context_id: str, context_ref: Any, operation: Any, lease: OperationLease,
+    ) -> bool:
+        """Run the claimed operation with heartbeat and route its outcome to settlement."""
+        try:
+            retry_governor = self._retry_governor(context_ref)
+            result = await self._run_with_heartbeat(context_id, operation, lease, context_ref,
+                retry_governor)
+        except Exception as error:
+            retryable_stage = self._retryable_error_stage(error)
+            if retryable_stage is None:
+                raise
+            return await self._settle_processor_error(
+                context_id, context_ref, lease, retryable_stage,
+            )
+
+        return await self._settle_processor_result(context_id, context_ref, lease, result)
+
+    @staticmethod
+    def _retryable_error_stage(error: Exception) -> bool | None:
+        """Resolve explicit retry classification while honoring governor outcome types."""
+        retryable_stage = getattr(error, "retryable_stage", None)
+        if isinstance(error, (RetryBudgetExceeded,)):
+            retryable_stage = False
+        if isinstance(error, UnknownOutcome):
+            retryable_stage = True
+        return retryable_stage if isinstance(retryable_stage, bool) else None
+
+    async def _settle_processor_error(
+        self, context_id: str, context_ref: Any, lease: OperationLease,
+        retryable_stage: bool,
+    ) -> bool:
+        """Release retryable failures for another attempt or terminally fail and advance."""
+        settled_at = self.clock()
+        if retryable_stage:
+            def wake_retry(transaction: Any, updated_context: dict[str, Any]) -> None:
+                _ensure_wakeup_in_transaction(
+                    self.client, transaction, updated_context,
+                    context_id=context_id, operation_id=lease.operation_id,
+                    schedule_at=settled_at, now=settled_at,
+                )
+            return await _offload_sync(release_head, self.client, context_ref,
+                operation_id=lease.operation_id, owner=lease.owner, fence=lease.fence,
+                now=settled_at, after_release=wake_retry) and False
+
+        def wake_next_after_failure(transaction: Any, next_id: str | None,
+                                    next_data: dict[str, Any] | None,
+                                    updated_context: dict[str, Any]) -> None:
+            if next_id and next_data is not None:
+                _ensure_wakeup_in_transaction(
+                    self.client, transaction, updated_context,
+                    context_id=context_id, operation_id=next_id,
+                    schedule_at=settled_at, now=settled_at,
+                )
+        return await _offload_sync(fail_head, self.client, context_ref,
+            operation_id=lease.operation_id, owner=lease.owner, fence=lease.fence,
+            now=settled_at, after_advance=wake_next_after_failure)
+
+    async def _settle_processor_result(
+        self, context_id: str, context_ref: Any, lease: OperationLease,
+        result: QueueOperationState | None,
+    ) -> bool:
+        """Release a yielded head or settle a terminal result and wake the next head."""
         if result is None:
             return False
         if result is QueueOperationState.RUNNING:
@@ -282,8 +398,9 @@ class TelegramQueueWorker:
 
     async def _run_with_heartbeat(
         self, context_id: str, operation: Any, lease: OperationLease, context_ref: Any,
+        retry_governor: RetryGovernor,
     ) -> QueueOperationState | None:
-        processor_task = asyncio.create_task(self.processor(context_id, operation, lease))
+        processor_task = asyncio.create_task(self._process(context_id, operation, lease, retry_governor))
 
         async def beat() -> bool:
             while True:
@@ -314,8 +431,11 @@ class TelegramQueueWorker:
             if not isinstance(result, QueueOperationState) or not result.is_terminal:
                 raise ValueError("processor must return a terminal or RUNNING QueueOperationState")
             return result
-        except BaseException:
-            release_lease = True
+        except BaseException as error:
+            release_lease = not (
+                isinstance(error, (RetryBudgetExceeded, UnknownOutcome))
+                or isinstance(getattr(error, "retryable_stage", None), bool)
+            )
             raise
         finally:
             for task in (processor_task, heartbeat_task):

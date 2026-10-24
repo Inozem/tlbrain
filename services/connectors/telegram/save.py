@@ -11,6 +11,8 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 from core.config import get_default_dialog_date
+from core.operations.models import OperationError
+from core.operations.retries import ConfirmedStageFailure, UnknownOutcome
 from core.dialogs.classification import FolderSelectionResult
 from services.connectors.telegram.preprocessing import (
     context_word_capacity,
@@ -79,7 +81,7 @@ def _prepared_row(item: Any) -> Any:
             "reliable_author_key": item.reliable_author_key,
             "text": item.text,
             "word_count": item.word_count,
-            "source_message_ids": tuple(item.source_message_ids),
+            "source_message_ids": list(item.source_message_ids),
         }
     return item
 
@@ -121,6 +123,52 @@ class TelegramClassifiedDialog:
     selection: FolderSelectionResult
 
 
+def _checkpoint_classified(value: Any) -> Any:
+    if not isinstance(value, TelegramClassifiedDialog):
+        return _checkpoint_analysis(value)
+    return {
+        "__telegram_classified_dialog__": True,
+        "payload": _checkpoint_analysis(value.payload),
+        "selection": {
+            "folder_id": value.selection.folder_id,
+            "speaker_candidate_ids": list(value.selection.speaker_candidate_ids),
+            "requires_unassigned": value.selection.requires_unassigned,
+        },
+    }
+
+
+def _restore_classified(value: Any) -> Any:
+    if not isinstance(value, Mapping) or value.get("__telegram_classified_dialog__") is not True:
+        return value
+    selection = value.get("selection") or {}
+    return TelegramClassifiedDialog(
+        payload=value.get("payload"),
+        selection=FolderSelectionResult(
+            folder_id=selection.get("folder_id"),
+            speaker_candidate_ids=tuple(selection.get("speaker_candidate_ids", ())),
+            requires_unassigned=bool(selection.get("requires_unassigned", False)),
+        ),
+    )
+
+
+def _checkpoint_analysis(value: Any) -> Any:
+    """Normalize analysis output to Firestore-native values before persistence.
+
+    Analysis providers return JSON-shaped payloads in the Telegram save flow.
+    Normalize mappings and sequences recursively, and fail clearly if an
+    injected provider returns an opaque model that cannot be safely restored.
+    """
+    if value is None or isinstance(value, (str, bool, int, float, bytes, datetime)):
+        return value
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("analysis result mapping keys must be strings")
+        return {key: _checkpoint_analysis(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_checkpoint_analysis(item) for item in value]
+    raise TypeError("analysis result must contain only Firestore-native values")
+
+
 @dataclass(frozen=True, slots=True)
 class _SealedInput:
     context_id: str
@@ -133,9 +181,10 @@ class _SealedInput:
 class TelegramSaveError(RuntimeError):
     """Safe workflow error carrying a user-visible stage and bounded code."""
 
-    def __init__(self, stage: str, error_code: str) -> None:
+    def __init__(self, stage: str, error_code: str, *, retryable_stage: bool | None = None) -> None:
         self.stage = stage
         self.error_code = error_code
+        self.retryable_stage = retryable_stage
         super().__init__(f"Telegram save failed during {stage} ({error_code})")
 
 
@@ -218,9 +267,25 @@ class TelegramSaveWorkflow:
         draft_id: str,
         context_id: str,
         dialog_date: str,
+        operation_id: str,
+        retry_governor: Any,
+        operation_lease: Any,
     ) -> Any:
         self._stage("preparation")
-        prepared = await _await(self.preprocess(messages))
+
+        async def prepare_for_checkpoint():
+            prepared = await _await(self.preprocess(messages))
+            if not isinstance(prepared, Sequence) or isinstance(prepared, (str, bytes)):
+                if retry_governor is not None and operation_lease is not None:
+                    raise ValueError("prepared utterances are malformed")
+                return prepared
+            rows = [_prepared_row(row) for row in prepared]
+            if retry_governor is not None and operation_lease is not None:
+                return [_checkpoint_analysis(row) for row in rows]
+            return rows
+
+        prepared = await _run_telegram_stage(retry_governor, operation_id, operation_lease,
+            "telegram.preparation", prepare_for_checkpoint)
         if not isinstance(prepared, Sequence) or isinstance(prepared, (str, bytes)):
             raise ValueError("prepared utterances are malformed")
         prepared_rows = [_prepared_row(row) for row in prepared]
@@ -233,11 +298,23 @@ class TelegramSaveWorkflow:
             "word_capacity": context_word_capacity(len(prepared_rows)),
         }
         self._stage("analysis")
-        return await _await(self.analyze(prepared_rows, context=context))
+        analyze = lambda: self.analyze(prepared_rows, context=context)
+        if retry_governor is None or operation_lease is None:
+            return await _await(analyze())
+
+        async def analyze_for_checkpoint():
+            return _checkpoint_analysis(await _await(analyze()))
+
+        return await _run_telegram_stage(retry_governor, operation_id, operation_lease,
+            "telegram.analysis", analyze_for_checkpoint)
 
     async def _transcribe_analyze_and_classify(
         self,
         sealed: _SealedInput,
+        *,
+        operation_id: str,
+        retry_governor: Any,
+        operation_lease: Any,
     ) -> tuple[Any, Any, str | None]:
         self._stage("transcription")
         guard_before = await _await(
@@ -252,13 +329,16 @@ class TelegramSaveWorkflow:
                 draft_id=sealed.draft_id,
                 context_id=sealed.context_id,
                 dialog_date=sealed.dialog_date,
+                operation_id=operation_id,
+                retry_governor=retry_governor,
+                operation_lease=operation_lease,
             )
 
-        result = await _await(self.audio_transcriber.process_messages(
-            sealed.messages,
-            draft_id=sealed.draft_id,
-            analyze=analyze_after_transcription,
-        ))
+        audio_args = {"draft_id": sealed.draft_id, "analyze": analyze_after_transcription}
+        if retry_governor is not None and operation_lease is not None:
+            audio_args.update(retry_governor=retry_governor, operation_id=operation_id,
+                              operation_lease=operation_lease)
+        result = await _await(self.audio_transcriber.process_messages(sealed.messages, **audio_args))
         self._stage("classification")
         topic_hint = None
         load_context = getattr(self.repository, "get_context", None)
@@ -281,7 +361,18 @@ class TelegramSaveWorkflow:
         ):
             if value is not None and _call_supports(self.classify, name):
                 classify_args[name] = value
-        classified = await _await(self.classify(result, **classify_args))
+
+        async def classify_for_checkpoint():
+            classified = await _await(self.classify(result, **classify_args))
+            if retry_governor is None or operation_lease is None:
+                return classified
+            return _checkpoint_classified(classified)
+
+        classified = await _run_telegram_stage(retry_governor, operation_id, operation_lease,
+            "telegram.classification", classify_for_checkpoint,
+            retryable=lambda error: not isinstance(error, (ValueError, TypeError, KeyError)))
+        if retry_governor is not None and operation_lease is not None:
+            classified = _restore_classified(classified)
         outcome = None
         if isinstance(classified, TelegramClassifiedDialog):
             selection = classified.selection
@@ -316,9 +407,15 @@ class TelegramSaveWorkflow:
         if _call_supports(self.save_pipeline, "dialog_date"):
             provider_args["dialog_date"] = sealed.dialog_date
         save_input = _with_save_metadata(classified, sealed.dialog_date)
-        receipt = await _await(self.save_pipeline(
-            save_input, **save_args, **provider_args,
-        ))
+        try:
+            receipt = await _await(self.save_pipeline(
+                save_input, **save_args, **provider_args,
+            ))
+        except Exception as error:
+            error.telegram_stage_retryable = _core_save_retryable(
+                getattr(self.repository, "client", None), operation_id, error,
+            )
+            raise
         if not isinstance(receipt, Mapping):
             raise ValueError("save receipt is missing")
 
@@ -368,11 +465,16 @@ class TelegramSaveWorkflow:
         draft_id: str,
         intent_id: str,
         operation_id: str,
+        retry_governor: Any = None,
+        operation_lease: Any = None,
     ) -> Any:
         self._stage("load")
         try:
             sealed = await self._load_sealed_input(draft_id)
-            classified, guard_before, classification_outcome = await self._transcribe_analyze_and_classify(sealed)
+            classified, guard_before, classification_outcome = await self._transcribe_analyze_and_classify(
+                sealed, operation_id=operation_id, retry_governor=retry_governor,
+                operation_lease=operation_lease,
+            )
             certificate = await self._save_and_complete(
                 classified,
                 sealed,
@@ -396,13 +498,55 @@ class TelegramSaveWorkflow:
             stage = self.status["stage"] or "load"
             code = _error_code(error)
             self.status = {"stage": stage, "state": "failed", "error_code": code}
-            raise TelegramSaveError(stage, code) from error
+            raise TelegramSaveError(stage, code,
+                retryable_stage=getattr(error, "telegram_stage_retryable", None)) from error
 
 
 async def _await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+async def _run_telegram_stage(
+    governor: Any,
+    operation_id: str,
+    lease: Any,
+    stage_key: str,
+    callback: Callable[[], Any],
+    *,
+    retryable: Callable[[BaseException], bool] | None = None,
+) -> Any:
+    if governor is None or lease is None:
+        return await _await(callback())
+    try:
+        return await governor.run_stage_async(
+            operation_id, stage_key, callback, owner=lease.owner, fence=lease.fence,
+            retryable=retryable or (lambda error: not isinstance(error, (ValueError, TypeError, KeyError))),
+            reconcile=lambda: ConfirmedStageFailure(OperationError(
+                code="unknown_outcome",
+                category="execution",
+                message="Telegram stage outcome was not durably recorded",
+                retryable=True,
+                stage=stage_key,
+            )),
+        )
+    except Exception as error:
+        if isinstance(error, UnknownOutcome):
+            error.telegram_stage_retryable = True
+            raise
+        try:
+            stage = governor.get_stage(operation_id, stage_key)
+            last_error = stage.last_error
+            error.telegram_stage_retryable = (
+                True if last_error is None else bool(
+                    last_error.retryable and stage.failures < governor.max_failures
+                )
+            )
+        except Exception:
+            # A failed read cannot establish a permanent or exhausted failure.
+            error.telegram_stage_retryable = True
+        raise
 
 
 def _with_save_metadata(value: Any, dialog_date: str) -> Any:
@@ -418,3 +562,22 @@ def _error_code(error: Exception) -> str:
     """Return a bounded exception category without exposing exception text."""
     name = type(error).__name__.lower()
     return "invalid_input" if isinstance(error, (ValueError, TypeError, KeyError)) else f"{name[:40]}_failed"
+
+
+def _core_save_retryable(client: Any, operation_id: str, error: Exception) -> bool:
+    """Read shared-save outcome state without adding Telegram attempt accounting."""
+    if client is not None:
+        try:
+            from core.integrations.firestore.operations import get_operation, get_stage
+            operation = get_operation(client, operation_id)
+            if operation is not None:
+                stage = get_stage(client, operation_id, operation.stage) if operation.stage else None
+                if operation.error is not None:
+                    return bool(operation.error.retryable and (operation.error.failures or 0) < 3)
+                if stage is not None and stage.last_error is not None:
+                    return bool(stage.last_error.retryable and stage.failures < 3)
+                if operation.state.value == "failed":
+                    return False
+        except Exception:
+            pass
+    return not isinstance(error, (ValueError, TypeError, KeyError))

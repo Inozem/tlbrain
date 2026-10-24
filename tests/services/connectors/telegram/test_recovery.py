@@ -18,7 +18,11 @@ from core.integrations.firestore.outbox import (
     task_payload,
 )
 from core.integrations.firestore.operations import create_operation, get_stage
-from core.integrations.firestore.operation_queue import get_operation
+from core.integrations.firestore.operation_queue import (
+    QueueOperationRetryStore,
+    claim_head,
+    get_operation,
+)
 from core.operations.models import OperationOrigin
 from core.operations.outbox import TaskTargetConfig, publish_due_outbox_records
 from core.operations.queue import QueueOperationState
@@ -153,8 +157,7 @@ def test_worker_reconciles_unknown_in_flight_stage_after_crash_without_second_pr
     )
     payload = task_payload(get_outbox_record(client, accepted.outbox_id))
 
-    with pytest.raises(UnknownOutcome):
-        _run(worker.handle_task(payload))
+    assert _run(worker.handle_task(payload)) is False
 
     stage_before_recovery = get_stage(client, accepted.operation_id, "save/index")
     assert stage_before_recovery.in_flight_attempt_id is not None
@@ -210,6 +213,42 @@ def test_nonterminal_slice_yield_keeps_same_head_for_next_delivery(firestore_fak
 
     assert _run(worker.handle_task(payload)) is True
     assert context_ref.get().to_dict()["reserved_operation_id"] is None
+
+
+def test_queue_retry_store_reconciles_in_flight_before_repeating_provider(firestore_fake):
+    client = firestore_fake.client_class()
+    accepted = _accepted_save(client, update_id=706)
+    payload = task_payload(get_outbox_record(client, accepted.outbox_id))
+    provider_calls = []
+    reconcile_calls = []
+    processor_calls = []
+
+    async def processor(context_id, operation, lease, *, retry_governor):
+        processor_calls.append(1)
+        async def provider():
+            provider_calls.append(1)
+            raise UnknownOutcome("provider response was lost")
+        async def reconcile():
+            reconcile_calls.append(1)
+            return ConfirmedStageSuccess({"transcript": "checkpointed"})
+        result = await retry_governor.run_stage_async(
+            operation.operation_id, "telegram.audio.1", provider,
+            owner=lease.owner, fence=lease.fence,
+            reconcile=reconcile if len(processor_calls) > 1 else None,
+        )
+        assert result == {"transcript": "checkpointed"}
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payload)) is False
+    assert _run(worker.handle_task(payload)) is True
+    assert provider_calls == [1]
+    assert reconcile_calls == [1]
+    stage = next(data for path, data in firestore_fake.documents.items()
+                 if path.endswith("/stages/telegram.audio.1"))
+    assert stage["attempts_started"] == 1
+    assert stage["failures"] == 0
+    assert stage["result"] == {"transcript": "checkpointed"}
 
 
 def test_timed_slice_cancels_processor_and_persists_same_head_wakeup(firestore_fake):
@@ -391,4 +430,31 @@ def test_telegram_stage_failure_budget_is_three_physical_single_attempt_calls(fi
 
     assert physical_calls == [accepted.operation_id] * 3
     assert get_stage(client, accepted.operation_id, "save/index").attempts_started == 3
+
+
+def test_stage_retry_store_updates_stage_without_rewriting_context_queue_document(firestore_fake):
+    client = firestore_fake.client_class()
+    accepted = _accepted_save(client, update_id=705)
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="stage-worker", now=NOW)
+    assert lease is not None
+    before = context_ref.get().to_dict()
+    governor = RetryGovernor(
+        client,
+        clock=_Clock(),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+    )
+
+    result = governor.run_stage(
+        accepted.operation_id,
+        "telegram.analysis",
+        lambda: {"title": "synthetic"},
+        owner=lease.owner,
+        fence=lease.fence,
+        now=NOW,
+    )
+
+    assert result == {"title": "synthetic"}
+    assert context_ref.get().to_dict() == before
+    assert governor.get_stage(accepted.operation_id, "telegram.analysis").result == result
 
