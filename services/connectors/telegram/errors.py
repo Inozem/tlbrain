@@ -29,6 +29,31 @@ def _reason(category: str, sanitized_message: Any) -> str:
         )
     if category == "rate_limited":
         return "The provider is temporarily limiting requests."
+    dependency_reasons = {
+        "The confirmed prerequisite did not complete successfully.": (
+            "The prerequisite did not complete successfully. Retry the save, then submit the command again."
+        ),
+        "The command's confirmed prerequisite is invalid.": (
+            "The prerequisite could not be verified. Retry the save, then submit the command again."
+        ),
+        "The command's confirmed prerequisite is unavailable.": (
+            "The prerequisite is unavailable. Retry the save, then submit the command again."
+        ),
+        "The completed prerequisite has no saved result for this command.": (
+            "The saved result is unavailable. Retry the save, then submit the command again."
+        ),
+        "The completed prerequisite's saved result is unavailable.": (
+            "The saved result is unavailable. Retry the save, then submit the command again."
+        ),
+        "The completed prerequisite's saved result is inconsistent.": (
+            "The saved result could not be verified. Retry the save, then submit the command again."
+        ),
+        "The completed prerequisite has an invalid saved result.": (
+            "The saved result could not be verified. Retry the save, then submit the command again."
+        ),
+    }
+    if category == "dependency" and isinstance(sanitized_message, str):
+        return dependency_reasons.get(sanitized_message, "The prerequisite could not be verified.")
     known_reasons = {
         "Transcription outcome was not checkpointed": "Transcription could not be checkpointed.",
         "Telegram stage outcome was not durably recorded": "The stage result could not be recorded.",

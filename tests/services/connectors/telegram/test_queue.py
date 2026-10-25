@@ -1,6 +1,7 @@
 """Focused tests for the Telegram single-head queue worker."""
 
 import asyncio
+import copy
 import os
 import socket
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from core.integrations.firestore.outbox import (
 )
 from core.integrations.firestore.operation_queue import (
     claim_head,
+    complete_head,
     fail_head,
     get_operation,
     register_operation,
@@ -476,6 +478,569 @@ def test_terminal_failure_advances_and_wakes_next_operation(firestore_fake):
     assert any(row.get("operation_id") == "op-b" for row in _rows(firestore_fake).values())
 
 
+def test_failed_confirmed_dependency_is_not_executed_and_delivers_one_durable_notice(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-save", "op-dependent", "op-later"))
+    context_ref.update({
+        "chat_id": 42, "last_doc_id": "old-doc", "selected_dialog_number": 99,
+        "dialog_number": 99,
+        "pending_save_operation_id": "op-dependent",
+    })
+    operations = context_ref.collection("operations")
+    operations.document("op-dependent").update({"dependency_operation_id": "op-save"})
+    operations.document("op-later").update({"pending_save_candidate_operation_id": "op-save"})
+    operations.document("op-dependent").update({
+        "input_ref": f"{SESSIONS}/ctx/commands/op-dependent",
+        "target_dialog_number": 17,
+    })
+    context_ref.collection("commands").document("op-dependent").set({
+        "operation_id": "op-dependent", "context_id": "ctx", "dialog_number": 42,
+    })
+
+    save_lease = claim_head(client, context_ref, owner="save", now=NOW)
+    assert save_lease is not None
+    assert fail_head(client, context_ref, operation_id="op-save", owner=save_lease.owner,
+                     fence=save_lease.fence, now=NOW)
+    processor_calls = []
+
+    async def processor(context_id, operation, lease):
+        processor_calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW, owner_factory=lambda: "worker")
+    assert _run(worker.handle_task(payloads["op-dependent"])) is True
+    assert processor_calls == []
+    assert context_ref.get().to_dict()["last_doc_id"] == "old-doc"
+    assert context_ref.get().to_dict()["reserved_operation_id"] == "op-later"
+    assert "pending_save_operation_id" not in context_ref.get().to_dict()
+
+    operation = operations.document("op-dependent").get().to_dict()
+    assert operation["state"] == "failed"
+    assert operation["stage"] == "dependency"
+    assert operation["status_updated_at"] == NOW
+    assert operation["error"] == {
+        "service": "telegram", "stage": "dependency", "code": "dependency_unavailable",
+        "category": "dependency",
+        "message": "The confirmed prerequisite did not complete successfully.",
+        "sanitized_message": "The confirmed prerequisite did not complete successfully.",
+        "retryable": False, "occurred_at": NOW, "failures": 0,
+        "operation_id": "op-dependent",
+    }
+    notification_rows = [
+        data for path, data in firestore_fake.documents.items()
+        if path.startswith("notification_outbox/")
+    ]
+    assert len(notification_rows) == 1
+    notification = notification_rows[0]
+    assert notification["kind"] == "error"
+    assert notification["dialog_number"] == 17
+    assert "Dialog #17" in notification["body"]
+    assert "telegram/dependency" in notification["body"]
+    assert "op-save" in notification["body"]
+    assert "op-dependent" in notification["body"]
+    assert "Retry the save" in notification["body"]
+    assert "Dialog #42" not in notification["body"]
+    dispatch_rows = [
+        data for data in _rows(firestore_fake).values()
+        if data.get("notification_id") == notification["notification_id"]
+    ]
+    assert len(dispatch_rows) == 1
+    assert dispatch_rows[0]["operation_id"] is None
+    assert any(row.get("operation_id") == "op-later" for row in _rows(firestore_fake).values())
+
+    assert _run(worker.handle_task(payloads["op-dependent"])) is False
+    assert len([path for path in firestore_fake.documents if path.startswith("notification_outbox/")]) == 1
+    assert _run(worker.handle_task(payloads["op-later"])) is True
+    assert processor_calls == ["op-later"]
+
+    old_parent = operations.document("op-save").get().to_dict()
+    old_dependent = operations.document("op-dependent").get().to_dict()
+    retry_operation = register_operation(
+        client, context_ref, "op-retry", identity_digest="digest:op-retry",
+        input_ref="input:op-retry", now=NOW + timedelta(seconds=1),
+    )
+    operations.document("op-retry").update({
+        "draft_id": "draft-1", "save_intent_id": "intent-1", "doc_id": "doc-1",
+    })
+    retry_record = create_outbox_record(
+        client, "task-ctx-op-retry", target_kind=OutboxTargetKind.TELEGRAM_DISPATCH,
+        generation=1, schedule_at=NOW + timedelta(seconds=1), now=NOW + timedelta(seconds=1),
+        context_id="ctx", operation_id=retry_operation.operation_id,
+    )
+    assert _run(worker.handle_task(task_payload(retry_record))) is True
+    assert processor_calls == ["op-later", "op-retry"]
+    assert operations.document("op-save").get().to_dict() == old_parent
+    assert operations.document("op-dependent").get().to_dict() == old_dependent
+
+
+def test_dependency_notice_is_reused_by_terminal_status_checks(firestore_fake, monkeypatch):
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+    from services.connectors.telegram.status_checks import TelegramStatusChecks
+
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-parent", "op-child"))
+    context_ref.update({"chat_id": 55})
+    operations = context_ref.collection("operations")
+    operations.document("op-child").update({"dependency_operation_id": "op-parent"})
+    parent_lease = claim_head(client, context_ref, owner="parent", now=NOW)
+    assert parent_lease is not None
+    assert fail_head(client, context_ref, operation_id="op-parent", owner=parent_lease.owner,
+                     fence=parent_lease.fence, now=NOW)
+    processor_calls = []
+
+    async def processor(context_id, operation, lease):
+        processor_calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    failed_operation = operations.document("op-child").get().to_dict()
+    dependency_notification_id = failed_operation["notification_id"]
+    assert dependency_notification_id.startswith("tgdep-")
+
+    class FakeTelegram:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, chat_id, text, *, message_thread_id=None):
+            self.sent.append((chat_id, text, message_thread_id))
+            return {"message_id": 913}
+
+        async def edit_message_text(self, chat_id, message_id, text):
+            raise AssertionError("the dependency notice should only be sent once")
+
+    repository = TelegramRepository(client)
+    telegram = FakeTelegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+    checks = TelegramStatusChecks(
+        client, status_reader=lambda _operation_id: None,
+        notification_publisher=publisher, clock=lambda: NOW + timedelta(seconds=60),
+    )
+    checks.terminal_notification_updater = lambda _record: None
+    check_records = checks.schedule_checks("ctx", "op-child", NOW)
+    document_paths_before_delivery = set(firestore_fake.documents)
+    async def direct_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", direct_to_thread)
+
+    assert _run(checks.handle_task(task_payload(check_records[0]))) == "failed"
+    delivered_notice = repository.get_notification(dependency_notification_id)
+    assert delivered_notice["state"] == "delivered"
+    assert delivered_notice["send_attempts_started"] == 1
+    assert len(telegram.sent) == 1
+    assert operations.document("op-child").get().to_dict()["notification_id"] == dependency_notification_id
+    assert set(firestore_fake.documents) == document_paths_before_delivery
+    delivered_documents = copy.deepcopy(firestore_fake.documents)
+
+    assert _run(checks.handle_task(task_payload(check_records[1]))) == "no_op"
+    assert repository.get_notification(dependency_notification_id)["send_attempts_started"] == 1
+    assert len(telegram.sent) == 1
+    assert processor_calls == []
+    assert firestore_fake.documents == delivered_documents
+
+
+def test_candidate_snapshot_does_not_block_command_but_completed_dependency_needs_fixed_target(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-save", "op-candidate"))
+    context_ref.update({"chat_id": 42})
+    operations = context_ref.collection("operations")
+    operations.document("op-candidate").update({
+        "pending_save_candidate_operation_id": "op-save",
+    })
+    save_lease = claim_head(client, context_ref, owner="save", now=NOW)
+    assert save_lease is not None
+    assert fail_head(client, context_ref, operation_id="op-save", owner=save_lease.owner,
+                     fence=save_lease.fence, now=NOW)
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW, owner_factory=lambda: "worker")
+    assert _run(worker.handle_task(payloads["op-candidate"])) is True
+    assert calls == ["op-candidate"]
+
+    context_ref, payloads = _setup(client, "ctx-confirmed", operation_ids=("op-parent", "op-child"))
+    context_ref.update({"chat_id": 43, "last_doc_id": "newer-selection"})
+    operations = context_ref.collection("operations")
+    operations.document("op-parent").update({
+        "draft_id": "draft-1", "dialog_number": 2,
+        "save_intent_id": "intent-retry", "doc_id": "saved-doc",
+    })
+    operations.document("op-child").update({
+        "dependency_operation_id": "op-parent", "target_doc_id": "saved-doc",
+    })
+    client.collection("dialog_operations").document("op-parent").set({
+        "operation_id": "op-parent", "state": "completed",
+        "save_intent_id": "intent-retry", "doc_id": "saved-doc",
+        "result": {"document_id": "saved-doc"},
+    })
+    parent_lease = claim_head(client, context_ref, owner="parent", now=NOW)
+    assert parent_lease is not None
+    assert complete_head(client, context_ref, operation_id="op-parent", owner=parent_lease.owner,
+                         fence=parent_lease.fence, now=NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    assert calls == ["op-candidate", "op-child"]
+
+
+def test_completed_dependency_without_durable_child_target_fails_closed(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-parent", "op-child"))
+    context_ref.update({
+        "chat_id": 44, "last_doc_id": "mutable-old-target",
+        "pending_save_operation_id": "newer-save",
+    })
+    operations = context_ref.collection("operations")
+    operations.document("op-parent").update({"target_doc_id": "saved-doc"})
+    operations.document("op-child").update({
+        "dependency_operation_id": "op-parent", "target_doc_id": "mutable-old-target",
+    })
+    parent_lease = claim_head(client, context_ref, owner="parent", now=NOW)
+    assert parent_lease is not None
+    from core.integrations.firestore.operation_queue import complete_head
+    assert complete_head(client, context_ref, operation_id="op-parent", owner=parent_lease.owner,
+                         fence=parent_lease.fence, now=NOW)
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    assert calls == []
+    assert context_ref.get().to_dict()["last_doc_id"] == "mutable-old-target"
+    assert context_ref.get().to_dict()["pending_save_operation_id"] == "newer-save"
+    assert operations.document("op-child").get().to_dict()["error"]["code"] == "dependency_unavailable"
+
+
+def test_original_confirmed_save_link_uses_exact_shared_result(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-save", "op-child"))
+    context_ref.update({"chat_id": 47, "last_doc_id": "later-selection"})
+    operations = context_ref.collection("operations")
+    operations.document("op-save").update({"save_operation_id": "shared-save"})
+    operations.document("op-child").update({
+        "dependency_operation_id": "op-save", "target_doc_id": "saved-doc",
+    })
+    client.collection("dialog_operations").document("shared-save").set({
+        "operation_id": "shared-save", "state": "completed",
+        "result": {"document_id": "saved-doc"},
+    })
+    save_lease = claim_head(client, context_ref, owner="save", now=NOW)
+    assert save_lease is not None
+    from core.integrations.firestore.operation_queue import complete_head
+    assert complete_head(client, context_ref, operation_id="op-save", owner=save_lease.owner,
+                         fence=save_lease.fence, now=NOW)
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    assert calls == ["op-child"]
+
+
+def test_malformed_linked_save_intent_fails_closed_and_advances_head(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-save", "op-child", "op-later"))
+    context_ref.update({"chat_id": 51})
+    operations = context_ref.collection("operations")
+    operations.document("op-save").update({
+        "save_operation_id": "shared-save", "save_intent_id": ["malformed"],
+    })
+    operations.document("op-child").update({
+        "dependency_operation_id": "op-save", "target_doc_id": "saved-doc",
+    })
+    client.collection("dialog_operations").document("shared-save").set({
+        "operation_id": "shared-save", "state": "completed",
+        "result": {"document_id": "saved-doc"},
+    })
+    save_lease = claim_head(client, context_ref, owner="save", now=NOW)
+    assert save_lease is not None
+    assert complete_head(client, context_ref, operation_id="op-save", owner=save_lease.owner,
+                         fence=save_lease.fence, now=NOW)
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    assert calls == []
+    assert operations.document("op-child").get().to_dict()["error"]["code"] == "dependency_unavailable"
+    assert context_ref.get().to_dict()["reserved_operation_id"] == "op-later"
+    assert any(row.get("operation_id") == "op-later" for row in _rows(firestore_fake).values())
+
+
+def test_original_linked_save_conflicting_parent_document_fails_closed(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-save", "op-child"))
+    context_ref.update({"chat_id": 52})
+    operations = context_ref.collection("operations")
+    operations.document("op-save").update({
+        "save_operation_id": "shared-save", "doc_id": "contradictory-doc",
+    })
+    operations.document("op-child").update({
+        "dependency_operation_id": "op-save", "target_doc_id": "saved-doc",
+    })
+    client.collection("dialog_operations").document("shared-save").set({
+        "operation_id": "shared-save", "state": "completed",
+        "result": {"document_id": "saved-doc"},
+    })
+    save_lease = claim_head(client, context_ref, owner="save", now=NOW)
+    assert save_lease is not None
+    assert complete_head(client, context_ref, operation_id="op-save", owner=save_lease.owner,
+                         fence=save_lease.fence, now=NOW)
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    assert calls == []
+    assert operations.document("op-child").get().to_dict()["error"]["code"] == "dependency_unavailable"
+
+
+def test_failed_retry_parent_uses_verified_draft_dialog_for_notice(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-retry", "op-child", "op-later"))
+    context_ref.update({"chat_id": 53, "selected_dialog_number": 99})
+    operations = context_ref.collection("operations")
+    operations.document("op-retry").update({
+        "draft_id": "draft-retry", "dialog_number": 17,
+        "save_intent_id": "retry-intent", "doc_id": "saved-doc",
+    })
+    operations.document("op-child").update({
+        "dependency_operation_id": "op-retry",
+        "input_ref": f"{SESSIONS}/ctx/commands/op-child",
+    })
+    context_ref.collection("drafts").document("draft-retry").set({
+        "draft_id": "draft-retry", "dialog_number": 17,
+    })
+    context_ref.collection("commands").document("op-child").set({
+        "operation_id": "op-child", "context_id": "ctx", "dialog_number": 42,
+    })
+    retry_lease = claim_head(client, context_ref, owner="retry", now=NOW)
+    assert retry_lease is not None
+    assert fail_head(client, context_ref, operation_id="op-retry", owner=retry_lease.owner,
+                     fence=retry_lease.fence, now=NOW)
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    assert calls == []
+    notification = next(
+        data for path, data in firestore_fake.documents.items()
+        if path.startswith("notification_outbox/")
+    )
+    assert notification["dialog_number"] == 17
+    assert "Dialog #17" in notification["body"]
+    assert "Dialog #42" not in notification["body"]
+    assert "Dialog #99" not in notification["body"]
+
+
+def test_malformed_retry_draft_id_omits_notice_attribution_and_advances(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-retry", "op-child", "op-later"))
+    context_ref.update({"chat_id": 54, "selected_dialog_number": 99})
+    operations = context_ref.collection("operations")
+    operations.document("op-retry").update({
+        "draft_id": "bad/draft", "dialog_number": 17,
+        "save_intent_id": "retry-intent", "doc_id": "saved-doc",
+    })
+    operations.document("op-child").update({
+        "dependency_operation_id": "op-retry",
+        "input_ref": f"{SESSIONS}/ctx/commands/op-child",
+    })
+    context_ref.collection("commands").document("op-child").set({
+        "operation_id": "op-child", "context_id": "ctx", "dialog_number": 42,
+    })
+    retry_lease = claim_head(client, context_ref, owner="retry", now=NOW)
+    assert retry_lease is not None
+    assert fail_head(client, context_ref, operation_id="op-retry", owner=retry_lease.owner,
+                     fence=retry_lease.fence, now=NOW)
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    assert calls == []
+    assert context_ref.get().to_dict()["reserved_operation_id"] == "op-later"
+    notification = next(
+        data for path, data in firestore_fake.documents.items()
+        if path.startswith("notification_outbox/")
+    )
+    assert notification["dialog_number"] is None
+    assert "Dialog #17" not in notification["body"]
+    assert "Dialog #42" not in notification["body"]
+    assert "Dialog #99" not in notification["body"]
+
+
+def test_contradictory_parent_route_target_fails_closed(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-save", "op-child"))
+    context_ref.update({"chat_id": 48})
+    operations = context_ref.collection("operations")
+    operations.document("op-save").update({
+        "save_operation_id": "shared-save", "target_doc_id": "saved-doc",
+        "route_result": {"target_doc_id": "contradictory-doc"},
+    })
+    operations.document("op-child").update({
+        "dependency_operation_id": "op-save", "target_doc_id": "saved-doc",
+    })
+    client.collection("dialog_operations").document("shared-save").set({
+        "operation_id": "shared-save", "state": "completed",
+        "result": {"document_id": "saved-doc"},
+    })
+    save_lease = claim_head(client, context_ref, owner="save", now=NOW)
+    assert save_lease is not None
+    from core.integrations.firestore.operation_queue import complete_head
+    assert complete_head(client, context_ref, operation_id="op-save", owner=save_lease.owner,
+                         fence=save_lease.fence, now=NOW)
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is True
+    assert calls == []
+    assert operations.document("op-child").get().to_dict()["error"]["code"] == "dependency_unavailable"
+
+
+def test_foreign_context_dependency_and_command_ref_cannot_supply_targets(firestore_fake):
+    client = firestore_fake.client_class()
+    foreign_ref, _ = _setup(client, "foreign", operation_ids=("foreign-parent",))
+    foreign_ref.update({"chat_id": 49})
+    foreign_ref.collection("commands").document("foreign-command").set({
+        "context_id": "foreign", "operation_id": "child", "dialog_number": 6,
+    })
+    context_ref, payloads = _setup(client, "local", operation_ids=("child",))
+    context_ref.update({"chat_id": 50, "selected_dialog_number": 99})
+    context_ref.collection("operations").document("child").update({
+        "dependency_operation_id": "foreign-parent",
+        "target_dialog_number": 17,
+        "input_ref": f"{SESSIONS}/foreign/commands/foreign-command",
+    })
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["child"])) is True
+    assert calls == []
+    notice = next(
+        data for path, data in firestore_fake.documents.items()
+        if path.startswith("notification_outbox/")
+    )
+    assert notice["dialog_number"] is None
+    assert "Dialog #17" not in notice["body"]
+    assert "Dialog #99" not in notice["body"]
+
+
+@pytest.mark.parametrize("dependency_id", ["missing-parent", "op-a", "op-b", "bad id"])
+def test_invalid_dependency_lineage_fails_closed_without_processor_effects(firestore_fake, dependency_id):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-a", "op-b"))
+    context_ref.update({"chat_id": 45})
+    context_ref.collection("operations").document("op-a").update({
+        "dependency_operation_id": dependency_id,
+    })
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-a"])) is True
+    assert calls == []
+    assert context_ref.collection("operations").document("op-a").get().to_dict()[
+        "error"
+    ]["code"] == "dependency_unavailable"
+
+
+def test_pending_dependency_releases_head_without_charging_execution_failures(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-parent", "op-child"))
+    context_ref.collection("operations").document("op-child").update({
+        "dependency_operation_id": "op-parent",
+    })
+    context_ref.update({"reserved_operation_id": "op-child", "head_sequence": 2})
+    calls = []
+
+    async def processor(context_id, operation, lease):
+        calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payloads["op-child"])) is False
+    assert calls == []
+    assert get_operation(context_ref, "op-child").state is QueueOperationState.RUNNING
+    assert context_ref.get().to_dict()["reserved_operation_id"] == "op-child"
+    assert context_ref.get().to_dict().get("active_operation_id") is None
+    assert not any(path.endswith("/stages/telegram.dependency") for path in firestore_fake.documents)
+    assert any(row.get("operation_id") == "op-child" for row in _rows(firestore_fake).values())
+
+
+def test_stale_lease_cannot_persist_dependency_error_or_advance_head(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-parent", "op-child", "op-later"))
+    context_ref.update({"chat_id": 46})
+    context_ref.collection("operations").document("op-child").update({
+        "dependency_operation_id": "op-parent",
+    })
+    parent_lease = claim_head(client, context_ref, owner="parent", now=NOW)
+    assert parent_lease is not None
+    assert fail_head(client, context_ref, operation_id="op-parent", owner=parent_lease.owner,
+                     fence=parent_lease.fence, now=NOW)
+    outbox_before = _rows(firestore_fake)
+    now = [NOW]
+    processor_calls = []
+
+    async def processor(context_id, operation, lease):
+        processor_calls.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: now[0], owner_factory=lambda: "old-worker")
+
+    def expire_and_replace(context_ref, operation_id, sequence):
+        now[0] += timedelta(seconds=121)
+        replacement = claim_head(client, context_ref, owner="replacement", now=now[0])
+        assert replacement is not None
+        return "failed", "op-parent", "The confirmed prerequisite did not complete successfully."
+
+    worker._dependency_state = expire_and_replace
+    assert _run(worker.handle_task(payloads["op-child"])) is False
+    assert processor_calls == []
+    context = context_ref.get().to_dict()
+    assert context["reserved_operation_id"] == "op-child"
+    assert context["active_operation_id"] == "op-child"
+    assert context["lock_owner"] == "replacement"
+    assert not any(path.startswith("notification_outbox/") for path in firestore_fake.documents)
+    assert _rows(firestore_fake) == outbox_before
+
+
 def test_queue_injected_governor_caps_physical_stage_failures_and_advances_only_on_exhaustion(
     firestore_fake,
 ):
@@ -520,6 +1085,7 @@ async def _fail_provider(calls):
 def test_permanent_stage_error_terminalizes_only_current_queue_head(firestore_fake):
     client = firestore_fake.client_class()
     context_ref, payloads = _setup(client, operation_ids=("op-a", "op-b"))
+    context_ref.update({"pending_save_operation_id": "op-a"})
     physical_calls = []
 
     async def processor(context_id, operation, lease, *, retry_governor):
@@ -539,6 +1105,7 @@ def test_permanent_stage_error_terminalizes_only_current_queue_head(firestore_fa
     assert _run(worker.handle_task(payloads["op-a"])) is True
     assert physical_calls == ["provider"]
     assert context_ref.get().to_dict()["reserved_operation_id"] == "op-b"
+    assert "pending_save_operation_id" not in context_ref.get().to_dict()
     stage = next(data for path, data in firestore_fake.documents.items()
                  if path.endswith("/stages/telegram.classification"))
     assert stage["failures"] == 1

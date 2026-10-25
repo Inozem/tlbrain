@@ -111,32 +111,65 @@ class _TelegramNotificationMixin:
             context_snap = context_ref.get(transaction=transaction)
             if not context_snap.exists:
                 raise ValueError("notification context does not exist")
-            context = context_snap.to_dict() or {}
-            chat_id = context.get("chat_id")
-            if type(chat_id) is not int:
-                raise ValueError("stored chat_id is invalid")
-            thread_id = context.get("thread_id")
-            if thread_id is not None:
-                thread_id = None if thread_id == 0 else _integer(thread_id, "thread_id", minimum=1)
             snap = notification_ref.get(transaction=transaction)
-            if snap.exists:
-                stored = snap.to_dict() or {}
-                identity = (stored.get("context_id"), stored.get("kind"), stored.get("body"), stored.get("chat_id"), stored.get("thread_id"), stored.get("dialog_number"), stored.get("operation_id"))
-                if identity != (context_id, kind, body, chat_id, thread_id, dialog_number, operation_id):
-                    raise ValueError("notification ID already belongs to a different identity")
-                return stored
-            row = {"notification_id": notification_id, "context_id": context_id, "kind": kind,
-                   "body": body, "chat_id": chat_id, "thread_id": thread_id, "message_id": None,
-                   "dialog_number": dialog_number, "operation_id": operation_id,
-                   "state": "pending", "revision": 1, "desired_status_revision": 1, "send_attempts_started": 0,
-                   "edit_attempts_started": 0, "unknown_send_outcome": False,
-                   "in_flight_attempt_id": None, "attempt_expires_at": None, "last_outcome": None,
-                   "retry_not_before": None, "terminal_failure": None, "last_error": None,
-                   "delivered_at": None, "failed_at": None, "created_at": now, "updated_at": now}
-            transaction.set(notification_ref, row)
+            row = self.prepare_notification_in_transaction(
+                notification_id, context_id=context_id, kind=kind, body=body, now=now,
+                context_data=context_snap.to_dict() or {}, existing_data=(
+                    snap.to_dict() or {} if snap.exists else None
+                ), dialog_number=dialog_number, operation_id=operation_id,
+            )
+            if not snap.exists:
+                transaction.set(notification_ref, row)
             return row
 
         return _txn(self.client.transaction(max_attempts=5))
+
+
+    def prepare_notification_in_transaction(
+        self, notification_id: str, *, context_id: str, kind: str, body: str, now: datetime,
+        context_data: Mapping[str, Any], existing_data: Mapping[str, Any] | None = None,
+        dialog_number: int | None = None, operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate/build a notification row after its context and ledger reads."""
+        notification_id = _identifier(notification_id, "notification_id")
+        context_id = _identifier(context_id, "context_id")
+        if kind not in NOTIFICATION_KINDS:
+            raise ValueError("kind is not an allowed notification kind")
+        if not isinstance(body, str) or not body.strip() or len(body) > 4096:
+            raise ValueError("body must be non-empty text of at most 4096 characters")
+        if dialog_number is not None:
+            dialog_number = _integer(dialog_number, "dialog_number", minimum=1)
+        if operation_id is not None:
+            operation_id = _identifier(operation_id, "operation_id")
+        now = _aware(now, "now")
+        chat_id = context_data.get("chat_id")
+        if type(chat_id) is not int:
+            raise ValueError("stored chat_id is invalid")
+        thread_id = context_data.get("thread_id")
+        if thread_id is not None:
+            thread_id = None if thread_id == 0 else _integer(thread_id, "thread_id", minimum=1)
+        if existing_data is not None:
+            identity = (
+                existing_data.get("context_id"), existing_data.get("kind"),
+                existing_data.get("body"), existing_data.get("chat_id"),
+                existing_data.get("thread_id"), existing_data.get("dialog_number"),
+                existing_data.get("operation_id"),
+            )
+            expected = (context_id, kind, body, chat_id, thread_id, dialog_number, operation_id)
+            if identity != expected:
+                raise ValueError("notification ID already belongs to a different identity")
+            return dict(existing_data)
+        return {
+            "notification_id": notification_id, "context_id": context_id, "kind": kind,
+            "body": body, "chat_id": chat_id, "thread_id": thread_id, "message_id": None,
+            "dialog_number": dialog_number, "operation_id": operation_id,
+            "state": "pending", "revision": 1, "desired_status_revision": 1,
+            "send_attempts_started": 0, "edit_attempts_started": 0,
+            "unknown_send_outcome": False, "in_flight_attempt_id": None,
+            "attempt_expires_at": None, "last_outcome": None, "retry_not_before": None,
+            "terminal_failure": None, "last_error": None, "delivered_at": None,
+            "failed_at": None, "created_at": now, "updated_at": now,
+        }
 
 
     def reserve_notification_attempt(

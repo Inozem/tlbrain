@@ -389,25 +389,28 @@ def release_head(
 def complete_head(
     client: Any,
     context_ref: Any, *, operation_id: str, owner: str, fence: int, now: datetime,
-    after_advance: Any = None,
+    after_advance: Any = None, after_advance_with_operation: Any = None,
 ) -> bool:
     return _finish_head(client, context_ref, operation_id=operation_id, owner=owner, fence=fence, now=now,
-                        state=QueueOperationState.COMPLETED, after_advance=after_advance)
+                        state=QueueOperationState.COMPLETED, after_advance=after_advance,
+                        after_advance_with_operation=after_advance_with_operation)
 
 
 def fail_head(
     client: Any,
     context_ref: Any, *, operation_id: str, owner: str, fence: int, now: datetime,
-    after_advance: Any = None,
+    after_advance: Any = None, after_advance_with_operation: Any = None,
 ) -> bool:
     return _finish_head(client, context_ref, operation_id=operation_id, owner=owner, fence=fence, now=now,
-                        state=QueueOperationState.FAILED, after_advance=after_advance)
+                        state=QueueOperationState.FAILED, after_advance=after_advance,
+                        after_advance_with_operation=after_advance_with_operation)
 
 
 def _finish_head(
     client: Any,
     context_ref: Any, *, operation_id: str, owner: str, fence: int, now: datetime,
     state: QueueOperationState, after_advance: Any = None,
+    after_advance_with_operation: Any = None,
 ) -> bool:
     now = _aware(now)
 
@@ -445,6 +448,8 @@ def _finish_head(
                             "queue_tail_operation_id": None})
         if after_advance is not None:
             after_advance(transaction, next_id, next_data, context)
+        if after_advance_with_operation is not None:
+            after_advance_with_operation(transaction, next_id, next_data, context, operation)
         transaction.set(operation_ref, operation)
         transaction.set(context_ref, context)
         return True

@@ -134,6 +134,32 @@ def create_outbox_record_in_transaction(
     notification_id: str | None = None,
 ) -> OutboxRecord:
     """Create/replay an outbox record inside a caller-owned transaction."""
+    prepared = prepare_outbox_record_in_transaction(
+        client, transaction, outbox_id,
+        target_kind=target_kind, generation=generation, schedule_at=schedule_at, now=now,
+        operation_id=operation_id, context_id=context_id, document_id=document_id,
+        save_intent_id=save_intent_id, notification_id=notification_id,
+    )
+    write_prepared_outbox_record(transaction, prepared)
+    return prepared[2]
+
+
+def prepare_outbox_record_in_transaction(
+    client: Any,
+    transaction: Any,
+    outbox_id: str,
+    *,
+    target_kind: OutboxTargetKind | str,
+    generation: int,
+    schedule_at: datetime,
+    now: datetime,
+    operation_id: str | None = None,
+    context_id: str | None = None,
+    document_id: str | None = None,
+    save_intent_id: str | None = None,
+    notification_id: str | None = None,
+) -> tuple[Any, dict[str, Any], OutboxRecord, bool]:
+    """Read and validate a row before a transaction performs any writes."""
     outbox_id = _id(outbox_id, "outbox_id")
     try:
         target = OutboxTargetKind(target_kind)
@@ -166,15 +192,21 @@ def create_outbox_record_in_transaction(
         stored = snapshot.to_dict() or {}
         if _identity(stored) != _identity(identity_data):
             raise ValueError("outbox ID already belongs to a different target identity")
-        return _from(stored)
+        return ref, stored, _from(stored), False
     data = {
         **identity_data, "task_name": task_name,
         "state": OutboxState.PENDING.value, "delivery_attempts": 0,
         "last_error": None, "created_at": now, "updated_at": now,
         "last_attempt_at": None,
     }
-    transaction.set(ref, data)
-    return _from(data)
+    return ref, data, _from(data), True
+
+
+def write_prepared_outbox_record(transaction: Any, prepared: tuple[Any, dict[str, Any], OutboxRecord, bool]) -> None:
+    """Write a previously prepared outbox row without issuing transaction reads."""
+    ref, data, _, should_write = prepared
+    if should_write:
+        transaction.set(ref, data)
 
 
 def get_outbox_record(client: Any, outbox_id: str) -> OutboxRecord | None:
@@ -333,6 +365,7 @@ __all__ = [
     "MAX_DUE_LIMIT", "OUTBOX_COLLECTION", "OutboxRecord", "OutboxState",
     "OutboxTargetKind", "PAYLOAD_SCHEMA_VERSION", "UNDELIVERED_STATES",
     "create_outbox_record", "get_outbox_record", "list_due_outbox_records", "task_payload",
-    "create_outbox_record_in_transaction",
+    "create_outbox_record_in_transaction", "prepare_outbox_record_in_transaction",
+    "write_prepared_outbox_record",
     "record_outbox_delivery_result",
 ]
