@@ -233,8 +233,10 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf 'gcloud\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
         "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n"
-        "case \"$*\" in *'run services describe'*) "
-        "service=\"$4\"; url=\"https://synthetic.example/$service\"; printf '%s\\n' \"$url\"; "
+        "case \"$*\" in *'projects describe'*) printf '123456789012\\n' ;; "
+        "*'run services describe'*'spec.template.spec.serviceAccountName'*) printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\\n' ;; "
+        "*'run services describe'*'status.url'*) "
+        "service=\"$4\"; url=\"https://$service-uc.a.run.app\"; printf '%s\\n' \"$url\"; "
         "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-result\", \"run-service-url\", sys.argv[1], sys.argv[2]]) + \"\\n\")' \"$service\" \"$url\" ;; "
         "*'functions describe'*) printf 'https://synthetic.example/%s\\n' \"$3\" ;; "
         "esac\n",

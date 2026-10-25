@@ -102,12 +102,18 @@ def test_optional_connector_capabilities_are_selected_by_nonblank_configuration(
     tldv_urls = [line for line in result.stdout.splitlines() if "https://synthetic.example/" in line and "tldv" in line]
     if tldv:
         assert tldv_lookups or tldv_deploys
+        assert "TLDV_RECONCILIATION_URL=" in " ".join(next(
+            event for event in _cloud_argv_events(events) if _is_mcp_deploy(event)
+        ))
         if route in TOP_ROUTES:
             assert len(tldv_deploys) == 2
     else:
         assert not tldv_lookups
         assert not tldv_deploys
         assert not tldv_urls
+        assert "TLDV_RECONCILIATION_URL" not in " ".join(next(
+            event for event in _cloud_argv_events(events) if _is_mcp_deploy(event)
+        ))
 
     if route in TOP_ROUTES:
         assert any(command.startswith("run deploy synthetic-vector-sync ") for command in commands)
@@ -141,6 +147,8 @@ def test_whitespace_connector_values_are_treated_as_unset(tmp_path: Path, route:
     mcp_command = _deploy_mcp_command(commands)
     assert "TELEGRAM_BOT_TOKEN" not in mcp_command
     assert "TELEGRAM_ALLOWED_USER_IDS" not in mcp_command
+    mcp_argv = next(event for event in _cloud_argv_events(events) if _is_mcp_deploy(event))
+    assert "TLDV_RECONCILIATION_URL" not in " ".join(mcp_argv)
     assert not any("functions describe" in command and "tldv" in command for command in commands)
     assert not any("functions deploy" in command and "tldv" in command for command in commands)
 
@@ -169,7 +177,7 @@ def test_first_mcp_deploy_waits_for_real_status_url_before_self_url_readiness(
         if event[:2] == ["gcloud-result", "run-service-url"] and event[2] == "synthetic-mcp"
     )
     real_url = url_event[3]
-    assert real_url == "https://synthetic.example/synthetic-mcp"
+    assert real_url == "https://synthetic-mcp-uc.a.run.app"
     url_position = events.index(url_event)
     initial_position = events.index(initial_deploy)
     assert initial_position < url_position
@@ -191,7 +199,30 @@ def test_first_mcp_deploy_waits_for_real_status_url_before_self_url_readiness(
     assert f"INTERNAL_DIALOG_OPERATIONS_URL={real_url}/internal/dialog-operations" in readiness_text
     assert "QUEUE" in readiness_text
     assert "OIDC" in readiness_text
+    for setting in (
+        "DIALOG_OPERATIONS_QUEUE=",
+        "CLOUD_TASKS_OIDC_AUDIENCE=",
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=",
+        "OIDC_AUDIENCE=",
+        "OIDC_SERVICE_ACCOUNT_EMAIL=",
+    ):
+        assert setting in readiness_text
     assert "synthetic-mcp.run.app" not in readiness_text
+
+
+@pytest.mark.parametrize("route", DIRECT_MCP_ROUTES)
+@pytest.mark.parametrize("allowed_email", ["first@example.invalid,second@example.invalid", ""])
+def test_direct_mcp_routes_preserve_allowlist_list_and_open_mode(
+    tmp_path: Path, route: str, allowed_email: str,
+) -> None:
+    result, events, _root = _run_route(
+        tmp_path, route,
+        env_overrides={**_connector_environment(False, False), "ALLOWED_EMAIL": allowed_email},
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    initial = next(event for event in _cloud_argv_events(events) if _is_mcp_deploy(event))
+    env_arg = next(arg for arg in initial if arg.startswith("^|^"))
+    assert f"ALLOWED_EMAIL={allowed_email}" in env_arg
 
 
 def _marker_position(events: list[list[str]], marker: str) -> int:
