@@ -315,30 +315,126 @@ def test_default_thread_zero_is_persisted_as_no_thread_for_ack_and_new_notice(fi
     assert telegram.sent == [(-10042, "switched", None)]
 
 
-def test_message_id_prevents_any_later_send_and_stale_attempt_cannot_settle(firestore_fake):
+def test_revision_keeps_active_attempt_and_stale_send_is_followed_by_edit(firestore_fake):
     repo = TelegramRepository(firestore_fake.client_class())
     accepted = _accepted(repo)
     reserved = repo.reserve_notification_attempt(accepted.notification_id, attempt_id="attempt-old", now=NOW)
     revised = repo.revise_notification(accepted.notification_id, body="new revision", now=NOW)
-    stale = repo.settle_notification_attempt(accepted.notification_id, attempt_id="attempt-old",
-                                             revision=reserved["attempt_revision"], outcome="sent",
-                                             message_id=111, now=NOW)
-    assert stale["settled"] is False
-    assert revised["message_id"] is None
-    repo.settle_notification_attempt(accepted.notification_id, attempt_id="attempt-new",
-                                     revision=revised["revision"], outcome="sent",
-                                     message_id=222, now=NOW)  # stale, no current reservation
-    row = repo.get_notification(accepted.notification_id)
-    assert row["message_id"] is None
-    next_attempt = repo.reserve_notification_attempt(accepted.notification_id,
-                                                     attempt_id="attempt-current", now=NOW)
-    assert next_attempt["reserved"] is True
-    repo.settle_notification_attempt(accepted.notification_id, attempt_id="attempt-current",
-                                     revision=next_attempt["attempt_revision"], outcome="sent",
-                                     message_id=333, now=NOW)
-    assert repo.reserve_notification_attempt(accepted.notification_id,
-                                             attempt_id="attempt-after-id", now=NOW)["state"] == "delivered"
-    assert repo.get_notification(accepted.notification_id)["send_attempts_started"] == 2
+    assert revised["in_flight_attempt_id"] == "attempt-old"
+    assert revised["revision"] == reserved["attempt_revision"] + 1
+    busy = repo.reserve_notification_attempt(accepted.notification_id, attempt_id="attempt-racer", now=NOW)
+    assert busy["reserved"] is False
+
+    stale_success = repo.settle_notification_attempt(
+        accepted.notification_id, attempt_id="attempt-old", revision=reserved["attempt_revision"],
+        outcome="sent", message_id=111, now=NOW,
+    )
+    assert stale_success["settled"] is True
+    assert stale_success["state"] == "pending"
+    assert stale_success["message_id"] == 111
+    next_attempt = repo.reserve_notification_attempt(
+        accepted.notification_id, attempt_id="attempt-edit", now=NOW,
+    )
+    assert next_attempt["reserved"] is True and next_attempt["is_send"] is False
+    assert next_attempt["message_id"] == 111 and next_attempt["body"] == "new revision"
+    settled = repo.settle_notification_attempt(
+        accepted.notification_id, attempt_id="attempt-edit", revision=next_attempt["attempt_revision"],
+        outcome="edited", now=NOW,
+    )
+    assert settled["state"] == "delivered"
+    assert repo.get_notification(accepted.notification_id)["send_attempts_started"] == 1
+
+
+def test_stale_rejection_does_not_fail_newer_revision(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    reserved = repo.reserve_notification_attempt(accepted.notification_id, attempt_id="old-reject", now=NOW)
+    repo.revise_notification(accepted.notification_id, body="new desired body", now=NOW)
+    result = repo.settle_notification_attempt(
+        accepted.notification_id, attempt_id="old-reject", revision=reserved["attempt_revision"],
+        outcome="rejected", now=NOW,
+    )
+    assert result["state"] == "pending"
+    assert result["revision"] == reserved["attempt_revision"] + 1
+    retry = repo.reserve_notification_attempt(accepted.notification_id, attempt_id="new-send", now=NOW)
+    assert retry["reserved"] is True
+    assert retry["body"] == "new desired body"
+
+
+def test_terminal_unknown_delivery_is_recorded_on_operation(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    operation_ref = client.collection("dialog_operations").document("save-unknown-notice")
+    operation_ref.set({"operation_id": "save-unknown-notice", "state": "completed"})
+    repo.create_notification("unknown-final", context_id=accepted.context_id, kind="final",
+                             body="saved", operation_id="save-unknown-notice", now=NOW)
+    clock = _Clock()
+    telegram = _Telegram(failures=3)
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish("unknown-final")) == "retry"
+    clock.advance(1)
+    assert _run(publisher.publish("unknown-final")) == "retry"
+    clock.advance(2)
+    assert _run(publisher.publish("unknown-final")) == "delivery_unknown"
+    operation = operation_ref.get().to_dict()
+    assert operation["state"] == "completed"
+    assert operation["final_delivery_state"] == "delivery_unknown"
+    assert len(telegram.sent) == 3
+
+
+def test_terminal_notification_delivery_is_durable_and_suppresses_stale_progress(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    operation_ref = client.collection("dialog_operations").document("save-final")
+    operation_ref.set({"operation_id": "save-final", "state": "completed"})
+    final = repo.create_notification("final-save", context_id=accepted.context_id, kind="final",
+                                     body="saved", operation_id="save-final", now=NOW)
+    assert repo.create_notification("final-save", context_id=accepted.context_id, kind="final",
+                                    body="saved", operation_id="save-final", now=NOW) == final
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=_Clock())
+    assert _run(publisher.publish("final-save")) == "delivered"
+    operation = operation_ref.get().to_dict()
+    assert operation["state"] == "completed"
+    assert operation["final_delivery_state"] == "delivered"
+
+    repo.create_notification("later-error", context_id=accepted.context_id, kind="error",
+                             body="later failure", operation_id="save-final", now=NOW)
+    failing_publisher = TelegramNotificationPublisher(
+        repo, _Telegram(failures=1, failure_category="forbidden"), clock=_Clock(),
+    )
+    assert _run(failing_publisher.publish("later-error")) == "failed"
+    operation = operation_ref.get().to_dict()
+    assert operation["state"] == "completed"
+    assert operation["final_delivery_state"] == "delivered"
+
+    progress = repo.create_notification("stale-progress", context_id=accepted.context_id,
+                                        kind="progress", body="still working",
+                                        operation_id="save-final", now=NOW)
+    assert _run(publisher.publish(progress["notification_id"])) == "superseded"
+    assert len(telegram.sent) == 1
+    assert repo.get_notification("stale-progress")["send_attempts_started"] == 0
+    with pytest.raises(ValueError, match="terminal notification"):
+        repo.revise_notification("final-save", body="stale final", now=NOW)
+
+
+def test_terminal_notification_failure_is_recorded_without_changing_operation_state(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    operation_ref = client.collection("dialog_operations").document("save-failed-notice")
+    operation_ref.set({"operation_id": "save-failed-notice", "state": "completed"})
+    repo.create_notification("failed-final", context_id=accepted.context_id, kind="error",
+                             body="save error", operation_id="save-failed-notice", now=NOW)
+    publisher = TelegramNotificationPublisher(
+        repo, _Telegram(failures=1, failure_category="forbidden"), clock=_Clock(),
+    )
+    assert _run(publisher.publish("failed-final")) == "failed"
+    operation = operation_ref.get().to_dict()
+    assert operation["state"] == "completed"
+    assert operation["final_delivery_state"] == "failed"
 
 
 def test_terminal_ack_failure_keeps_collecting_draft_and_sealed_identity(firestore_fake):

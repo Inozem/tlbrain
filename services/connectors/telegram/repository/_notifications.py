@@ -56,7 +56,7 @@ class _TelegramNotificationMixin:
     def revise_notification(
         self, notification_id: str, *, body: str, now: datetime,
     ) -> dict[str, Any]:
-        """Persist a new server-authored body revision and fence older attempts."""
+        """Persist a new body revision without releasing an active delivery lease."""
         notification_id = _identifier(notification_id, "notification_id")
         if not isinstance(body, str) or not body.strip() or len(body) > 4096:
             raise ValueError("body must be non-empty text of at most 4096 characters")
@@ -71,14 +71,17 @@ class _TelegramNotificationMixin:
             data = snap.to_dict() or {}
             if data.get("state") in {"failed", "delivery_unknown"}:
                 raise ValueError("terminal notification cannot be revised")
+            if data.get("kind") in {"final", "error"}:
+                raise ValueError("terminal notification cannot be revised")
             if data.get("kind") == "draft_ack" and data.get("message_id") is not None:
                 raise ValueError("delivered draft acknowledgement cannot be revised")
             new_revision = _integer(data.get("revision", 1), "revision", minimum=1) + 1
             updates = {"body": body, "revision": new_revision,
                        "desired_status_revision": new_revision,
-                "state": "pending", "in_flight_attempt_id": None,
-                       "attempt_expires_at": None, "retry_not_before": None,
-                       "delivered_at": None, "last_error": None, "updated_at": now}
+                       "state": (data.get("state") if data.get("in_flight_attempt_id")
+                                 else "pending"),
+                       "retry_not_before": None, "delivered_at": None,
+                       "last_error": None, "updated_at": now}
             transaction.update(ref, updates)
             return {**data, **updates}
 
@@ -153,6 +156,12 @@ class _TelegramNotificationMixin:
             data = snap.to_dict() or {}
             if data.get("state") in {"delivered", "failed", "delivery_unknown"}:
                 return {**data, "reserved": False}
+            if data.get("kind") == "progress" and data.get("operation_id"):
+                operation_ref = self.client.collection("dialog_operations").document(data["operation_id"])
+                operation_snap = operation_ref.get(transaction=transaction)
+                operation = operation_snap.to_dict() or {} if operation_snap.exists else {}
+                if operation.get("final_delivery_state") == "delivered":
+                    return {**data, "reserved": False, "state": "superseded"}
             if data.get("retry_not_before") and data["retry_not_before"] > now:
                 return {**data, "reserved": False}
             inflight = data.get("in_flight_attempt_id")
@@ -170,6 +179,7 @@ class _TelegramNotificationMixin:
                 updates = {"state": terminal, "terminal_failure": terminal, "updated_at": now,
                            "last_error": "attempts_exhausted", "failed_at": now,
                            "in_flight_attempt_id": None, "attempt_expires_at": None}
+                self._persist_final_delivery_state(transaction, data, terminal, now)
                 transaction.update(ref, updates)
                 return {**data, **updates, "reserved": False}
             revision = _integer(data.get("revision", 1), "revision", minimum=1)
@@ -187,6 +197,7 @@ class _TelegramNotificationMixin:
                     updates.update({"state": "failed", "terminal_failure": "failed",
                                     "last_error": "attempts_exhausted", "failed_at": now,
                                     "in_flight_attempt_id": None, "attempt_expires_at": None})
+                    self._persist_final_delivery_state(transaction, data, "failed", now)
                     transaction.update(ref, updates)
                     return {**data, **updates, "reserved": False}
                 updates["edit_attempts_started"] = edit_attempts + 1
@@ -197,11 +208,52 @@ class _TelegramNotificationMixin:
         return _txn(self.client.transaction(max_attempts=5))
 
 
+    def _persist_final_delivery_state(
+        self, transaction: Any, notification: Mapping[str, Any], state: str, now: datetime,
+    ) -> None:
+        """Record terminal final/error delivery without changing save execution state."""
+        snapshot = self._read_final_delivery_operation(transaction, notification)
+        self._write_final_delivery_state(transaction, snapshot, state, now)
+
+
+    def _read_final_delivery_operation(
+        self, transaction: Any, notification: Mapping[str, Any],
+    ) -> tuple[Any, dict[str, Any]] | None:
+        """Read the linked operation before a settlement transaction performs writes."""
+        if notification.get("kind") not in {"final", "error"}:
+            return
+        operation_id = notification.get("operation_id")
+        if not isinstance(operation_id, str):
+            return
+        operation_ref = self.client.collection("dialog_operations").document(operation_id)
+        operation_snap = operation_ref.get(transaction=transaction)
+        if not operation_snap.exists:
+            return
+        return operation_ref, operation_snap.to_dict() or {}
+
+
+    @staticmethod
+    def _write_final_delivery_state(
+        transaction: Any, snapshot: tuple[Any, dict[str, Any]] | None,
+        state: str, now: datetime,
+    ) -> None:
+        """Apply a previously read terminal delivery update without another read."""
+        if snapshot is None:
+            return
+        operation_ref, operation = snapshot
+        previous = operation.get("final_delivery_state")
+        if previous == "delivered" and state != "delivered":
+            return
+        if previous == state:
+            return
+        transaction.update(operation_ref, {"final_delivery_state": state, "updated_at": now})
+
+
     def settle_notification_attempt(
         self, notification_id: str, *, attempt_id: str, revision: int, outcome: str,
         now: datetime, message_id: int | None = None,
     ) -> dict[str, Any] | None:
-        """Settle only the current attempt and current notification revision."""
+        """Settle the reserved attempt, retaining success from a superseded revision."""
         notification_id = _identifier(notification_id, "notification_id")
         attempt_id = _identifier(attempt_id, "attempt_id")
         revision = _integer(revision, "revision", minimum=1)
@@ -222,30 +274,40 @@ class _TelegramNotificationMixin:
             data = snap.to_dict() or {}
             if (data.get("in_flight_attempt_id") != attempt_id
                     or data.get("attempt_revision") != revision
-                    or data.get("revision") != revision
                     or data.get("state") in {"delivered", "failed", "delivery_unknown"}):
                 return {**data, "settled": False}
+            stale_revision = data.get("revision") != revision
+            final_operation = self._read_final_delivery_operation(transaction, data)
             updates: dict[str, Any] = {"in_flight_attempt_id": None, "attempt_expires_at": None,
                                        "last_outcome": outcome, "updated_at": now}
             if outcome in {"sent", "edited"}:
                 if outcome == "sent":
                     updates["message_id"] = message_id
-                updates.update({"state": "delivered", "terminal_failure": None, "retry_not_before": None,
-                                "last_error": None, "delivered_at": now, "failed_at": None})
+                if stale_revision:
+                    updates.update({"state": "pending", "terminal_failure": None,
+                                    "retry_not_before": None, "last_error": None,
+                                    "delivered_at": None, "failed_at": None})
+                else:
+                    updates.update({"state": "delivered", "terminal_failure": None, "retry_not_before": None,
+                                    "last_error": None, "delivered_at": now, "failed_at": None})
             else:
                 sends = _integer(data.get("send_attempts_started", 0), "send_attempts_started")
                 exhausted = (data.get("message_id") is None and sends >= NOTIFICATION_MAX_SENDS) or (
                     data.get("message_id") is not None
                     and _integer(data.get("edit_attempts_started", 0), "edit_attempts_started") >= NOTIFICATION_MAX_SENDS
                 )
-                if exhausted:
+                definitive_send_rejection = (
+                    data.get("message_id") is None and outcome == "rejected" and not stale_revision
+                )
+                if exhausted or definitive_send_rejection:
                     terminal = ("delivery_unknown" if data.get("unknown_send_outcome") or outcome == "unknown"
                                 else "failed") if data.get("message_id") is None else "failed"
                     updates.update({"state": terminal, "terminal_failure": terminal, "retry_not_before": None,
                                     "last_error": outcome, "failed_at": now})
                 else:
                     delay = min(2 ** max(0, sends - 1), 60)
-                    updates.update({"state": "retry", "retry_not_before": now + timedelta(seconds=delay),
+                    updates.update({"state": "pending" if stale_revision else "retry",
+                                    "retry_not_before": None if stale_revision else now + timedelta(seconds=delay),
                                     "last_error": outcome})
                     if outcome == "unknown" and data.get("message_id") is None:
                         updates["unknown_send_outcome"] = True
@@ -257,6 +319,8 @@ class _TelegramNotificationMixin:
                     result["ack_failure_action"] = action
                     updates["ack_failure_action"] = action
             transaction.update(ref, updates)
+            if result.get("state") in {"delivered", "failed", "delivery_unknown"}:
+                self._write_final_delivery_state(transaction, final_operation, result["state"], now)
             return result
 
         return _txn(self.client.transaction(max_attempts=5))

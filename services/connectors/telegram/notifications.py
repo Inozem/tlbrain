@@ -100,7 +100,7 @@ class TelegramNotificationPublisher:
             return "not_found"
         if not reservation.get("reserved"):
             state = reservation.get("state")
-            return state if state in {"delivered", "failed", "delivery_unknown"} else "busy"
+            return state if state in {"delivered", "failed", "delivery_unknown", "superseded"} else "busy"
 
         chat_id = reservation["chat_id"]
         thread_id = reservation.get("thread_id")

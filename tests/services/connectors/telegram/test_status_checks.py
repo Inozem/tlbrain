@@ -183,7 +183,7 @@ def test_delivered_final_makes_remaining_checks_noops_without_new_send_or_execut
     operation_ref.set({"operation_id": "save-op", "context_id": "ctx-1", "state": "completed",
                        "accepted_at": ACCEPTED_AT, "attempts_started": 1, "failures": 0,
                        "lease_owner": None, "save_effects": ["effect-1"],
-                       "final_notification_state": "delivered", "notification_id": "final-save-op"})
+                       "final_delivery_state": "delivered", "notification_id": "final-save-op"})
     clock.current = records[0].schedule_at
 
     assert checks.handle_task(task_payload(records[0])) == "no_op"
@@ -219,7 +219,7 @@ def test_stale_progress_check_cannot_replace_delivered_final_or_reset_send_budge
                        "state": "completed", "accepted_at": ACCEPTED_AT,
                        "attempts_started": 1, "failures": 0,
                        "notification_id": final["notification_id"],
-                       "final_notification_state": "delivered"})
+                       "final_delivery_state": "delivered"})
     checks = _service(client, clock=_Clock(), reader=_StatusReader("completed"), publisher=_Publisher())
     records = checks.schedule_checks(accepted.context_id, "save-op", ACCEPTED_AT)
 
@@ -258,10 +258,10 @@ def test_pending_at_five_minutes_is_reported_without_failure_then_final_can_deli
 
     # Completion uses the ordinary durable notification ID; the check does not
     # create a replacement notification or execute the save again.
-    operation_ref.update({"state": "completed", "final_notification_state": "pending"})
+    operation_ref.update({"state": "completed", "final_delivery_state": "pending"})
     awaitable = publisher.publish("final-save-op")
     assert _run(awaitable) == "delivered"
-    operation_ref.update({"final_notification_state": "delivered"})
+    operation_ref.update({"final_delivery_state": "delivered"})
     assert checks.handle_task(task_payload(records[2])) == "no_op"
     completed = operation_ref.get().to_dict()
     assert completed["state"] == "completed"
