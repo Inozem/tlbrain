@@ -23,8 +23,10 @@ from core.integrations.firestore.operation_queue import (
     claim_head,
     get_operation,
 )
+from core.integrations.firestore.telegram_recovery import FirestoreTelegramQueueRecoveryStore
 from core.operations.models import OperationOrigin
 from core.operations.outbox import TaskTargetConfig, publish_due_outbox_records
+from core.operations.outbox import enqueue_expired_telegram_queue_recoveries
 from core.operations.queue import QueueOperationState
 from core.operations.retries import (
     ConfirmedStageSuccess,
@@ -393,6 +395,80 @@ def test_delivered_wakeup_tombstone_is_replaced_with_new_generation_for_reserved
     assert repair["operation_id"] == accepted.operation_id
     assert repair_id.startswith("tgqueue-")
     assert context_ref.get().to_dict()["reserved_operation_id"] == accepted.operation_id
+
+
+def test_checker_recovery_wakes_only_expired_reserved_heads_and_advances_tombstones(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    accepted = _accepted_save(client, update_id=799)
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    context_ref.update({
+        "active_operation_id": accepted.operation_id,
+        "lock_owner": "expired-owner",
+        "lock_expires_at": NOW - timedelta(seconds=1),
+        "fence": 1,
+    })
+    context_ref.collection("operations").document(accepted.operation_id).update({"state": "running"})
+
+    store = FirestoreTelegramQueueRecoveryStore(client)
+    assert enqueue_expired_telegram_queue_recoveries(store, now=NOW, limit=10) == 1
+    records = [
+        (path.rsplit("/", 1)[-1], data)
+        for path, data in firestore_fake.documents.items()
+        if path.startswith(f"{OUTBOX_COLLECTION}/")
+        and data.get("context_id") == accepted.context_id
+        and data.get("operation_id") == accepted.operation_id
+    ]
+    wake_id, wake = next((item for item in records if item[0] != accepted.outbox_id))
+    assert wake["target_kind"] == OutboxTargetKind.TELEGRAM_DISPATCH.value
+    assert wake["generation"] == 2
+    assert wake["state"] == OutboxState.PENDING.value
+    assert context_ref.get().to_dict()["lock_expires_at"] == NOW - timedelta(seconds=1)
+
+    record_outbox_delivery_result(client, wake_id, delivered=True, now=NOW)
+    assert enqueue_expired_telegram_queue_recoveries(
+        store, now=NOW + timedelta(seconds=1), limit=10,
+    ) == 1
+    records = [
+        data for path, data in firestore_fake.documents.items()
+        if path.startswith(f"{OUTBOX_COLLECTION}/")
+        and data.get("context_id") == accepted.context_id
+        and data.get("operation_id") == accepted.operation_id
+    ]
+    assert sorted(item["generation"] for item in records) == [1, 2, 3]
+
+
+def test_checker_recovery_null_head_contexts_do_not_starve_lease_less_head(firestore_fake):
+    client = firestore_fake.client_class()
+    client.collection(SESSIONS).document("a-empty-context").set({
+        "reserved_operation_id": None,
+        "lock_expires_at": None,
+    })
+    head_ref = client.collection(SESSIONS).document("z-reserved-context")
+    head_ref.set({
+        "reserved_operation_id": "operation-z",
+        "active_operation_id": None,
+        "lock_expires_at": None,
+        "fence": 0,
+    })
+    head_ref.collection("operations").document("operation-z").set({
+        "operation_id": "operation-z",
+        "sequence": 1,
+        "state": "pending",
+    })
+
+    recovered = enqueue_expired_telegram_queue_recoveries(
+        FirestoreTelegramQueueRecoveryStore(client), now=NOW, limit=1,
+    )
+
+    assert recovered == 1
+    wakeup = next(
+        data for path, data in firestore_fake.documents.items()
+        if path.startswith(f"{OUTBOX_COLLECTION}/")
+    )
+    assert wakeup["context_id"] == "z-reserved-context"
+    assert wakeup["operation_id"] == "operation-z"
 
 
 def test_telegram_stage_failure_budget_is_three_physical_single_attempt_calls(firestore_fake):

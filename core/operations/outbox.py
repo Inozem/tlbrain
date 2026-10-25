@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Mapping
+from typing import Mapping, Protocol
 from urllib.parse import urlsplit
 
 from core.integrations.cloud_tasks.client import enqueue_task
@@ -25,6 +25,7 @@ from core.operations.models import OperationOrigin, OperationState
 
 MCP_RECOVERY_STALE_AGE = timedelta(minutes=5)
 MCP_RECOVERY_SWEEP_LIMIT = 50
+TELEGRAM_RECOVERY_SWEEP_LIMIT = 50
 _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,480}$")
 
 
@@ -71,6 +72,12 @@ class _PublicationOutcome(Enum):
     ALREADY_EXISTS = "already_exists"
     SKIPPED = "skipped"
     FAILED = "failed"
+
+
+class TelegramQueueRecoveryStore(Protocol):
+    """Storage boundary for repairing reserved Telegram queue-head wakeups."""
+
+    def recover_expired_heads(self, *, now: datetime, limit: int) -> int: ...
 
 
 def _targets_by_kind(
@@ -243,9 +250,25 @@ def enqueue_stale_mcp_save_recoveries(
     return enqueued
 
 
+def enqueue_expired_telegram_queue_recoveries(
+    store: TelegramQueueRecoveryStore,
+    *,
+    now: datetime,
+    limit: int = TELEGRAM_RECOVERY_SWEEP_LIMIT,
+) -> int:
+    """Ask the configured storage adapter to wake expired reserved queue heads."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+        raise ValueError("limit must be an integer from 1 to 500")
+    return store.recover_expired_heads(now=now.astimezone(timezone.utc), limit=limit)
+
+
 __all__ = [
     "OutboxSweepResult",
     "TaskTargetConfig",
+    "TelegramQueueRecoveryStore",
+    "enqueue_expired_telegram_queue_recoveries",
     "enqueue_stale_mcp_save_recoveries",
     "publish_due_outbox_records",
 ]

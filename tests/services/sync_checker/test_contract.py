@@ -42,6 +42,7 @@ def test_targeted_doc_queues_anonymous_task_and_skips_checker_queries(
         "get_stale_syncing", "get_error_docs", "get_drive_sync_token",
         "get_drive_changes", "get_start_page_token", "scan_root_folder",
         "enqueue_stale_mcp_save_recoveries", "publish_due_outbox_records",
+        "enqueue_expired_telegram_queue_recoveries",
     ):
         monkeypatch.setattr(checker_main, name, lambda *args, _name=name, **kwargs: pytest.fail(
             f"targeted request must skip {_name}"
@@ -122,9 +123,12 @@ def test_scheduled_checker_runs_configured_mcp_recovery_sweep(checker_main, monk
     monkeypatch.setenv("OIDC_AUDIENCE", "https://callback.synthetic.test/internal/dialog-operations")
     monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "worker@synthetic.test")
     monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "worker@synthetic.test")
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.synthetic.test/internal/dispatch")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "telegram-control")
     monkeypatch.setenv("VECTOR_SYNC_URL", "https://sync.synthetic.test")
     calls = []
     monkeypatch.setattr(checker_main, "enqueue_stale_mcp_save_recoveries", lambda db, **kwargs: calls.append(("recover", kwargs)))
+    monkeypatch.setattr(checker_main, "enqueue_expired_telegram_queue_recoveries", lambda store, **kwargs: calls.append(("telegram_recover", kwargs)))
     monkeypatch.setattr(checker_main, "publish_due_outbox_records", lambda db, targets, **kwargs: (
         calls.append(("publish", targets, kwargs)) or SimpleNamespace(selected=0, failed=0)
     ))
@@ -137,13 +141,51 @@ def test_scheduled_checker_runs_configured_mcp_recovery_sweep(checker_main, monk
     response = checker_main.checker(_request())
 
     assert response == ({"queued": 0, "stale_syncing": 0, "error_docs": 0}, 200)
-    assert [call[0] for call in calls] == ["recover", "publish"]
-    assert calls[1][1][checker_main.OutboxTargetKind.MCP_SAVE_RECOVERY].url == (
+    assert [call[0] for call in calls] == ["recover", "telegram_recover", "publish"]
+    assert calls[2][1][checker_main.OutboxTargetKind.MCP_SAVE_RECOVERY].url == (
         "https://callback.synthetic.test/internal/dialog-operations"
     )
-    assert calls[1][1][checker_main.OutboxTargetKind.MCP_SAVE_RECOVERY].audience == (
+    assert calls[2][1][checker_main.OutboxTargetKind.MCP_SAVE_RECOVERY].audience == (
         "https://callback.synthetic.test/internal/dialog-operations"
     )
+    telegram_target = calls[2][1][checker_main.OutboxTargetKind.TELEGRAM_DISPATCH]
+    assert telegram_target.url == "https://telegram.synthetic.test/internal/dispatch"
+    assert telegram_target.queue_name == "telegram-control"
+
+
+@pytest.mark.parametrize("telegram_url", [None, "https://telegram.synthetic.test/wrong-path"])
+def test_missing_or_mismatched_telegram_target_keeps_scheduled_checker_running(
+    checker_main, monkeypatch, telegram_url,
+):
+    monkeypatch.setenv("INTERNAL_DIALOG_OPERATIONS_URL", "https://callback.synthetic.test/internal/dialog-operations")
+    monkeypatch.setenv("DIALOG_OPERATIONS_QUEUE", "dialog-recovery")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://callback.synthetic.test/internal/dialog-operations")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://callback.synthetic.test/internal/dialog-operations")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "worker@synthetic.test")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "worker@synthetic.test")
+    monkeypatch.setenv("VECTOR_SYNC_URL", "https://sync.synthetic.test")
+    monkeypatch.delenv("TELEGRAM_CONTROL_URL", raising=False)
+    monkeypatch.delenv("TELEGRAM_CONTROL_QUEUE", raising=False)
+    if telegram_url is not None:
+        monkeypatch.setenv("TELEGRAM_CONTROL_URL", telegram_url)
+        monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "telegram-control")
+    published = []
+    monkeypatch.setattr(checker_main, "enqueue_stale_mcp_save_recoveries", lambda *args, **kwargs: None)
+    monkeypatch.setattr(checker_main, "enqueue_expired_telegram_queue_recoveries", lambda *args, **kwargs: None)
+    monkeypatch.setattr(checker_main, "publish_due_outbox_records", lambda db, targets, **kwargs: (
+        published.append(targets) or SimpleNamespace(selected=0, failed=0)
+    ))
+    monkeypatch.setattr(checker_main, "get_stale_syncing", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_error_docs", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_drive_sync_token", lambda: "page-token")
+    monkeypatch.setattr(checker_main, "get_drive_changes", lambda token: ([], "next-token"))
+    monkeypatch.setattr(checker_main, "set_drive_sync_token", lambda token: None)
+
+    assert checker_main.checker(_request()) == (
+        {"queued": 0, "stale_syncing": 0, "error_docs": 0}, 200
+    )
+    assert len(published) == 1
+    assert set(published[0]) == {checker_main.OutboxTargetKind.MCP_SAVE_RECOVERY}
 
 
 def test_missing_or_mismatched_recovery_config_skips_sweep_and_keeps_checker_running(

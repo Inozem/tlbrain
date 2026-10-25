@@ -94,6 +94,58 @@ def test_publisher_uses_trusted_target_and_ids_only_body(firestore_fake, monkeyp
     assert operation_ref.get().to_dict() == operation_before
 
 
+def test_notification_dispatch_publishes_identifier_only_without_changing_send_budget(
+    firestore_fake, monkeypatch,
+):
+    client = firestore_fake.client_class()
+    record = create_outbox_record(
+        client,
+        "notification-wakeup",
+        target_kind=OutboxTargetKind.TELEGRAM_DISPATCH,
+        generation=1,
+        schedule_at=NOW,
+        now=NOW,
+        context_id="telegram-context",
+        notification_id="notification-ack",
+    )
+    notification_ref = client.collection("notification_outbox").document("notification-ack")
+    notification_ref.set({
+        "notification_id": "notification-ack",
+        "state": "pending",
+        "send_attempts_started": 0,
+        "edit_attempts_started": 0,
+        "unknown_send_outcome": False,
+        "in_flight_attempt_id": None,
+    })
+    ledger_before = notification_ref.get().to_dict()
+    calls = []
+    monkeypatch.setattr(publisher, "enqueue_task", lambda **kwargs: calls.append(kwargs) or True)
+
+    result = publish_due_outbox_records(
+        client, {OutboxTargetKind.TELEGRAM_DISPATCH: TARGET}, now=NOW, limit=1,
+    )
+
+    assert result.published == 1
+    assert calls == [{
+        "queue_name": TARGET.queue_name,
+        "url": TARGET.url,
+        "task_id": record.task_name,
+        "body": {
+            "schema_version": 1,
+            "outbox_id": "notification-wakeup",
+            "target_kind": "telegram_dispatch",
+            "generation": 1,
+            "context_id": "telegram-context",
+            "notification_id": "notification-ack",
+        },
+        "schedule_time": NOW,
+        "service_account_email": TARGET.service_account_email,
+        "audience": TARGET.audience,
+        "dispatch_deadline": TARGET.dispatch_deadline,
+    }]
+    assert notification_ref.get().to_dict() == ledger_before
+
+
 def test_duplicate_result_recovers_crash_after_cloud_tasks_acceptance(firestore_fake, monkeypatch):
     client = firestore_fake.client_class()
     record = _create(client, "outbox-crash")

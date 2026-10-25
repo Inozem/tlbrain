@@ -237,6 +237,22 @@ def test_firestore_indexes_are_valid_and_match_schema_collection_groups():
 
     assert config["indexes"] == [
         {
+            "collectionGroup": "telegram_sessions",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "reserved_operation_id", "order": "ASCENDING"},
+                {"fieldPath": "lock_expires_at", "order": "ASCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "telegram_sessions",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "lock_expires_at", "order": "ASCENDING"},
+                {"fieldPath": "reserved_operation_id", "order": "ASCENDING"},
+            ],
+        },
+        {
             "collectionGroup": "task_outbox",
             "queryScope": "COLLECTION",
             "fields": [
