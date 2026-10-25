@@ -478,7 +478,9 @@ def test_checker_recovery_null_head_contexts_do_not_starve_lease_less_head(fires
     assert wakeup["operation_id"] == "operation-z"
 
 
-def test_telegram_stage_failure_budget_is_three_physical_single_attempt_calls(firestore_fake):
+def test_telegram_stage_failure_budget_is_three_physical_single_attempt_calls(
+    firestore_fake, monkeypatch,
+):
     client = firestore_fake.client_class()
     accepted = _accepted_save(client, update_id=704)
     _stage_operation(client, accepted.operation_id)
@@ -513,6 +515,34 @@ def test_telegram_stage_failure_budget_is_three_physical_single_attempt_calls(fi
 
     assert physical_calls == [accepted.operation_id] * 3
     assert get_stage(client, accepted.operation_id, "save/index").attempts_started == 3
+
+    from services.connectors.telegram.status_checks import TelegramStatusChecks
+
+    class _Publisher:
+        async def publish(self, _notification_id):
+            return "delivered"
+
+    checks = TelegramStatusChecks(
+        client,
+        status_reader=lambda _operation_id: {"state": "failed"},
+        notification_publisher=_Publisher(),
+        clock=lambda: NOW + timedelta(minutes=5),
+    )
+    checks.terminal_notification_updater = lambda _record: None
+    status_record = checks.schedule_checks(
+        accepted.context_id, accepted.operation_id, NOW,
+    )[2]
+
+    async def direct_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", direct_to_thread)
+
+    assert _run(checks.handle_task(task_payload(status_record))) == "failed"
+    assert physical_calls == [accepted.operation_id] * 3
+    stage_after_status = get_stage(client, accepted.operation_id, "save/index")
+    assert stage_after_status.attempts_started == 3
+    assert stage_after_status.failures == 3
 
 
 def test_explicit_retry_of_unknown_create_keeps_original_gate_and_reconciles_only(

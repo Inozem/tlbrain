@@ -293,6 +293,7 @@ def test_pending_at_five_minutes_is_reported_without_failure_then_final_can_deli
     assert still_running["state"] == "running"
     assert still_running["attempts_started"] == 1 and still_running["failures"] == 0
     assert still_running["lease_owner"] == "worker-1"
+    assert reader.calls == ["save-op"]
 
     # Completion uses the ordinary durable notification ID; the check does not
     # create a replacement notification or execute the save again.
@@ -530,7 +531,9 @@ def test_failed_terminal_fallback_renders_persisted_error_and_bound_dialog_after
         message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
     )
     context_ref = client.collection("telegram_sessions").document(accepted.context_id)
-    context_ref.update({"selected_dialog_number": 9})
+    context_ref.update({"selected_dialog_number": 9, "active_draft_id": "newer-draft",
+                        "reserved_operation_id": "newer-operation", "lock_owner": "newer-worker"})
+    context_before = context_ref.get().to_dict()
     operation_id = "failed-with-safe-error"
     context_ref.collection("operations").document(operation_id).set({
         "operation_id": operation_id,
@@ -577,6 +580,7 @@ def test_failed_terminal_fallback_renders_persisted_error_and_bound_dialog_after
     assert "Automatic retries have stopped" in body
     assert "administrator" in body and "logs" in body
     assert "billing" not in body.casefold()
+    assert context_ref.get().to_dict() == context_before
 
 
 def test_failed_queue_operation_without_shared_record_uses_failed_stage_error(firestore_fake):
@@ -639,7 +643,7 @@ def test_status_read_failure_preserves_execution_focus_draft_and_save_state(fire
     checks = _service(client, clock=clock, reader=reader, publisher=publisher)
     record = checks.schedule_checks("ctx-1", "save-op", ACCEPTED_AT)[0]
     session_ref = client.collection("telegram_sessions").document("ctx-1")
-    session_ref.set({"reserved_operation_id": "save-op", "active_draft_id": "draft-1",
+    session_ref.set({"chat_id": -10042, "reserved_operation_id": "save-op", "active_draft_id": "draft-1",
                      "selected_dialog_number": 7, "lock_owner": "worker-1"})
     client.collection("telegram_sessions").document("ctx-1").collection("drafts").document("draft-1").set(
         {"draft_id": "draft-1", "state": "processing", "manifest_ref": "manifests/m1"}
@@ -656,6 +660,23 @@ def test_status_read_failure_preserves_execution_focus_draft_and_save_state(fire
 
     assert firestore_fake.documents == before
     assert publisher.calls == []
+    assert reader.calls == ["save-op"]
+
+    # The same durable task can be retried after the status provider recovers.
+    reader.error = None
+    assert _run(checks.handle_task(task_payload(record))) == "running"
+    assert reader.calls == ["save-op", "save-op"]
+    operation = operation_ref.get().to_dict()
+    assert operation["attempts_started"] == 2 and operation["failures"] == 1
+    assert operation["lease_owner"] == "worker-1"
+    context = session_ref.get().to_dict()
+    assert context["reserved_operation_id"] == "save-op"
+    assert context["active_draft_id"] == "draft-1"
+    assert context["selected_dialog_number"] == 7
+    assert context["lock_owner"] == "worker-1"
+    assert client.collection("telegram_sessions").document("ctx-1").collection(
+        "drafts"
+    ).document("draft-1").get().to_dict()["state"] == "processing"
 
 
 @pytest.mark.parametrize("outcome", ["retry", "busy", "stale", "pending"])
