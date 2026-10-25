@@ -233,8 +233,10 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf 'gcloud\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
         "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n"
-        "case \"$*\" in *'services describe'*) printf 'https://synthetic.example/service\\n' ;; "
-        "*'functions describe'*) printf 'https://synthetic.example/function\\n' ;; "
+        "case \"$*\" in *'run services describe'*) "
+        "service=\"$4\"; url=\"https://synthetic.example/$service\"; printf '%s\\n' \"$url\"; "
+        "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-result\", \"run-service-url\", sys.argv[1], sys.argv[2]]) + \"\\n\")' \"$service\" \"$url\" ;; "
+        "*'functions describe'*) printf 'https://synthetic.example/%s\\n' \"$3\" ;; "
         "esac\n",
         encoding="utf-8",
     )
@@ -265,12 +267,27 @@ def _read_route_events(log: Path) -> list[list[str]]:
 
 def _run_route(
     tmp_path: Path, command: str, *, fail_service: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+    stdin_answers: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], Path]:
     bash = _bash()
     root = tmp_path / "synthetic checkout"
     _copy_checkout(root)
     bin_dir, _helper = _install_fakes(root, tmp_path)
     log = tmp_path / "route-events.jsonl"
+    marker_hook = tmp_path / "route-marker-hook.sh"
+    marker_hook.write_text(
+        "_route_record_marker() {\n"
+        "  case \"$*\" in\n"
+        "    *rollout_phase:decoder_compatible*|*rollout_phase:guards_compatible*|"
+        "*rollout_gate:old_workers_drained*|*rollout_phase:writers_enabled*)\n"
+        "      \"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"rollout-marker\", sys.argv[1]]) + \"\\n\")' \"$*\" ;;\n"
+        "  esac\n"
+        "}\n"
+        "echo() { _route_record_marker \"$*\"; builtin echo \"$@\"; }\n"
+        "printf() { _route_record_marker \"$*\"; builtin printf \"$@\"; }\n",
+        encoding="utf-8",
+    )
     python_dir = str(Path(sys.executable).parent)
     environment = {
         **{
@@ -283,6 +300,7 @@ def _run_route(
         "TMP": str(tmp_path),
         "ROUTE_PYTHON": sys.executable,
         "ROUTE_EVENT_LOG": str(log),
+        "BASH_ENV": str(marker_hook),
         "ROUTE_FAIL_SERVICE": fail_service or "",
         "PROJECT_ID": "synthetic-project",
         "REGION": "synthetic-region",
@@ -314,8 +332,11 @@ def _run_route(
         "TLDV_RECONCILIATION_SCHEDULE": "0 3 * * *",
         "DOCKER_CONFIG": str(tmp_path / "docker-config"),
     }
+    environment.update(env_overrides or {})
     script = root / "infra" / "deploy" / command
-    answer = b"y\n" if command in {"deploy.sh", "local_deploy.sh"} else b""
+    if stdin_answers is None:
+        stdin_answers = "y\ny\n" if command in {"deploy.sh", "local_deploy.sh"} else ""
+    answer = stdin_answers.encode("utf-8")
     completed = subprocess.run([bash, str(script)], cwd=root, env=environment, input=answer,
                                capture_output=True, check=False, timeout=180)
     result = subprocess.CompletedProcess(
