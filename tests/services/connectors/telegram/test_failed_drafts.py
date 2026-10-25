@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -115,6 +116,27 @@ def _seed_failed_draft(firestore_fake, *, update_id=12):
         "updated_at": NOW,
         "status_updated_at": NOW,
     })
+    client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).set({
+        "save_intent_id": intent_id,
+        "immutable_input_digest": f"digest-{old_operation_id}",
+        "desired_content_hash": f"content-{old_operation_id}",
+        "desired_parent_id_hash": None,
+        "desired_parent_id": None,
+        "immutable_title_digest": None,
+        "immutable_provider_digest": None,
+        "state": "unknown",
+        "create_outcome": "unknown",
+        "dispatch_token": f"dispatch-{old_operation_id}",
+        "dispatch_operation_id": old_operation_id,
+        "dispatch_owner": "original-save-worker",
+        "dispatch_fence": 1,
+        "doc_id": f"doc-{update_id}",
+        "confirmed_result": None,
+        "fill_checkpoint_ref": f"save_checkpoints/{old_operation_id}/fill",
+        "index_checkpoint_ref": None,
+        "created_at": NOW,
+        "updated_at": NOW,
+    })
     context_ref = client.collection(SESSIONS).document(context_id)
     context = context_ref.get().to_dict()
     context.update({
@@ -176,6 +198,8 @@ def test_manual_retry_reuses_failed_draft_intent_manifest_and_completed_progress
         _seed_failed_draft(firestore_fake)
     )
     before = repository.get_draft(context_id, draft_id)
+    intent_ref = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+    intent_before = intent_ref.get().to_dict()
     manifest = _document(client, before["manifest_ref"]).get().to_dict()
     messages = repository.list_messages(context_id, draft_id)
 
@@ -186,6 +210,7 @@ def test_manual_retry_reuses_failed_draft_intent_manifest_and_completed_progress
     assert _value(retried, "dialog_number") == before["dialog_number"]
     assert _value(retried, "operation_id") != old_operation_id
     after = repository.get_draft(context_id, draft_id)
+    assert intent_ref.get().to_dict() == intent_before
     assert after["state"] == "processing"
     assert after["active_save_operation_id"] == _value(retried, "operation_id")
     assert after["immutable_save_intent_id"] == intent_id
@@ -215,6 +240,21 @@ def test_manual_retry_reuses_failed_draft_intent_manifest_and_completed_progress
     assert client.collection("task_outbox").document(_value(retried, "outbox_id")).get().exists
 
 
+def test_manual_retry_replay_for_same_update_adds_no_records(firestore_fake):
+    repository, _client, context_id, _draft_id, _old_operation_id, _intent_id = (
+        _seed_failed_draft(firestore_fake)
+    )
+    first = _retry(repository, context_id, 1, update_id=901)
+    paths_after_first = set(firestore_fake.documents)
+    documents_after_first = dict(firestore_fake.documents)
+
+    replay = _retry(repository, context_id, 1, update_id=901)
+
+    assert replay == first
+    assert set(firestore_fake.documents) == paths_after_first
+    assert firestore_fake.documents == documents_after_first
+
+
 def test_unknown_dialog_retry_allocates_no_operation_or_outbox_and_preserves_selection(
     firestore_fake,
 ):
@@ -241,6 +281,31 @@ def test_unknown_dialog_retry_allocates_no_operation_or_outbox_and_preserves_sel
     assert set(firestore_fake.documents) == before_paths
 
 
+def test_retry_without_durable_save_intent_is_write_free(firestore_fake):
+    repository, client, context_id, draft_id, _old_operation_id, intent_id = (
+        _seed_failed_draft(firestore_fake)
+    )
+    client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).delete()
+    draft_before = repository.get_draft(context_id, draft_id)
+    context_before = repository.get_context(context_id)
+    documents_before = dict(firestore_fake.documents)
+
+    rejected = _retry(repository, context_id, 1, update_id=902)
+
+    assert _value(rejected, "accepted") is False
+    assert _value(rejected, "operation_id") is None
+    assert _value(rejected, "outbox_id") is None
+    assert firestore_fake.documents == documents_before
+    assert repository.get_draft(context_id, draft_id) == draft_before
+    assert repository.get_context(context_id) == context_before
+    assert client.collection(SESSIONS).document(context_id).collection(
+        "commands"
+    ).document("902").get().exists is False
+    assert client.collection(SESSIONS).document(context_id).collection(
+        "updates"
+    ).document("902").get().exists is False
+
+
 def test_manual_retry_gets_a_fresh_three_failure_stage_budget(firestore_fake):
     repository, client, context_id, draft_id, old_operation_id, _intent_id = (
         _seed_failed_draft(firestore_fake)
@@ -248,7 +313,7 @@ def test_manual_retry_gets_a_fresh_three_failure_stage_budget(firestore_fake):
     retried = _retry(repository, context_id, 1)
     operation_id = _value(retried, "operation_id")
     assert operation_id != old_operation_id
-    governor = RetryGovernor(client, clock=lambda: NOW)
+    governor = RetryGovernor(client, clock=SimpleNamespace(now=lambda: NOW))
     failed_calls = []
 
     for attempt in range(1, 4):

@@ -17,6 +17,7 @@ from services.connectors.telegram.repository._commands import _TelegramCommandMi
 from services.connectors.telegram.repository._drafts import _TelegramDraftMixin
 from services.connectors.telegram.repository._intake import _TelegramIntakeMixin
 from services.connectors.telegram.repository._notifications import _TelegramNotificationMixin
+from services.connectors.telegram.repository._retry import _TelegramRetryMixin
 from services.connectors.telegram.repository._save_commands import _TelegramSaveCommandMixin
 
 
@@ -26,6 +27,7 @@ class TelegramRepository(
     _TelegramNotificationMixin,
     _TelegramDraftMixin,
     _TelegramSaveCommandMixin,
+    _TelegramRetryMixin,
 ):
     """Own Firestore transactions for durable Telegram intake state."""
 
