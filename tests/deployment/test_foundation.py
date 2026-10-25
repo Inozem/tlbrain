@@ -35,9 +35,7 @@ EXPECTED_ENTRIES = {
     "tldv_reconciliation": "main.py",
 }
 FOUNDATION_ARTIFACT_EXCLUSIONS = (
-    "core/dialogs/",
     "services/connectors/telegram/",
-    "core/operations/registry.py",
 )
 MCP_SHARED_OPERATIONS = {
     "core/operations/read.py",
@@ -47,7 +45,7 @@ MCP_SHARED_OPERATIONS = {
 IMAGE_SERVICES = {"mcp", "vector_sync", "tldv_import"}
 EXPECTED_INTEGRATION_REQUIREMENTS = {
     "mcp": {
-        "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
+        "cloud_tasks", "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
     },
     "vector_sync": {
         "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
@@ -220,7 +218,7 @@ def test_dialog_and_telegram_package_boundaries_are_passive() -> None:
 def test_all_six_current_service_sources_assemble_to_isolated_runtime_artifacts() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     services = manifest["services"]
-    assert set(services) == set(EXPECTED_SERVICES)
+    assert set(services) == set(EXPECTED_SERVICES) | {"telegram"}
 
     build_root = APP_ROOT / ".build"
     build_root.mkdir(exist_ok=True)

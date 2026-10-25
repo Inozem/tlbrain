@@ -120,6 +120,23 @@
       "extra_modules": [],
       "resources": [],
       "model_preparation": []
+    },
+    "telegram": {
+      "entry_roots": [
+        "services/connectors/telegram/app/main.py"
+      ],
+      "runtime": {
+        "kind": "asgi",
+        "target": "services.connectors.telegram.app.main:app"
+      },
+      "path_remaps": {},
+      "module_aliases": {},
+      "requirements_roots": [
+        "services/connectors/telegram/requirements.txt"
+      ],
+      "extra_modules": [],
+      "resources": [],
+      "model_preparation": []
     }
   }
 }
