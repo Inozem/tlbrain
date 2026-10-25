@@ -12,6 +12,7 @@ import pytest
 from services.connectors.telegram.notifications import (
     _VerifiedTelegramLifecycle, TelegramNotificationPublisher, build_lifecycle_body,
 )
+from services.connectors.telegram.errors import format_terminal_error
 from services.connectors.telegram.client import TelegramAPIError
 from services.connectors.telegram.repository import TelegramRepository
 
@@ -125,6 +126,47 @@ def test_verified_classification_outcome_is_bounded_and_user_visible():
     assert "The folder could not be determined confidently; saved to _unassigned." in unassigned
     assert "The closest match was selected." not in old_certificate
     assert "raw user content" not in invalid
+
+
+def test_terminal_error_has_safe_fields_exhaustion_advice_and_confirmed_only_billing_wording():
+    common = dict(
+        dialog_number=7, operation_id="op-error", service="google_drive",
+        stage="telegram.audio.42", code="provider_error", occurred_at=NOW,
+        sanitized_message="Stage execution failed (RuntimeError)", failures=3,
+    )
+    generic = format_terminal_error(**common, category="rate_limited")
+    assert generic.startswith("Dialog #7: Error in google_drive/telegram.audio.42")
+    assert "code=provider_error, category=rate_limited" in generic
+    assert "2026-10-22T00:00:00+00:00" in generic
+    assert "operation_id=op-error" in generic
+    assert "temporarily limiting requests" in generic
+    assert "billing" not in generic.casefold() and "funds" not in generic.casefold()
+    assert "Automatic retries have stopped" in generic
+    assert "administrator" in generic and "logs" in generic
+    assert "RuntimeError" not in generic
+
+    billing = format_terminal_error(**{**common, "failures": 1}, category="billing")
+    quota = format_terminal_error(**{**common, "failures": 1}, category="quota")
+    assert "confirmed a billing issue" in billing
+    assert "confirmed a quota limit" in quota
+    assert "Check provider billing" in billing
+    assert "Check provider billing" not in quota
+
+
+def test_terminal_error_drops_untrusted_error_text_and_malformed_identifiers():
+    message = format_terminal_error(
+        dialog_number=None, operation_id="op-1?token=secret", service="https://evil.test",
+        stage="save", code="bad code", category="provider_error",
+        sanitized_message="raw provider body https://secret.test/token?key=secret",
+        occurred_at="not a timestamp", failures=1,
+    )
+    assert "Dialog #" not in message
+    assert "https://" not in message and "secret" not in message
+    assert "service=unknown" not in message
+    assert "Error in unknown/save" in message
+    assert "code=operation_failed" in message
+    assert "operation_id=unavailable" in message
+    assert "Occurred: unavailable" in message
 
 
 @pytest.mark.parametrize(

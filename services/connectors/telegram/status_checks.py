@@ -36,6 +36,26 @@ def _read_queue_operation(client: Any, context_id: str, operation_id: str) -> di
     return snapshot.to_dict() if snapshot.exists else None
 
 
+def _read_operation_dialog_number(client: Any, context_id: str, operation_id: str) -> int | None:
+    """Resolve the dialog captured by this operation's accepted command and draft."""
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    queue_operation = context_ref.collection("operations").document(operation_id).get()
+    input_ref = (queue_operation.to_dict() or {}).get("input_ref") if queue_operation.exists else None
+    prefix = f"telegram_sessions/{context_id}/commands/"
+    if not isinstance(input_ref, str) or not input_ref.startswith(prefix):
+        return None
+    command_id = input_ref[len(prefix):]
+    if not command_id or "/" in command_id:
+        return None
+    command = context_ref.collection("commands").document(command_id).get()
+    draft_id = (command.to_dict() or {}).get("draft_id") if command.exists else None
+    if not isinstance(draft_id, str) or not draft_id:
+        return None
+    draft = context_ref.collection("drafts").document(draft_id).get()
+    dialog_number = (draft.to_dict() or {}).get("dialog_number") if draft.exists else None
+    return dialog_number if type(dialog_number) is int and dialog_number > 0 else None
+
+
 class TelegramStatusChecks:
     """Schedule and handle status reads without entering the execution queue."""
 
@@ -248,14 +268,37 @@ class TelegramStatusChecks:
                 return notification_id
             raise RuntimeError("terminal notification ID is already in use")
 
-        body = (
-            "Operation completed."
-            if state == "completed"
-            else "Operation failed."
+        dialog_number = _read_operation_dialog_number(
+            self.client, record.context_id, record.operation_id,
         )
+        if state == "completed":
+            body = "Operation completed."
+        else:
+            from services.connectors.telegram.errors import format_terminal_error
+            from core.integrations.firestore.operations import get_operation
+            from services.connectors.telegram.app.terminal_notifications import _terminal_error_details
+
+            operation = get_operation(self.client, record.operation_id)
+            details = _terminal_error_details(self.client, record, operation)
+            if details:
+                body = format_terminal_error(
+                    dialog_number=dialog_number,
+                    operation_id=record.operation_id,
+                    service=details.get("service") or "telegram",
+                    stage=details.get("stage") or getattr(operation, "stage", None) or "processing",
+                    code=details.get("code"), category=details.get("category"),
+                    sanitized_message=details.get("sanitized_message"),
+                    occurred_at=details.get("occurred_at"), failures=details.get("failures"),
+                )
+            else:
+                body = format_terminal_error(
+                    dialog_number=dialog_number, operation_id=record.operation_id,
+                    service="telegram", stage="processing", code="operation_failed",
+                    category="unknown", sanitized_message=None, occurred_at=None, failures=None,
+                )
         repository.create_notification(
             notification_id, context_id=record.context_id, kind=expected_kind,
-            body=body, now=_aware(self.clock(), "clock"),
+            body=body, now=_aware(self.clock(), "clock"), dialog_number=dialog_number,
             operation_id=record.operation_id,
         )
         return notification_id

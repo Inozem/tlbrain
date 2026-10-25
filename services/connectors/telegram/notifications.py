@@ -17,7 +17,7 @@ from services.connectors.telegram.repository import TelegramRepository
 
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-notification")
 _SYNC_WAIT_SECONDS = 15.0
-_SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 
 
@@ -43,6 +43,11 @@ class _VerifiedTelegramLifecycle:
     folder_path: str | None = None
     completion_confirmed: bool = False
     classification_outcome: str | None = None
+    code: str | None = None
+    category: str | None = None
+    occurred_at: datetime | None = None
+    failures: int | None = None
+    sanitized_message: str | None = None
 
 
 def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
@@ -73,8 +78,19 @@ def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
         return f"{body}{note}"[:4096]
     if lifecycle.reason in {"in_progress", "index_pending"}:
         return f"{prefix}: Processing or indexing is still in progress."
-    return (f"{prefix}: Error in {lifecycle.service}/{lifecycle.stage} "
-            f"({lifecycle.reason}); operation_id={lifecycle.operation_id}.")
+    from services.connectors.telegram.errors import format_terminal_error
+
+    return format_terminal_error(
+        dialog_number=lifecycle.dialog_number,
+        operation_id=lifecycle.operation_id,
+        service=lifecycle.service,
+        stage=lifecycle.stage,
+        code=lifecycle.code or lifecycle.reason,
+        category=lifecycle.category,
+        sanitized_message=lifecycle.sanitized_message,
+        occurred_at=lifecycle.occurred_at,
+        failures=lifecycle.failures,
+    )
 
 
 class TelegramNotificationPublisher:

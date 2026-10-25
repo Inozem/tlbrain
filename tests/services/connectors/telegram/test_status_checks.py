@@ -520,6 +520,119 @@ def test_terminal_fallback_persists_delivery_and_suppresses_remaining_checks(
     assert len(telegram.sent) == 1
 
 
+def test_failed_terminal_fallback_renders_persisted_error_and_bound_dialog_after_selection_changes(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    context_ref.update({"selected_dialog_number": 9})
+    operation_id = "failed-with-safe-error"
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id,
+        "state": "failed",
+        "input_ref": f"telegram_sessions/{accepted.context_id}/commands/1",
+    })
+    context_ref.collection("commands").document("1").set({"draft_id": accepted.draft_id})
+    client.collection("dialog_operations").document(operation_id).set({
+        "operation_id": operation_id,
+        "origin": "telegram",
+        "caller_binding": "telegram:test",
+        "immutable_input_digest": "digest",
+        "immutable_input_ref": "telegram_sessions/test/drafts/input",
+        "state": "failed",
+        "stage": "indexing",
+        "error": {
+            "service": "google_drive",
+            "stage": "indexing",
+            "code": "provider_error",
+            "category": "rate_limited",
+            "sanitized_message": "Stage execution failed (RuntimeError)",
+            "occurred_at": ACCEPTED_AT,
+            "retryable": True,
+            "failures": 3,
+            "operation_id": operation_id,
+        },
+    })
+    publisher = _Publisher()
+    checks = _service(client, reader=lambda _: {"state": "failed"}, publisher=publisher)
+    checks.terminal_notification_updater = lambda _: None
+    record = checks.schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)[0]
+
+    assert _run(checks.handle_task(task_payload(record))) == "failed"
+
+    notification = repo.get_notification(publisher.calls[0])
+    body = notification["body"]
+    assert notification["kind"] == "error"
+    assert notification["dialog_number"] == 1
+    assert body.startswith("Dialog #1:")
+    assert "Error in google_drive/indexing" in body
+    assert "code=provider_error, category=rate_limited" in body
+    assert "2026-10-22T12:00:00+00:00" in body
+    assert f"operation_id={operation_id}" in body
+    assert "Automatic retries have stopped" in body
+    assert "administrator" in body and "logs" in body
+    assert "billing" not in body.casefold()
+
+
+def test_failed_queue_operation_without_shared_record_uses_failed_stage_error(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    operation_id = "queue-stage-terminal-failure"
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id,
+        "state": "failed",
+        "input_ref": f"telegram_sessions/{accepted.context_id}/commands/1",
+    })
+    context_ref.collection("commands").document("1").set({"draft_id": accepted.draft_id})
+    context_ref.collection("operations").document(operation_id).collection("stages").document(
+        "telegram.audio.41"
+    ).set({
+        "stage_key": "telegram.audio.41",
+        "state": "failed",
+        "failures": 3,
+        "last_error": {
+            "service": "speech_provider",
+            "stage": "telegram.audio.41",
+            "code": "provider_error",
+            "category": "rate_limited",
+            "message": "Stage execution failed (RuntimeError)",
+            "sanitized_message": "Stage execution failed (RuntimeError)",
+            "occurred_at": ACCEPTED_AT,
+            "retryable": True,
+            "failures": 3,
+            "operation_id": operation_id,
+        },
+    })
+    publisher = _Publisher()
+    checks = _service(client, reader=lambda _: {"state": "failed"}, publisher=publisher)
+    checks.terminal_notification_updater = lambda _: None
+    record = checks.schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)[0]
+
+    assert _run(checks.handle_task(task_payload(record))) == "failed"
+    assert not client.collection("dialog_operations").document(operation_id).get().exists
+
+    notification = repo.get_notification(publisher.calls[0])
+    body = notification["body"]
+    assert notification["kind"] == "error"
+    assert "Error in speech_provider/telegram.audio.41" in body
+    assert "code=provider_error, category=rate_limited" in body
+    assert "2026-10-22T12:00:00+00:00" in body
+    assert f"operation_id={operation_id}" in body
+    assert "Automatic retries have stopped" in body
+    assert "administrator" in body and "logs" in body
+    assert "billing" not in body.casefold()
+
+
 def test_status_read_failure_preserves_execution_focus_draft_and_save_state(firestore_fake):
     client = firestore_fake.client_class()
     clock, reader, publisher = _Clock(), _StatusReader("running"), _Publisher()

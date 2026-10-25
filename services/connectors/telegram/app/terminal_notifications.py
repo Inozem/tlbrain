@@ -146,7 +146,7 @@ def _verified_completion_details(
 
 def _safe_lifecycle_code(value: Any, fallback: str) -> str:
     """Keep externally rendered lifecycle codes within their public identifier format."""
-    return value if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value) else fallback
+    return value if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", value) else fallback
 
 
 def _terminal_notification_status(operation: Any, completion_confirmed: bool) -> tuple[str, str, str, str]:
@@ -169,6 +169,69 @@ def _terminal_notification_status(operation: Any, completion_confirmed: bool) ->
     )
 
 
+def _has_failed_stage_error(stage_data: dict[str, Any]) -> bool:
+    """Accept only failed stage documents that contain a structured last error."""
+    return stage_data.get("state") == "failed" and isinstance(stage_data.get("last_error"), dict)
+
+
+def _preferred_failed_stage(stages_ref: Any, preferred_stage: Any) -> dict[str, Any]:
+    """Load the preferred stage only when it records a structured failure."""
+    if not isinstance(preferred_stage, str) or not preferred_stage:
+        return {}
+    snapshot = stages_ref.document(preferred_stage).get()
+    candidate = snapshot.to_dict() or {} if snapshot.exists else {}
+    return candidate if _has_failed_stage_error(candidate) else {}
+
+
+def _first_failed_stage(stages_ref: Any) -> dict[str, Any]:
+    """Choose the failed stage with the smallest stage key for deterministic fallback."""
+    failed_stages = []
+    for snapshot in stages_ref.stream():
+        candidate = snapshot.to_dict() or {}
+        if _has_failed_stage_error(candidate):
+            key = candidate.get("stage_key")
+            if not isinstance(key, str) or not key:
+                key = snapshot.id
+            failed_stages.append((key, candidate))
+    return min(failed_stages, key=lambda item: item[0])[1] if failed_stages else {}
+
+
+def _queue_failed_stage_data(client: Any, record: Any, operation: Any) -> dict[str, Any]:
+    """Resolve this queued operation's preferred failed stage, then its deterministic fallback."""
+    queue_ref = (client.collection("telegram_sessions").document(record.context_id)
+                 .collection("operations").document(record.operation_id))
+    queue_snapshot = queue_ref.get()
+    queue_operation = queue_snapshot.to_dict() or {} if queue_snapshot.exists else {}
+    stages_ref = queue_ref.collection("stages")
+    preferred_stage = getattr(operation, "stage", None) or queue_operation.get("stage")
+    return _preferred_failed_stage(stages_ref, preferred_stage) or _first_failed_stage(stages_ref)
+
+
+def _error_field(error: Any, name: str) -> Any:
+    """Read an error field from either a mapping or an attribute-based error object."""
+    return error.get(name) if isinstance(error, dict) else getattr(error, name, None)
+
+
+def _terminal_error_details(client: Any, record: Any, operation: Any) -> dict[str, Any]:
+    """Resolve safe shared or Telegram stage error fields for a failed operation."""
+    error = getattr(operation, "error", None)
+    stage_data: dict[str, Any] = {}
+    if error is None and record.context_id and record.operation_id:
+        stage_data = _queue_failed_stage_data(client, record, operation)
+        error = stage_data.get("last_error") if stage_data else None
+    if error is None:
+        return {}
+    return {
+        "service": _error_field(error, "service"),
+        "stage": _error_field(error, "stage") or stage_data.get("stage_key"),
+        "code": _error_field(error, "code"),
+        "category": _error_field(error, "category"),
+        "sanitized_message": _error_field(error, "sanitized_message"),
+        "occurred_at": _error_field(error, "occurred_at"),
+        "failures": _error_field(error, "failures"),
+    }
+
+
 def _persist_terminal_notification(
     client: Any, record: Any, dialog_number: int, operation: Any,
     completion_confirmed: bool, folder_path: str | None,
@@ -181,11 +244,21 @@ def _persist_terminal_notification(
     from services.connectors.telegram.repository import TelegramRepository
 
     service, stage, reason, kind = _terminal_notification_status(operation, completion_confirmed)
+    error_details = (
+        _terminal_error_details(client, record, operation)
+        if operation.state.value == "failed" else {}
+    )
+    service = _safe_lifecycle_code(error_details.get("service"), service)
+    stage = _safe_lifecycle_code(error_details.get("stage"), stage)
     lifecycle = _VerifiedTelegramLifecycle(
         dialog_number=dialog_number, operation_id=record.operation_id,
         service=service, stage=stage, reason=reason, folder_path=folder_path,
         completion_confirmed=completion_confirmed,
         classification_outcome=classification_outcome,
+        code=error_details.get("code"), category=error_details.get("category"),
+        occurred_at=error_details.get("occurred_at"),
+        failures=error_details.get("failures"),
+        sanitized_message=error_details.get("sanitized_message"),
     )
     body = build_lifecycle_body(lifecycle=lifecycle)
     notification_id = "tg" + kind + "-" + hashlib.sha256(record.operation_id.encode("utf-8")).hexdigest()
