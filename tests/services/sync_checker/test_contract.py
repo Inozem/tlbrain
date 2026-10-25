@@ -151,6 +151,11 @@ def test_scheduled_checker_runs_configured_mcp_recovery_sweep(checker_main, monk
     telegram_target = calls[2][1][checker_main.OutboxTargetKind.TELEGRAM_DISPATCH]
     assert telegram_target.url == "https://telegram.synthetic.test/internal/dispatch"
     assert telegram_target.queue_name == "telegram-control"
+    status_target = calls[2][1][checker_main.OutboxTargetKind.TELEGRAM_STATUS_CHECK]
+    assert status_target.url == "https://telegram.synthetic.test/internal/status-check"
+    assert status_target.queue_name == telegram_target.queue_name
+    assert status_target.audience == telegram_target.audience
+    assert status_target.service_account_email == telegram_target.service_account_email
 
 
 @pytest.mark.parametrize("telegram_url", [None, "https://telegram.synthetic.test/wrong-path"])

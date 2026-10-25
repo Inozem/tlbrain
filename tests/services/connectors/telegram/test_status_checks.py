@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
+import socket
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -24,6 +26,7 @@ from starlette.requests import Request
 from core.integrations.firestore.outbox import (
     OUTBOX_COLLECTION,
     OutboxTargetKind,
+    create_outbox_record,
     get_outbox_record,
     task_payload,
 )
@@ -60,12 +63,13 @@ class _StatusReader:
 
 
 class _Publisher:
-    def __init__(self):
+    def __init__(self, outcome: str = "delivered"):
         self.calls: list[str] = []
+        self.outcome = outcome
 
     async def publish(self, notification_id: str) -> str:
         self.calls.append(notification_id)
-        return "delivered"
+        return self.outcome
 
 
 def _service(client, *, clock=None, reader=None, publisher=None):
@@ -110,12 +114,46 @@ def _route(app, path):
     return next(route.endpoint for route in app.routes if getattr(route, "path", None) == path)
 
 
-def _run(awaitable):
-    return asyncio.run(awaitable)
-
-
 async def _direct_to_thread(func, /, *args, **kwargs):
     return func(*args, **kwargs)
+
+
+def _run(awaitable):
+    original_to_thread = asyncio.to_thread
+    asyncio.to_thread = _direct_to_thread
+    try:
+        return asyncio.run(awaitable, loop_factory=_selector_loop)
+    finally:
+        asyncio.to_thread = original_to_thread
+
+
+def _selector_loop():
+    """Use loopback datagrams for asyncio's Windows self-pipe under the socket guard."""
+    if os.name != "nt":
+        return asyncio.SelectorEventLoop()
+    original_socketpair = socket.socketpair
+    pairs = []
+
+    def local_pair(*_args, **_kwargs):
+        reader = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        writer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            reader.bind(("127.0.0.1", 0))
+            writer.bind(("127.0.0.1", 0))
+            writer.connect(reader.getsockname())
+            reader.connect(writer.getsockname())
+            pairs.append((reader, writer))
+            return reader, writer
+        except BaseException:
+            reader.close()
+            writer.close()
+            raise
+
+    socket.socketpair = local_pair
+    try:
+        return asyncio.SelectorEventLoop()
+    finally:
+        socket.socketpair = original_socketpair
 
 
 def test_checks_are_scheduled_at_immutable_acceptance_offsets_and_use_id_only_payloads(firestore_fake):
@@ -163,7 +201,7 @@ def test_each_due_check_reads_the_same_operation_without_claiming_execution(fire
     record = next(item for item in records if item.schedule_at == ACCEPTED_AT + timedelta(seconds=offset))
     clock.current = record.schedule_at
 
-    assert checks.handle_task(task_payload(record)) == "running"
+    assert _run(checks.handle_task(task_payload(record))) == "running"
     assert reader.calls == ["save-op"]
     assert publisher.calls == ["progress-save-op"]
     assert _scheduled_rows(client) == records
@@ -186,9 +224,9 @@ def test_delivered_final_makes_remaining_checks_noops_without_new_send_or_execut
                        "final_delivery_state": "delivered", "notification_id": "final-save-op"})
     clock.current = records[0].schedule_at
 
-    assert checks.handle_task(task_payload(records[0])) == "no_op"
-    assert checks.handle_task(task_payload(records[1])) == "no_op"
-    assert checks.handle_task(task_payload(records[2])) == "no_op"
+    assert _run(checks.handle_task(task_payload(records[0]))) == "no_op"
+    assert _run(checks.handle_task(task_payload(records[1]))) == "no_op"
+    assert _run(checks.handle_task(task_payload(records[2]))) == "no_op"
     assert reader.calls == []
     assert publisher.calls == []
     final_operation = operation_ref.get().to_dict()
@@ -224,7 +262,7 @@ def test_stale_progress_check_cannot_replace_delivered_final_or_reset_send_budge
     records = checks.schedule_checks(accepted.context_id, "save-op", ACCEPTED_AT)
 
     # Replayed +60/+120/+300 status tasks are older than the delivered final.
-    assert [checks.handle_task(task_payload(record)) for record in records] == [
+    assert [_run(checks.handle_task(task_payload(record))) for record in records] == [
         "no_op", "no_op", "no_op",
     ]
     final_after = repo.get_notification(final["notification_id"])
@@ -249,7 +287,7 @@ def test_pending_at_five_minutes_is_reported_without_failure_then_final_can_deli
                        "lease_owner": "worker-1", "notification_id": "final-save-op"})
     clock.current = ACCEPTED_AT + timedelta(seconds=300)
 
-    assert checks.handle_task(task_payload(records[2])) == "running"
+    assert _run(checks.handle_task(task_payload(records[2]))) == "running"
     assert publisher.calls == ["final-save-op"]
     still_running = operation_ref.get().to_dict()
     assert still_running["state"] == "running"
@@ -259,14 +297,227 @@ def test_pending_at_five_minutes_is_reported_without_failure_then_final_can_deli
     # Completion uses the ordinary durable notification ID; the check does not
     # create a replacement notification or execute the save again.
     operation_ref.update({"state": "completed", "final_delivery_state": "pending"})
-    awaitable = publisher.publish("final-save-op")
-    assert _run(awaitable) == "delivered"
+    assert _run(publisher.publish("final-save-op")) == "delivered"
     operation_ref.update({"final_delivery_state": "delivered"})
-    assert checks.handle_task(task_payload(records[2])) == "no_op"
+    assert _run(checks.handle_task(task_payload(records[2]))) == "no_op"
     completed = operation_ref.get().to_dict()
     assert completed["state"] == "completed"
     assert completed["attempts_started"] == 1 and completed["failures"] == 0
     assert publisher.calls == ["final-save-op", "final-save-op"]
+
+
+def test_real_operation_without_notification_id_gets_one_stable_progress_notification(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id = "save-op-no-notification"
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id,
+        "input_ref": f"telegram_sessions/{accepted.context_id}/commands/1",
+    })
+    # The notification metadata comes from the accepted command's real draft.
+    command_ref = client.collection("telegram_sessions").document(accepted.context_id).collection("commands").document("1")
+    command_ref.set({"draft_id": accepted.draft_id})
+    operation_ref = client.collection("dialog_operations").document(operation_id)
+    operation_ref.set({"operation_id": operation_id, "context_id": accepted.context_id,
+                       "state": "running", "final_delivery_state": "pending"})
+    clock, reader, publisher = _Clock(), _StatusReader("running"), _Publisher()
+    checks = _service(client, clock=clock, reader=reader, publisher=publisher)
+    records = checks.schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)
+
+    first = _run(checks.handle_task(task_payload(records[0])))
+    notification_ids = [
+        data["notification_id"] for snapshot in client.collection("notification_outbox").stream()
+        if (data := snapshot.to_dict() or {}).get("kind") == "progress"
+    ]
+    first_revision = copy.deepcopy(repo.get_notification(notification_ids[0]))
+    second = _run(checks.handle_task(task_payload(records[1])))
+    third = _run(checks.handle_task(task_payload(records[2])))
+
+    assert first == second == third == "running"
+    assert len(notification_ids) == 1
+    assert publisher.calls == [notification_ids[0]] * 3
+    notification = repo.get_notification(notification_ids[0])
+    assert notification["kind"] == "progress"
+    assert notification["operation_id"] == operation_id
+    assert notification["send_attempts_started"] == 0
+    assert notification["revision"] == first_revision["revision"] + 2
+    assert notification["body"] != first_revision["body"]
+    assert "5" in notification["body"]
+
+
+def test_queued_operation_status_works_before_shared_save_operation_exists(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id = "queued-op"
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id, "state": "pending",
+        "input_ref": f"telegram_sessions/{accepted.context_id}/commands/1",
+    })
+    context_ref.collection("commands").document("1").set({"draft_id": accepted.draft_id})
+    publisher, clock = _Publisher(), _Clock()
+    checks = _service(client, clock=clock, reader=lambda _: None, publisher=publisher)
+    record = checks.schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)[0]
+
+    assert _run(checks.handle_task(task_payload(record))) == "pending"
+    rows = [row.to_dict() for row in client.collection("notification_outbox").stream()]
+    progress = [row for row in rows if row.get("kind") == "progress"]
+    assert len(progress) == 1
+    assert progress[0]["operation_id"] == operation_id
+    assert publisher.calls == [progress[0]["notification_id"]]
+
+
+@pytest.mark.parametrize("selected_dialog_number", [7, None])
+def test_regular_command_progress_does_not_require_a_draft_or_dialog_number(
+    firestore_fake, selected_dialog_number,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id = "regular-command"
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    context_ref.update({"selected_dialog_number": selected_dialog_number})
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id, "state": "pending",
+    })
+    # This ordinary command has no draft reference or dialog-number draft.
+    publisher = _Publisher()
+    checks = _service(client, reader=lambda _: None, publisher=publisher)
+    record = checks.schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)[0]
+
+    assert _run(checks.handle_task(task_payload(record))) == "pending"
+    notification = repo.get_notification(publisher.calls[0])
+    if selected_dialog_number is None:
+        assert notification["dialog_number"] is None
+        assert ":" not in notification["body"]
+    else:
+        assert notification["dialog_number"] == selected_dialog_number
+        assert notification["body"].startswith(f"Dialog #{selected_dialog_number}:")
+
+
+def test_terminal_check_uses_persisted_final_lifecycle_notification(firestore_fake):
+    client = firestore_fake.client_class()
+    publisher = _Publisher()
+    reader = _StatusReader("completed")
+    checks = _service(client, reader=reader, publisher=publisher)
+    checks.terminal_notification_updater = lambda record: "final-save-op"
+    record = checks.schedule_checks("ctx-1", "save-op", ACCEPTED_AT)[0]
+    client.collection("dialog_operations").document("save-op").set(
+        {"operation_id": "save-op", "context_id": "ctx-1", "state": "completed",
+         "final_delivery_state": "pending"}
+    )
+
+    assert _run(checks.handle_task(task_payload(record))) == "completed"
+    assert publisher.calls == ["final-save-op"]
+    assert list(client.collection("notification_outbox").stream()) == []
+
+
+def test_terminal_operation_without_draft_lifecycle_still_gets_status_notification(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id = "regular-command-terminal"
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id, "state": "completed",
+    })
+    publisher = _Publisher()
+    checks = _service(
+        client, reader=lambda _: None, publisher=publisher,
+        clock=_Clock(),
+    )
+    checks.terminal_notification_updater = lambda _: None
+    record = checks.schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)[0]
+
+    assert _run(checks.handle_task(task_payload(record))) == "completed"
+    notification = repo.get_notification(publisher.calls[0])
+    assert notification["kind"] == "final"
+    assert notification["operation_id"] == operation_id
+    assert notification["body"] != ""
+
+
+@pytest.mark.parametrize(
+    ("state", "kind"), [("completed", "final"), ("failed", "error")],
+)
+def test_terminal_fallback_persists_delivery_and_suppresses_remaining_checks(
+    firestore_fake, state, kind,
+):
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id = f"terminal-{state}"
+    client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations"
+    ).document(operation_id).set({"operation_id": operation_id, "state": state})
+    clock = _Clock()
+    records = _service(
+        client, reader=lambda _: {"state": state}, clock=clock,
+        publisher=_Publisher(),
+    ).schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)
+
+    class FakeTelegram:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, chat_id, text, *, message_thread_id=None):
+            self.sent.append((chat_id, text, message_thread_id))
+            return {"message_id": 912}
+
+        async def edit_message_text(self, chat_id, message_id, text):
+            raise AssertionError("terminal fallback should send only once")
+
+    telegram = FakeTelegram()
+    durable_publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+
+    class CountingPublisher:
+        def __init__(self):
+            self.calls = []
+
+        async def publish(self, notification_id):
+            self.calls.append(notification_id)
+            return await durable_publisher.publish(notification_id)
+
+    publisher = CountingPublisher()
+    checks = _service(
+        client, reader=lambda _: {"state": state}, clock=clock,
+        publisher=publisher,
+    )
+    checks.terminal_notification_updater = lambda _: None
+
+    assert _run(checks.handle_task(task_payload(records[0]))) == state
+    assert not client.collection("dialog_operations").document(operation_id).get().exists
+    terminal_id = publisher.calls[0]
+    notification = repo.get_notification(terminal_id)
+    assert notification["kind"] == kind
+    assert notification["operation_id"] == operation_id
+    assert notification["state"] == "delivered"
+    assert len(telegram.sent) == 1
+
+    assert [
+        _run(checks.handle_task(task_payload(record))) for record in records[1:]
+    ] == ["no_op", "no_op"]
+    assert publisher.calls == [terminal_id]
+    assert len(telegram.sent) == 1
 
 
 def test_status_read_failure_preserves_execution_focus_draft_and_save_state(firestore_fake):
@@ -288,10 +539,29 @@ def test_status_read_failure_preserves_execution_focus_draft_and_save_state(fire
     reader.error = OSError("synthetic status store outage")
 
     with pytest.raises(OSError, match="synthetic status store outage"):
-        checks.handle_task(task_payload(record))
+        _run(checks.handle_task(task_payload(record)))
 
     assert firestore_fake.documents == before
     assert publisher.calls == []
+
+
+@pytest.mark.parametrize("outcome", ["retry", "busy", "stale", "pending"])
+def test_pending_status_delivery_is_retryable_and_does_not_ack_task(firestore_fake, outcome):
+    client = firestore_fake.client_class()
+    accepted = TelegramRepository(client).accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    checks = _service(
+        client, reader=_StatusReader("running"), publisher=_Publisher(outcome),
+    )
+    record = checks.schedule_checks(accepted.context_id, "save-op", ACCEPTED_AT)[0]
+    client.collection("dialog_operations").document("save-op").set({
+        "operation_id": "save-op", "context_id": accepted.context_id, "state": "running",
+    })
+
+    with pytest.raises(RuntimeError, match="delivery is pending"):
+        _run(checks.handle_task(task_payload(record)))
 
 
 def test_internal_status_check_accepts_only_canonical_server_payload(firestore_fake, monkeypatch):
@@ -335,3 +605,153 @@ def test_internal_status_check_accepts_only_canonical_server_payload(firestore_f
     assert rejected.status_code == 400
     assert accepted == {"status": "running"}
     assert calls == [payload]
+
+    class RetryWorker:
+        async def handle_task(self, payload):
+            raise RuntimeError("notification still pending")
+
+    app.state.telegram_status_check_worker = RetryWorker()
+    retry = _run(endpoint(_request("/internal/status-check", payload, token="valid")))
+    assert retry.status_code == 503
+
+
+def test_dispatch_schedules_acceptance_relative_checks_before_queue_worker(firestore_fake, monkeypatch):
+    monkeypatch.setattr(asyncio, "to_thread", _direct_to_thread)
+    _configure_status_task_target(monkeypatch)
+    client = firestore_fake.client_class()
+    accepted_at = ACCEPTED_AT
+    record = create_outbox_record(
+        client, "tgcommand-operation-1", target_kind=OutboxTargetKind.TELEGRAM_DISPATCH,
+        generation=1, schedule_at=ACCEPTED_AT + timedelta(hours=2), now=accepted_at,
+        context_id="ctx-1", operation_id="operation-1",
+    )
+    events = []
+
+    def enqueue_task(**kwargs):
+        events.append(("enqueue", kwargs))
+        # Cloud Tasks reports an existing deterministic task as False.
+        return not kwargs["task_id"].endswith("-120-g1")
+
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_task)
+
+    class QueueWorker:
+        async def handle_task(self, payload):
+            events.append(("queue", dict(payload)))
+            return True
+
+    class StatusWorker:
+        def schedule_checks(self, context_id, operation_id, scheduled_at):
+            events.append(("schedule", context_id, operation_id, scheduled_at))
+            from services.connectors.telegram.status_checks import TelegramStatusChecks
+
+            return TelegramStatusChecks(
+                client, notification_publisher=_Publisher(), clock=lambda: ACCEPTED_AT,
+            ).schedule_checks(context_id, operation_id, scheduled_at)
+
+        async def handle_task(self, payload):
+            raise AssertionError("dispatch must not execute a status check")
+
+    app = create_app(
+        queue_worker=QueueWorker(), status_check_worker=StatusWorker(),
+        oidc_verifier=lambda token: type("Identity", (), {"authorized": token == "valid"})()
+        if token == "valid" else None,
+    )
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: client)
+    monkeypatch.setattr("services.connectors.telegram.app.main._first_ack_state", lambda record: None)
+    monkeypatch.setattr("services.connectors.telegram.app.main._update_terminal_notification", lambda record: None)
+    endpoint = _route(app, "/internal/dispatch")
+
+    response = _run(endpoint(_request("/internal/dispatch", task_payload(record), token="valid")))
+
+    assert response == {"status": "processed"}
+    assert [event[0] for event in events] == [
+        "schedule", "enqueue", "enqueue", "enqueue", "queue",
+    ]
+    schedule_event = events[0]
+    assert schedule_event == ("schedule", "ctx-1", "operation-1", record.created_at)
+    assert schedule_event[3] != record.schedule_at
+    scheduled = [
+        item for item in _scheduled_rows(client, "operation-1")
+        if item.target_kind is OutboxTargetKind.TELEGRAM_STATUS_CHECK
+    ]
+    assert len(scheduled) == 3
+    assert [item.schedule_at for item in scheduled] == [
+        record.created_at + timedelta(seconds=60),
+        record.created_at + timedelta(seconds=120),
+        record.created_at + timedelta(seconds=300),
+    ]
+    enqueued = [event[1] for event in events if event[0] == "enqueue"]
+    assert [call["schedule_time"] for call in enqueued] == [item.schedule_at for item in scheduled]
+    assert [call["task_id"] for call in enqueued] == [item.task_name for item in scheduled]
+    assert [call["body"] for call in enqueued] == [task_payload(item) for item in scheduled]
+    assert all(call["queue_name"] == "telegram-status-queue" for call in enqueued)
+    assert all(call["url"] == "https://telegram.synthetic.test/internal/status-check" for call in enqueued)
+    assert all(call["service_account_email"] == "worker@synthetic.test" for call in enqueued)
+    assert all(call["audience"] == "https://telegram.synthetic.test" for call in enqueued)
+    assert all(item.state.value == "delivered" for item in scheduled)
+
+
+def _configure_status_task_target(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.synthetic.test/internal/dispatch")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "telegram-status-queue")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://telegram.synthetic.test")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://telegram.synthetic.test")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "worker@synthetic.test")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "worker@synthetic.test")
+
+
+def test_dispatch_enqueue_failure_marks_status_row_retry_and_skips_queue(
+    firestore_fake, monkeypatch,
+):
+    monkeypatch.setattr(asyncio, "to_thread", _direct_to_thread)
+    _configure_status_task_target(monkeypatch)
+    client = firestore_fake.client_class()
+    record = create_outbox_record(
+        client, "tgcommand-operation-failure", target_kind=OutboxTargetKind.TELEGRAM_DISPATCH,
+        generation=1, schedule_at=ACCEPTED_AT + timedelta(hours=2), now=ACCEPTED_AT,
+        context_id="ctx-1", operation_id="operation-failure",
+    )
+    events = []
+
+    def enqueue_task(**kwargs):
+        events.append(kwargs)
+        raise RuntimeError("synthetic provider detail must not persist")
+
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_task)
+
+    class QueueWorker:
+        async def handle_task(self, payload):
+            events.append("queue")
+            return True
+
+    class StatusWorker:
+        def schedule_checks(self, context_id, operation_id, scheduled_at):
+            from services.connectors.telegram.status_checks import TelegramStatusChecks
+
+            return TelegramStatusChecks(
+                client, notification_publisher=_Publisher(), clock=lambda: ACCEPTED_AT,
+            ).schedule_checks(context_id, operation_id, scheduled_at)
+
+    app = create_app(
+        queue_worker=QueueWorker(), status_check_worker=StatusWorker(),
+        oidc_verifier=lambda token: type("Identity", (), {"authorized": token == "valid"})()
+        if token == "valid" else None,
+    )
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: client)
+    monkeypatch.setattr("services.connectors.telegram.app.main._first_ack_state", lambda _: None)
+    monkeypatch.setattr("services.connectors.telegram.app.main._update_terminal_notification", lambda _: None)
+
+    response = _run(_route(app, "/internal/dispatch")(
+        _request("/internal/dispatch", task_payload(record), token="valid")
+    ))
+
+    assert response.status_code == 503
+    assert len(events) == 1 and isinstance(events[0], dict)
+    failed = get_outbox_record(client, events[0]["body"]["outbox_id"])
+    assert failed is not None
+    assert failed.state.value == "retry"
+    assert failed.last_error == "cloud_tasks_enqueue_failed"
+    rows = [item for item in _scheduled_rows(client, "operation-failure")
+            if item.target_kind is OutboxTargetKind.TELEGRAM_STATUS_CHECK]
+    assert len(rows) == 3
+    assert sum(item.state.value == "retry" for item in rows) == 1

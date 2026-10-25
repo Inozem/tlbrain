@@ -176,9 +176,104 @@ def _notification_runtime() -> Any:
     return TelegramNotificationPublisher(TelegramRepository(get_client()), TelegramClient(token))
 
 
+def _status_check_runtime(notification_publisher: Any = None) -> Any:
+    from core.integrations.firestore.client import get_client
+    from services.connectors.telegram.status_checks import TelegramStatusChecks
+
+    publisher = notification_publisher or _notification_runtime()
+    return TelegramStatusChecks(get_client(), notification_publisher=publisher)
+
+
+def _telegram_status_check_target() -> Any:
+    """Build the status-check callback only from deploy-matched Telegram OIDC config."""
+    from urllib.parse import urlsplit
+    from core.operations.outbox import TaskTargetConfig
+
+    callback_url = os.environ.get("TELEGRAM_CONTROL_URL")
+    queue_name = os.environ.get("TELEGRAM_CONTROL_QUEUE")
+    audience = os.environ.get("CLOUD_TASKS_OIDC_AUDIENCE") or os.environ.get("TASK_OIDC_AUDIENCE")
+    service_account = (
+        os.environ.get("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("TASK_OIDC_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("TASK_SERVICE_ACCOUNT_EMAIL")
+    )
+    expected_audience = os.environ.get("OIDC_AUDIENCE")
+    expected_account = os.environ.get("OIDC_SERVICE_ACCOUNT_EMAIL")
+    try:
+        parsed = urlsplit(callback_url or "")
+        valid_url = (
+            parsed.scheme == "https" and bool(parsed.hostname)
+            and parsed.username is None and parsed.password is None
+            and parsed.path == "/internal/dispatch"
+            and not parsed.query and not parsed.fragment
+        )
+        if not (
+            valid_url and queue_name and queue_name.strip()
+            and audience and audience.strip() and audience == expected_audience
+            and service_account and service_account.strip()
+            and service_account == expected_account
+        ):
+            return None
+        return TaskTargetConfig(
+            queue_name=queue_name,
+            url=parsed._replace(path="/internal/status-check").geturl(),
+            service_account_email=service_account,
+            audience=audience,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _enqueue_status_check_records(records: Any) -> None:
+    """Enqueue scheduled status rows directly; the outbox remains the retry source."""
+    from core.integrations.cloud_tasks.client import enqueue_task
+    from core.integrations.firestore.client import get_client
+    from core.integrations.firestore.outbox import (
+        OutboxState,
+        record_outbox_delivery_result,
+        task_payload,
+    )
+
+    target = _telegram_status_check_target()
+    if target is None:
+        raise RuntimeError("Telegram status check task target is not configured")
+    client = get_client()
+    now = datetime.now(timezone.utc)
+    for record in records or ():
+        if record.state is OutboxState.DELIVERED:
+            continue
+        try:
+            enqueue_task(
+                queue_name=target.queue_name,
+                url=target.url,
+                task_id=record.task_name,
+                body=task_payload(record),
+                schedule_time=record.schedule_at,
+                service_account_email=target.service_account_email,
+                audience=target.audience,
+                dispatch_deadline=target.dispatch_deadline,
+            )
+        except Exception:
+            try:
+                record_outbox_delivery_result(
+                    client, record.outbox_id, delivered=False, now=now,
+                    safe_error="cloud_tasks_enqueue_failed",
+                )
+            except Exception:
+                pass
+            raise RuntimeError("Telegram status check task enqueue failed") from None
+        result = record_outbox_delivery_result(
+            client, record.outbox_id, delivered=True, now=now,
+        )
+        if result is None:
+            raise RuntimeError("Telegram status check outbox row disappeared")
+
+
 def create_app(
     *, intake: Any = None, webhook_secret: str | None = None,
     queue_worker: Any = None, notification_publisher: Any = None,
+    status_check_worker: Any = None,
     oidc_verifier: Any = None,
 ) -> FastAPI:
     app = FastAPI()
@@ -186,6 +281,7 @@ def create_app(
     app.state.telegram_webhook_secret = webhook_secret
     app.state.telegram_queue_worker = queue_worker
     app.state.telegram_notification_publisher = notification_publisher
+    app.state.telegram_status_check_worker = status_check_worker
     app.state.telegram_oidc_verifier = oidc_verifier
 
     async def authenticate(request: Request):
@@ -304,6 +400,20 @@ def create_app(
             worker = app.state.telegram_queue_worker
             if worker is None:
                 return JSONResponse({"error": "Dispatch unavailable"}, status_code=503)
+            if record.operation_id and record.outbox_id.startswith("tgcommand-"):
+                status_worker = app.state.telegram_status_check_worker
+                if status_worker is None:
+                    status_worker = await _offload_sync(
+                        _status_check_runtime, publisher,
+                    )
+                    app.state.telegram_status_check_worker = status_worker
+                schedule = getattr(status_worker, "schedule_checks", None)
+                if schedule is not None:
+                    accepted_at = record.created_at or record.schedule_at
+                    status_records = await _offload_sync(
+                        schedule, record.context_id, record.operation_id, accepted_at,
+                    )
+                    await _offload_sync(_enqueue_status_check_records, status_records)
             # Queue worker isolates each synchronous Firestore operation from its heartbeat loop.
             settled = await worker.handle_task(payload)
             if record.operation_id:
@@ -320,6 +430,39 @@ def create_app(
         except Exception:
             return JSONResponse({"error": "Dispatch unavailable"}, status_code=503)
         return {"status": "processed" if settled else "noop"}
+
+    @app.post("/internal/status-check")
+    async def status_check(request: Request):
+        auth_error = await authenticate(request)
+        if auth_error is not None:
+            return auth_error
+        payload, error = await task_payload_from(request)
+        if error is not None:
+            return error
+        if payload.get("target_kind") != "telegram_status_check":
+            return JSONResponse({"error": "Invalid task"}, status_code=400)
+        try:
+            record = await _offload_sync(_load_task_record, payload, "telegram_status_check")
+            if record is None:
+                return {"status": "noop"}
+            worker = app.state.telegram_status_check_worker
+            if worker is None:
+                worker = await _offload_sync(
+                    _status_check_runtime, app.state.telegram_notification_publisher,
+                )
+                app.state.telegram_status_check_worker = worker
+            handler = worker.handle_task
+            if asyncio.iscoroutinefunction(handler):
+                result = await handler(payload)
+            else:
+                result = await _offload_sync(handler, payload)
+                if asyncio.iscoroutine(result):
+                    result = await result
+        except (ValueError, KeyError):
+            return JSONResponse({"error": "Invalid task"}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "Status check unavailable"}, status_code=503)
+        return {"status": result}
 
     @app.post("/internal/deliver")
     async def deliver(request: Request):

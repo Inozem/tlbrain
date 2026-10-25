@@ -93,6 +93,13 @@ def _run_mcp_recovery_sweep(db: firestore.Client) -> None:
         targets[OutboxTargetKind.MCP_SAVE_RECOVERY] = mcp_target
     if telegram_target is not None:
         targets[OutboxTargetKind.TELEGRAM_DISPATCH] = telegram_target
+        targets[OutboxTargetKind.TELEGRAM_STATUS_CHECK] = TaskTargetConfig(
+            queue_name=telegram_target.queue_name,
+            url=urlsplit(telegram_target.url)._replace(path="/internal/status-check").geturl(),
+            service_account_email=telegram_target.service_account_email,
+            audience=telegram_target.audience,
+            dispatch_deadline=telegram_target.dispatch_deadline,
+        )
     now = datetime.now(timezone.utc)
     if mcp_target is not None:
         try:
