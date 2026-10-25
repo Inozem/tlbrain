@@ -75,7 +75,7 @@ def test_forward_transaction_persists_receipt_draft_dialog_message_and_ack(fires
     notification = _read(client, f"notification_outbox/{result.notification_id}")
     task = _read(client, f"task_outbox/{result.outbox_id}")
     assert notification["kind"] == "draft_ack"
-    assert notification["body"] == "Диалог №1: сообщение принято"
+    assert notification["body"] == "Dialog #1: Message received"
     assert task["notification_id"] == result.notification_id
 
 

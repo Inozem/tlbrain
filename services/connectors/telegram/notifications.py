@@ -56,24 +56,24 @@ def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
     for name in ("service", "stage", "reason"):
         if not isinstance(getattr(lifecycle, name), str) or not _SAFE_CODE.fullmatch(getattr(lifecycle, name)):
             raise ValueError(f"{name} is invalid")
-    prefix = f"\u0414\u0438\u0430\u043b\u043e\u0433 \u2116{lifecycle.dialog_number}"
+    prefix = f"Dialog #{lifecycle.dialog_number}"
     if lifecycle.completion_confirmed:
         path = " ".join(lifecycle.folder_path.split()) if lifecycle.folder_path else ""
         outcome = lifecycle.classification_outcome
         if outcome not in {None, "ambiguous", "unassigned"}:
             outcome = None
         note = {
-            "ambiguous": " \u0412\u044b\u0431\u0440\u0430\u043d \u043d\u0430\u0438\u0431\u043e\u043b\u0435\u0435 \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0438\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442.",
-            "unassigned": " \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0443\u0432\u0435\u0440\u0435\u043d\u043d\u043e \u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0438\u0442\u044c \u043f\u0430\u043f\u043a\u0443; \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e \u0432 _unassigned.",
+            "ambiguous": " The closest match was selected.",
+            "unassigned": " The folder could not be determined confidently; saved to _unassigned.",
         }.get(outcome, "")
         if path and len(path) <= 512 and not any(ord(char) < 32 for char in path):
-            body = f"{prefix}: \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d, \u0438\u043d\u0434\u0435\u043a\u0441 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d. \u041f\u0430\u043f\u043a\u0430: {path}."
+            body = f"{prefix}: Saved and indexed. Folder: {path}."
         else:
-            body = f"{prefix}: \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d, \u0438\u043d\u0434\u0435\u043a\u0441 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d."
+            body = f"{prefix}: Saved and indexed."
         return f"{body}{note}"[:4096]
     if lifecycle.reason in {"in_progress", "index_pending"}:
-        return f"{prefix}: обработка или индексация продолжается."
-    return (f"{prefix}: ошибка {lifecycle.service}/{lifecycle.stage} "
+        return f"{prefix}: Processing or indexing is still in progress."
+    return (f"{prefix}: Error in {lifecycle.service}/{lifecycle.stage} "
             f"({lifecycle.reason}); operation_id={lifecycle.operation_id}.")
 
 

@@ -237,7 +237,7 @@ def _prepare_forward_persistence(
     notification = {
         "notification_id": notification_id, "context_id": context_id,
         "kind": "draft_ack",
-        "body": f"\u0414\u0438\u0430\u043b\u043e\u0433 \u2116{draft.dialog_number}: \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043f\u0440\u0438\u043d\u044f\u0442\u043e",
+        "body": f"Dialog #{draft.dialog_number}: Message received",
         "chat_id": delivery_chat_id, "thread_id": delivery_thread_id or None,
         "draft_id": draft.draft_id, "dialog_number": draft.dialog_number,
         "operation_id": None, "desired_status_revision": 1,

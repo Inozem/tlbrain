@@ -59,27 +59,49 @@ class _Telegram:
 
 
 def _run(awaitable):
-    import asyncio
-    return asyncio.run(awaitable)
+    if os.name != "nt":
+        return asyncio.run(awaitable)
+
+    old_pair = socket.socketpair
+    pairs = []
+
+    def datagram_pair(*_args, **_kwargs):
+        reader = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        writer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        reader.bind(("127.0.0.1", 0))
+        writer.bind(("127.0.0.1", 0))
+        writer.connect(reader.getsockname())
+        reader.connect(writer.getsockname())
+        pairs.append((reader, writer))
+        return reader, writer
+
+    socket.socketpair = datagram_pair
+    try:
+        return asyncio.run(awaitable, loop_factory=asyncio.SelectorEventLoop)
+    finally:
+        socket.socketpair = old_pair
+        for reader, writer in pairs:
+            reader.close()
+            writer.close()
 
 
 def test_lifecycle_body_accepts_only_server_result_and_omits_unrequested_link():
     common = dict(dialog_number=12, operation_id="op-1", service="save", stage="verification",
                   reason="completion_unverified")
     without_proof = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(**common))
-    assert "индекс подтверждён" not in without_proof
-    assert "обработка или индексация продолжается" not in without_proof
+    assert "saved and indexed" not in without_proof
+    assert "Processing or indexing is still in progress" not in without_proof
     assert "operation_id=op-1" in without_proof
     assert "Notes/2026" not in without_proof
     hidden_link = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(
         **{**common, "reason": "completed"}, folder_path="Notes/2026", completion_confirmed=True,
     ))
-    assert "Notes/2026" in hidden_link and "индекс подтверждён" in hidden_link
+    assert "Notes/2026" in hidden_link and "Saved and indexed" in hidden_link
     no_path = build_lifecycle_body(lifecycle=_VerifiedTelegramLifecycle(
         **{**common, "reason": "completed"}, folder_path=None, completion_confirmed=True,
     ))
-    assert "сохранён, индекс подтверждён" in no_path
-    assert "Папка:" not in no_path
+    assert "Saved and indexed" in no_path
+    assert "Folder:" not in no_path
     assert "http" not in no_path
     with pytest.raises(TypeError):
         build_lifecycle_body(lifecycle={**common, "current_generation_proof": {"current": True}})
@@ -99,9 +121,9 @@ def test_verified_classification_outcome_is_bounded_and_user_visible():
         **common, classification_outcome="raw user content",
     ))
 
-    assert "\u0412\u044b\u0431\u0440\u0430\u043d \u043d\u0430\u0438\u0431\u043e\u043b\u0435\u0435 \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0438\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442." in ambiguous
-    assert "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0443\u0432\u0435\u0440\u0435\u043d\u043d\u043e \u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0438\u0442\u044c \u043f\u0430\u043f\u043a\u0443; \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e \u0432 _unassigned." in unassigned
-    assert "\u0412\u044b\u0431\u0440\u0430\u043d \u043d\u0430\u0438\u0431\u043e\u043b\u0435\u0435 \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0438\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442." not in old_certificate
+    assert "The closest match was selected." in ambiguous
+    assert "The folder could not be determined confidently; saved to _unassigned." in unassigned
+    assert "The closest match was selected." not in old_certificate
     assert "raw user content" not in invalid
 
 
@@ -168,30 +190,7 @@ def test_slow_sync_reservation_does_not_block_event_loop_heartbeat():
         assert await delivery == "busy"
         await heartbeat
 
-    if os.name == "nt":
-        old_pair = socket.socketpair
-        pairs = []
-
-        def datagram_pair(*_args, **_kwargs):
-            reader = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            writer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            reader.bind(("127.0.0.1", 0))
-            writer.bind(("127.0.0.1", 0))
-            writer.connect(reader.getsockname())
-            reader.connect(writer.getsockname())
-            pairs.append((reader, writer))
-            return reader, writer
-
-        socket.socketpair = datagram_pair
-        try:
-            asyncio.run(run(), loop_factory=asyncio.SelectorEventLoop)
-        finally:
-            socket.socketpair = old_pair
-            for reader, writer in pairs:
-                reader.close()
-                writer.close()
-    else:
-        asyncio.run(run())
+    _run(run())
     assert started.is_set()
     assert beats == ["alive"]
 
@@ -204,7 +203,7 @@ def test_ack_is_immutable_and_progress_send_then_edit_adds_no_conversation_turn(
     assert row["kind"] == "draft_ack"
     assert row["chat_id"] == -10042 and row["thread_id"] == 5
     assert row["message_id"] is None and row["send_attempts_started"] == 0
-    assert row["body"] == "Диалог №1: сообщение принято"
+    assert row["body"] == "Dialog #1: Message received"
 
     clock, telegram = _Clock(), _Telegram()
     publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
