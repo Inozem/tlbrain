@@ -7,13 +7,16 @@ no credentials or provider calls are used.
 from __future__ import annotations
 
 import re
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_deploy_routes import _run_route
+from test_deploy_routes import _bash, _run_route
 
 
 TOP_ROUTES = ("deploy.sh", "local_deploy.sh")
@@ -297,4 +300,128 @@ def test_partial_telegram_configuration_fails_before_cloud_or_docker_mutation(
     assert "TELEGRAM_BOT_TOKEN" in result.stdout + result.stderr
     assert "TELEGRAM_ALLOWED_USER_IDS" in result.stdout + result.stderr
     assert not any(event[0] in {"gcloud", "gcloud-argv", "docker", "docker-argv"} for event in events)
+
+
+def _run_deploy_helper(tmp_path: Path, helper: str, *args: str, **overrides: str):
+    bash = _bash()
+    bin_dir = tmp_path / "helper-bin"
+    bin_dir.mkdir()
+    log = tmp_path / "helper-events.jsonl"
+    fake_gcloud = bin_dir / "gcloud"
+    fake_gcloud.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os,sys; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps(sys.argv[1:])+\"\\n\")' \"$@\"\n"
+        "case \"$*\" in\n"
+        "  *'run services describe'*) echo \"${FAKE_RUNTIME_SERVICE_ACCOUNT-mcp-runtime@example-project.iam.gserviceaccount.com}\" ;;\n"
+        "  *'projects describe'*) echo '123456789' ;;\n"
+        "  *'iam service-accounts describe'*) echo 'NOT_FOUND: service account missing' >&2; exit 1 ;;\n"
+        "  *'tasks queues describe'*) if [[ \"${FAKE_QUEUE_EXISTS:-0}\" == 1 ]]; then exit 0; else echo 'NOT_FOUND: queue missing' >&2; exit 1; fi ;;\n"
+        "  *'firestore indexes composite create'*'FAKE_INDEX_ERROR=1'*) echo 'PERMISSION_DENIED' >&2; exit 1 ;;\n"
+        "  *'firestore indexes composite create'*) echo 'ALREADY_EXISTS: index already exists' >&2; exit 1 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_gcloud.chmod(0o755)
+    environment = {
+        **{name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT") if name in os.environ},
+        "PATH": os.pathsep.join((str(bin_dir), str(Path(sys.executable).parent), os.environ.get("PATH", ""))),
+        "ROUTE_PYTHON": sys.executable,
+        "ROUTE_EVENT_LOG": str(log),
+        "PROJECT_ID": "example-project",
+        "REGION": "europe-west1",
+        **overrides,
+    }
+    script = Path(__file__).resolve().parents[2] / "infra" / "deploy" / "core" / "helpers" / helper
+    result = subprocess.run([bash, str(script), *args], cwd=script.parents[4], env=environment,
+                            text=True, capture_output=True, check=False, timeout=30)
+    events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+    return result, events
+
+
+def test_dialog_operations_helper_uses_confirmed_url_and_scoped_iam(tmp_path: Path) -> None:
+    base_url = "https://synthetic-mcp-uc.a.run.app"
+    result, events = _run_deploy_helper(tmp_path, "deploy_dialog_operations.sh", base_url)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    output = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    task_invoker = "tlbrain-dialog-operations-invoker@example-project.iam.gserviceaccount.com"
+    runtime = "mcp-runtime@example-project.iam.gserviceaccount.com"
+    assert output == {
+        "INTERNAL_DIALOG_OPERATIONS_URL": base_url + "/internal/dialog-operations",
+        "DIALOG_OPERATIONS_QUEUE": "tlbrain-dialog-operations",
+        "CLOUD_TASKS_OIDC_AUDIENCE": base_url,
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL": task_invoker,
+        "OIDC_AUDIENCE": base_url,
+        "OIDC_SERVICE_ACCOUNT_EMAIL": task_invoker,
+    }
+    queue = next(event for event in events if event[:4] == ["tasks", "queues", "create", "tlbrain-dialog-operations"])
+    assert "--max-concurrent-dispatches=2" in queue
+    assert "--location" in queue and queue[queue.index("--location") + 1] == "europe-west1"
+    assert any(event[:3] == ["tasks", "queues", "describe"] for event in events)
+    assert any(event[:4] == ["iam", "service-accounts", "create", "tlbrain-dialog-operations-invoker"] for event in events)
+
+    bindings = [event for event in events if "add-iam-policy-binding" in event]
+    role_bindings = {
+        (tuple(event[0:3]), next(arg.split("=", 1)[1] for arg in event if arg.startswith("--role=")),
+         next(arg.split("=", 1)[1] for arg in event if arg.startswith("--member=")))
+        for event in bindings
+    }
+    assert (("run", "services", "add-iam-policy-binding"), "roles/run.invoker", f"serviceAccount:{task_invoker}") in role_bindings
+    assert (("iam", "service-accounts", "add-iam-policy-binding"), "roles/iam.serviceAccountTokenCreator", "serviceAccount:service-123456789@gcp-sa-cloudtasks.iam.gserviceaccount.com") in role_bindings
+    assert (("tasks", "queues", "add-iam-policy-binding"), "roles/cloudtasks.enqueuer", f"serviceAccount:{runtime}") in role_bindings
+    assert (("iam", "service-accounts", "add-iam-policy-binding"), "roles/iam.serviceAccountUser", f"serviceAccount:{runtime}") in role_bindings
+    assert any(event[:3] == ["projects", "add-iam-policy-binding", "example-project"]
+               and any(arg.endswith("roles/datastore.user") for arg in event) for event in events)
+    trace = " ".join(" ".join(event) for event in events)
+    assert "roles/owner" not in trace and "roles/editor" not in trace
+    assert "roles/cloudtasks.admin" not in trace and "roles/datastore.owner" not in trace
+    assert not any("remove-iam-policy-binding" in event or "set-iam-policy" in event for event in events)
+
+
+def test_dialog_operations_rejects_unconfirmed_or_non_base_urls_before_cloud_calls(tmp_path: Path) -> None:
+    result, events = _run_deploy_helper(
+        tmp_path, "deploy_dialog_operations.sh", "https://untrusted.invalid/internal/dialog-operations",
+    )
+    assert result.returncode != 0
+    assert events == []
+
+
+def test_dialog_operations_uses_default_compute_identity_when_service_account_is_empty(tmp_path: Path) -> None:
+    result, events = _run_deploy_helper(
+        tmp_path, "deploy_dialog_operations.sh", "https://synthetic-mcp-uc.a.run.app",
+        FAKE_RUNTIME_SERVICE_ACCOUNT="",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    runtime = "123456789-compute@developer.gserviceaccount.com"
+    assert any(event[:3] == ["tasks", "queues", "add-iam-policy-binding"]
+               and any(arg.endswith(f"serviceAccount:{runtime}") for arg in event) for event in events)
+    assert any(event[:3] == ["projects", "add-iam-policy-binding", "example-project"]
+               and any(arg.endswith(f"serviceAccount:{runtime}") for arg in event)
+               and "--role=roles/datastore.user" in event
+               for event in events)
+    assert any(event[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]
+               and any(arg.endswith(f"serviceAccount:{runtime}") for arg in event)
+               and "--role=roles/iam.serviceAccountUser" in event
+               for event in events)
+
+
+def test_firestore_index_helper_adds_declared_indexes_and_exemptions_idempotently(tmp_path: Path) -> None:
+    result, events = _run_deploy_helper(tmp_path, "deploy_firestore_indexes.sh")
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    composites = [event for event in events if event[:5] == ["firestore", "indexes", "composite", "create", "--project"]]
+    assert len(composites) == 6
+    as_text = [" ".join(event) for event in composites]
+    assert any("--collection-group telegram_sessions" in text and "reserved_operation_id" in text and "lock_expires_at" in text for text in as_text)
+    assert any("--collection-group task_outbox" in text and "target_kind" in text and "schedule_at" in text for text in as_text)
+    assert any("--collection-group dialog_operations" in text and "origin" in text and "updated_at" in text for text in as_text)
+    assert any("--collection-group drafts" in text and "cleanup_state" in text and "updated_at" in text for text in as_text)
+    exemptions = [event for event in events if event[:4] == ["firestore", "indexes", "fields", "update"]]
+    assert len(exemptions) == 9
+    assert {event[4] for event in exemptions} == {
+        "text", "caption", "transcription_text", "parts", "raw_command_envelope", "body", "payload",
+    }
+    assert all("--disable-indexes" in event and "--collection-group" in " ".join(event) for event in exemptions)
+    assert all("--project example-project" in " ".join(event) for event in events)
+    trace = " ".join(" ".join(event) for event in events)
+    assert "delete" not in trace and "clear" not in trace and "indexes import" not in trace
+    assert "ALREADY_EXISTS" not in result.stderr
 
