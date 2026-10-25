@@ -146,6 +146,106 @@ def test_webhook_registration_subscribes_to_messages_without_dropping_pending(
     assert webhook_url not in diagnostics
 
 
+def test_webhook_registration_default_path_posts_safely_with_bot_token(
+    firestore_fake, monkeypatch,
+):
+    from infra.deploy.connectors.telegram.webhook_admin import register_telegram_webhook
+
+    bot_token = "synthetic-default-path-token"
+    webhook_url = "https://telegram.synthetic.invalid/default-path"
+    client = firestore_fake.client_class()
+    observed = {}
+
+    class Response:
+        status = 200
+
+        def read(self, limit):
+            observed["read_limit"] = limit
+            return b'{"ok": true, "result": true}'
+
+    class Connection:
+        def __init__(self, host, *, timeout):
+            observed["host"] = host
+            observed["timeout"] = timeout
+
+        def request(self, method, path, *, body, headers):
+            observed.update(method=method, path=path, body=body, headers=headers)
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            observed["closed"] = True
+
+    monkeypatch.setattr(
+        "infra.deploy.connectors.telegram.webhook_admin.http.client.HTTPSConnection",
+        Connection,
+    )
+    result = register_telegram_webhook(
+        client=client,
+        bot_token=bot_token,
+        webhook_url=webhook_url,
+    )
+
+    assert result is True
+    assert observed["host"] == "api.telegram.org"
+    assert observed["timeout"] == 10
+    assert observed["method"] == "POST"
+    assert observed["path"] == f"/bot{bot_token}/setWebhook"
+    payload = json.loads(observed["body"])
+    stored_secret_values = {
+        value
+        for value in firestore_fake.documents["tokens/telegram_webhook"].values()
+        if isinstance(value, str)
+    }
+    assert payload["url"] == webhook_url
+    assert payload["allowed_updates"] == ["message"]
+    assert payload["secret_token"] in stored_secret_values
+    assert "drop_pending_updates" not in payload
+    assert type(result) is bool
+    assert observed["closed"] is True
+
+
+def test_webhook_registration_default_path_does_not_claim_provider_failure(
+    firestore_fake, monkeypatch,
+):
+    from infra.deploy.connectors.telegram.webhook_admin import register_telegram_webhook
+
+    client = firestore_fake.client_class()
+
+    class Response:
+        status = 200
+
+        def read(self, _limit):
+            return b'{"ok": false, "description": "synthetic failure"}'
+
+    class Connection:
+        def __init__(self, _host, *, timeout):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "infra.deploy.connectors.telegram.webhook_admin.http.client.HTTPSConnection",
+        Connection,
+    )
+
+    result = register_telegram_webhook(
+        client=client,
+        bot_token="synthetic-failure-token",
+        webhook_url="https://telegram.synthetic.invalid/failure",
+    )
+
+    assert result is False
+
+
 def test_disable_uses_runtime_telegram_identity_without_deploy_token_and_preserves_records(
     firestore_fake, monkeypatch,
 ):
