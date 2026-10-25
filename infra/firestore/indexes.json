@@ -41,6 +41,14 @@
         { "fieldPath": "state", "order": "ASCENDING" },
         { "fieldPath": "updated_at", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "drafts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "cleanup_state", "order": "ASCENDING" },
+        { "fieldPath": "updated_at", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": [

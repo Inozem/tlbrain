@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from google.cloud import firestore
@@ -82,6 +82,9 @@ class _TelegramDraftMixin:
                 "completion_certificate_ref": f"{SAVE_INTENTS_COLLECTION}/{intent_id}",
                 "doc_id": shared_certificate.get("doc_id"),
             })
+            if draft.get("cleanup_state") not in {"pending", "authorized", "cleaned"}:
+                draft["cleanup_state"] = "pending"
+                draft["updated_at"] = datetime.now(timezone.utc)
             context["last_completion_draft_id"] = draft_id
             context["last_doc_id"] = shared_certificate.get("doc_id")
             transaction.set(draft_ref, draft)
@@ -92,13 +95,31 @@ class _TelegramDraftMixin:
 
 
     def load_completion_certificate(self, context_id: str) -> dict[str, Any] | None:
-        """Load the locally linked certificate for the context's latest completed draft."""
+        """Load the oldest unfinished completion so delayed cleanup can resume."""
         context_id = _identifier(context_id, "context_id")
+        draft_collection = self.client.collection(SESSIONS).document(context_id).collection("drafts")
+        pending = []
+        for cleanup_state in ("pending", "authorized"):
+            query = draft_collection.where("cleanup_state", "==", cleanup_state)
+            order_by = getattr(query, "order_by", None)
+            if callable(order_by):
+                query = order_by("updated_at")
+            snapshots = list(query.limit(1).stream())
+            if snapshots:
+                draft = snapshots[0].to_dict() or {}
+                certificate = draft.get("completion_certificate")
+                if isinstance(certificate, Mapping):
+                    pending.append((str(draft.get("updated_at", "")), draft))
+        if pending:
+            pending.sort(key=lambda item: (item[0], item[1].get("draft_id", "")))
+            return dict(pending[0][1]["completion_certificate"])
         context = self.get_context(context_id) or {}
         draft_id = context.get("last_completion_draft_id")
         if not draft_id:
             return None
         draft = self.get_draft(context_id, _identifier(draft_id, "draft_id")) or {}
+        if draft.get("cleanup_state") == "cleaned":
+            return None
         certificate = draft.get("completion_certificate")
         return dict(certificate) if isinstance(certificate, Mapping) else None
 

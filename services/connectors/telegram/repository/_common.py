@@ -71,6 +71,23 @@ def _completion_records_match(
                "manifest_digest": manifest_digest}
     shared = intent.get("completion_certificate") or {}
     authorization = intent.get("cleanup_authorization") or {}
+    retry = operation.get("retry_authorization") or {}
+    intent_operation_matches = (
+        intent.get("operation_id", intent.get("dispatch_operation_id")) == operation_id
+        or (
+            retry.get("operation_id") == operation_id
+            and retry.get("create_gate_operation_id", retry.get("previous_operation_id"))
+                == intent.get("dispatch_operation_id")
+            and retry.get("context_id") == context_id
+            and retry.get("draft_id") == draft_id
+            and retry.get("manifest_digest") == manifest_digest
+            and retry.get("caller_binding") == operation.get("caller_binding")
+            and retry.get("immutable_input_digest") == operation.get("immutable_input_digest")
+            and operation.get("origin_binding") == binding
+            and operation.get("retry_of_operation_id") == retry.get("previous_operation_id")
+            and operation.get("retry_draft_id") == draft_id
+        )
+    )
     return (
         draft.get("state") in {TelegramDraftState.PROCESSING.value,
                                 TelegramDraftState.COMPLETED.value}
@@ -87,7 +104,7 @@ def _completion_records_match(
         and manifest.get("manifest_digest") == manifest_digest
         and manifest.get("ordered_message_ids") == draft.get("ordered_message_ids")
         and intent.get("save_intent_id") == intent_id
-        and intent.get("operation_id") == operation_id
+        and intent_operation_matches
         and shared.get("save_intent_id") == intent_id
         and shared.get("operation_id") == operation_id
         and shared.get("origin_binding") == binding
@@ -127,7 +144,6 @@ def _cleanup_authority_matches(
         draft.get("state") == TelegramDraftState.COMPLETED.value
         and draft.get("doc_id") == shared.get("doc_id")
         and draft.get("completion_certificate_ref") == f"{SAVE_INTENTS_COLLECTION}/{intent_id}"
-        and context.get("last_completion_draft_id") == draft_id
         and _telegram_certificate_matches(
             draft.get("completion_certificate"), telegram_certificate,
         )

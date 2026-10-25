@@ -278,6 +278,14 @@ def test_firestore_indexes_are_valid_and_match_schema_collection_groups():
                 {"fieldPath": "updated_at", "order": "ASCENDING"},
             ],
         },
+        {
+            "collectionGroup": "drafts",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "cleanup_state", "order": "ASCENDING"},
+                {"fieldPath": "updated_at", "order": "ASCENDING"},
+            ],
+        },
     ]
     overrides = {(item["collectionGroup"], item["fieldPath"]): item["indexes"]
                  for item in config["fieldOverrides"]}

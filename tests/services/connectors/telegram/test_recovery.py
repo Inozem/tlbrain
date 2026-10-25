@@ -17,7 +17,13 @@ from core.integrations.firestore.outbox import (
     record_outbox_delivery_result,
     task_payload,
 )
-from core.integrations.firestore.operations import create_operation, get_stage
+from core.integrations.firestore.operations import (
+    claim_operation,
+    create_operation,
+    get_operation as get_shared_operation,
+    get_stage,
+)
+from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION
 from core.integrations.firestore.operation_queue import (
     QueueOperationRetryStore,
     claim_head,
@@ -39,6 +45,7 @@ from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY, with_retry
 from services.connectors.telegram.commands import parse_command
 from services.connectors.telegram.queue import TelegramQueueWorker
 from services.connectors.telegram.repository import SESSIONS, TelegramRepository
+from services.connectors.telegram.save import TelegramCompletionCertificate
 
 
 NOW = datetime(2026, 10, 22, tzinfo=timezone.utc)
@@ -506,6 +513,681 @@ def test_telegram_stage_failure_budget_is_three_physical_single_attempt_calls(fi
 
     assert physical_calls == [accepted.operation_id] * 3
     assert get_stage(client, accepted.operation_id, "save/index").attempts_started == 3
+
+
+def test_explicit_retry_of_unknown_create_keeps_original_gate_and_reconciles_only(
+    firestore_fake, sdk_fakes,
+):
+    from core.dialogs.saving import accept_save, advance_save
+    from core.integrations.firestore.operations import fail_operation
+    from tests.services.connectors.telegram.test_failed_drafts import (
+        _document,
+        _seed_failed_draft,
+        _retry,
+    )
+    from core.integrations.google_drive.files import DriveCreateError
+    from core.operations.models import OperationError
+    from tests.fixtures.sdk_fakes import fake_discovery_build
+
+    repository, client, context_id, draft_id, original_id, intent_id = (
+        _seed_failed_draft(firestore_fake, update_id=77)
+    )
+    draft_ref = _document(client, f"{SESSIONS}/{context_id}/drafts/{draft_id}")
+    draft_ref.update({"doc_id": None})
+    original_shared_ref = client.collection("dialog_operations").document(original_id)
+    intent_ref = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+    # Replace the old hand-seeded core records with a real accepted save so this
+    # test crosses the same core create and retry boundaries as production.
+    original_shared_ref.delete()
+    intent_ref.delete()
+    accepted = accept_save(
+        client,
+        {
+            "provider": "telegram", "title": "Recovered dialog",
+            "folder_path": ["Client"],
+            "utterances": [{"speaker": "Alex", "text": "sealed source text"}],
+        },
+        operation_id=original_id, caller_binding=f"telegram:{context_id}",
+        origin=OperationOrigin.TELEGRAM,
+        origin_operation_ref=f"{SESSIONS}/{context_id}/operations/{original_id}",
+        now=NOW, save_intent_id=intent_id,
+    )
+    assert accepted.save_intent_id == intent_id
+    original_lease = claim_operation(
+        client, original_id, owner="original-save", now=NOW, lease_seconds=600,
+    )
+    assert original_lease is not None
+    sdk_fakes.drive.queue("files.create", error=RuntimeError("lost create response"))
+    with pytest.raises(DriveCreateError):
+        advance_save(
+            client, original_id, owner="original-save", fence=original_lease.fence, now=NOW,
+            folders={"folder-a": {"name": "Client", "parent_id": "root"}},
+            root_folder_id="root", speaker_index_lookup=lambda _speaker: (),
+            suggestion=lambda *_args: None,
+            drive=fake_discovery_build("drive", "v3"),
+            docs=fake_discovery_build("docs", "v1"),
+            governor=RetryGovernor(client, clock=_Clock(NOW)),
+        )
+    assert len([row for row in sdk_fakes.trace if row["operation"] == "files.create"]) == 1
+    intent_after_unknown = intent_ref.get().to_dict()
+    assert intent_after_unknown["state"] == "unknown"
+    assert intent_after_unknown["dispatch_operation_id"] == original_id
+    assert fail_operation(
+        client, original_id, owner="original-save", fence=original_lease.fence,
+        error=OperationError(
+            code="create_outcome_unknown", category="execution",
+            message="Create outcome is unknown", retryable=False,
+        ), now=NOW,
+    ) is True
+    # The Telegram draft and source manifest are still the original sealed input.
+    draft_ref.update({"doc_id": None})
+    original_telegram_operation_ref = (
+        client.collection(SESSIONS).document(context_id)
+        .collection("operations").document(original_id)
+    )
+    original_telegram_operation_ref.update({"state": "failed", "finished_at": NOW})
+    before_intent = intent_ref.get().to_dict()
+    reusable = {
+        "telegram.preparation": [{"text": "prepared source"}],
+        "telegram.analysis": {"title": "Recovered title"},
+        "telegram.classification": {"folder_id": "folder-a"},
+    }
+    old_queue_operation_ref = (
+        client.collection(SESSIONS).document(context_id)
+        .collection("operations").document(original_id)
+    )
+    for stage_key, result in reusable.items():
+        old_queue_operation_ref.collection("stages").document(stage_key).set({
+            "operation_id": original_id, "stage_key": stage_key,
+            "state": "completed", "failures": 0, "attempts_started": 1,
+            "result": result, "checkpoint_refs": [], "updated_at": NOW,
+        })
+
+    retry_acceptance = _retry(repository, context_id, 1, update_id=990)
+    assert retry_acceptance.accepted is True
+    retry_id = retry_acceptance.operation_id
+    retry_shared = client.collection("dialog_operations").document(retry_id).get().to_dict()
+    assert retry_shared["doc_id"] is None
+    assert retry_shared["immutable_input_digest"] == original_shared_ref.get().to_dict()[
+        "immutable_input_digest"
+    ]
+    assert retry_shared["immutable_input_ref"] == original_shared_ref.get().to_dict()[
+        "immutable_input_ref"
+    ]
+    assert retry_shared["origin_binding"] == {
+        "context_id": context_id, "draft_id": draft_id,
+        "manifest_digest": repository.get_draft(context_id, draft_id)["manifest_digest"],
+    }
+    assert intent_ref.get().to_dict() == before_intent
+    for stage_key, result in reusable.items():
+        stage = (
+            client.collection(SESSIONS).document(context_id)
+            .collection("operations").document(retry_id)
+            .collection("stages").document(stage_key).get().to_dict()
+        )
+        assert stage["state"] == "completed" and stage["result"] == result
+        assert stage["operation_id"] == retry_id
+        assert stage["failures"] == 0 and stage["attempts_started"] == 0
+
+    lease = claim_operation(
+        client, retry_id, owner="explicit-retry", now=NOW, lease_seconds=600,
+    )
+    assert lease is not None
+    sdk_fakes.drive.queue("files.list", response={"files": []})
+    with pytest.raises(UnknownOutcome):
+        advance_save(
+            client, retry_id, owner="explicit-retry", fence=lease.fence, now=NOW,
+            folders={"folder-a": {"name": "Client", "parent_id": "root"}},
+            root_folder_id="root", speaker_index_lookup=lambda _speaker: (),
+            suggestion=lambda *_args: None,
+            drive=fake_discovery_build("drive", "v3"),
+            docs=fake_discovery_build("docs", "v1"),
+            governor=RetryGovernor(client, clock=_Clock(NOW)),
+        )
+    create_calls = [row for row in sdk_fakes.trace if row["operation"] == "files.create"]
+    marker_queries = [row for row in sdk_fakes.trace if row["operation"] == "files.list"]
+    assert len(create_calls) == 1
+    assert len(marker_queries) == 1
+    assert intent_ref.get().to_dict()["state"] == "unknown"
+    assert intent_ref.get().to_dict()["dispatch_operation_id"] == original_id
+
+    # A later positive marker read resolves that same in-flight create stage and
+    # lets the retry continue with the original document identity.
+    sdk_fakes.drive.queue("files.list", response={"files": [{
+        "id": "marker-reconciled-doc",
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": ["folder-a"], "trashed": False,
+        "appProperties": {"tlbrain_save_id": intent_id},
+    }]})
+    with pytest.raises(RuntimeError):
+        advance_save(
+            client, retry_id, owner="explicit-retry", fence=lease.fence, now=NOW,
+            folders={"folder-a": {"name": "Client", "parent_id": "root"}},
+            root_folder_id="root", speaker_index_lookup=lambda _speaker: (),
+            suggestion=lambda *_args: None,
+            drive=fake_discovery_build("drive", "v3"),
+            docs=fake_discovery_build("docs", "v1"),
+            governor=RetryGovernor(client, clock=_Clock(NOW)),
+        )
+    resolved_intent = intent_ref.get().to_dict()
+    assert resolved_intent["state"] == "confirmed"
+    assert resolved_intent["doc_id"] == "marker-reconciled-doc"
+    assert get_shared_operation(client, retry_id).doc_id == "marker-reconciled-doc"
+    assert len([row for row in sdk_fakes.trace if row["operation"] == "files.create"]) == 1
+    assert intent_ref.get().to_dict()["dispatch_operation_id"] == original_id
+
+    from core.integrations.firestore.save_intents import _completion_operation_binding_matches
+
+    binding = retry_shared["origin_binding"]
+    assert _completion_operation_binding_matches(
+        retry_shared, intent_ref.get().to_dict(), operation_id=retry_id,
+        origin_binding=binding,
+    ) is True
+    foreign_binding = {**binding, "draft_id": "another-draft"}
+    assert _completion_operation_binding_matches(
+        retry_shared, intent_ref.get().to_dict(), operation_id=retry_id,
+        origin_binding=foreign_binding,
+    ) is False
+
+
+def test_delayed_cleanup_resumes_old_authorization_while_newer_selection_survives(
+    firestore_fake, monkeypatch,
+):
+    from tests.services.connectors.telegram.test_failed_drafts import (
+        _document,
+        _retry,
+        _seed_failed_draft,
+    )
+    from services.connectors.telegram.cleanup import TelegramDraftCleanup
+
+    repository, client, context_id, old_draft_id, _original_id, _intent_id = (
+        _seed_failed_draft(firestore_fake, update_id=88)
+    )
+    current = repository.accept_forward(
+        188, chat_id=42, thread_id=11,
+        message={"message_id": 288, "text": "current selection"}, now=NOW,
+    )
+    retry = _retry(repository, context_id, 1, update_id=988)
+    retry_id = retry.operation_id
+    old_draft = repository.get_draft(context_id, old_draft_id)
+    intent_id = old_draft["immutable_save_intent_id"]
+    manifest_digest = old_draft["manifest_digest"]
+    doc_id = old_draft["doc_id"]
+    binding = {
+        "context_id": context_id, "draft_id": old_draft_id,
+        "manifest_digest": manifest_digest,
+    }
+    certificate_id = f"completion-{retry_id}"
+    shared_certificate = {
+        "certificate_id": certificate_id, "save_intent_id": intent_id,
+        "operation_id": retry_id, "doc_id": doc_id, "origin_binding": binding,
+        "receipt_ref": f"index_completions/{doc_id}", "receipt_version": 1,
+    }
+    shared_authorization = {
+        "certificate_id": certificate_id, "save_intent_id": intent_id,
+        "operation_id": retry_id, "origin_binding": binding,
+    }
+    intent_ref = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+    intent_data = intent_ref.get().to_dict()
+    intent_data.update({
+        "completion_certificate": shared_certificate,
+        "cleanup_authorization": shared_authorization,
+    })
+    intent_ref.set(intent_data)
+    operation_ref = client.collection("dialog_operations").document(retry_id)
+    operation_data = operation_ref.get().to_dict()
+    operation_data.update({
+        "state": "completed", "doc_id": doc_id,
+        "cleanup_authorization": shared_authorization,
+    })
+    operation_ref.set(operation_data)
+    certificate = TelegramCompletionCertificate(
+        context_id=context_id, draft_id=old_draft_id, manifest_digest=manifest_digest,
+        save_intent_id=intent_id, operation_id=retry_id,
+        receipt_ref=shared_certificate["receipt_ref"], receipt_version=1,
+        receipt_digest=f"receipt-{retry_id}",
+        origin_binding=(context_id, old_draft_id, manifest_digest),
+    )
+    assert repository.commit_completion(certificate) is True
+
+    newer_completed_id = "newer-completed"
+    newer_certificate = {
+        "context_id": context_id, "draft_id": newer_completed_id,
+        "manifest_digest": "newer-manifest",
+    }
+    _document(client, f"{SESSIONS}/{context_id}/drafts/{newer_completed_id}").set({
+        "draft_id": newer_completed_id, "state": "cleaned", "cleanup_state": "cleaned",
+        "completion_certificate": newer_certificate, "updated_at": NOW + timedelta(seconds=1),
+    })
+    context_ref = client.collection(SESSIONS).document(context_id)
+    context_ref.update({
+        "last_completion_draft_id": newer_completed_id,
+        "last_doc_id": "newer-doc",
+        "active_draft_id": current.draft_id,
+    })
+    client.collection("transcript_index").document(doc_id).set({
+        "doc_id": doc_id, "user_facts": {"external-edit": "preserve"},
+    })
+
+    original_delete = repository.delete_prepared_page
+    first_call = True
+
+    def fail_after_source_cleanup(*args, **kwargs):
+        nonlocal first_call
+        if first_call:
+            first_call = False
+            raise RuntimeError("synthetic crash during prepared deletion")
+        return original_delete(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "delete_prepared_page", fail_after_source_cleanup)
+    cleanup = TelegramDraftCleanup(repository=repository, page_size=1)
+    with pytest.raises(RuntimeError, match="synthetic crash"):
+        _run(cleanup.cleanup(context_id=context_id))
+    assert repository.list_messages(context_id, old_draft_id) == []
+    assert repository.list_messages(context_id, current.draft_id)
+
+    monkeypatch.setattr(repository, "delete_prepared_page", original_delete)
+    assert _run(cleanup.cleanup(context_id=context_id)) is True
+    deleted_source_after_resume = list(repository.list_messages(context_id, old_draft_id))
+    assert _run(cleanup.cleanup(context_id=context_id)) is False
+    assert repository.list_messages(context_id, old_draft_id) == deleted_source_after_resume == []
+    context = repository.get_context(context_id)
+    assert context["active_draft_id"] == current.draft_id
+    assert context["last_completion_draft_id"] == newer_completed_id
+    assert context["last_doc_id"] == "newer-doc"
+    assert client.collection("transcript_index").document(doc_id).get().to_dict()[
+        "user_facts"
+    ] == {"external-edit": "preserve"}
+
+
+@pytest.mark.parametrize(
+    ("state", "create_outcome"),
+    [("planned", None), ("planned", "rejected")],
+)
+def test_explicit_retry_accepts_pre_dispatch_or_definitively_rejected_create(
+    firestore_fake, state, create_outcome,
+):
+    from tests.services.connectors.telegram.test_failed_drafts import (
+        _document,
+        _retry,
+        _seed_failed_draft,
+    )
+
+    repository, client, context_id, draft_id, operation_id, intent_id = (
+        _seed_failed_draft(firestore_fake, update_id=97)
+    )
+    _document(client, f"{SESSIONS}/{context_id}/drafts/{draft_id}").update({"doc_id": None})
+    client.collection("dialog_operations").document(operation_id).update({"doc_id": None})
+    intent_ref = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+    intent = intent_ref.get().to_dict()
+    intent.update({
+        "state": state, "create_outcome": create_outcome,
+        "dispatch_token": None, "dispatch_operation_id": None,
+        "dispatch_owner": None, "dispatch_fence": None, "doc_id": None,
+        "confirmed_result": None,
+    })
+    intent_ref.set(intent)
+
+    retry = _retry(repository, context_id, 1, update_id=2097)
+
+    assert retry.accepted is True
+    assert retry.operation_id
+    assert intent_ref.get().to_dict() == intent
+
+
+def test_explicit_retry_reuses_confirmed_doc_and_fill_checkpoint_without_writes(
+    firestore_fake, sdk_fakes,
+):
+    from core.dialogs.saving import accept_save, advance_save
+    from core.integrations.firestore.operations import fail_operation
+    from core.operations.models import OperationError
+    from tests.services.connectors.telegram.test_failed_drafts import (
+        _document,
+        _retry,
+        _seed_failed_draft,
+    )
+    from tests.fixtures.sdk_fakes import fake_discovery_build
+
+    repository, client, context_id, draft_id, original_id, intent_id = (
+        _seed_failed_draft(firestore_fake, update_id=98)
+    )
+    document_id = f"doc-98"
+    draft_ref = _document(client, f"{SESSIONS}/{context_id}/drafts/{draft_id}")
+    draft_ref.update({"state": "failed", "doc_id": None})
+    shared_ref = client.collection("dialog_operations").document(original_id)
+    intent_ref = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+    shared_ref.delete()
+    intent_ref.delete()
+    accepted = accept_save(
+        client,
+        {
+            "provider": "telegram", "title": "Recovered dialog",
+            "folder_path": ["Client"],
+            "utterances": [{"speaker": "Alex", "text": "sealed source text"}],
+        },
+        operation_id=original_id, caller_binding=f"telegram:{context_id}",
+        origin=OperationOrigin.TELEGRAM,
+        origin_operation_ref=f"{SESSIONS}/{context_id}/operations/{original_id}",
+        now=NOW, save_intent_id=intent_id,
+    )
+    original_lease = claim_operation(
+        client, original_id, owner="original-save", now=NOW, lease_seconds=600,
+    )
+    assert original_lease is not None
+    sdk_fakes.drive.queue("files.create", response={"id": document_id})
+    empty_document = {"revisionId": "rev-before", "body": {"content": [
+        {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
+    ]}}
+    sdk_fakes.docs.queue("documents.get", response=empty_document)
+    sdk_fakes.docs.queue("documents.get", response=empty_document)
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"revisionId": "rev-after"})
+    sdk_fakes.drive.queue("files.get", response={
+        "id": document_id, "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "fill-time",
+    })
+    sdk_fakes.drive.queue("files.get", response={
+        "id": document_id, "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "post-fill-time",
+    })
+    original_progress = advance_save(
+        client, original_id, owner="original-save", fence=original_lease.fence, now=NOW,
+        folders={"folder-a": {"name": "Client", "parent_id": "root"}},
+        root_folder_id="root", speaker_index_lookup=lambda _speaker: (),
+        suggestion=lambda *_args: None,
+        drive=fake_discovery_build("drive", "v3"),
+        docs=fake_discovery_build("docs", "v1"),
+        governor=RetryGovernor(client, clock=_Clock(NOW)),
+    )
+    assert original_progress.document_id == document_id
+    confirmed_intent = intent_ref.get().to_dict()
+    assert confirmed_intent["state"] == "confirmed"
+    assert confirmed_intent["dispatch_operation_id"] == original_id
+    assert confirmed_intent["doc_id"] == document_id
+    assert confirmed_intent["fill_checkpoint_ref"]
+    assert fail_operation(
+        client, original_id, owner="original-save", fence=original_lease.fence,
+        error=OperationError(
+            code="later_stage_failed", category="execution",
+            message="Later save stage failed", retryable=False,
+        ), now=NOW,
+    ) is True
+
+    retry = _retry(repository, context_id, 1, update_id=2098)
+
+    assert retry.accepted is True
+    retry_operation = client.collection("dialog_operations").document(retry.operation_id).get().to_dict()
+    assert retry_operation["immutable_input_ref"] == accepted.immutable_input_ref
+    assert retry_operation["immutable_input_digest"] == accepted.immutable_input_digest
+    assert retry_operation["doc_id"] == document_id
+    assert intent_ref.get().to_dict() == confirmed_intent
+    lease = claim_operation(
+        client, retry.operation_id, owner="confirmed-retry", now=NOW, lease_seconds=600,
+    )
+    assert lease is not None
+    sdk_fakes.drive.queue("files.get", response={
+        "id": document_id,
+        "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "post-fill-time",
+    })
+    progress = advance_save(
+        client, retry.operation_id, owner="confirmed-retry", fence=lease.fence, now=NOW,
+        folders={"folder-a": {"name": "Client", "parent_id": "root"}},
+        root_folder_id="root", speaker_index_lookup=lambda _speaker: (),
+        suggestion=lambda *_args: None,
+        drive=fake_discovery_build("drive", "v3"),
+        docs=fake_discovery_build("docs", "v1"),
+        governor=RetryGovernor(client, clock=_Clock(NOW)),
+    )
+
+    assert progress.document_id == document_id
+    assert len([row for row in sdk_fakes.trace if row["operation"] == "files.create"]) == 1
+    assert len([row for row in sdk_fakes.trace if row["operation"] == "documents.batchUpdate"]) == 1
+    assert intent_ref.get().to_dict()["dispatch_operation_id"] == original_id
+
+    assert fail_operation(
+        client, retry.operation_id, owner="confirmed-retry", fence=lease.fence,
+        error=OperationError(
+            code="later_stage_failed", category="execution",
+            message="Later retry stage failed", retryable=False,
+        ), now=NOW,
+    ) is True
+    client.collection(SESSIONS).document(context_id).collection("operations").document(
+        retry.operation_id
+    ).update({"state": "failed", "finished_at": NOW})
+    draft_ref.update({"state": "failed"})
+
+    second_retry = _retry(repository, context_id, 1, update_id=3098)
+    assert second_retry.accepted is True
+    second_operation = client.collection("dialog_operations").document(
+        second_retry.operation_id
+    ).get().to_dict()
+    assert second_operation["retry_of_operation_id"] == retry.operation_id
+    assert second_operation["retry_authorization"]["previous_operation_id"] == retry.operation_id
+    assert second_operation["retry_authorization"]["create_gate_operation_id"] == original_id
+    assert second_operation["doc_id"] == document_id
+    second_lease = claim_operation(
+        client, second_retry.operation_id, owner="second-confirmed-retry",
+        now=NOW, lease_seconds=600,
+    )
+    assert second_lease is not None
+    sdk_fakes.drive.queue("files.get", response={
+        "id": document_id,
+        "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "post-fill-time",
+    })
+    second_progress = advance_save(
+        client, second_retry.operation_id, owner="second-confirmed-retry",
+        fence=second_lease.fence, now=NOW,
+        folders={"folder-a": {"name": "Client", "parent_id": "root"}},
+        root_folder_id="root", speaker_index_lookup=lambda _speaker: (),
+        suggestion=lambda *_args: None,
+        drive=fake_discovery_build("drive", "v3"),
+        docs=fake_discovery_build("docs", "v1"),
+        governor=RetryGovernor(client, clock=_Clock(NOW)),
+    )
+    assert second_progress.document_id == document_id
+    assert len([row for row in sdk_fakes.trace if row["operation"] == "files.create"]) == 1
+    assert len([row for row in sdk_fakes.trace if row["operation"] == "documents.batchUpdate"]) == 1
+
+    binding = {
+        "context_id": context_id, "draft_id": draft_id,
+        "manifest_digest": repository.get_draft(context_id, draft_id)["manifest_digest"],
+    }
+    certificate_id = f"completion-{second_retry.operation_id}"
+    shared_certificate = {
+        "certificate_id": certificate_id, "save_intent_id": intent_id,
+        "operation_id": second_retry.operation_id, "doc_id": document_id,
+        "origin_binding": binding,
+        "receipt_ref": f"index_completions/{document_id}", "receipt_version": 1,
+    }
+    cleanup_authorization = {
+        "certificate_id": certificate_id, "save_intent_id": intent_id,
+        "operation_id": second_retry.operation_id, "origin_binding": binding,
+    }
+    completed_intent = intent_ref.get().to_dict()
+    completed_intent.update({
+        "completion_certificate": shared_certificate,
+        "cleanup_authorization": cleanup_authorization,
+    })
+    intent_ref.set(completed_intent)
+    second_shared_ref = client.collection("dialog_operations").document(second_retry.operation_id)
+    second_shared = second_shared_ref.get().to_dict()
+    second_shared.update({
+        "state": "completed", "doc_id": document_id,
+        "cleanup_authorization": cleanup_authorization,
+    })
+    second_shared_ref.set(second_shared)
+    from core.integrations.firestore.save_intents import _completion_operation_binding_matches
+
+    assert _completion_operation_binding_matches(
+        second_shared, completed_intent,
+        operation_id=second_retry.operation_id, origin_binding=binding,
+    ) is True
+    certificate = TelegramCompletionCertificate(
+        context_id=context_id, draft_id=draft_id,
+        manifest_digest=binding["manifest_digest"], save_intent_id=intent_id,
+        operation_id=second_retry.operation_id,
+        receipt_ref=shared_certificate["receipt_ref"], receipt_version=1,
+        receipt_digest=f"receipt-{second_retry.operation_id}",
+        origin_binding=(context_id, draft_id, binding["manifest_digest"]),
+    )
+    assert repository.commit_completion(certificate) is True
+    assert repository.authorize_cleanup(context_id, certificate) is True
+
+
+def test_retry_recovers_confirmed_create_before_shared_doc_checkpoint(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.dialogs import saving
+    from core.dialogs.saving import accept_save, advance_save
+    from core.integrations.firestore.operations import fail_operation
+    from core.operations.models import OperationError
+    from tests.services.connectors.telegram.test_failed_drafts import (
+        _document,
+        _retry,
+        _seed_failed_draft,
+    )
+    from tests.fixtures.sdk_fakes import fake_discovery_build
+
+    repository, client, context_id, draft_id, original_id, intent_id = (
+        _seed_failed_draft(firestore_fake, update_id=98)
+    )
+    document_id = "doc-before-shared-checkpoint"
+    draft_ref = _document(client, f"{SESSIONS}/{context_id}/drafts/{draft_id}")
+    draft_ref.update({"state": "failed", "doc_id": None})
+    shared_ref = client.collection("dialog_operations").document(original_id)
+    intent_ref = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+    shared_ref.delete()
+    intent_ref.delete()
+    accept_save(
+        client,
+        {
+            "provider": "telegram", "title": "Recovered dialog",
+            "folder_path": ["Client"],
+            "utterances": [{"speaker": "Alex", "text": "sealed source text"}],
+        },
+        operation_id=original_id, caller_binding=f"telegram:{context_id}",
+        origin=OperationOrigin.TELEGRAM,
+        origin_operation_ref=f"{SESSIONS}/{context_id}/operations/{original_id}",
+        now=NOW, save_intent_id=intent_id,
+    )
+    lease = claim_operation(
+        client, original_id, owner="before-shared-checkpoint", now=NOW, lease_seconds=600,
+    )
+    assert lease is not None
+    sdk_fakes.drive.queue("files.create", response={"id": document_id})
+
+    def crash_before_shared_checkpoint(*_args, **_kwargs):
+        raise RuntimeError("crash before shared doc checkpoint")
+
+    store_created_doc = saving._store_created_doc
+    monkeypatch.setattr(saving, "_store_created_doc", crash_before_shared_checkpoint)
+    with pytest.raises(RuntimeError, match="before shared doc checkpoint"):
+        advance_save(
+            client, original_id, owner="before-shared-checkpoint", fence=lease.fence,
+            now=NOW, folders={"folder-a": {"name": "Client", "parent_id": "root"}},
+            root_folder_id="root", speaker_index_lookup=lambda _speaker: (),
+            suggestion=lambda *_args: None,
+            drive=fake_discovery_build("drive", "v3"),
+            docs=fake_discovery_build("docs", "v1"),
+            governor=RetryGovernor(client, clock=_Clock(NOW)),
+        )
+    intent_after_crash = intent_ref.get().to_dict()
+    assert intent_after_crash["state"] == "confirmed"
+    assert intent_after_crash["doc_id"] == document_id
+    assert client.collection("dialog_operations").document(original_id).get().to_dict()[
+        "doc_id"
+    ] is None
+    assert draft_ref.get().to_dict()["doc_id"] is None
+    assert fail_operation(
+        client, original_id, owner="before-shared-checkpoint", fence=lease.fence,
+        error=OperationError(
+            code="create_checkpoint_interrupted", category="execution",
+            message="Create checkpoint interrupted", retryable=False,
+        ), now=NOW,
+    ) is True
+    monkeypatch.setattr(saving, "_store_created_doc", store_created_doc)
+
+    retry = _retry(repository, context_id, 1, update_id=3098)
+    assert retry.accepted is True
+    assert client.collection("dialog_operations").document(retry.operation_id).get().to_dict()[
+        "doc_id"
+    ] == document_id
+    retry_lease = claim_operation(
+        client, retry.operation_id, owner="after-shared-checkpoint",
+        now=NOW, lease_seconds=600,
+    )
+    assert retry_lease is not None
+    empty_document = {"revisionId": "rev-before", "body": {"content": [
+        {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
+    ]}}
+    sdk_fakes.docs.queue("documents.get", response=empty_document)
+    sdk_fakes.docs.queue("documents.get", response=empty_document)
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"revisionId": "rev-after"})
+    sdk_fakes.drive.queue("files.get", response={
+        "id": document_id, "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "fill-time",
+    })
+    sdk_fakes.drive.queue("files.get", response={
+        "id": document_id, "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "post-fill-time",
+    })
+    progress = advance_save(
+        client, retry.operation_id, owner="after-shared-checkpoint", fence=retry_lease.fence,
+        now=NOW, folders={"folder-a": {"name": "Client", "parent_id": "root"}},
+        root_folder_id="root", speaker_index_lookup=lambda _speaker: (),
+        suggestion=lambda *_args: None,
+        drive=fake_discovery_build("drive", "v3"),
+        docs=fake_discovery_build("docs", "v1"),
+        governor=RetryGovernor(client, clock=_Clock(NOW)),
+    )
+
+    assert progress.document_id == document_id
+    assert len([row for row in sdk_fakes.trace if row["operation"] == "files.create"]) == 1
+    assert len([row for row in sdk_fakes.trace if row["operation"] == "documents.batchUpdate"]) == 1
+
+
+@pytest.mark.parametrize(("malformed", "draft_doc_id", "shared_doc_id"), [
+    ({"state": "planned", "create_outcome": "confirmed"}, "doc-99", "doc-99"),
+    ({"state": "planned", "create_outcome": "rejected", "dispatch_token": None,
+      "dispatch_operation_id": None, "dispatch_owner": None, "dispatch_fence": None,
+      "doc_id": None, "confirmed_result": None}, "doc-99", "doc-99"),
+    ({"state": "unknown", "create_outcome": "unknown", "doc_id": None,
+      "confirmed_result": None}, "doc-99", "doc-99"),
+    ({"state": "dispatched", "create_outcome": "dispatched", "doc_id": None,
+      "confirmed_result": None}, "doc-99", "doc-99"),
+    ({"state": "rejected"}, "doc-99", "doc-99"),
+    ({"state": "confirmed", "create_outcome": "confirmed", "dispatch_token": None},
+     "doc-99", "doc-99"),
+    ({"state": "confirmed", "create_outcome": "confirmed", "doc_id": "foreign-doc"},
+     "doc-99", "doc-99"),
+])
+def test_explicit_retry_rejects_inconsistent_intent_binding_write_free(
+    firestore_fake, malformed, draft_doc_id, shared_doc_id,
+):
+    from tests.services.connectors.telegram.test_failed_drafts import (
+        _document,
+        _retry,
+        _seed_failed_draft,
+    )
+
+    repository, client, context_id, draft_id, operation_id, intent_id = (
+        _seed_failed_draft(firestore_fake, update_id=99)
+    )
+    intent_ref = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id)
+    intent_ref.update(malformed)
+    _document(client, f"{SESSIONS}/{context_id}/drafts/{draft_id}").update({
+        "doc_id": draft_doc_id,
+    })
+    client.collection("dialog_operations").document(operation_id).update({
+        "doc_id": shared_doc_id,
+    })
+    before = firestore_fake.documents
+
+    retry = _retry(repository, context_id, 1, update_id=2099)
+
+    assert retry.accepted is False
+    assert firestore_fake.documents == before
 
 
 def test_stage_retry_store_updates_stage_without_rewriting_context_queue_document(firestore_fake):

@@ -512,7 +512,9 @@ def _completion_replay_result(
     stored_result = _result_from(operation.get("result"))
     if (operation.get("save_intent_id") == save_intent_id
             and intent.get("save_intent_id") == save_intent_id
-            and intent.get("dispatch_operation_id") == operation_id
+            and _completion_operation_binding_matches(
+                operation, intent, operation_id=operation_id, origin_binding=origin_binding,
+            )
             and intent.get("doc_id") == doc_id
             and certificate.get("operation_id") == operation_id
             and certificate.get("save_intent_id") == save_intent_id
@@ -521,6 +523,35 @@ def _completion_replay_result(
             and stored_result is not None and stored_result.document_id == doc_id):
         return True, stored_result
     return True, None
+
+
+def _completion_operation_binding_matches(
+    operation: dict[str, Any], intent: dict[str, Any], *,
+    operation_id: str, origin_binding: dict[str, str],
+) -> bool:
+    """Validate the durable create gate and its explicitly linked retry lineage."""
+    if intent.get("dispatch_operation_id") == operation_id:
+        stored_binding = operation.get("origin_binding")
+        if stored_binding is not None:
+            return stored_binding == origin_binding
+        return (
+            origin_binding.get("context_id") == operation.get("origin_operation_ref")
+            and origin_binding.get("manifest_digest") == operation.get("immutable_input_digest")
+        )
+    authorization = operation.get("retry_authorization") or {}
+    return (
+        authorization.get("operation_id") == operation_id
+        and authorization.get("create_gate_operation_id", authorization.get("previous_operation_id"))
+            == intent.get("dispatch_operation_id")
+        and authorization.get("context_id") == origin_binding.get("context_id")
+        and authorization.get("draft_id") == origin_binding.get("draft_id")
+        and authorization.get("manifest_digest") == origin_binding.get("manifest_digest")
+        and authorization.get("caller_binding") == operation.get("caller_binding")
+        and authorization.get("immutable_input_digest") == operation.get("immutable_input_digest")
+        and operation.get("retry_of_operation_id") == authorization.get("previous_operation_id")
+        and operation.get("retry_draft_id") == origin_binding.get("draft_id")
+        and operation.get("origin_binding") == origin_binding
+    )
 
 
 def _completion_inputs_valid(
@@ -547,13 +578,17 @@ def _completion_inputs_valid(
     if (not _valid_lease(operation, owner, fence, commit_now)
             or operation.get("save_intent_id") != save_intent_id
             or intent.get("save_intent_id") != save_intent_id
-            or intent.get("dispatch_operation_id") != operation_id
+            or not _completion_operation_binding_matches(
+                operation, intent, operation_id=operation_id, origin_binding=origin_binding,
+            )
             or intent.get("state") != SaveIntentState.CONFIRMED.value
             or intent.get("doc_id") != doc_id
             or not intent.get("confirmed_result")
             or not origin_binding
-            or origin_binding.get("context_id") != operation.get("origin_operation_ref")
-            or origin_binding.get("manifest_digest") != operation.get("immutable_input_digest")
+            or (operation.get("origin_binding") is None and (
+                origin_binding.get("context_id") != operation.get("origin_operation_ref")
+                or origin_binding.get("manifest_digest") != operation.get("immutable_input_digest")
+            ))
             or not isinstance(origin_binding.get("draft_id"), str)
             or not origin_binding.get("draft_id")):
         return False

@@ -380,6 +380,9 @@ def test_completion_cleanup_authorization_requires_exact_shared_bindings(firesto
     context_id, draft_id, operation_id, certificate = _seed_completion_records(client)
 
     assert repo.commit_completion(certificate) is True
+    pending = repo.get_draft(context_id, draft_id)
+    assert pending["cleanup_state"] == "pending"
+    assert isinstance(pending["updated_at"], datetime)
     assert repo.authorize_cleanup(context_id, certificate) is True
     draft = repo.get_draft(context_id, draft_id)
     assert draft["cleanup_state"] == "authorized"
