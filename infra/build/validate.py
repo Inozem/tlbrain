@@ -22,7 +22,7 @@ from typing import Any
 
 
 SUPPORTED_SERVICES = {
-    "mcp", "vector_sync", "tldv_import", "sync_checker", "tldv_webhook",
+    "mcp", "vector_sync", "tldv_import", "telegram", "sync_checker", "tldv_webhook",
     "tldv_reconciliation",
 }
 
@@ -101,7 +101,7 @@ def _module_for_target(target: str, service: str, report: dict[str, Any]) -> tup
         kind = runtime.get("kind")
         target = runtime.get("target") or target
     else:
-        kind = {"mcp": "asgi", "vector_sync": "asgi", "tldv_import": "asgi"}.get(service, "function")
+        kind = {"mcp": "asgi", "vector_sync": "asgi", "tldv_import": "asgi", "telegram": "asgi"}.get(service, "function")
     if not isinstance(target, str) or not target:
         raise ValueError("assembly report has no runtime target")
     if ":" in target:

@@ -21,6 +21,7 @@ DOCKERFILES = {
     "mcp": APP_ROOT / "infra" / "docker" / "Dockerfile.mcp",
     "vector_sync": APP_ROOT / "infra" / "docker" / "Dockerfile.vector_sync",
     "tldv_import": APP_ROOT / "infra" / "docker" / "Dockerfile.tldv_import",
+    "telegram": APP_ROOT / "infra" / "docker" / "Dockerfile.telegram",
 }
 
 
@@ -54,7 +55,7 @@ def _assemble_service(service: str, temporary_root: Path) -> tuple[Path, Path]:
     return output, output_root
 
 
-@pytest.mark.parametrize("service", ["mcp", "vector_sync", "tldv_import"])
+@pytest.mark.parametrize("service", ["mcp", "vector_sync", "tldv_import", "telegram"])
 def test_dockerfile_and_manifest_describe_the_runtime_artifact(service: str) -> None:
     manifest = json.loads((BUILD_TOOLS / "service-manifests.json").read_text(encoding="utf-8"))
     config = manifest["services"][service]
@@ -77,10 +78,10 @@ def test_dockerfile_and_manifest_describe_the_runtime_artifact(service: str) -> 
     metadata = importlib.import_module("infra.build.image_metadata")
     assert metadata._SERVICE_CMDS[service] == expected_command
     assert config["runtime"]["kind"] == "asgi"
-    assert config["model_preparation"] == ([] if service == "tldv_import" else ["Qdrant/bm25"])
+    assert config["model_preparation"] == ([] if service in {"tldv_import", "telegram"} else ["Qdrant/bm25"])
 
     prep_lines = [line for line in runtime if "SparseTextEmbedding" in line or "fastembed" in line.lower()]
-    if service == "tldv_import":
+    if service in {"tldv_import", "telegram"}:
         assert not prep_lines
     else:
         assert prep_lines == [
@@ -88,7 +89,7 @@ def test_dockerfile_and_manifest_describe_the_runtime_artifact(service: str) -> 
         ]
 
 
-@pytest.mark.parametrize("service", ["mcp", "vector_sync", "tldv_import"])
+@pytest.mark.parametrize("service", ["mcp", "vector_sync", "tldv_import", "telegram"])
 def test_real_image_preflight_validates_runtime_cache_and_binds_evidence(
     service: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -215,5 +216,6 @@ def test_real_image_preflight_validates_runtime_cache_and_binds_evidence(
         assert result["image_id"] == f"sha256:immutable-{service}"
         assert result["config"]["Cmd"] == metadata._SERVICE_CMDS[service]
         assert "PORT=8080" in result["config"]["Env"]
+        assert metadata._validate_final_evidence(docker.bound_evidence, result) == docker.bound_evidence
     finally:
         shutil.rmtree(generated_root, ignore_errors=True)

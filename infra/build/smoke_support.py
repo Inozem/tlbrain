@@ -23,6 +23,7 @@ _SERVICE_KINDS = {
     "mcp": "asgi",
     "vector_sync": "asgi",
     "tldv_import": "asgi",
+    "telegram": "asgi",
     "sync_checker": "function",
     "tldv_webhook": "function",
     "tldv_reconciliation": "function",
@@ -330,6 +331,7 @@ def run_smoke(service: str, artifact: str | Path) -> None:
         "mcp",
         "vector_sync",
         "tldv_import",
+        "telegram",
         "sync_checker",
         "tldv_webhook",
         "tldv_reconciliation",
@@ -349,7 +351,7 @@ def run_smoke(service: str, artifact: str | Path) -> None:
         target = runtime.get("target")
     else:
         # Production assembly reports expose only the target. Runtime kind is
-        # a stable property of the six supported service entrypoints.
+        # a stable property of the supported service entrypoints.
         kind = _SERVICE_KINDS.get(service)
         target = report.get("runtime_target")
     if kind not in {"asgi", "function"} or not isinstance(target, str):

@@ -21,23 +21,26 @@ REQUIRED_PATHS = {
     "pytest.ini",
     ".github/workflows/**",
 }
-SOURCE_SERVICES = {
+SOURCE_SERVICES = [
     "mcp",
     "vector_sync",
     "tldv_import",
     "sync_checker",
     "tldv_webhook",
     "tldv_reconciliation",
-}
+    "telegram",
+]
 IMAGE_DOCKERFILES = {
     "mcp": "infra/docker/Dockerfile.mcp",
     "vector_sync": "infra/docker/Dockerfile.vector_sync",
     "tldv_import": "infra/docker/Dockerfile.tldv_import",
+    "telegram": "infra/docker/Dockerfile.telegram",
 }
 PUBLISH_JOBS = {
     "build-mcp": ("mcp", "inozem/tlbrain-mcp"),
     "build-vector-sync": ("vector_sync", "inozem/tlbrain-vector-sync"),
     "build-tldv-import": ("tldv_import", "inozem/tlbrain-tldv-import"),
+    "build-telegram": ("telegram", "inozem/tlbrain-telegram"),
 }
 GATES = {
     "offline-regression",
@@ -93,7 +96,7 @@ def test_workflow_keeps_on_as_a_mapping_and_validates_relevant_changes() -> None
 def test_source_validation_matrix_covers_every_supported_service() -> None:
     job = _workflow()["jobs"]["source-validation"]
     assert job["runs-on"] == "ubuntu-latest"
-    assert job["strategy"]["matrix"]["service"] == sorted(SOURCE_SERVICES, key=("mcp", "vector_sync", "tldv_import", "sync_checker", "tldv_webhook", "tldv_reconciliation").index)
+    assert job["strategy"]["matrix"]["service"] == SOURCE_SERVICES
     assert any(step.get("with", {}).get("python-version") == "3.12" for step in _steps(job))
     invocation = " ".join(str(step.get("run", "")) for step in _steps(job))
     assert "infra/build/preflight.sh" in invocation

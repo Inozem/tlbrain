@@ -26,6 +26,7 @@ PUBLISH_JOBS = {
     "build-mcp": "mcp",
     "build-vector-sync": "vector_sync",
     "build-tldv-import": "tldv_import",
+    "build-telegram": "telegram",
 }
 REQUIRED_PATHS = {
     "core/**", "services/**", "infra/**", "tests/**", "migrations/**",
