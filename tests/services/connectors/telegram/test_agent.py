@@ -188,6 +188,36 @@ def test_gemini_agent_does_not_execute_python_tools_and_exposes_usage_without_mo
     assert "sensitive synthetic model text" not in caplog.text
 
 
+def test_gemini_agent_passes_tools_and_uses_shared_single_attempt_client(monkeypatch):
+    module = importlib.import_module("core.integrations.gemini.agent")
+    fake_client = FakeGeminiClient([_response()])
+    factory_calls = []
+
+    def make_client(*, single_attempt=False):
+        factory_calls.append(single_attempt)
+        return fake_client
+
+    monkeypatch.setattr(module.gemini_client, "make_client", make_client)
+    agent = module.GeminiAgent()
+    tools = [{"function_declarations": [{"name": "query"}]}]
+    agent.generate(contents=[{"role": "user", "parts": ["synthetic"]}], mode="routing", tools=tools)
+
+    assert factory_calls == [True]
+    sdk_tools = _field(fake_client.models.requests[0]["config"], "tools")
+    declarations = _field(sdk_tools[0], "function_declarations")
+    assert _field(declarations[0], "name") == "query"
+
+
+def test_gemini_agent_rejects_unsupported_mode_clearly():
+    client = FakeGeminiClient()
+    agent = _gemini_agent()(client=client)
+
+    with pytest.raises(ValueError, match="unsupported Gemini agent mode"):
+        agent.generate(contents=[], mode="unsupported")
+
+    assert client.models.requests == []
+
+
 class FakeLedger:
     """Minimal persistence contract: save the complete response before effects."""
 
