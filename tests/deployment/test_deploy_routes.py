@@ -63,6 +63,9 @@ def record(*parts):
     with events.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(list(map(str, parts))) + "\n")
 
+record("child-env", "preflight", bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+       bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")))
+
 def run(argv):
     return subprocess.run(argv, cwd=root, text=True, capture_output=True, check=False)
 
@@ -232,7 +235,11 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     gcloud.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf 'gcloud\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"child-env\",\"gcloud\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\"))])+\"\\n\")'\n"
         "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n"
+        "gcloud_args=(\"$@\"); env_file=\"\"; for ((i=0; i<${#gcloud_args[@]}; i++)); do if [[ \"${gcloud_args[$i]}\" == --env-vars-file ]]; then env_file=\"${gcloud_args[$((i+1))]}\"; break; fi; done\n"
+        "if [[ -n \"${env_file}\" ]]; then \"$ROUTE_PYTHON\" -c 'import json,os,sys; data=json.load(open(sys.argv[1],encoding=\"utf-8\"));\n"
+        "if \"TELEGRAM_ALLOWED_USER_IDS\" in data: open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"telegram-env-file\",data.get(\"TELEGRAM_ALLOWED_USER_IDS\"),bool(data.get(\"TELEGRAM_BOT_TOKEN\"))])+\"\\n\")' \"${env_file}\"; fi\n"
         "case \"$*\" in *'projects describe'*) printf '123456789012\\n' ;; "
         "*'run services describe'*'spec.template.spec.serviceAccountName'*) printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\\n' ;; "
         "*'run services describe'*'status.url'*) "
@@ -247,10 +254,20 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     docker.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf 'docker\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"child-env\",\"docker\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\"))])+\"\\n\")'\n"
         "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"docker-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n",
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    python3 = bin_dir / "python3"
+    python3.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os,sys; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"python3-child\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\")),sys.argv[1:]])+\"\\n\")' \"$@\"\n"
+        "case \"$*\" in *register_telegram_webhook*) echo 'Telegram webhook registration succeeded'; exit 0 ;; esac\n"
+        "exec \"$ROUTE_PYTHON\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    python3.chmod(0o755)
     return bin_dir, helper
 
 
@@ -270,11 +287,17 @@ def _read_route_events(log: Path) -> list[list[str]]:
 def _run_route(
     tmp_path: Path, command: str, *, fail_service: str | None = None,
     env_overrides: dict[str, str] | None = None,
+    env_file: dict[str, str] | None = None,
     stdin_answers: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], Path]:
     bash = _bash()
     root = tmp_path / "synthetic checkout"
     _copy_checkout(root)
+    if env_file:
+        (root / ".env").write_text(
+            "\n".join(f"{key}={value}" for key, value in env_file.items()) + "\n",
+            encoding="utf-8",
+        )
     bin_dir, _helper = _install_fakes(root, tmp_path)
     log = tmp_path / "route-events.jsonl"
     marker_hook = tmp_path / "route-marker-hook.sh"
@@ -374,11 +397,23 @@ def test_route_entrypoints_keep_the_ordinary_and_local_operator_commands() -> No
     ordinary = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
     local = (DEPLOY / "local_deploy.sh").read_text(encoding="utf-8")
     assert "bash infra/deploy/core/deploy_vector_sync.sh" in ordinary
+    assert 'if [[ "${TLDV_ENABLED}" == "1" ]]' in ordinary
     assert "bash infra/deploy/connectors/deploy_tldv.sh" in ordinary
     assert "bash infra/deploy/core/deploy_sync_checker.sh" in ordinary
     assert "bash infra/deploy/core/deploy_mcp.sh" in ordinary
     assert "bash infra/deploy/core/local_deploy_vector_sync.sh" in local
+    assert 'if [[ "${TLDV_ENABLED}" == "1" ]]' in local
     assert "bash infra/deploy/connectors/local_deploy_tldv.sh" in local
+    assert 'if [[ "${TELEGRAM_ENABLED}" == "1" ]]' in ordinary
+    assert 'if [[ "${TELEGRAM_ENABLED}" == "1" ]]' in local
+    assert "rollout_gate:old_workers_drained" in ordinary
+    assert "rollout_gate:old_workers_drained" in local
+    oauth_setup = (DEPLOY / "setup_tokens.sh").read_text(encoding="utf-8")
+    env_load = oauth_setup.index('set -a; source "$ENV_FILE"; set +a')
+    telegram_unexport = oauth_setup.index(
+        "export -n TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USER_IDS 2>/dev/null || true"
+    )
+    assert env_load < telegram_unexport < oauth_setup.index("if command -v powershell.exe")
     assert "bash infra/deploy/core/deploy_sync_checker.sh" in local
     assert "bash infra/deploy/core/local_deploy_mcp.sh" in local
 
@@ -496,8 +531,7 @@ def test_top_level_route_hands_only_validated_sources_and_images_forward(
                           if command.startswith("functions deploy synthetic-sync-checker "))
     mcp_deploy = next(i for i, command in enumerate(cloud_text)
                       if command.startswith("run deploy synthetic-mcp "))
-    assert vector_deploy < import_deploy
-    assert checker_deploy < mcp_deploy
+    assert vector_deploy < import_deploy < checker_deploy < mcp_deploy
 
 
 @pytest.mark.parametrize(

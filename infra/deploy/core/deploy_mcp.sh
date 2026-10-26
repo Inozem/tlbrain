@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 if [ -f "${REPO_ROOT}/.env" ]; then
   export $(grep -v '^#' "${REPO_ROOT}/.env" | xargs)
 fi
+export -n TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USER_IDS 2>/dev/null || true
 
 TELEGRAM_BOT_TOKEN_CHECK=${TELEGRAM_BOT_TOKEN:-}
 TELEGRAM_BOT_TOKEN_CHECK=${TELEGRAM_BOT_TOKEN_CHECK//[[:space:]]/}
@@ -87,29 +88,31 @@ if [[ -z "${MCP_URL}" ]]; then
   exit 1
 fi
 
-DIALOG_SETTINGS_OUTPUT=$(bash "${REPO_ROOT}/infra/deploy/core/helpers/deploy_dialog_operations.sh" "${MCP_URL}")
-DIALOG_ENV_VARS=()
-declare -A DIALOG_SETTING_SEEN=()
-while IFS= read -r setting; do
-  case "${setting}" in
-    INTERNAL_DIALOG_OPERATIONS_URL=*|DIALOG_OPERATIONS_QUEUE=*|CLOUD_TASKS_OIDC_AUDIENCE=*|CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=*|OIDC_AUDIENCE=*|OIDC_SERVICE_ACCOUNT_EMAIL=*)
-      setting_name=${setting%%=*}
-      if [[ -n "${DIALOG_SETTING_SEEN[${setting_name}]:-}" ]]; then
-        echo "Duplicate dialog operations setting from helper: ${setting_name}" >&2
-        exit 1
-      fi
-      DIALOG_SETTING_SEEN["${setting_name}"]=1
-      DIALOG_ENV_VARS+=("${setting}") ;;
-  esac
-done <<< "${DIALOG_SETTINGS_OUTPUT}"
-if [[ ${#DIALOG_ENV_VARS[@]} -ne 6 ]]; then
-  echo "Dialog operations helper returned incomplete readiness settings" >&2
-  exit 1
+if [[ "${DEPLOY_DEFER_DIALOG_READINESS:-}" != "1" ]]; then
+  DIALOG_SETTINGS_OUTPUT=$(bash "${REPO_ROOT}/infra/deploy/core/helpers/deploy_dialog_operations.sh" "${MCP_URL}")
+  DIALOG_ENV_VARS=()
+  declare -A DIALOG_SETTING_SEEN=()
+  while IFS= read -r setting; do
+    case "${setting}" in
+      INTERNAL_DIALOG_OPERATIONS_URL=*|DIALOG_OPERATIONS_QUEUE=*|CLOUD_TASKS_OIDC_AUDIENCE=*|CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=*|OIDC_AUDIENCE=*|OIDC_SERVICE_ACCOUNT_EMAIL=*)
+        setting_name=${setting%%=*}
+        if [[ -n "${DIALOG_SETTING_SEEN[${setting_name}]:-}" ]]; then
+          echo "Duplicate dialog operations setting from helper: ${setting_name}" >&2
+          exit 1
+        fi
+        DIALOG_SETTING_SEEN["${setting_name}"]=1
+        DIALOG_ENV_VARS+=("${setting}") ;;
+    esac
+  done <<< "${DIALOG_SETTINGS_OUTPUT}"
+  if [[ ${#DIALOG_ENV_VARS[@]} -ne 6 ]]; then
+    echo "Dialog operations helper returned incomplete readiness settings" >&2
+    exit 1
+  fi
+  DIALOG_ENV_VARS_JOINED=$(IFS='|'; echo "${DIALOG_ENV_VARS[*]}")
+  gcloud run services update "${MCP_SERVICE_NAME}" \
+    --region "${REGION}" \
+    --update-env-vars "^|^${DIALOG_ENV_VARS_JOINED}"
 fi
-DIALOG_ENV_VARS_JOINED=$(IFS='|'; echo "${DIALOG_ENV_VARS[*]}")
-gcloud run services update "${MCP_SERVICE_NAME}" \
-  --region "${REGION}" \
-  --update-env-vars "^|^${DIALOG_ENV_VARS_JOINED}"
 
 echo
 echo "MCP Service: ${MCP_URL}/mcp"

@@ -208,17 +208,19 @@ def test_tldv_and_top_level_wrapper_routes_prompts_tokens_and_order_are_preserve
     assert 'bash infra/deploy/setup_tokens.sh' in top_source
     assert 'export $(grep -v \'^#\' .env | xargs)' in top_source
     assert 'SKIP_CONFIRM=1 bash infra/deploy/connectors/deploy_tldv.sh' in top_source
+    assert 'if [[ "${TLDV_ENABLED}" == "1" ]]' in top_source
     assert top_source.index('bash infra/deploy/core/deploy_vector_sync.sh') < top_source.index(
         'SKIP_CONFIRM=1 bash infra/deploy/connectors/deploy_tldv.sh'
     ) < top_source.index('bash infra/deploy/core/deploy_sync_checker.sh') < top_source.index(
-        'bash infra/deploy/core/deploy_mcp.sh'
+        'DEPLOY_DEFER_DIALOG_READINESS=1 bash infra/deploy/core/deploy_mcp.sh'
     )
     assert 'read -p "Continue deploy? (y/n): " CONFIRM' in local_top_source
     assert 'SKIP_CONFIRM=1 bash infra/deploy/connectors/local_deploy_tldv.sh' in local_top_source
+    assert 'if [[ "${TLDV_ENABLED}" == "1" ]]' in local_top_source
     assert local_top_source.index('bash infra/deploy/core/local_deploy_vector_sync.sh') < local_top_source.index(
         'SKIP_CONFIRM=1 bash infra/deploy/connectors/local_deploy_tldv.sh'
     ) < local_top_source.index('bash infra/deploy/core/deploy_sync_checker.sh') < local_top_source.index(
-        'bash infra/deploy/core/local_deploy_mcp.sh'
+        'DEPLOY_DEFER_DIALOG_READINESS=1 bash infra/deploy/core/local_deploy_mcp.sh'
     )
 
 

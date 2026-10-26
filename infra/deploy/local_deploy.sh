@@ -9,6 +9,9 @@ if [ -f .env ]; then
   echo "Loading .env file..."
   export $(grep -v '^#' .env | xargs)
 fi
+TELEGRAM_BOT_TOKEN_VALUE=${TELEGRAM_BOT_TOKEN:-}
+TELEGRAM_ALLOWED_USER_IDS_VALUE=${TELEGRAM_ALLOWED_USER_IDS:-}
+export -n TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USER_IDS 2>/dev/null || true
 
 # =========================
 # Defaults
@@ -32,6 +35,35 @@ QDRANT_API_KEY=${QDRANT_API_KEY:-}
 TLDV_API_KEY=${TLDV_API_KEY:-}
 ROOT_FOLDER_URL=${ROOT_FOLDER_URL:-}
 ALLOWED_EMAIL=${ALLOWED_EMAIL:-}
+TELEGRAM_BOT_TOKEN_CHECK=${TELEGRAM_BOT_TOKEN_VALUE}
+TELEGRAM_BOT_TOKEN_CHECK=${TELEGRAM_BOT_TOKEN_CHECK//[[:space:]]/}
+TELEGRAM_ALLOWED_USER_IDS_CHECK=${TELEGRAM_ALLOWED_USER_IDS_VALUE}
+TELEGRAM_ALLOWED_USER_IDS_CHECK=${TELEGRAM_ALLOWED_USER_IDS_CHECK//[[:space:]]/}
+TLDV_API_KEY_CHECK=${TLDV_API_KEY}
+TLDV_API_KEY_CHECK=${TLDV_API_KEY_CHECK//[[:space:]]/}
+if [[ -n "${TELEGRAM_BOT_TOKEN_CHECK}" && -z "${TELEGRAM_ALLOWED_USER_IDS_CHECK}" ]] || \
+  [[ -z "${TELEGRAM_BOT_TOKEN_CHECK}" && -n "${TELEGRAM_ALLOWED_USER_IDS_CHECK}" ]]; then
+  echo "TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_IDS must be configured together" >&2
+  exit 1
+fi
+TELEGRAM_ENABLED=0
+if [[ -n "${TELEGRAM_BOT_TOKEN_CHECK}" ]]; then
+  IFS=',' read -r -a TELEGRAM_USER_IDS <<< "${TELEGRAM_ALLOWED_USER_IDS_VALUE}"
+  for telegram_user_id in "${TELEGRAM_USER_IDS[@]}"; do
+    if [[ ! "${telegram_user_id}" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]]; then
+      echo "TELEGRAM_ALLOWED_USER_IDS must be a comma-separated list of positive decimal IDs" >&2
+      exit 1
+    fi
+    telegram_user_id=${telegram_user_id//[[:space:]]/}
+    if [[ ! "${telegram_user_id}" =~ [1-9] ]]; then
+      echo "TELEGRAM_ALLOWED_USER_IDS must be a comma-separated list of positive decimal IDs" >&2
+      exit 1
+    fi
+  done
+  TELEGRAM_ENABLED=1
+fi
+TLDV_ENABLED=0
+if [[ -n "${TLDV_API_KEY_CHECK}" ]]; then TLDV_ENABLED=1; fi
 
 mask() { local v="$1"; local l=${#v}; if [ $l -le 8 ]; then echo "****"; else echo "${v:0:4}****${v: -4}"; fi; }
 
@@ -68,6 +100,9 @@ if [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
   echo "GOOGLE_REFRESH_TOKEN not set — running OAuth setup (browser will open)..."
   bash infra/deploy/setup_tokens.sh
   export $(grep -v '^#' .env | xargs)
+  TELEGRAM_BOT_TOKEN_VALUE=${TELEGRAM_BOT_TOKEN:-}
+  TELEGRAM_ALLOWED_USER_IDS_VALUE=${TELEGRAM_ALLOWED_USER_IDS:-}
+  export -n TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USER_IDS 2>/dev/null || true
   echo "Token saved. Continuing deploy..."
   echo
 fi
@@ -102,25 +137,79 @@ gcloud services enable \
   cloudfunctions.googleapis.com \
   cloudscheduler.googleapis.com
 
+bash infra/deploy/core/helpers/deploy_firestore_indexes.sh
+
 # =========================
 # Deploy core (except MCP)
 # =========================
 bash infra/deploy/core/local_deploy_vector_sync.sh
+echo "rollout_phase:decoder_compatible"
 
 # =========================
 # Deploy TL;DV Connector
 # =========================
-SKIP_CONFIRM=1 bash infra/deploy/connectors/local_deploy_tldv.sh
+if [[ "${TLDV_ENABLED}" == "1" ]]; then
+  SKIP_CONFIRM=1 bash infra/deploy/connectors/local_deploy_tldv.sh
+fi
 
 # =========================
 # Deploy Checker (after TL;DV — needs TLDV_IMPORT_SERVICE_URL)
 # =========================
 bash infra/deploy/core/deploy_sync_checker.sh
+echo "rollout_phase:guards_compatible"
+DEPLOY_DEFER_DIALOG_READINESS=1 bash infra/deploy/core/local_deploy_mcp.sh
+
+echo "Confirm that old workers and their external I/O are drained or terminated. This script does not drain workers."
+if ! read -r -p "Confirm old workers and external I/O are drained/terminated? (y/n): " DRAIN_CONFIRMED; then
+  echo "Drain confirmation is required before writer activation." >&2
+  exit 1
+fi
+if [[ "${DRAIN_CONFIRMED}" != "y" ]]; then
+  echo "Drain confirmation declined; writer activation cancelled." >&2
+  exit 1
+fi
+echo "rollout_gate:old_workers_drained (operator attestation)"
+
+MCP_URL=$(gcloud run services describe "${MCP_SERVICE_NAME}" \
+  --region "${REGION}" --format='value(status.url)')
+if [[ -z "${MCP_URL}" ]]; then
+  echo "Could not determine deployed MCP service URL" >&2
+  exit 1
+fi
+DIALOG_SETTINGS_OUTPUT=$(bash infra/deploy/core/helpers/deploy_dialog_operations.sh "${MCP_URL}")
+DIALOG_ENV_VARS=()
+declare -A DIALOG_SETTING_SEEN=()
+while IFS= read -r setting; do
+  case "${setting}" in
+    INTERNAL_DIALOG_OPERATIONS_URL=*|DIALOG_OPERATIONS_QUEUE=*|CLOUD_TASKS_OIDC_AUDIENCE=*|CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=*|OIDC_AUDIENCE=*|OIDC_SERVICE_ACCOUNT_EMAIL=*)
+      setting_name=${setting%%=*}
+      if [[ -n "${DIALOG_SETTING_SEEN[${setting_name}]:-}" ]]; then
+        echo "Duplicate dialog operations setting from helper: ${setting_name}" >&2
+        exit 1
+      fi
+      DIALOG_SETTING_SEEN["${setting_name}"]=1
+      DIALOG_ENV_VARS+=("${setting}") ;;
+  esac
+done <<< "${DIALOG_SETTINGS_OUTPUT}"
+if [[ ${#DIALOG_ENV_VARS[@]} -ne 6 ]]; then
+  echo "Dialog operations helper returned incomplete readiness settings" >&2
+  exit 1
+fi
+DIALOG_ENV_VARS_JOINED=$(IFS='|'; echo "${DIALOG_ENV_VARS[*]}")
+echo "rollout_phase:writers_enabled"
+gcloud run services update "${MCP_SERVICE_NAME}" \
+  --region "${REGION}" --update-env-vars "^|^${DIALOG_ENV_VARS_JOINED}"
+
+if [[ "${TELEGRAM_ENABLED}" == "1" ]]; then
+  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN_VALUE}" \
+    TELEGRAM_ALLOWED_USER_IDS="${TELEGRAM_ALLOWED_USER_IDS_VALUE}" \
+    bash infra/deploy/connectors/local_deploy_telegram.sh
+fi
 
 # =========================
 # Deploy MCP (last — needs URLs from services above)
 # =========================
-bash infra/deploy/core/local_deploy_mcp.sh
+# MCP was deployed in compatible-reader mode before guard consumers.
 
 # =========================
 # Final URLs
@@ -137,9 +226,11 @@ CHECKER_URL=$(gcloud functions describe "${SYNC_CHECKER_NAME}" \
   --region "${REGION}" \
   --format='value(serviceConfig.uri)')
 
-WEBHOOK_URL=$(gcloud functions describe "${TLDV_WEBHOOK_FUNCTION_NAME}" \
-  --region "${REGION}" \
-  --format='value(serviceConfig.uri)')
+if [[ "${TLDV_ENABLED}" == "1" ]]; then
+  WEBHOOK_URL=$(gcloud functions describe "${TLDV_WEBHOOK_FUNCTION_NAME}" \
+    --region "${REGION}" \
+    --format='value(serviceConfig.uri)')
+fi
 
 echo
 echo "========================================="
@@ -157,13 +248,15 @@ echo "│     Client Secret: $(mask "${GOOGLE_CLIENT_SECRET}")"
 echo "│"
 echo "└──────────────────────────────────────────────────────────"
 echo
-echo "┌─ TL;DV Webhook ──────────────────────────────────────────"
-echo "│"
-echo "│  TL;DV Settings → Webhooks → Add:"
-echo "│     POST ${WEBHOOK_URL}"
-echo "│"
-echo "└──────────────────────────────────────────────────────────"
-echo
+if [[ "${TLDV_ENABLED}" == "1" ]]; then
+  echo "┌─ TL;DV Webhook ──────────────────────────────────────────"
+  echo "│"
+  echo "│  TL;DV Settings → Webhooks → Add:"
+  echo "│     POST ${WEBHOOK_URL}"
+  echo "│"
+  echo "└──────────────────────────────────────────────────────────"
+  echo
+fi
 echo "Internal:"
 echo "  Sync trigger:  POST ${VECTOR_SYNC_URL}/sync"
 echo "  Checker:       ${CHECKER_URL}"

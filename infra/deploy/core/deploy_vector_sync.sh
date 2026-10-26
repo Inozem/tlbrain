@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 if [ -f "${REPO_ROOT}/.env" ]; then
   export $(grep -v '^#' "${REPO_ROOT}/.env" | xargs)
 fi
+export -n TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USER_IDS 2>/dev/null || true
 
 PROJECT_ID=${PROJECT_ID:-tlbrain-prod}
 REGION=${REGION:-europe-west1}

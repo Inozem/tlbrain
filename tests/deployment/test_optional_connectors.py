@@ -70,6 +70,10 @@ def _assert_telegram_secret_absent(result, events: list[list[str]]) -> None:
     assert token not in result.stderr
 
 
+def _false_event_value(value: object) -> bool:
+    return value is False or value == "False"
+
+
 @pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.parametrize("telegram,tldv", [(False, False), (False, True), (True, False), (True, True)])
 def test_optional_connector_capabilities_are_selected_by_nonblank_configuration(
@@ -80,6 +84,9 @@ def test_optional_connector_capabilities_are_selected_by_nonblank_configuration(
     )
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     _assert_telegram_secret_absent(result, events)
+    provider_env = [event for event in events if event[0] == "child-env"]
+    assert provider_env
+    assert all(_false_event_value(event[2]) and _false_event_value(event[3]) for event in provider_env)
 
     commands = _cloud_commands(events)
     mcp_command = _deploy_mcp_command(commands)
@@ -87,12 +94,9 @@ def test_optional_connector_capabilities_are_selected_by_nonblank_configuration(
     if route in TOP_ROUTES and telegram:
         assert telegram_deploys
         # The allowlist is configuration, while the bot token remains in Firestore.
-        configured_allowlist = [
-            arg for event in telegram_deploys for arg in event
-            if "TELEGRAM_ALLOWED_USER_IDS" in arg
-        ]
-        assert configured_allowlist
-        assert all("TELEGRAM_ALLOWED_USER_IDS=101,202" in arg for arg in configured_allowlist)
+        telegram_env_files = [event for event in events if event[0] == "telegram-env-file"]
+        assert telegram_env_files
+        assert all(event[1] == "101,202" and event[2] for event in telegram_env_files)
     else:
         assert not telegram_deploys
     assert "TELEGRAM_BOT_TOKEN=synthetic-telegram-token" not in mcp_command
@@ -126,6 +130,9 @@ def test_both_optional_connectors_off_keeps_core_services_available(tmp_path: Pa
     result, events, _root = _run_route(tmp_path, route, env_overrides=_connector_environment(False, False))
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     _assert_telegram_secret_absent(result, events)
+    if route in TOP_ROUTES:
+        assert "TL;DV Webhook" not in result.stdout
+        assert "https://synthetic.example/synthetic-tldv-webhook" not in result.stdout
     commands = _cloud_commands(events)
     assert any(command.startswith("run deploy synthetic-mcp ") for command in commands)
     if route in TOP_ROUTES:
@@ -246,10 +253,11 @@ def _rollout_config_events(events: list[list[str]], service: str) -> list[int]:
             if event[0] == "gcloud-argv" and _is_service_config(event, service)]
 
 
-def test_rollout_orders_compatible_readers_consumers_drain_then_writers(tmp_path: Path) -> None:
+@pytest.mark.parametrize("route", TOP_ROUTES)
+def test_rollout_orders_compatible_readers_consumers_drain_then_writers(tmp_path: Path, route: str) -> None:
     result, events, _root = _run_route(
         tmp_path,
-        "deploy.sh",
+        route,
         env_overrides=_connector_environment(True, False),
         stdin_answers="y\ny\n",
     )
@@ -262,11 +270,17 @@ def test_rollout_orders_compatible_readers_consumers_drain_then_writers(tmp_path
     writers = _marker_position(events, "rollout_phase:writers_enabled")
     assert decoder < guards < drained < writers
 
-    for service in ("synthetic-mcp", "synthetic-vector-sync"):
-        configs = _rollout_config_events(events, service)
-        assert configs, f"no config/deploy event for {service}"
-        assert len(configs) >= 2
-        assert configs[0] < decoder < configs[1] < guards
+    mcp_configs = _rollout_config_events(events, "synthetic-mcp")
+    vector_configs = _rollout_config_events(events, "synthetic-vector-sync")
+    assert len(mcp_configs) >= 2
+    assert vector_configs
+    checker_deploy = next(
+        index for index, event in enumerate(events)
+        if event[0] == "gcloud-argv" and event[1:4] == ["functions", "deploy", "synthetic-sync-checker"]
+    )
+    assert vector_configs[0] < decoder < checker_deploy < guards
+    assert guards < mcp_configs[0] < drained < writers
+    assert writers < mcp_configs[1]
 
     writer_commands = [
         index for index, event in enumerate(events)
@@ -282,13 +296,14 @@ def test_rollout_orders_compatible_readers_consumers_drain_then_writers(tmp_path
     assert writers < min(telegram_commands)
 
 
+@pytest.mark.parametrize("route", TOP_ROUTES)
 @pytest.mark.parametrize("answers", ["y\nn\n", "y\n"], ids=["operator-declines", "missing-confirmation"])
 def test_rollout_without_drain_confirmation_stops_before_writer_activation(
-    tmp_path: Path, answers: str,
+    tmp_path: Path, route: str, answers: str,
 ) -> None:
     result, events, _root = _run_route(
         tmp_path,
-        "deploy.sh",
+        route,
         env_overrides=_connector_environment(True, False),
         stdin_answers=answers,
     )
@@ -331,6 +346,48 @@ def test_partial_telegram_configuration_fails_before_cloud_or_docker_mutation(
     assert "TELEGRAM_BOT_TOKEN" in result.stdout + result.stderr
     assert "TELEGRAM_ALLOWED_USER_IDS" in result.stdout + result.stderr
     assert not any(event[0] in {"gcloud", "gcloud-argv", "docker", "docker-argv"} for event in events)
+
+
+@pytest.mark.parametrize("route", TOP_ROUTES)
+@pytest.mark.parametrize("allowed_ids", ["0", "000, 00", "10,abc", "10,,20"])
+def test_invalid_telegram_allowlist_fails_before_cloud_or_docker_mutation(
+    tmp_path: Path, route: str, allowed_ids: str,
+) -> None:
+    result, events, _root = _run_route(
+        tmp_path,
+        route,
+        env_overrides={
+            "TELEGRAM_BOT_TOKEN": "synthetic-telegram-token",
+            "TELEGRAM_ALLOWED_USER_IDS": allowed_ids,
+            "TLDV_API_KEY": "",
+        },
+    )
+    assert result.returncode != 0
+    assert "positive decimal IDs" in result.stdout + result.stderr
+    _assert_telegram_secret_absent(result, events)
+    assert not any(event[0] in {"gcloud", "gcloud-argv", "docker", "docker-argv"} for event in events)
+
+
+@pytest.mark.parametrize("route", TOP_ROUTES)
+def test_telegram_values_from_env_file_do_not_reach_provider_children(
+    tmp_path: Path, route: str,
+) -> None:
+    result, events, root = _run_route(
+        tmp_path,
+        route,
+        env_file={
+            "TELEGRAM_BOT_TOKEN": "synthetic-telegram-token",
+            "TELEGRAM_ALLOWED_USER_IDS": "101,202",
+            "TLDV_API_KEY": "",
+        },
+        stdin_answers="y\ny\n",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert (root / ".env").is_file()
+    _assert_telegram_secret_absent(result, events)
+    provider_env = [event for event in events if event[0] == "child-env"]
+    assert provider_env
+    assert all(_false_event_value(event[2]) and _false_event_value(event[3]) for event in provider_env)
 
 
 def _run_deploy_helper(tmp_path: Path, helper: str, *args: str, **overrides: str):

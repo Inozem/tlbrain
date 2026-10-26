@@ -17,6 +17,7 @@ OAUTH_PORT=8085
 if [ -f "$ENV_FILE" ]; then
   set -a; source "$ENV_FILE"; set +a
 fi
+export -n TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USER_IDS 2>/dev/null || true
 
 CLIENT_ID="${GOOGLE_CLIENT_ID:-}"
 CLIENT_SECRET="${GOOGLE_CLIENT_SECRET:-}"
