@@ -230,6 +230,55 @@ def test_scan_respects_queued_freshness_and_retries_import_errors(
     ]
 
 
+def test_foreign_records_are_excluded_from_recovery_and_do_not_suppress_meetings(
+    reconciliation, firestore_fake, monkeypatch, sdk_fakes
+):
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
+    _fixed_now(monkeypatch, reconciliation, now)
+    stale = now - timedelta(hours=2)
+    foreign = {
+        "meeting_id": "foreign-stale", "provider": "telegram", "status": "downloading",
+        "status_changed_at": stale, "error": "preserve", "unrelated": "keep",
+    }
+    _seed(firestore_fake, "foreign-stale-doc", foreign)
+    _seed(firestore_fake, "foreign-same-id", {
+        "meeting_id": "fresh-tldv", "provider": "mcp", "status": "imported", "keep": True,
+    })
+    monkeypatch.setenv("TLDV_IMPORT_SERVICE_URL", "https://import.synthetic.test")
+    monkeypatch.setattr(reconciliation, "tldv_get", lambda _path: pytest.fail("foreign record must not be recovered"))
+    monkeypatch.setattr(reconciliation, "get_meetings", lambda _since: [{"id": "fresh-tldv"}])
+
+    result, status_code = reconciliation.tldv_reconciliation(_request({}))
+
+    assert status_code == 200
+    assert result["recovered"] == 0
+    assert result["missing"] == 1
+    assert result["queued"] == 1
+    assert _task_events(sdk_fakes)[0]["arguments"]["task"]["name"].endswith("/tasks/tldv-import-fresh-tldv")
+    assert firestore_fake.documents["transcript_index/foreign-stale-doc"] == foreign
+    assert firestore_fake.documents["transcript_index/foreign-same-id"] == {
+        "meeting_id": "fresh-tldv", "provider": "mcp", "status": "imported", "keep": True,
+    }
+    assert firestore_fake.documents["transcript_index/tldv-fresh-tldv"]["provider"] == "tldv"
+
+
+def test_foreign_reserved_placeholder_collision_is_not_overwritten(
+    reconciliation, firestore_fake, monkeypatch, sdk_fakes
+):
+    foreign = {"meeting_id": "collision", "provider": "telegram", "status": "imported", "keep": "safe"}
+    _seed(firestore_fake, "tldv-collision", foreign)
+    monkeypatch.setenv("TLDV_IMPORT_SERVICE_URL", "https://import.synthetic.test")
+    monkeypatch.setattr(reconciliation, "tldv_get", lambda _path: {"results": []})
+    monkeypatch.setattr(reconciliation, "get_meetings", lambda _since: [{"id": "collision"}])
+
+    result, status_code = reconciliation.tldv_reconciliation(_request({}))
+
+    assert status_code == 200
+    assert result["queued"] == 1
+    assert firestore_fake.documents["transcript_index/tldv-collision"] == foreign
+    assert len(_task_events(sdk_fakes)) == 1
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_since"),
     [

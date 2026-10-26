@@ -81,6 +81,81 @@ def test_import_skips_existing_nonqueued_record_without_fetch(
     assert response.json() == {"ok": True, "skipped": True}
 
 
+@pytest.mark.parametrize("provider", ["tldv", None])
+def test_import_deduplicates_tldv_and_legacy_records(import_main, firestore_fake, monkeypatch, provider):
+    record = {"meeting_id": "meeting-1", "status": "imported"}
+    if provider is not None:
+        record["provider"] = provider
+    _seed(firestore_fake, "transcript_index", "existing-doc", record)
+    monkeypatch.setattr(import_main, "tldv_get", lambda _path: pytest.fail("provider fetch must not run"))
+
+    response = _request(import_main.app, {"meeting_id": "meeting-1"})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "skipped": True}
+
+
+def test_import_ignores_foreign_matching_record_and_preserves_reserved_collision(
+    import_main, firestore_fake, sdk_fakes, monkeypatch
+):
+    meeting_id = "foreign-matching"
+    foreign = {"meeting_id": meeting_id, "provider": "telegram", "status": "imported", "keep": True}
+    _seed(firestore_fake, "transcript_index", f"tldv-{meeting_id}", foreign)
+    _seed(firestore_fake, "folders", "folder-import", {
+        "folder_id": "folder-import", "name": "_unassigned", "parent_id": "pytest-synthetic-root",
+        "speakers": {},
+    })
+    sdk_fakes.drive.queue("files.create", response={"id": "doc-imported", "modifiedTime": "synthetic-time"})
+    sdk_fakes.docs.queue("documents.batchUpdate", response={})
+    monkeypatch.delenv("VECTOR_SYNC_URL", raising=False)
+    monkeypatch.delenv("VECTOR_SYNC_QUEUE", raising=False)
+    monkeypatch.setattr(import_main, "tldv_get", lambda path: (
+        {"id": meeting_id, "name": "Foreign collision", "happenedAt": "2025-02-03T10:15:00Z"}
+        if path == f"/meetings/{meeting_id}"
+        else {"results": [{"speaker": "Speaker 1", "text": "Transcript."}]}
+    ))
+
+    response = _request(import_main.app, {"meeting_id": meeting_id})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "doc_id": "doc-imported", "meeting_id": meeting_id}
+    assert firestore_fake.documents[f"transcript_index/tldv-{meeting_id}"] == foreign
+    assert firestore_fake.documents["transcript_index/doc-imported"]["provider"] == "tldv"
+
+
+def test_import_preserves_imported_record_when_doc_id_matches_reserved_placeholder(
+    import_main, firestore_fake, sdk_fakes, monkeypatch
+):
+    meeting_id = "reserved-doc-id"
+    doc_id = f"tldv-{meeting_id}"
+    _seed(firestore_fake, "transcript_index", doc_id, {
+        "meeting_id": meeting_id, "provider": "tldv", "status": "queued",
+    })
+    _seed(firestore_fake, "folders", "folder-reserved", {
+        "folder_id": "folder-reserved", "name": "_unassigned", "parent_id": "pytest-synthetic-root",
+        "speakers": {},
+    })
+    sdk_fakes.drive.queue("files.create", response={"id": doc_id, "modifiedTime": "synthetic-time"})
+    sdk_fakes.docs.queue("documents.batchUpdate", response={})
+    monkeypatch.delenv("VECTOR_SYNC_URL", raising=False)
+    monkeypatch.delenv("VECTOR_SYNC_QUEUE", raising=False)
+    monkeypatch.setattr(import_main, "tldv_get", lambda path: (
+        {"id": meeting_id, "name": "Reserved ID", "happenedAt": "2025-02-03T10:15:00Z"}
+        if path == f"/meetings/{meeting_id}"
+        else {"results": [{"speaker": "Speaker 1", "text": "Transcript."}]}
+    ))
+
+    response = _request(import_main.app, {"meeting_id": meeting_id})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "doc_id": doc_id, "meeting_id": meeting_id}
+    record = firestore_fake.documents[f"transcript_index/{doc_id}"]
+    assert record["doc_id"] == doc_id
+    assert record["meeting_id"] == meeting_id
+    assert record["provider"] == "tldv"
+    assert record["status"] == "imported"
+
+
 @pytest.mark.parametrize(
     ("endpoint", "status", "expected", "placeholder_after"),
     [

@@ -7,6 +7,7 @@ import requests
 from google.cloud import firestore
 
 from core.integrations.firestore.transcripts import (
+    is_tldv_transcript_record,
     mark_download_error,
     stream_index_records,
     update_index,
@@ -45,9 +46,10 @@ def _recover_stale_import_docs(
     for doc in stream_index_records(db=db):
         data = doc.to_dict() or {}
 
-        meeting_id = data.get("meeting_id")
-        if not meeting_id:
+        if not is_tldv_transcript_record(data):
             continue
+
+        meeting_id = data.get("meeting_id")
 
         status = data.get("status")
         error_stage = data.get("error_stage")
@@ -149,9 +151,9 @@ def tldv_reconciliation(request):
     existing: set[str] = set()
     for doc in stream_index_records(db=db):
         data = doc.to_dict() or {}
-        mid = data.get("meeting_id")
-        if not mid:
+        if not is_tldv_transcript_record(data):
             continue
+        mid = data.get("meeting_id")
         if data.get("status") == "error" and data.get("error_stage") == "import":
             continue  # allow reconciliation to retry import errors
         if data.get("status") == "queued":

@@ -15,6 +15,16 @@ STALE_SYNCING_MINUTES = 15
 _NO_RETRY_STAGES = {"import", "invalid_format"}
 
 
+def is_tldv_transcript_record(data: dict[str, Any] | None) -> bool:
+    """Return whether a record belongs to TL;DV or is a valid legacy record."""
+    if not isinstance(data, dict):
+        return False
+    meeting_id = data.get("meeting_id")
+    if not isinstance(meeting_id, str) or not meeting_id.strip():
+        return False
+    return "provider" not in data or data.get("provider") == "tldv"
+
+
 def get_transcript_record(doc_id: str, db: firestore.Client | None = None) -> dict | None:
     """Return a transcript_index record for a document, or None if absent."""
     client = db if db is not None else get_client()
@@ -286,6 +296,8 @@ def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
         snapshot = ref.get(transaction=transaction)
         if snapshot.exists:
             data = snapshot.to_dict() or {}
+            if not is_tldv_transcript_record(data):
+                return False
             if data.get("status") == "error" and data.get("error_stage") == "import":
                 transaction.update(ref, {
                     "status": "queued",
@@ -297,6 +309,7 @@ def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
             return False
         transaction.set(ref, {
             "meeting_id": meeting_id,
+            "provider": "tldv",
             "status": "queued",
             "status_changed_at": firestore.SERVER_TIMESTAMP,
         })
@@ -308,8 +321,13 @@ def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
     return result
 
 
-def mark_downloading(meeting_id: str) -> None:
-    get_client().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
+def mark_downloading(meeting_id: str, db: firestore.Client | None = None) -> None:
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
+    snapshot = ref.get()
+    if snapshot.exists and not is_tldv_transcript_record(snapshot.to_dict() or {}):
+        return
+    ref.update({
         "status": "downloading",
         "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
@@ -322,7 +340,11 @@ def mark_download_error(
     db: firestore.Client | None = None,
 ) -> None:
     client = db if db is not None else get_client()
-    client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
+    ref = client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
+    snapshot = ref.get()
+    if snapshot.exists and not is_tldv_transcript_record(snapshot.to_dict() or {}):
+        return
+    ref.update({
         "status": "error",
         "error": error,
         "error_stage": "import",
@@ -331,8 +353,22 @@ def mark_download_error(
     logger.info("Marked download error: %s — %s", meeting_id, error)
 
 
-def delete_queued_placeholder(meeting_id: str) -> None:
-    get_client().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").delete()
+def delete_queued_placeholder(meeting_id: str, db: firestore.Client | None = None) -> None:
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
+    snapshot = ref.get()
+    if not snapshot.exists:
+        return
+    data = snapshot.to_dict() or {}
+    if not is_tldv_transcript_record(data):
+        return
+    is_placeholder = (
+        data.get("status") in ("queued", "downloading")
+        or (data.get("status") == "error" and data.get("error_stage") == "import")
+    )
+    if not is_placeholder:
+        return
+    ref.delete()
     logger.info("Deleted queued placeholder: %s", meeting_id)
 
 
