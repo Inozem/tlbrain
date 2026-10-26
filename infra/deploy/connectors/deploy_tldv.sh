@@ -9,6 +9,12 @@ if [ -f "${REPO_ROOT}/.env" ]; then
   export $(grep -v '^#' "${REPO_ROOT}/.env" | xargs)
 fi
 
+TLDV_API_KEY=${TLDV_API_KEY:-}
+if [[ -z "${TLDV_API_KEY//[[:space:]]/}" ]]; then
+  echo "TL;DV is disabled because TLDV_API_KEY is not configured; skipping TL;DV deployment."
+  exit 0
+fi
+
 PROJECT_ID=${PROJECT_ID:-tlbrain-prod}
 REGION=${REGION:-europe-west1}
 TLDV_IMPORT_SERVICE_NAME=${TLDV_IMPORT_SERVICE_NAME:-tlbrain-tldv-import}

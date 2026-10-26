@@ -838,6 +838,13 @@ def _handle_list_folders(request: JSONRPCRequest) -> dict:
 
 
 def _handle_sync_tldv_all(request: JSONRPCRequest, arguments: dict) -> dict:
+    if not os.environ.get("TLDV_API_KEY", "").strip():
+        return build_jsonrpc_error(
+            request_id=request.id,
+            code=-32603,
+            message="TL;DV integration is unavailable because TLDV_API_KEY is not configured",
+        )
+
     reconciliation_url = os.environ.get("TLDV_RECONCILIATION_URL", "")
     if not reconciliation_url:
         return build_jsonrpc_error(

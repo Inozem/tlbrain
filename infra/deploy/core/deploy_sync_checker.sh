@@ -9,6 +9,10 @@ if [ -f "${REPO_ROOT}/.env" ]; then
   export $(grep -v '^#' "${REPO_ROOT}/.env" | xargs)
 fi
 
+# The Sync Checker serves common sync recovery and must not consume or forward
+# optional connector configuration inherited from the deploy environment.
+unset TLDV_API_KEY TLDV_RECONCILIATION_URL
+
 PROJECT_ID=${PROJECT_ID:-tlbrain-prod}
 REGION=${REGION:-europe-west1}
 SYNC_CHECKER_NAME=${SYNC_CHECKER_NAME:-tlbrain-sync-checker}

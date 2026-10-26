@@ -15,6 +15,10 @@ IMPORT_SCRIPTS = {
     "registry": APP_ROOT / "infra/deploy/connectors/tldv/deploy_import.sh",
     "local": APP_ROOT / "infra/deploy/connectors/tldv/local_deploy_import.sh",
 }
+DIRECT_DEPLOY_SCRIPTS = {
+    "registry": APP_ROOT / "infra/deploy/connectors/deploy_tldv.sh",
+    "local": APP_ROOT / "infra/deploy/connectors/local_deploy_tldv.sh",
+}
 REPOSITORY = "inozem/tlbrain-tldv-import"
 DIGEST = "sha256:" + "b" * 64
 
@@ -216,3 +220,49 @@ def test_tldv_and_top_level_wrapper_routes_prompts_tokens_and_order_are_preserve
     ) < local_top_source.index('bash infra/deploy/core/deploy_sync_checker.sh') < local_top_source.index(
         'bash infra/deploy/core/local_deploy_mcp.sh'
     )
+
+
+@pytest.mark.parametrize("mode", ["registry", "local"])
+@pytest.mark.parametrize("api_key", [None, " \t  "])
+def test_direct_tldv_routes_skip_before_config_expansion_or_commands(
+    tmp_path: Path, mode: str, api_key: str | None,
+) -> None:
+    bash = _bash()
+    repo = tmp_path / "repo"
+    deploy_dir = repo / "infra" / "deploy" / "connectors"
+    bin_dir = tmp_path / "bin"
+    deploy_dir.mkdir(parents=True)
+    bin_dir.mkdir()
+    script = deploy_dir / DIRECT_DEPLOY_SCRIPTS[mode].name
+    shutil.copyfile(DIRECT_DEPLOY_SCRIPTS[mode], script)
+
+    event_log = tmp_path / "events.log"
+    for command in ("gcloud", "docker"):
+        stub = bin_dir / command
+        stub.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            f"printf '{command}:%s\\n' \"$*\" >> \"$EVENT_LOG\"\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+    environment = os.environ.copy()
+    environment.update({
+        "PATH": str(bin_dir) + os.pathsep + environment.get("PATH", ""),
+        "EVENT_LOG": str(event_log),
+    })
+    for name in ("VERSION", "GOOGLE_REFRESH_TOKEN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"):
+        environment.pop(name, None)
+    if api_key is None:
+        environment.pop("TLDV_API_KEY", None)
+    else:
+        environment["TLDV_API_KEY"] = api_key
+
+    result = subprocess.run([bash, str(script)], env=environment, text=True, capture_output=True, check=False)
+    runner_output = (result.stdout + result.stderr).replace("\x00", "")
+    if any(marker in runner_output for marker in ("E_ACCESSDENIED", "NtCreateDirectoryObject", "0xC0000022")):
+        pytest.skip("MXC blocks child Bash with E_ACCESSDENIED / NtCreateDirectoryObject")
+
+    assert result.returncode == 0, runner_output
+    assert "TL;DV is disabled" in runner_output
+    assert not event_log.exists() or event_log.read_text(encoding="utf-8") == ""
