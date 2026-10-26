@@ -31,8 +31,11 @@ class FakeModel:
         self.error = error
         self.calls = []
 
-    async def route(self, *, text, candidates):
-        self.calls.append({"text": text, "candidates": tuple(candidates)})
+    async def route(self, *, text, candidates, operation_candidates=()):
+        self.calls.append({
+            "text": text, "candidates": tuple(candidates),
+            "operation_candidates": tuple(operation_candidates),
+        })
         if self.error is not None:
             raise self.error
         return deepcopy(self.response)
@@ -54,7 +57,7 @@ class FakeStore:
         self.created_drafts = []
 
     def existing_dialog_candidates(self):
-        return tuple(self.docs)
+        return tuple({"doc_id": doc_id, **metadata} for doc_id, metadata in self.docs.items())
 
     def get_doc(self, doc_id):
         self.get_calls.append(doc_id)
@@ -90,6 +93,10 @@ class FakeStore:
 
     def create_draft(self, *args, **kwargs):
         self.created_drafts.append((args, kwargs))
+
+    def confirm_save_command(self, context_id, operation_id, *, owner, fence, now):
+        self.save_confirmations.append((context_id, operation_id, owner, fence, now))
+        return self.save_confirmation_result
 
 
 class FakeSearch:
@@ -130,6 +137,7 @@ def _decision(kind="substantive", **overrides):
     value = {
         "kind": kind,
         "target_ref": None,
+        "target_operation_id": None,
         "dialog_number": None,
         "result_refs": [],
         "substantive_text": None,
@@ -162,6 +170,8 @@ def _harness(*, decision=None, docs=None, current=None, last=None, numbers=None,
         last=last,
     )
     store = FakeStore(docs or {})
+    store.save_confirmations = []
+    store.save_confirmation_result = True
     store.bind_existing_numbers(context.context_id, numbers or {})
     model = FakeModel(decision, error=model_error)
     search = FakeSearch(search_results, error=search_error)
@@ -170,7 +180,11 @@ def _harness(*, decision=None, docs=None, current=None, last=None, numbers=None,
     return context, store, model, search, notices, actions
 
 
-def _call(text, *, context, store, model, search, notices, actions):
+def _call(text, *, context, store, model, search, notices, actions,
+          operation_id="operation-1", owner="worker", fence=1, now=None,
+          save_candidates=None):
+    from datetime import datetime, timezone
+    now = now or datetime.now(timezone.utc)
     return _route(
         text=text,
         context=context,
@@ -179,6 +193,11 @@ def _call(text, *, context, store, model, search, notices, actions):
         search=search,
         notices=notices,
         actions=actions,
+        operation_id=operation_id,
+        owner=owner,
+        fence=fence,
+        now=now,
+        save_candidates=save_candidates,
     )
 
 
@@ -193,7 +212,10 @@ def test_current_topic_continues_without_notice_and_automatic_switch_uses_target
                       search=search, notices=notices, actions=actions)
     assert continued["target_doc_id"] == "doc-current"
     assert notices.sent == []
-    assert model.calls[0]["candidates"] == ("doc-current", "doc-other")
+    cards = model.calls[0]["candidates"]
+    assert tuple(card["doc_id"] for card in cards) == ("doc-current", "doc-other")
+    assert cards[0]["title"] == "Current"
+    assert all("content" not in card and "transcript" not in card for card in cards)
 
     model.response = _decision("pure_switch", target_ref="doc-other")
     switched = _call("unrelated thought", context=context, store=store, model=model,
@@ -265,6 +287,136 @@ def test_last_target_uses_context_id_without_semantic_search():
                    search=search, notices=notices, actions=actions)
     assert result["target_doc_id"] == "doc-last"
     assert search.calls == []
+
+
+def _saved_predecessor(operation_id="op-save", *, predecessor=None):
+    route = {
+        "kind": "save", "target_doc_id": "doc-saved",
+        "target_dialog_number": 5,
+        "target_conversation_id": "conversation:doc-saved",
+    }
+    return {
+        "operation_id": operation_id,
+        "state": "completed",
+        "predecessor_operation_id": predecessor,
+        "save_operation_id": operation_id,
+        "target_doc_id": "doc-saved",
+        "target_dialog_number": 5,
+        "target_conversation_id": "conversation:doc-saved",
+        "route_result": route,
+        "title": "Saved topic",
+        "candidate": "private command text",
+    }
+
+
+def test_snapshot_save_predecessor_candidate_sets_exact_dependency_and_fixed_target():
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision(
+            "substantive", target_ref="last", target_operation_id="op-save",
+            substantive_text="continue the saved topic",
+        ),
+        docs={"doc-stale": {"title": "Old"}}, current="doc-stale", last="doc-stale",
+        numbers={"doc-stale": 2},
+    )
+    result = _call(
+        "continue from the pending save", context=context, store=store, model=model,
+        search=search, notices=notices, actions=actions,
+        save_candidates=[_saved_predecessor()],
+    )
+    assert result["status"] == "ok"
+    assert result["dependency_operation_id"] == "op-save"
+    assert result["target_operation_id"] == "op-save"
+    assert result["target_doc_id"] == "doc-saved"
+    assert result["dialog_number"] == 5
+    assert result["conversation_id"] == "conversation:doc-saved"
+    offered = model.calls[0]["operation_candidates"]
+    assert offered == ({
+        "operation_id": "op-save", "doc_id": "doc-saved", "dialog_number": 5,
+        "conversation_id": "conversation:doc-saved", "title": "Saved topic",
+    },)
+    assert "private command text" not in repr(offered)
+
+
+def test_explicit_dialog_number_overrides_conflicting_save_target():
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision(
+            "substantive", target_ref="doc-stale", dialog_number=3,
+            target_operation_id="op-save", substantive_text="continue this dialog",
+        ),
+        docs={"doc-explicit": {}, "doc-stale": {}}, current="doc-stale",
+        last="doc-stale", numbers={"doc-explicit": 3, "doc-stale": 2},
+    )
+    result = _call(
+        "continue dialog 3", context=context, store=store, model=model,
+        search=search, notices=notices, actions=actions,
+        save_candidates=[_saved_predecessor()],
+    )
+    assert result["target_doc_id"] == "doc-explicit"
+    assert result["dialog_number"] == 3
+    assert "dependency_operation_id" not in result
+
+
+def test_explicit_dialog_number_wins_when_operation_id_is_not_a_candidate():
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision(
+            "substantive", target_ref="doc-explicit", dialog_number=3,
+            target_operation_id="op-unknown", substantive_text="continue this dialog",
+        ),
+        docs={"doc-explicit": {}, "doc-stale": {}}, current="doc-stale",
+        last="doc-stale", numbers={"doc-explicit": 3, "doc-stale": 2},
+    )
+    result = _call("continue dialog 3", context=context, store=store, model=model,
+                   search=search, notices=notices, actions=actions,
+                   save_candidates=[])
+    assert result["target_doc_id"] == "doc-explicit"
+    assert result["dialog_number"] == 3
+    assert "dependency_operation_id" not in result
+
+
+def test_concrete_target_ref_cannot_contradict_selected_save_operation():
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision(
+            "substantive", target_ref="doc-other", target_operation_id="op-save",
+            substantive_text="continue",
+        ),
+        docs={"doc-other": {}}, current="doc-other", numbers={"doc-other": 1},
+    )
+    result = _call("continue from saved result", context=context, store=store,
+                   model=model, search=search, notices=notices, actions=actions,
+                   save_candidates=[_saved_predecessor()])
+    assert result["status"] == "invalid_route"
+    assert notices.sent == []
+    assert actions.calls == []
+
+
+@pytest.mark.parametrize("target_operation_id", [
+    "op-foreign", "op-not-save", "op-save-not-in-chain",
+])
+def test_unverified_or_non_chain_save_target_fails_without_last_fallback(target_operation_id):
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision(
+            "substantive", target_ref="last", target_operation_id=target_operation_id,
+            substantive_text="continue",
+        ),
+        docs={"doc-stale": {}}, current="doc-stale", last="doc-stale",
+        numbers={"doc-stale": 2},
+    )
+    predecessor = _saved_predecessor()
+    candidates = [predecessor]
+    if target_operation_id == "op-not-save":
+        candidates = [{**_saved_predecessor("op-not-save"), "state": "failed"}]
+    elif target_operation_id == "op-save-not-in-chain":
+        candidates = [_saved_predecessor("op-other")]
+    result = _call(
+        "continue from that save", context=context, store=store, model=model,
+        search=search, notices=notices, actions=actions,
+        save_candidates=candidates,
+    )
+    assert result["status"] == "invalid_route"
+    assert result.get("target_doc_id") is None
+    assert result.get("dependency_operation_id") is None
+    assert notices.sent == []
+    assert actions.calls == []
 
 
 def test_explicit_search_creates_only_search_session_then_selects_existing_result():
@@ -370,6 +522,8 @@ def test_structured_intents_determine_outcome_across_languages(
                    notices=notices, actions=actions)
     assert model.calls[0]["text"] == phrase
     assert result["kind"] == expected_kind
+    if expected_kind == "pure_switch":
+        assert result["substantive_text"] is None
     assert [call[0] for call in actions.calls] == (
         [] if expected_operation is None else [expected_operation]
     )
@@ -476,6 +630,124 @@ def test_identical_wording_can_produce_different_results_from_different_structur
                   notices=notices, actions=actions)
     assert saved["kind"] == "save"
     assert actions.calls == []
+    assert store.save_confirmations[-1][:4] == (
+        context.context_id, "operation-1", "worker", 1,
+    )
+
+
+def test_save_route_without_fence_or_with_rejected_confirmation_fails_closed():
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision("save"), docs={"doc-a": {}}, current="doc-a",
+        numbers={"doc-a": 1},
+    )
+    missing = _call("save", context=context, store=store, model=model, search=search,
+                    notices=notices, actions=actions, operation_id=None)
+    assert missing["kind"] == "save"
+    assert missing["status"] == "unconfirmed"
+    assert store.save_confirmations == []
+
+    store.save_confirmation_result = False
+    rejected = _call("save", context=context, store=store, model=model, search=search,
+                     notices=notices, actions=actions)
+    assert rejected["status"] == "unconfirmed"
+    assert rejected["confirmed"] is False
+
+
+def test_pure_switch_from_no_current_conversation_is_a_focus_change():
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision("pure_switch", target_ref="doc-a",
+                           substantive_text="must be discarded"),
+        docs={"doc-a": {"title": "A", "content": "private transcript"}},
+    )
+    result = _call("open dialog", context=context, store=store, model=model,
+                   search=search, notices=notices, actions=actions)
+    assert result["selection_changed"] is True
+    assert result["substantive_text"] is None
+    assert notices.sent == [("doc-a", result["dialog_number"])]
+    assert model.calls[0]["candidates"] == ({"doc_id": "doc-a", "title": "A"},)
+
+
+def test_link_flag_is_rejected_for_operations_other_than_get_transcript():
+    decision = _decision(
+        "substantive", target_ref="doc-a", substantive_text="list folders",
+        tool_choice={"name": "list_folders", "arguments": {}, "link_requested": True},
+    )
+    context, store, model, search, notices, actions = _harness(
+        decision=decision, docs={"doc-a": {}}, current="doc-a", numbers={"doc-a": 1},
+    )
+    result = _call("list folders", context=context, store=store, model=model,
+                   search=search, notices=notices, actions=actions)
+    assert result["status"] == "invalid_route"
+    assert actions.calls == []
+    assert notices.sent == []
+
+
+@pytest.mark.parametrize("substantive_text", ["", " \t\n"])
+def test_blank_substantive_text_fails_closed(substantive_text):
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision("substantive", target_ref="doc-a",
+                           substantive_text=substantive_text),
+        docs={"doc-a": {}}, current="doc-a", numbers={"doc-a": 1},
+    )
+    result = _call("do something", context=context, store=store, model=model,
+                   search=search, notices=notices, actions=actions)
+    assert result["status"] == "invalid_route"
+    assert actions.calls == []
+    assert notices.sent == []
+
+
+@pytest.mark.parametrize("malformation", ["target", "number", "conversation"])
+def test_malformed_store_target_or_dialog_identity_fails_before_effects(malformation):
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision("pure_switch", target_ref="doc-a"),
+        docs={"doc-a": {}},
+    )
+    if malformation == "target":
+        store.resolve_dialog_number = lambda *_: "doc-outside-candidate-set"
+        model.response = _decision("pure_switch", target_ref="doc-a", dialog_number=8)
+    elif malformation == "number":
+        store.get_or_assign_dialog_number = lambda *_: True
+    else:
+        store.docs["doc-a"]["conversation_id"] = ""
+    result = _call("open dialog", context=context, store=store, model=model,
+                   search=search, notices=notices, actions=actions)
+    assert result["status"] in {"invalid_route", "not_found", "error"}
+    assert actions.calls == []
+    assert notices.sent == []
+
+
+def test_save_confirmation_requires_live_fence_and_uses_repository_boundary():
+    from services.connectors.telegram.sessions import confirm_save_route
+
+    class SaveStore:
+        def __init__(self):
+            self.calls = []
+
+        def confirm_save_command(self, context_id, operation_id, **kwargs):
+            self.calls.append((context_id, operation_id, kwargs))
+            return True
+
+    store = SaveStore()
+    route = {"kind": "save"}
+    assert not confirm_save_route(
+        store, context_id="42_7", operation_id=None, owner="worker", fence=3,
+        now=None, route_result=route,
+    )
+    assert store.calls == []
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    assert confirm_save_route(
+        store, context_id="42_7", operation_id="operation-1", owner="worker",
+        fence=3, now=now, route_result=route,
+    )
+    assert store.calls == [("42_7", "operation-1", {
+        "owner": "worker", "fence": 3, "now": now,
+    })]
+    assert not confirm_save_route(
+        store, context_id="42_7", operation_id="operation-2", owner="worker",
+        fence=3, now=now, route_result={"kind": "substantive"},
+    )
 
 
 @pytest.mark.parametrize(("response", "model_error"), [
