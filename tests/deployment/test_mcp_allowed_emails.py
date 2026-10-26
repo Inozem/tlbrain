@@ -26,8 +26,14 @@ def test_mcp_deploy_preserves_allowed_email_value(tmp_path, script_name, allowed
     build = repo / "infra/build"
     scripts.mkdir(parents=True)
     build.mkdir(parents=True)
+    helper_dir = scripts / "helpers"
+    helper_dir.mkdir()
     script = scripts / script_name
     shutil.copyfile(ROOT / "infra/deploy/core" / script_name, script)
+    shutil.copyfile(
+        ROOT / "infra/deploy/core/helpers/deploy_dialog_operations.sh",
+        helper_dir / "deploy_dialog_operations.sh",
+    )
     (build / "preflight.sh").write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'sha256:%064d\\n' 0\n", encoding="utf-8",
     )
@@ -47,6 +53,10 @@ set -euo pipefail
 gcloud() {
     if [[ "${1:-} ${2:-}" == "run deploy" ]]; then
         printf '%s\n' "$@" > "$DEPLOY_ARGS_LOG"
+    elif [[ "$*" == *"serviceAccountName"* ]]; then
+        printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\n'
+    elif [[ "${1:-} ${2:-}" == "projects describe" ]]; then
+        printf '123456789012\n'
     else
         printf 'https://service.example\n'
     fi
@@ -62,9 +72,11 @@ bash "$1"
     assert result.returncode == 0, result.stderr
     args = args_log.read_text(encoding="utf-8").splitlines()
     values = [args[index + 1] for index, arg in enumerate(args) if arg == "--set-env-vars"]
-    assert len(values) == 2
-    assert values[1] == f"^|^ALLOWED_EMAIL={allowed_email}"
-    other_variables = dict(item.split("=", 1) for item in values[0].split(","))
-    assert "ALLOWED_EMAIL" not in other_variables
+    assert len(values) == 1
+    assert values[0].startswith("^|^")
+    deployed_variables = dict(
+        item.split("=", 1) for item in values[0][len("^|^"):].split("|")
+    )
+    assert deployed_variables["ALLOWED_EMAIL"] == allowed_email
     for key in ("ROOT_FOLDER_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "VERSION"):
-        assert other_variables[key] == environment[key]
+        assert deployed_variables[key] == environment[key]

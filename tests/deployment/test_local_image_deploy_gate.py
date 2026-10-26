@@ -56,8 +56,8 @@ def test_local_deployment_settings_and_vector_queue_behavior_are_preserved() -> 
     mcp = _script("mcp")
     vector = _script("vector_sync")
     assert '--max-instances "${MCP_MAX_INSTANCES}"' in mcp
-    assert 'VECTOR_SYNC_URL="${VECTOR_SYNC_URL}"' in mcp
-    assert 'VERSION="${VERSION}"' in mcp
+    assert '"VECTOR_SYNC_URL=${VECTOR_SYNC_URL}"' in mcp
+    assert '"VERSION=${VERSION}"' in mcp
     assert "--timeout 3600" in vector
     assert "--concurrency 1" in vector
     assert '--max-instances "${VECTOR_SYNC_MAX_INSTANCES}"' in vector
@@ -67,7 +67,7 @@ def test_local_deployment_settings_and_vector_queue_behavior_are_preserved() -> 
         "ROOT_FOLDER_URL", "GEMINI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY",
         "QDRANT_COLLECTION", "GOOGLE_REFRESH_TOKEN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
     ):
-        assert f'{name}="${{{name}}}"' in mcp
+        assert f'"{name}=${{{name}}}"' in mcp
         assert f'{name}="${{{name}}}"' in vector
 
 
@@ -91,6 +91,13 @@ def _run_sandbox(tmp_path: Path, service: str, *, gate_fails: bool = False) -> t
     bin_dir.mkdir()
     script = deploy_dir / SCRIPTS[service].name
     shutil.copyfile(SCRIPTS[service], script)
+    if service == "mcp":
+        helper_dir = deploy_dir / "helpers"
+        helper_dir.mkdir()
+        shutil.copyfile(
+            ROOT / "infra" / "deploy" / "core" / "helpers" / "deploy_dialog_operations.sh",
+            helper_dir / "deploy_dialog_operations.sh",
+        )
 
     preflight = build_dir / "preflight.sh"
     preflight.write_text(
@@ -111,7 +118,10 @@ def _run_sandbox(tmp_path: Path, service: str, *, gate_fails: bool = False) -> t
     gcloud.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf 'gcloud:%s\\n' \"$*\" >> \"$EVENT_LOG\"\n"
-        "case \"$*\" in *'services describe'*) printf 'https://service.example\\n' ;; esac\n",
+        "case \"$*\" in "
+        "*'serviceAccountName'*) printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\\n' ;; "
+        "*'projects describe'*) printf '123456789012\\n' ;; "
+        "*'services describe'*) printf 'https://service.example\\n' ;; esac\n",
         encoding="utf-8",
     )
     gcloud.chmod(0o755)

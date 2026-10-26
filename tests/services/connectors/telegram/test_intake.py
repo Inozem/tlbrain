@@ -279,6 +279,7 @@ def test_disallowed_chat_or_sender_is_acknowledged_without_persisting_content(
     app = app_module.create_app(
         intake=intake,
         webhook_secret="synthetic-webhook-secret",
+        telegram_enabled=True,
     )
 
     async def request():
@@ -308,6 +309,7 @@ def test_invalid_webhook_secret_is_rejected_before_intake_or_persistence(
     app = app_module.create_app(
         intake=intake,
         webhook_secret="synthetic-webhook-secret",
+        telegram_enabled=True,
     )
 
     async def request():
@@ -329,7 +331,11 @@ def test_malformed_json_is_rejected(firestore_fake):
     repository, _ = _repository(firestore_fake)
     intake = _intake(repository, _Publisher(), _Classifier(), _Classifier())
     app_module = importlib.import_module("services.connectors.telegram.app.main")
-    app = app_module.create_app(intake=intake, webhook_secret="synthetic-webhook-secret")
+    app = app_module.create_app(
+        intake=intake,
+        webhook_secret="synthetic-webhook-secret",
+        telegram_enabled=True,
+    )
 
     async def request():
         transport = httpx.ASGITransport(app=app)
@@ -351,7 +357,11 @@ def test_publisher_failure_returns_service_unavailable(firestore_fake):
     publisher.failures = 1
     intake = _intake(repository, publisher, _Classifier(), _Classifier())
     app_module = importlib.import_module("services.connectors.telegram.app.main")
-    app = app_module.create_app(intake=intake, webhook_secret="synthetic-webhook-secret")
+    app = app_module.create_app(
+        intake=intake,
+        webhook_secret="synthetic-webhook-secret",
+        telegram_enabled=True,
+    )
 
     async def request():
         transport = httpx.ASGITransport(app=app)

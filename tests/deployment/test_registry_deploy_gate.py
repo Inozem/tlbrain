@@ -41,6 +41,13 @@ def _sandbox(tmp_path: Path, service: str, *, verifier_fails: bool = False) -> t
     bin_dir.mkdir()
     script = deploy_dir / SCRIPTS[service].name
     shutil.copyfile(SCRIPTS[service], script)
+    if service == "mcp":
+        helper_dir = deploy_dir / "helpers"
+        helper_dir.mkdir()
+        shutil.copyfile(
+            ROOT / "infra" / "deploy" / "core" / "helpers" / "deploy_dialog_operations.sh",
+            helper_dir / "deploy_dialog_operations.sh",
+        )
 
     verifier = build_dir / "preflight.sh"
     verifier.write_text(
@@ -57,7 +64,10 @@ def _sandbox(tmp_path: Path, service: str, *, verifier_fails: bool = False) -> t
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "printf '%s\\n' \"$*\" >> \"$GCLOUD_LOG\"\n"
-        "case \"$*\" in *'services describe'*) printf 'https://service.example\\n' ;; esac\n",
+        "case \"$*\" in "
+        "*'serviceAccountName'*) printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\\n' ;; "
+        "*'projects describe'*) printf '123456789012\\n' ;; "
+        "*'services describe'*) printf 'https://service.example\\n' ;; esac\n",
         encoding="utf-8",
     )
     gcloud.chmod(0o755)
@@ -153,8 +163,8 @@ def test_deploy_settings_are_preserved() -> None:
     mcp = SCRIPTS["mcp"].read_text(encoding="utf-8")
     vector = SCRIPTS["vector_sync"].read_text(encoding="utf-8")
     assert '--max-instances "${MCP_MAX_INSTANCES}"' in mcp
-    assert 'VECTOR_SYNC_URL="${VECTOR_SYNC_URL}"' in mcp
-    assert 'VERSION="${VERSION}"' in mcp
+    assert '"VECTOR_SYNC_URL=${VECTOR_SYNC_URL}"' in mcp
+    assert '"VERSION=${VERSION}"' in mcp
     assert "--timeout 3600" in vector
     assert "--concurrency 1" in vector
     assert '--max-instances "${VECTOR_SYNC_MAX_INSTANCES}"' in vector
