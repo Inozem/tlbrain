@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from datetime import datetime
 
 import pytest
 
@@ -47,27 +48,34 @@ class _Repository:
     def route_snapshot(self):
         return deepcopy((self.conversations, self.docs, self.search_index))
 
-    def get_history(self, conversation_id):
-        return self.conversations[conversation_id]
-
     def persist_route(self, operation_id, route):
         self.route_records[operation_id] = deepcopy(route)
         self.writes.append(("route", operation_id, deepcopy(route)))
 
-    def update_selection(self, operation_id, *, conversation_id, dialog_number):
-        self.selection = {
-            "active_conversation_id": conversation_id,
-            "selected_dialog_number": dialog_number,
-            "selection_sequence": self.selection["selection_sequence"] + 1,
-        }
-        self.writes.append(("selection", operation_id, deepcopy(self.selection)))
-        self.events.append(("selection", operation_id, deepcopy(self.selection)))
+    def list_turns(self, context_id, conversation_id):
+        assert context_id == self.context_id
+        return self.conversations[conversation_id]
 
-    def append_turn(self, conversation_id, *, role, content):
-        turn = {"role": role, "content": content}
+    def append_turn(
+        self, context_id, conversation_id, *, turn_id, operation_id,
+        role, parts, now,
+    ):
+        assert context_id == self.context_id
+        turn = {
+            "turn_id": turn_id, "operation_id": operation_id,
+            "role": role, "parts": deepcopy(parts),
+        }
+        existing = next((row for row in self.conversations[conversation_id]
+                         if row.get("turn_id") == turn_id), None)
+        if existing is not None:
+            assert {key: existing.get(key) for key in ("operation_id", "role", "parts")} == {
+                key: turn[key] for key in ("operation_id", "role", "parts")
+            }
+            return existing
         self.conversations[conversation_id].append(turn)
         self.writes.append(("turn", conversation_id, deepcopy(turn)))
         self.events.append(("append", conversation_id, deepcopy(turn)))
+        return turn
 
     def save_doc(self, target_doc_id, content):
         self.docs[target_doc_id] = content
@@ -76,6 +84,19 @@ class _Repository:
     def update_search_index(self, target_doc_id, content):
         self.search_index[target_doc_id] = [content]
         self.writes.append(("index", target_doc_id, content))
+
+
+class _EnvelopeRepository(_Repository):
+    """Record the route/cleanup boundary used by the Firestore adapter."""
+
+    def persist_route(self, operation_id, route, **lease):
+        super().persist_route(operation_id, route)
+        self.events.append(("route_persisted", operation_id))
+        return True
+
+    def clear_command_candidate(self, context_id, operation_id, **lease):
+        self.events.append(("candidate_cleared", operation_id))
+        return True
 
 
 class _Router:
@@ -153,12 +174,12 @@ def _harness(route, *, outcomes=()):
     events = []
     repository = _Repository(context, {
         "conversation:old": [
-            {"role": "user", "content": "old user turn"},
-            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "parts": [{"text": "old user turn"}]},
+            {"role": "model", "parts": [{"text": "old answer"}]},
         ],
         "conversation:target": [
-            {"role": "user", "content": "target user turn"},
-            {"role": "assistant", "content": "target answer"},
+            {"role": "user", "parts": [{"text": "target user turn"}]},
+            {"role": "model", "parts": [{"text": "target answer"}]},
         ],
     }, events)
     router = _Router(repository, route)
@@ -192,7 +213,21 @@ def _call(operation_id, context, repository, router, agent, notifications, queue
         agent=agent,
         notifications=notifications,
         queue=queue,
+        selection_publisher=lambda op, *, conversation_id, dialog_number: _publish_selection(
+            repository, op, conversation_id=conversation_id,
+            dialog_number=dialog_number,
+        ),
     )
+
+
+def _publish_selection(repository, operation_id, *, conversation_id, dialog_number):
+    repository.selection = {
+        "active_conversation_id": conversation_id,
+        "selected_dialog_number": dialog_number,
+        "selection_sequence": repository.selection["selection_sequence"] + 1,
+    }
+    repository.writes.append(("selection", operation_id, deepcopy(repository.selection)))
+    repository.events.append(("selection", operation_id, deepcopy(repository.selection)))
 
 
 def _contains(value, fragment):
@@ -229,6 +264,10 @@ def test_pure_switch_changes_focus_only_after_confirmed_notice_and_never_enters_
     }
     assert repository.conversations == before_histories
     assert (repository.docs, repository.search_index) == before_target_data
+    assert "switch to dialog 2" not in repr(repository.route_records["op-switch"])
+    assert "substantive_text" not in repository.route_records["op-switch"]
+    assert "text" not in repository.route_records["op-switch"]
+    assert "Dialog #2" not in repr(repository.route_records["op-switch"])
     assert agent.prompts == []
     assert [row[0] for row in repository.writes] == ["route", "selection"]
     assert notifications.attempts[0]["target_doc_id"] == "doc-target"
@@ -265,10 +304,12 @@ def test_mixed_switch_persists_only_substantive_text_and_result_in_target():
 
     assert repository.conversations["conversation:old"] == before_old
     target = repository.conversations["conversation:target"]
-    assert target[len(before_target):] == [
-        {"role": "user", "content": substantive},
-        {"role": "assistant", "content": "synthetic answer"},
+    additions = target[len(before_target):]
+    assert [(row["role"], row["parts"]) for row in additions] == [
+        ("user", [{"text": substantive}]),
+        ("model", [{"text": "synthetic answer"}]),
     ]
+    assert all(row["operation_id"] == "op-mixed" for row in additions)
     assert not _contains(target, "open dialog 2")
     assert not _contains(target, switch_notice)
     prompt = agent.prompts[0]["prompt"]
@@ -276,6 +317,8 @@ def test_mixed_switch_persists_only_substantive_text_and_result_in_target():
     assert not _contains(prompt, switch_notice)
     assert not _contains(prompt, "old user turn")
     assert not _contains(prompt, "old answer")
+    assert "open dialog 2" not in repr(repository.route_records["op-mixed"])
+    assert "substantive_text" not in repository.route_records["op-mixed"]
     kinds = [event[0] for event in repository.events]
     notice_position = kinds.index("notice_confirmed")
     selection_position = kinds.index("selection")
@@ -300,9 +343,8 @@ def test_automatic_semantic_target_change_preserves_entire_question_in_target():
     )
 
     assert repository.conversations["conversation:old"] == before_old
-    assert repository.conversations["conversation:target"][-2] == {
-        "role": "user", "content": question,
-    }
+    assert repository.conversations["conversation:target"][-2]["role"] == "user"
+    assert repository.conversations["conversation:target"][-2]["parts"] == [{"text": question}]
     assert (repository.docs, repository.search_index) == before_saved_data
     assert not any(row[0] in {"doc", "index"} for row in repository.writes)
 
@@ -318,6 +360,209 @@ def test_router_observes_unchanged_histories_before_target_resolution_or_append(
     assert router.observed == [before]
     assert router.calls[0]["text"] == "new request"
     assert repository.writes[0][0] == "route"
+
+
+def test_operation_replay_reuses_deterministic_turn_ids_and_skips_duplicate_agent_call():
+    context, repository, router, agent, notifications, queue = _harness(
+        _route("substantive", substantive_text="replay me once"),
+    )
+    selected_context = _current_context(context, repository)
+
+    first = _call(
+        "op-replay", selected_context, repository, router, agent, notifications, queue,
+        "raw envelope",
+    )
+    turns_after_first = deepcopy(repository.conversations["conversation:target"])
+    replay = _call(
+        "op-replay", selected_context, repository, router, agent, notifications, queue,
+        "raw envelope",
+    )
+
+    assert first["status"] == replay["status"] == "completed"
+    assert repository.conversations["conversation:target"] == turns_after_first
+    assert [turn["role"] for turn in turns_after_first[-2:]] == ["user", "model"]
+    assert [turn["operation_id"] for turn in turns_after_first[-2:]] == ["op-replay", "op-replay"]
+    assert len({turn["turn_id"] for turn in turns_after_first[-2:]}) == 2
+    assert len(agent.prompts) == 1
+
+
+def test_search_route_stays_in_its_separate_session_without_target_history_changes():
+    context, repository, router, agent, notifications, queue = _harness({
+        "status": "ok",
+        "kind": "search",
+        "result_refs": ["doc-target"],
+        "search_session_id": "search-1",
+    })
+    before = repository.snapshot()
+
+    result = _call(
+        "op-search", context, repository, router, agent, notifications, queue,
+        "find the target document",
+    )
+
+    assert result == {
+        "status": "ok", "kind": "search",
+        "result_refs": ["doc-target"], "search_session_id": "search-1",
+    }
+    assert repository.snapshot() == before
+    assert repository.route_records["op-search"] == {
+        "status": "ok", "kind": "search",
+    }
+    assert agent.prompts == []
+    assert notifications.attempts == []
+
+
+def test_invalid_substantive_route_is_recorded_as_invalid_before_any_side_effect():
+    route = _route("substantive", substantive_text=None)
+    context, repository, router, agent, notifications, queue = _harness(route)
+    before = repository.snapshot()
+
+    result = _call(
+        "op-invalid", context, repository, router, agent, notifications, queue,
+        "raw command content",
+    )
+
+    assert result["status"] == "invalid_route"
+    assert repository.route_records["op-invalid"]["status"] == "invalid_route"
+    assert repository.snapshot() == before
+    assert agent.prompts == []
+    assert notifications.attempts == []
+    assert "raw command content" not in repr(repository.route_records["op-invalid"])
+
+
+@pytest.mark.parametrize("malformed", [
+    {"status": [], "kind": "pure_switch"},
+    {"status": "ok", "kind": []},
+])
+def test_unhashable_route_status_or_kind_fails_closed(malformed):
+    context, repository, router, agent, notifications, queue = _harness(malformed)
+
+    result = _call(
+        "op-malformed", context, repository, router, agent, notifications, queue,
+        "do not store this command",
+    )
+
+    assert result["status"] == "invalid_route"
+    assert repository.route_records["op-malformed"]["status"] == "invalid_route"
+    assert "do not store this command" not in repr(repository.route_records["op-malformed"])
+
+
+def test_orchestration_clears_candidate_only_after_successful_route_persistence():
+    context, base, router, agent, notifications, queue = _harness(
+        _route("substantive", substantive_text="target request"),
+    )
+    repository = _EnvelopeRepository(context, base.conversations, base.events)
+
+    result = _process(
+        operation_id="op-cleanup", context=context, text="raw command envelope",
+        repository=repository, router=router, agent=agent,
+        notifications=notifications, queue=queue, owner="worker", fence=1,
+        now=datetime.now().astimezone(),
+    )
+
+    event_kinds = [event[0] for event in repository.events]
+    assert result["status"] == "completed"
+    assert event_kinds.index("route_persisted") < event_kinds.index("candidate_cleared")
+    assert event_kinds.index("append") < event_kinds.index("candidate_cleared")
+    assert event_kinds.index("candidate_cleared") < event_kinds.index("agent")
+
+
+def test_control_route_record_preserves_safe_dependency_operation_ids():
+    route = _route("retry")
+    route.update({
+        "target_operation_id": "target-operation",
+        "dependency_operation_id": "dependency-operation",
+        "text": "raw command envelope",
+    })
+    context, repository, router, agent, notifications, queue = _harness(route)
+
+    _call(
+        "op-control-target", context, repository, router, agent, notifications, queue,
+        "raw command envelope",
+    )
+
+    assert repository.route_records["op-control-target"]["target_operation_id"] == "target-operation"
+    assert repository.route_records["op-control-target"]["dependency_operation_id"] == "dependency-operation"
+    assert "raw command envelope" not in repr(repository.route_records["op-control-target"])
+
+
+def test_orchestration_does_not_clear_candidate_for_invalid_route():
+    context, base, router, agent, notifications, queue = _harness(
+        _route("substantive", substantive_text=None),
+    )
+    repository = _EnvelopeRepository(context, base.conversations, base.events)
+
+    result = _process(
+        operation_id="op-invalid-cleanup", context=context,
+        text="raw command envelope", repository=repository, router=router,
+        agent=agent, notifications=notifications, queue=queue,
+        owner="worker", fence=1, now=datetime.now().astimezone(),
+    )
+
+    assert result["status"] == "invalid_route"
+    assert not any(event[0] == "candidate_cleared" for event in repository.events)
+
+
+@pytest.mark.parametrize("route", [
+    {"status": "ok", "kind": "save", "confirmed": True},
+    {
+        **_route("retry"),
+        "status": "ok",
+    },
+])
+def test_non_conversation_routes_pass_through_without_turns(route):
+    context, repository, router, agent, notifications, queue = _harness(route)
+    before = deepcopy(repository.conversations)
+
+    result = _call(
+        "op-control", context, repository, router, agent, notifications, queue,
+        "control command",
+    )
+
+    assert result["kind"] == route["kind"]
+    assert repository.conversations == before
+    assert notifications.attempts == []
+    assert agent.prompts == []
+    assert "control command" not in repr(repository.route_records["op-control"])
+
+
+def test_successful_save_route_records_draft_target_without_command_text():
+    context, repository, router, agent, notifications, queue = _harness({
+        "status": "ok",
+        "kind": "save",
+        "confirmed": True,
+        "target_draft_id": "draft-target",
+        "text": "raw command envelope",
+        "substantive_text": "private route payload",
+    })
+
+    result = _call(
+        "op-save-route", context, repository, router, agent, notifications, queue,
+        "raw command envelope",
+    )
+
+    assert result == {"status": "ok", "kind": "save", "confirmed": True}
+    assert repository.route_records["op-save-route"] == {
+        "status": "ok", "kind": "save", "target_draft_id": "draft-target",
+    }
+    assert "raw command envelope" not in repr(repository.route_records["op-save-route"])
+    assert "private route payload" not in repr(repository.route_records["op-save-route"])
+
+
+def test_route_message_notice_marker_prevents_a_second_notice_in_operation_seam():
+    route = _route("substantive", substantive_text="target request")
+    route["selection_changed"] = True
+    route["notice_sent"] = True
+    context, repository, router, agent, notifications, queue = _harness(route)
+
+    _call(
+        "op-routed", context, repository, router, agent, notifications, queue,
+        "raw route envelope",
+    )
+
+    assert notifications.attempts == []
+    assert repository.selection["active_conversation_id"] == "conversation:target"
+    assert agent.prompts[0]["prompt"]["request"] == "target request"
 
 
 def test_three_unknown_notice_sends_release_head_and_same_operation_replay_is_suppressed():
@@ -369,8 +614,8 @@ def test_late_completion_preserves_newer_focus_and_older_operation_pinned_target
             target_doc_id="doc-newer",
             dialog_number=9,
         )
-        repository.update_selection(
-            "op-new", conversation_id="conversation:newer", dialog_number=9,
+        _publish_selection(
+            repository, "op-new", conversation_id="conversation:newer", dialog_number=9,
         )
         newer_selection.append(deepcopy(repository.selection))
 
@@ -383,9 +628,10 @@ def test_late_completion_preserves_newer_focus_and_older_operation_pinned_target
     assert result["status"] in {"completed", "processed"}
     assert agent.prompts[0]["target_doc_id"] == "doc-target"
     assert repository.route_records["op-old"]["conversation_id"] == "conversation:target"
-    assert repository.conversations["conversation:target"] == target_history + [
-        {"role": "user", "content": "pinned old operation"},
-        {"role": "assistant", "content": "synthetic answer"},
+    assert repository.conversations["conversation:target"][:len(target_history)] == target_history
+    assert [(row["role"], row["parts"]) for row in repository.conversations["conversation:target"][len(target_history):]] == [
+        ("user", [{"text": "pinned old operation"}]),
+        ("model", [{"text": "synthetic answer"}]),
     ]
     assert repository.conversations["conversation:old"] == old_history
     assert repository.conversations["conversation:newer"] == []

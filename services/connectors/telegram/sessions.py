@@ -7,11 +7,15 @@ metadata before allowing connector effects.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 from collections.abc import Mapping
-from datetime import datetime
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 from core.operations.registry import OPERATIONS, validate_arguments
+from services.connectors.telegram.conversations import TurnRole, build_agent_prompt
 
 
 _ROUTE_KINDS = frozenset({"pure_switch", "search", "substantive", "save", "retry"})
@@ -415,7 +419,7 @@ def _action_matches_target(decision: Mapping[str, Any], target: str) -> bool:
 
 async def _finish_targeted_route(
     decision: Mapping[str, Any], *, target: Mapping[str, Any],
-    context: Any, notices: Any, actions: Any,
+    context: Any, notices: Any, actions: Any, notify_switch: bool,
 ) -> dict[str, Any]:
     """Build a targeted result, notify focus changes, then run its action."""
     kind = decision["kind"]
@@ -441,9 +445,12 @@ async def _finish_targeted_route(
         result["target_operation_id"] = dependency_operation_id
         result["dependency_operation_id"] = dependency_operation_id
     result["selection_changed"] = changed_focus
+    result["notice_sent"] = bool(
+        notify_switch and changed_focus and kind in {"pure_switch", "substantive"}
+    )
     if not _action_matches_target(decision, target_doc_id):
         return _failure("invalid_route", kind=kind)
-    if kind in {"pure_switch", "substantive"} and changed_focus:
+    if notify_switch and kind in {"pure_switch", "substantive"} and changed_focus:
         notices.send_switch_notice(doc_id=target_doc_id, dialog_number=number)
     if kind == "substantive" and decision["tool_choice"] is not None:
         choice = decision["tool_choice"]
@@ -463,6 +470,7 @@ async def route_message(
     notices: Any, actions: Any, operation_id: str | None = None,
     owner: str | None = None, fence: int | None = None,
     now: datetime | None = None, save_candidates: Any = None,
+    notify_switch: bool = True,
 ) -> dict[str, Any]:
     """Route one command using only a validated structured model response.
 
@@ -501,6 +509,369 @@ async def route_message(
         return _failure(failure, kind=kind)
     return await _finish_targeted_route(
         decision, target=target, context=context, notices=notices, actions=actions,
+        notify_switch=notify_switch,
+    )
+
+
+def _control_route_record(route: Any) -> dict[str, Any]:
+    """Keep only target and status metadata in the operation control ledger."""
+    if not isinstance(route, Mapping):
+        return {"status": "invalid_route"}
+    safe: dict[str, Any] = {}
+    allowed_statuses = {
+        "ok", "success", "invalid_route", "uncertain", "error",
+        "not_found", "unconfirmed",
+    }
+    allowed_kinds = _ROUTE_KINDS
+    for field in (
+        "status", "kind", "target_doc_id", "conversation_id",
+        "target_draft_id", "target_operation_id", "dependency_operation_id",
+    ):
+        value = route.get(field)
+        if field == "status" and (not isinstance(value, str) or value not in allowed_statuses):
+            continue
+        if field == "kind" and (not isinstance(value, str) or value not in allowed_kinds):
+            continue
+        if isinstance(value, str) and value:
+            safe[field] = value
+    number = route.get("dialog_number")
+    if type(number) is int and number > 0:
+        safe["dialog_number"] = number
+    safe.setdefault("status", "error")
+    return safe
+
+
+def _operation_route_status(route: Any) -> str:
+    """Validate the operation route before recording a successful status."""
+    if not isinstance(route, Mapping):
+        return "invalid_route"
+    status = route.get("status")
+    if status is not None and (not isinstance(status, str) or status not in {"ok", "success"}):
+        return status if isinstance(status, str) and status in {
+            "invalid_route", "uncertain", "error", "not_found", "unconfirmed",
+        } else "invalid_route"
+    kind = route.get("kind")
+    if not isinstance(kind, str) or kind not in {
+        "pure_switch", "substantive", "search", "save", "retry",
+    }:
+        return "invalid_route"
+    if kind == "search":
+        return "ok"
+    if kind == "save":
+        if type(route.get("confirmed")) is not bool:
+            return "invalid_route"
+        return "ok" if route.get("confirmed") else "unconfirmed"
+    if (
+        not isinstance(route.get("target_doc_id"), str)
+        or not route.get("target_doc_id")
+        or not isinstance(route.get("conversation_id"), str)
+        or not route.get("conversation_id")
+        or type(route.get("dialog_number")) is not int
+        or route.get("dialog_number") < 1
+    ):
+        return "invalid_route"
+    if kind == "substantive":
+        value = route.get("substantive_text")
+        if not isinstance(value, str) or not value.strip():
+            return "invalid_route"
+    return "ok"
+
+
+@dataclass(frozen=True)
+class _PersistedOperationRoute:
+    """Carry a sanitized route and the lease-bound candidate cleanup handle."""
+
+    route: Any
+    route_record: dict[str, Any]
+    context_id: Any
+    clear_candidate: Callable[..., Any] | None
+
+
+async def _invoke_operation_router(
+    *, router: Any, operation_id: str, context: Any, text: str,
+) -> Any:
+    """Resolve the structured route before this seam reads or changes history."""
+    try:
+        return await router(
+            operation_id=operation_id, context=context, text=text,
+        )
+    except Exception:
+        return {"status": "error"}
+
+
+def _persist_operation_route(
+    route: Any, *, operation_id: str, context: Any, repository: Any,
+    owner: str | None, fence: int | None, now: datetime | None,
+) -> _PersistedOperationRoute | None:
+    """Validate and persist only allowlisted route metadata before any side effect."""
+    validation_status = _operation_route_status(route)
+    route_record = _control_route_record(route)
+    route_record["status"] = validation_status
+    clear_candidate = getattr(repository, "clear_command_candidate", None)
+    context_id = None
+    if callable(clear_candidate):
+        context_id = getattr(context, "context_id", None)
+        if (
+            not isinstance(context_id, str) or not context_id
+            or not isinstance(owner, str) or not owner
+            or type(fence) is not int or fence < 1
+            or not isinstance(now, datetime)
+        ):
+            return None
+        persisted = repository.persist_route(
+            operation_id, route_record, context_id=context_id,
+            owner=owner, fence=fence, now=now,
+        )
+    else:
+        persisted = repository.persist_route(operation_id, route_record)
+    if persisted is False:
+        return None
+    return _PersistedOperationRoute(
+        route=route, route_record=route_record, context_id=context_id,
+        clear_candidate=clear_candidate if callable(clear_candidate) else None,
+    )
+
+
+def _route_failure_result(state: _PersistedOperationRoute) -> dict[str, Any] | None:
+    """Return a persisted routing failure without entering a control flow."""
+    route_record = state.route_record
+    if route_record.get("status") in {"ok", "success"}:
+        return None
+    if route_record.get("kind") == "save":
+        confirmed = state.route.get("confirmed") if isinstance(state.route, Mapping) else False
+        return {
+            "status": route_record["status"], "kind": "save",
+            "confirmed": confirmed is True,
+        }
+    return route_record
+
+
+def _clear_command_candidate(
+    state: _PersistedOperationRoute, *, operation_id: str,
+    owner: str | None, fence: int | None, now: datetime | None,
+) -> bool:
+    """Clear the raw envelope only through the previously validated live lease."""
+    if state.clear_candidate is None:
+        return True
+    return bool(state.clear_candidate(
+        state.context_id, operation_id, owner=owner, fence=fence, now=now,
+    ))
+
+
+def _handle_control_route(
+    state: _PersistedOperationRoute, *, kind: Any, operation_id: str,
+    owner: str | None, fence: int | None, now: datetime | None,
+) -> dict[str, Any] | None:
+    """Finish search, save, and retry routes without creating conversation turns."""
+    if kind == "search":
+        result: dict[str, Any] = {"status": "ok", "kind": "search"}
+        route = state.route
+        refs = route.get("result_refs") if isinstance(route, Mapping) else None
+        session_id = route.get("search_session_id") if isinstance(route, Mapping) else None
+        if isinstance(refs, list) and all(isinstance(item, str) for item in refs):
+            result["result_refs"] = list(refs)
+        if isinstance(session_id, str) and session_id:
+            result["search_session_id"] = session_id
+        if not _clear_command_candidate(
+            state, operation_id=operation_id, owner=owner, fence=fence, now=now,
+        ):
+            return {"status": "error", "kind": "search"}
+        return result
+    if kind in {"save", "retry"}:
+        if not _clear_command_candidate(
+            state, operation_id=operation_id, owner=owner, fence=fence, now=now,
+        ):
+            return {"status": "error", "kind": kind}
+        if kind == "save":
+            return {"status": "ok", "kind": "save", "confirmed": True}
+        return {"status": "ok", "kind": kind}
+    return None
+
+
+def _conversation_route_target(
+    route_record: Mapping[str, Any],
+) -> tuple[str, str, int] | None:
+    """Extract the fixed target accepted by successful conversation routes."""
+    kind = route_record.get("kind")
+    target_doc_id = route_record.get("target_doc_id")
+    conversation_id = route_record.get("conversation_id")
+    number = route_record.get("dialog_number")
+    if (
+        kind not in {"pure_switch", "substantive"}
+        or not isinstance(target_doc_id, str)
+        or not isinstance(conversation_id, str)
+        or type(number) is not int
+    ):
+        return None
+    return target_doc_id, conversation_id, number
+
+
+def _substantive_route_text(route: Any, kind: str) -> str | None:
+    """Accept text only for substantive routes; switches never retain payloads."""
+    substantive_text = (
+        route.get("substantive_text")
+        if kind == "substantive" and isinstance(route, Mapping)
+        else None
+    )
+    if kind == "substantive" and (
+        not isinstance(substantive_text, str) or not substantive_text.strip()
+    ):
+        return None
+    return substantive_text
+
+
+async def _confirm_selection_change(
+    *, route: Any, operation_id: str, target_doc_id: str,
+    conversation_id: str, number: int, context: Any, notifications: Any,
+    selection_publisher: Callable[..., Any] | None,
+) -> bool | None:
+    """Confirm the notice before publishing a changed selection, unless already sent."""
+    if context.active_conversation_id == conversation_id:
+        return False
+    already_notified = isinstance(route, Mapping) and route.get("notice_sent") is True
+    if not already_notified:
+        try:
+            notice_result = await notifications.send_switch_notice(
+                operation_id=operation_id,
+                notification_id=f"switch-{operation_id}",
+                target_doc_id=target_doc_id,
+                dialog_number=number,
+            )
+        except Exception:
+            return None
+        if notice_result != "confirmed":
+            return None
+    if selection_publisher is not None:
+        published = selection_publisher(
+            operation_id, conversation_id=conversation_id,
+            dialog_number=number,
+        )
+        if inspect.isawaitable(published):
+            await published
+    return True
+
+
+async def _process_substantive_turn(
+    *, operation_id: str, context_id: str, kind: str, substantive_text: str,
+    target_doc_id: str, conversation_id: str, number: int, repository: Any,
+    agent: Any, state: _PersistedOperationRoute, owner: str | None,
+    fence: int | None, now: datetime | None,
+) -> dict[str, Any]:
+    """Append the substantive question once, skip completed replays, and run its pinned target."""
+    history = repository.list_turns(context_id, conversation_id)
+    prompt_history = [
+        turn for turn in history
+        if not isinstance(turn, Mapping) or turn.get("operation_id") != operation_id
+    ]
+    completed = any(
+        isinstance(turn, Mapping)
+        and turn.get("operation_id") == operation_id
+        and turn.get("role") == TurnRole.MODEL.value
+        for turn in history
+    )
+    if completed:
+        if not _clear_command_candidate(
+            state, operation_id=operation_id, owner=owner, fence=fence, now=now,
+        ):
+            return {"status": "error", "kind": kind}
+        return {
+            "status": "completed", "kind": kind,
+            "target_doc_id": target_doc_id,
+            "conversation_id": conversation_id,
+            "dialog_number": number,
+        }
+    prompt = build_agent_prompt(prompt_history, substantive_text)
+    turn_now = now or datetime.now(timezone.utc)
+    turn_id = lambda role: "telegram-" + hashlib.sha256(
+        f"{operation_id}:{role}".encode("utf-8")
+    ).hexdigest()
+    repository.append_turn(
+        context_id, conversation_id,
+        turn_id=turn_id(TurnRole.USER.value), operation_id=operation_id,
+        role=TurnRole.USER.value, parts=[{"text": substantive_text}], now=turn_now,
+    )
+    if not _clear_command_candidate(
+        state, operation_id=operation_id, owner=owner, fence=fence, now=now,
+    ):
+        return {"status": "error", "kind": kind}
+    try:
+        answer = await agent(prompt=prompt, target_doc_id=target_doc_id)
+    except Exception:
+        return {"status": "error", "kind": kind}
+    repository.append_turn(
+        context_id, conversation_id,
+        turn_id=turn_id(TurnRole.MODEL.value), operation_id=operation_id,
+        role=TurnRole.MODEL.value, parts=[{"text": answer}], now=turn_now,
+    )
+    return {
+        "status": "completed", "kind": kind,
+        "target_doc_id": target_doc_id,
+        "conversation_id": conversation_id,
+        "dialog_number": number,
+    }
+
+
+async def process_operation(
+    *, operation_id: str, context: Any, text: str, repository: Any,
+    router: Any, agent: Any, notifications: Any, queue: Any = None,
+    selection_publisher: Callable[..., Any] | None = None,
+    owner: str | None = None, fence: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Route first, persist safe metadata, then finish controls or the pinned turn."""
+    route = await _invoke_operation_router(
+        router=router, operation_id=operation_id, context=context, text=text,
+    )
+    state = _persist_operation_route(
+        route, operation_id=operation_id, context=context, repository=repository,
+        owner=owner, fence=fence, now=now,
+    )
+    if state is None:
+        return {"status": "error"}
+    failure = _route_failure_result(state)
+    if failure is not None:
+        return failure
+
+    kind = state.route_record.get("kind")
+    control_result = _handle_control_route(
+        state, kind=kind, operation_id=operation_id,
+        owner=owner, fence=fence, now=now,
+    )
+    if control_result is not None:
+        return control_result
+    target = _conversation_route_target(state.route_record)
+    if target is None:
+        return {"status": "invalid_route", **({"kind": kind} if kind else {})}
+    target_doc_id, conversation_id, number = target
+    substantive_text = _substantive_route_text(state.route, kind)
+    if kind == "substantive" and substantive_text is None:
+        return {"status": "invalid_route", "kind": kind}
+
+    changed_focus = await _confirm_selection_change(
+        route=state.route, operation_id=operation_id,
+        target_doc_id=target_doc_id, conversation_id=conversation_id,
+        number=number, context=context, notifications=notifications,
+        selection_publisher=selection_publisher,
+    )
+    if changed_focus is None:
+        return {"status": "error", "kind": kind}
+    if kind == "pure_switch":
+        if not _clear_command_candidate(
+            state, operation_id=operation_id, owner=owner, fence=fence, now=now,
+        ):
+            return {"status": "error", "kind": kind}
+        return {
+            "status": "switched", "kind": kind,
+            "target_doc_id": target_doc_id,
+            "conversation_id": conversation_id,
+            "dialog_number": number,
+        }
+
+    return await _process_substantive_turn(
+        operation_id=operation_id, context_id=context.context_id, kind=kind,
+        substantive_text=substantive_text, target_doc_id=target_doc_id,
+        conversation_id=conversation_id, number=number, repository=repository,
+        agent=agent, state=state, owner=owner, fence=fence, now=now,
     )
 
 
@@ -528,4 +899,4 @@ def confirm_save_route(
     return bool(confirm(context_id, operation_id, owner=owner, fence=fence, now=now))
 
 
-__all__ = ["confirm_save_route", "route_message"]
+__all__ = ["confirm_save_route", "process_operation", "route_message"]

@@ -91,6 +91,137 @@ def test_confirmation_seals_only_the_captured_candidate_and_replays_idempotently
     assert repository.get_draft(accepted.context_id, draft_id)["sealed_at"] == NOW
 
 
+def test_routed_command_candidate_cleanup_preserves_save_cutoff_and_confirmation(firestore_fake):
+    client, repository, accepted, context_ref, lease, draft_id = _setup(firestore_fake)
+    command_ref = context_ref.collection("commands").document("2")
+    original = command_ref.get().to_dict()
+    raw_candidate = original["candidate"]
+
+    assert repository.persist_route(
+        lease.operation_id,
+        {
+            "status": "ok", "kind": "save", "target_draft_id": draft_id,
+            "text": raw_candidate, "substantive_text": raw_candidate,
+        },
+        context_id=accepted.context_id, owner=lease.owner,
+        fence=lease.fence, now=NOW,
+    ) is True
+    operation = context_ref.collection("operations").document(lease.operation_id).get().to_dict()
+    assert operation["route_control"] == {
+        "status": "ok", "kind": "save", "target_draft_id": draft_id,
+    }
+    assert raw_candidate not in repr(operation["route_control"])
+    assert "route_result" not in operation
+    assert command_ref.get().to_dict()["candidate"] == raw_candidate
+    same_route = {
+        "status": "ok", "kind": "save", "target_draft_id": draft_id,
+    }
+    assert repository.persist_route(
+        lease.operation_id, same_route, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is True
+    assert repository.persist_route(
+        lease.operation_id,
+        {**same_route, "status": "success"},
+        context_id=accepted.context_id, owner=lease.owner,
+        fence=lease.fence, now=NOW,
+    ) is False
+    assert repository.persist_route(
+        lease.operation_id,
+        {**same_route, "target_doc_id": "different-target"},
+        context_id=accepted.context_id, owner=lease.owner,
+        fence=lease.fence, now=NOW,
+    ) is False
+
+    assert repository.clear_command_candidate(
+        accepted.context_id, lease.operation_id, owner=lease.owner,
+        fence=lease.fence, now=NOW,
+    ) is True
+    cleared = command_ref.get().to_dict()
+    assert "candidate" not in cleared
+    for field in (
+        "kind", "draft_id", "cutoff_message_ids", "cutoff_intake_sequence",
+        "operation_id", "context_id", "update_id",
+    ):
+        assert cleared[field] == original[field]
+
+    assert repository.clear_command_candidate(
+        accepted.context_id, lease.operation_id, owner=lease.owner,
+        fence=lease.fence, now=NOW,
+    ) is True
+    assert repository.confirm_save_command(
+        accepted.context_id, lease.operation_id, owner=lease.owner,
+        fence=lease.fence, now=NOW,
+    ) is True
+    confirmed = context_ref.collection("operations").document(lease.operation_id).get().to_dict()
+    assert confirmed["route_result"] == {"kind": "save", "target_draft_id": draft_id}
+
+
+@pytest.mark.parametrize("failure", [
+    "uncommitted", "invalid_route", "wrong_owner", "wrong_fence", "expired",
+    "malformed_route", "persistence_failure",
+])
+def test_candidate_cleanup_fails_closed_and_retains_command_text(firestore_fake, failure):
+    client, repository, accepted, context_ref, lease, draft_id = _setup(firestore_fake)
+    command_ref = context_ref.collection("commands").document("2")
+    candidate = command_ref.get().to_dict()["candidate"]
+
+    if failure == "invalid_route":
+        assert repository.persist_route(
+            lease.operation_id, {"status": "invalid_route", "kind": "save"},
+            context_id=accepted.context_id, owner=lease.owner,
+            fence=lease.fence, now=NOW,
+        ) is True
+    elif failure == "malformed_route":
+        with pytest.raises(ValueError):
+            repository.persist_route(
+                lease.operation_id,
+                {"status": "ok", "kind": []},
+                context_id=accepted.context_id, owner=lease.owner,
+                fence=lease.fence, now=NOW,
+            )
+    elif failure == "persistence_failure":
+        firestore_fake.fail_next(
+            "commit", path=f"telegram_sessions/{accepted.context_id}/operations/{lease.operation_id}",
+        )
+        with pytest.raises(RuntimeError):
+            repository.persist_route(
+                lease.operation_id, {"status": "ok", "kind": "save"},
+                context_id=accepted.context_id, owner=lease.owner,
+                fence=lease.fence, now=NOW,
+            )
+    elif failure != "uncommitted":
+        assert repository.persist_route(
+            lease.operation_id, {"status": "ok", "kind": "save"},
+            context_id=accepted.context_id, owner=lease.owner,
+            fence=lease.fence, now=NOW,
+        ) is True
+
+    owner, fence, now = lease.owner, lease.fence, NOW
+    if failure == "wrong_owner":
+        owner = "stale-worker"
+    elif failure == "wrong_fence":
+        fence += 1
+    elif failure == "expired":
+        now = NOW + timedelta(minutes=10)
+    assert repository.clear_command_candidate(
+        accepted.context_id, lease.operation_id, owner=owner,
+        fence=fence, now=now,
+    ) is False
+    assert command_ref.get().to_dict()["candidate"] == candidate
+    if failure == "invalid_route":
+        assert repository.persist_route(
+            lease.operation_id, {"status": "ok", "kind": "save"},
+            context_id=accepted.context_id, owner=lease.owner,
+            fence=lease.fence, now=NOW,
+        ) is True
+        assert repository.clear_command_candidate(
+            accepted.context_id, lease.operation_id, owner=lease.owner,
+            fence=lease.fence, now=NOW,
+        ) is True
+        assert "candidate" not in command_ref.get().to_dict()
+
+
 @pytest.mark.parametrize("failure", [
     "wrong_owner", "wrong_fence", "expired", "changed_sources", "route_conflict",
     "terminal_operation", "non_head_operation", "foreign_input_ref", "mismatched_command",

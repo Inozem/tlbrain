@@ -180,3 +180,41 @@ def build_turn_payload(
         "source_refs": _json_value(source_refs, "source_refs"),
         "created_at": _timestamp(now, "now"),
     }
+
+
+def build_agent_prompt(history: Any, substantive_text: str) -> dict[str, Any]:
+    """Build an agent input from one conversation and its substantive request.
+
+    Keeping this shape here makes the persisted role vocabulary explicit at
+    the boundary between conversation history and agent execution.
+    """
+    if not isinstance(history, (list, tuple)):
+        raise TypeError("history must be a list of conversation turns")
+    if not isinstance(substantive_text, str) or not substantive_text.strip():
+        raise ValueError("substantive_text must be non-empty")
+    canonical_history: list[dict[str, Any]] = []
+    for turn in history:
+        if not isinstance(turn, Mapping):
+            raise TypeError("history turns must be mappings")
+        try:
+            role = TurnRole(turn.get("role"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("history contains an unsupported turn role") from exc
+        if "parts" in turn:
+            raw_parts = turn["parts"]
+            if not isinstance(raw_parts, (list, tuple)):
+                raise TypeError("history parts must be a list of mappings")
+        else:
+            content = turn.get("content")
+            if not isinstance(content, str):
+                raise TypeError("history turn is missing a valid parts payload")
+            raw_parts = [{"text": content}]
+        parts: list[dict[str, Any]] = []
+        for part in raw_parts:
+            if not isinstance(part, Mapping):
+                raise TypeError("history parts must be mappings")
+            clean_part = _json_value(part, "part")
+            if clean_part:
+                parts.append(clean_part)
+        canonical_history.append({"role": role.value, "parts": parts})
+    return {"history": canonical_history, "request": substantive_text}

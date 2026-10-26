@@ -8,10 +8,35 @@ import pytest
 from core.integrations.firestore import folders as folder_repository
 from core.integrations.firestore import sync_state as sync_state_repository
 from core.integrations.firestore import transcripts as transcript_repository
+from core.integrations.firestore.operation_queue import validate_context_queue_lease
 
 
 INDEX = "transcript_index"
 FOLDERS = "folders"
+
+
+def test_context_queue_lease_validator_checks_owner_fence_and_expiry():
+    now = datetime(2026, 8, 9, tzinfo=timezone.utc)
+    context = {
+        "reserved_operation_id": "op-1", "active_operation_id": "op-1",
+        "lock_owner": "worker", "fence": 3,
+    }
+    assert validate_context_queue_lease(
+        context, "op-1", owner="worker", fence=3,
+        now=now, expiry=now + timedelta(minutes=1),
+    )
+    assert not validate_context_queue_lease(
+        context, "op-1", owner="stale", fence=3,
+        now=now, expiry=now + timedelta(minutes=1),
+    )
+    assert not validate_context_queue_lease(
+        context, "op-1", owner="worker", fence=2,
+        now=now, expiry=now + timedelta(minutes=1),
+    )
+    assert not validate_context_queue_lease(
+        context, "op-1", owner="worker", fence=3,
+        now=now, expiry=now,
+    )
 
 
 def _client(firestore_fake):

@@ -182,7 +182,7 @@ def _harness(*, decision=None, docs=None, current=None, last=None, numbers=None,
 
 def _call(text, *, context, store, model, search, notices, actions,
           operation_id="operation-1", owner="worker", fence=1, now=None,
-          save_candidates=None):
+          save_candidates=None, notify_switch=True):
     from datetime import datetime, timezone
     now = now or datetime.now(timezone.utc)
     return _route(
@@ -198,6 +198,7 @@ def _call(text, *, context, store, model, search, notices, actions,
         fence=fence,
         now=now,
         save_candidates=save_candidates,
+        notify_switch=notify_switch,
     )
 
 
@@ -248,6 +249,26 @@ def test_substantive_semantic_switch_preserves_question_and_notifies_target_numb
     assert result["dialog_number"] == expected_number
     assert result["substantive_text"] == question
     assert notices.sent == [("doc-research", expected_number)]
+
+
+def test_route_message_can_defer_notice_to_operation_orchestrator():
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision(
+            "substantive", target_ref="doc-research",
+            substantive_text="continue the research question",
+        ),
+        docs={"doc-current": {}, "doc-research": {}},
+        current="doc-current", numbers={"doc-current": 1},
+    )
+
+    result = _call(
+        "continue research", context=context, store=store, model=model,
+        search=search, notices=notices, actions=actions, notify_switch=False,
+    )
+
+    assert result["selection_changed"] is True
+    assert result["notice_sent"] is False
+    assert notices.sent == []
 
 
 def test_explicit_dialog_number_wins_over_conflicting_semantic_target():

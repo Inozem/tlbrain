@@ -2,7 +2,11 @@ from datetime import datetime, timezone
 
 import pytest
 
-from services.connectors.telegram.conversations import build_conversation, build_turn_payload
+from services.connectors.telegram.conversations import (
+    build_agent_prompt,
+    build_conversation,
+    build_turn_payload,
+)
 from services.connectors.telegram.repository import TelegramRepository
 
 
@@ -36,6 +40,56 @@ def test_conversation_kinds_enforce_their_target_shapes():
     with pytest.raises(ValueError):
         build_turn_payload("ctx-1", turn_id="1", operation_id="op", role="system",
                            parts=[], now=NOW)
+
+
+def test_agent_prompt_uses_only_canonical_conversation_roles_and_request():
+    history = [{
+        "role": "tool",
+        "turn_id": "private-turn-id",
+        "operation_id": "private-operation-id",
+        "created_at": NOW,
+        "raw_envelope": "discard this metadata",
+        "parts": [
+            {"text": "prior request"},
+            {"function_response": {"name": "lookup", "response": {"ok": True}}},
+        ],
+    }]
+    prompt = build_agent_prompt(history, "selected target question")
+    assert prompt == {
+        "history": [{
+            "role": "tool",
+            "parts": [
+                {"text": "prior request"},
+                {"function_response": {"name": "lookup", "response": {"ok": True}}},
+            ],
+        }],
+        "request": "selected target question",
+    }
+    assert history[0]["turn_id"] == "private-turn-id"
+    with pytest.raises(ValueError):
+        build_agent_prompt([{"role": "assistant", "parts": []}], "question")
+
+
+@pytest.mark.parametrize("bad_part", ["malformed", {"nested": object()}])
+def test_agent_prompt_fails_closed_on_malformed_stored_parts(bad_part):
+    with pytest.raises(TypeError):
+        build_agent_prompt([{"role": "tool", "parts": [bad_part]}], "question")
+
+
+@pytest.mark.parametrize("turn", [
+    {"role": "tool", "parts": "malformed", "content": "must not fallback"},
+    {"role": "tool", "parts": None, "content": "must not fallback"},
+    {"role": "tool"},
+    {"role": "tool", "content": None},
+])
+def test_agent_prompt_fails_closed_on_missing_or_malformed_top_level_payload(turn):
+    with pytest.raises(TypeError):
+        build_agent_prompt([turn], "question")
+
+
+def test_agent_prompt_preserves_legacy_string_content_fallback():
+    prompt = build_agent_prompt([{"role": "user", "content": "legacy turn"}], "question")
+    assert prompt["history"] == [{"role": "user", "parts": [{"text": "legacy turn"}]}]
 
 
 def test_draft_session_record_is_separate_and_creation_is_idempotent(firestore_fake):

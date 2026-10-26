@@ -11,12 +11,16 @@ from typing import Any, Mapping
 from google.cloud import firestore
 
 from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record_in_transaction
-from core.integrations.firestore.operation_queue import register_operation_in_transaction
+from core.integrations.firestore.operation_queue import (
+    register_operation_in_transaction,
+    validate_context_queue_lease,
+)
 from services.connectors.telegram.models import TelegramDraftState, build_context_id
 from services.connectors.telegram.repository._common import (
     SESSIONS,
     TelegramIntakeResult,
     _document_ref,
+    _identifier,
     _integer,
     _receipt_result,
     _aware,
@@ -309,6 +313,162 @@ def _persist_command_acceptance(
 
 class _TelegramCommandMixin:
     """Persist idempotent command acceptance and operation registration."""
+
+    @staticmethod
+    def _route_control_data(route: Mapping[str, Any]) -> dict[str, Any]:
+        """Project route state to metadata safe for the operation ledger."""
+        allowed_status = {
+            "ok", "success", "invalid_route", "uncertain", "error",
+            "not_found", "unconfirmed",
+        }
+        allowed_kinds = {"pure_switch", "search", "substantive", "save", "retry"}
+        status = route.get("status")
+        kind = route.get("kind")
+        if not isinstance(status, str) or status not in allowed_status:
+            raise ValueError("route status is invalid")
+        if kind is not None and (not isinstance(kind, str) or kind not in allowed_kinds):
+            raise ValueError("route kind is invalid")
+        safe: dict[str, Any] = {"status": status}
+        if kind is not None:
+            safe["kind"] = kind
+        for field in (
+            "target_doc_id", "conversation_id", "target_draft_id",
+            "target_operation_id", "dependency_operation_id",
+        ):
+            value = route.get(field)
+            if value is not None:
+                if not isinstance(value, str) or not value:
+                    raise ValueError(f"{field} is invalid")
+                safe[field] = value
+        number = route.get("dialog_number")
+        if number is not None:
+            if type(number) is not int or number < 1:
+                raise ValueError("dialog_number is invalid")
+            safe["dialog_number"] = number
+        return safe
+
+    def _command_for_operation(
+        self, transaction: Any, *, context_id: str, operation_id: str,
+        operation: Mapping[str, Any],
+    ):
+        input_ref = operation.get("input_ref")
+        parts = input_ref.split("/") if isinstance(input_ref, str) else []
+        if (len(parts) != 4 or parts[:3] != [SESSIONS, context_id, "commands"]):
+            return None, None
+        try:
+            _identifier(parts[3], "command_id")
+        except ValueError:
+            return None, None
+        command_ref = _document_ref(self.client, input_ref)
+        snapshot = command_ref.get(transaction=transaction)
+        command = snapshot.to_dict() or {} if snapshot.exists else {}
+        if (not snapshot.exists or command.get("context_id") != context_id
+                or command.get("operation_id") != operation_id):
+            return None, None
+        return command_ref, command
+
+    def persist_route(
+        self, operation_id: str, route: Mapping[str, Any], *, context_id: str,
+        owner: str, fence: int, now: datetime,
+    ) -> bool:
+        """Persist sanitized route state only under the current operation lease."""
+        context_id = _identifier(context_id, "context_id")
+        operation_id = _identifier(operation_id, "operation_id")
+        if not isinstance(route, Mapping):
+            raise TypeError("route must be a mapping")
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("owner must be a non-empty string")
+        fence = _integer(fence, "fence", minimum=1)
+        now = _aware(now, "now")
+        safe_route = self._route_control_data(route)
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        operation_ref = context_ref.collection("operations").document(operation_id)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> bool:
+            context_snapshot = context_ref.get(transaction=transaction)
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            if not context_snapshot.exists or not operation_snapshot.exists:
+                return False
+            context = context_snapshot.to_dict() or {}
+            operation = operation_snapshot.to_dict() or {}
+            if (operation.get("operation_id") != operation_id
+                    or operation.get("state") != "running"
+                    or not validate_context_queue_lease(
+                        context, operation_id, owner=owner, fence=fence, now=now,
+                        expiry=context.get("lock_expires_at"),
+                    )):
+                return False
+            _, command = self._command_for_operation(
+                transaction, context_id=context_id,
+                operation_id=operation_id, operation=operation,
+            )
+            if command is None:
+                return False
+            existing_route = operation.get("route_control")
+            if isinstance(existing_route, Mapping) and existing_route.get("status") in {
+                "ok", "success",
+            }:
+                return dict(existing_route) == safe_route
+            transaction.update(operation_ref, {
+                "route_control": safe_route,
+                "route_control_recorded_at": now,
+            })
+            return True
+
+        return _txn(self.client.transaction(max_attempts=5))
+
+    def clear_command_candidate(
+        self, context_id: str, operation_id: str, *, owner: str, fence: int,
+        now: datetime,
+    ) -> bool:
+        """Delete only a successfully routed candidate under its current fence.
+
+        The route record and command link are rechecked in this transaction.
+        Replays after deletion are idempotent and preserve every other field.
+        """
+        context_id = _identifier(context_id, "context_id")
+        operation_id = _identifier(operation_id, "operation_id")
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("owner must be a non-empty string")
+        fence = _integer(fence, "fence", minimum=1)
+        now = _aware(now, "now")
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        operation_ref = context_ref.collection("operations").document(operation_id)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> bool:
+            context_snapshot = context_ref.get(transaction=transaction)
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            if not context_snapshot.exists or not operation_snapshot.exists:
+                return False
+            context = context_snapshot.to_dict() or {}
+            operation = operation_snapshot.to_dict() or {}
+            if (operation.get("operation_id") != operation_id
+                    or operation.get("state") != "running"
+                    or not validate_context_queue_lease(
+                        context, operation_id, owner=owner, fence=fence, now=now,
+                        expiry=context.get("lock_expires_at"),
+                    )):
+                return False
+            route = operation.get("route_control")
+            if (not isinstance(route, Mapping)
+                    or route.get("status") not in {"ok", "success"}):
+                return False
+            command_ref, command = self._command_for_operation(
+                transaction, context_id=context_id,
+                operation_id=operation_id, operation=operation,
+            )
+            if command_ref is None or command is None:
+                return False
+            if "candidate" not in command:
+                return True
+            if not isinstance(command.get("candidate"), str):
+                return False
+            transaction.update(command_ref, {"candidate": firestore.DELETE_FIELD})
+            return True
+
+        return _txn(self.client.transaction(max_attempts=5))
 
     def _accept_command_in_transaction(
         self,

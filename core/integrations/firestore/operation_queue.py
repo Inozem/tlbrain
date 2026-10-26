@@ -471,8 +471,28 @@ def _valid_lease(
     )
 
 
+def validate_context_queue_lease(
+    context: Mapping[str, Any], operation_id: str, *, owner: str, fence: int,
+    now: datetime, expiry: datetime | None,
+) -> bool:
+    """Validate a per-context queue lease from a transaction-read context."""
+    if not isinstance(context, Mapping) or not isinstance(operation_id, str) or not operation_id:
+        return False
+    if not isinstance(owner, str) or not owner or type(fence) is not int or fence < 1:
+        return False
+    try:
+        current_time = _aware(now)
+        current_expiry = _aware(expiry) if isinstance(expiry, datetime) else None
+    except ValueError:
+        return False
+    return _valid_lease(
+        dict(context), operation_id, owner, fence, current_time, current_expiry,
+    )
+
+
 __all__ = [
     "HEARTBEAT_INTERVAL_SECONDS", "LEASE_SECONDS", "claim_head", "complete_head",
     "fail_head", "get_operation", "heartbeat", "register_operation",
     "register_operation_in_transaction", "release_head", "QueueOperationRetryStore",
+    "validate_context_queue_lease",
 ]
