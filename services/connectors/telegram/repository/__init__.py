@@ -14,6 +14,7 @@ from services.connectors.telegram.repository._common import (
     TelegramIntakeResult,
 )
 from services.connectors.telegram.repository._commands import _TelegramCommandMixin
+from services.connectors.telegram.repository._conversations import _TelegramConversationMixin
 from services.connectors.telegram.repository._drafts import _TelegramDraftMixin
 from services.connectors.telegram.repository._intake import _TelegramIntakeMixin
 from services.connectors.telegram.repository._notifications import _TelegramNotificationMixin
@@ -26,6 +27,7 @@ class TelegramRepository(
     _TelegramCommandMixin,
     _TelegramNotificationMixin,
     _TelegramDraftMixin,
+    _TelegramConversationMixin,
     _TelegramSaveCommandMixin,
     _TelegramRetryMixin,
 ):

@@ -474,7 +474,17 @@ class _TelegramDraftMixin:
                 binding = binding_snap.to_dict() or {}
                 if binding.get("doc_id") != doc_id:
                     raise RuntimeError("document binding hash collision")
-                return _integer(binding["dialog_number"], "dialog_number", minimum=1)
+                if binding.get("conversation_id") != conversation_id:
+                    raise ValueError("document is already bound to a different conversation")
+                number = _integer(binding["dialog_number"], "dialog_number", minimum=1)
+                dialog_ref = _document_ref(self.client, f"{SESSIONS}/{context_id}/dialogs/{number}")
+                dialog_snap = dialog_ref.get(transaction=transaction)
+                dialog = dialog_snap.to_dict() or {}
+                if (not dialog_snap.exists or dialog.get("doc_id") != doc_id
+                        or dialog.get("conversation_id") != conversation_id
+                        or dialog.get("dialog_number") != number):
+                    raise RuntimeError("document binding and dialog record disagree")
+                return number
             context_snap = context_ref.get(transaction=transaction)
             context = context_snap.to_dict() or {}
             number = _integer(context.get("next_dialog_number", 1), "next_dialog_number", minimum=1)
