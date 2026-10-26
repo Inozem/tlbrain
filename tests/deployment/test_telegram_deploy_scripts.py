@@ -49,10 +49,13 @@ if [[ "$1" == --verify-mode ]]; then printf 'sha256:%064d\\n' 7; fi
     _write(bindir / "gcloud", """#!/usr/bin/env bash
 set -euo pipefail
 "$REAL_PYTHON" -c 'import json,os,sys; a=sys.argv[1:]; f=open(os.environ["EVENT_LOG"],"a"); f.write(json.dumps(["gcloud",*a])+"\\n"); f.write(json.dumps(["child-env","gcloud",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS"))])+"\\n");
-if a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and "status.url" in " ".join(a): print("https://telegram.synthetic.invalid")
+if a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and os.environ.get("SERVICE_MISSING"): print("NOT_FOUND",file=sys.stderr); raise SystemExit(1)
+elif a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and "status.url" in " ".join(a): print("https://telegram.synthetic.invalid")
 elif a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and "serviceAccountName" in " ".join(a): print("telegram-runtime@synthetic-project.iam.gserviceaccount.com")
 elif a[:2]==["projects","describe"]: print("123456789012")
 elif a[:3]==["iam","service-accounts","describe"]: raise SystemExit(1)
+elif a[:2]==["config","get-value"]: print("operator@example.test")
+elif a[:2]==["auth","print-identity-token"]: print("synthetic-deployer-id-token")
 if "--env-vars-file" in a:
  p=a[a.index("--env-vars-file")+1]; d=json.load(open(p)); mode=oct(os.stat(p).st_mode & 0o777); f.write(json.dumps(["env-file",d.get("TELEGRAM_BOT_TOKEN")=="synthetic-telegram-token-do-not-log",sorted(d),mode,p])+"\\n")' "$@"
 """, True)
@@ -64,6 +67,11 @@ set -euo pipefail
     _write(bindir / "python3", """#!/usr/bin/env bash
 set -euo pipefail
 "$REAL_PYTHON" -c 'import json,os,sys; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["python-argv",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")),*sys.argv[1:]])+"\\n")' "$@"
+if [[ -n "${TELEGRAM_DISABLE_URL:-}" ]]; then
+  "$REAL_PYTHON" -c 'import json,os; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["disable",os.environ.get("TELEGRAM_DISABLE_URL"),bool(os.environ.get("TELEGRAM_DISABLE_ID_TOKEN"))])+"\\n")'
+  [[ "${DISABLE_FAIL:-0}" == 1 ]] && exit 1
+  exit 0
+fi
 case "$*" in
   *register_telegram_webhook*)
     "$REAL_PYTHON" -c 'import json,os; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["webhook",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),os.environ.get("TELEGRAM_WEBHOOK_URL"),os.environ.get("PYTHONPATH")])+"\\n"); print("Telegram webhook registration succeeded")'
@@ -94,8 +102,11 @@ def _run(tmp_path: Path, script: str, overrides: dict[str, str] | None = None):
     env.update(overrides or {})
     outside = tmp_path / "outside-checkout"
     outside.mkdir()
+    command = [_bash(), str(root / "infra" / "deploy" / "connectors" / script)]
+    if script == "telegram_deploy_common.sh":
+        command.append("off")
     result = subprocess.run(
-        [_bash(), str(root / "infra" / "deploy" / "connectors" / script)],
+        command,
         cwd=outside, env=env, text=True, capture_output=True, timeout=90, check=False,
     )
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
@@ -138,6 +149,7 @@ def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_
         "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=tlbrain-telegram-task-invoker@synthetic-project.iam.gserviceaccount.com",
         "OIDC_AUDIENCE=https://telegram.synthetic.invalid",
         "OIDC_SERVICE_ACCOUNT_EMAIL=tlbrain-telegram-task-invoker@synthetic-project.iam.gserviceaccount.com",
+        "TELEGRAM_DISABLE_OIDC_SERVICE_ACCOUNT_EMAIL=tlbrain-telegram-deployer@synthetic-project.iam.gserviceaccount.com",
         "TZ=Asia/Jerusalem",
     ):
         assert setting in settings
@@ -151,8 +163,12 @@ def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_
                    and f"--max-concurrent-dispatches={limit}" in e for e in events)
     cloud = [e for e in events if e[0] == "gcloud"]
     assert any(e[1:4] == ["iam", "service-accounts", "create"] and e[4] == "tlbrain-telegram-task-invoker" for e in cloud)
+    assert any(e[1:4] == ["iam", "service-accounts", "create"] and e[4] == "tlbrain-telegram-deployer" for e in cloud)
     assert any(e[1:4] == ["run", "services", "add-iam-policy-binding"] and e[4] == "synthetic-telegram" for e in cloud)
     assert any("roles/iam.serviceAccountTokenCreator" in " ".join(e) for e in cloud)
+    assert any("tlbrain-telegram-deployer@synthetic-project.iam.gserviceaccount.com" in " ".join(e)
+               and "user:operator@example.test" in " ".join(e)
+               and "roles/iam.serviceAccountTokenCreator" in " ".join(e) for e in cloud)
     assert any("roles/iam.serviceAccountUser" in " ".join(e) for e in cloud)
     queue_grants = [e for e in cloud if "roles/cloudtasks.enqueuer" in " ".join(e)]
     assert len(queue_grants) == 2
@@ -175,6 +191,36 @@ def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_
         assert env_file[3] == "0o600"
     assert TOKEN not in json.dumps(events) + result.stdout + result.stderr
     assert not list(root.parent.glob("tlbrain-telegram-env.*"))
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_off_confirms_runtime_delete_before_removing_credentials(tmp_path: Path, failure: bool):
+    result, events, _root = _run(tmp_path, "telegram_deploy_common.sh", {
+        "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_ALLOWED_USER_IDS": "",
+        "DISABLE_FAIL": "1" if failure else "0",
+    })
+    disable_index = next(i for i, event in enumerate(events) if event[0] == "disable")
+    token_command = next(event for event in events
+                         if event[0] == "gcloud" and event[1:3] == ["auth", "print-identity-token"])
+    assert "--include-email" in token_command
+    removes = [i for i, event in enumerate(events)
+               if event[0] == "gcloud" and "--remove-env-vars" in event]
+    assert bool(result.returncode) is failure
+    assert events[disable_index][1:] == ["https://telegram.synthetic.invalid/internal/disable-webhook", True]
+    assert bool(removes) is not failure
+    if removes:
+        assert disable_index < removes[0]
+        assert "TELEGRAM_BOT_TOKEN,TELEGRAM_ALLOWED_USER_IDS" in events[removes[0]]
+    assert "synthetic-deployer-id-token" not in result.stdout + result.stderr + json.dumps(events)
+
+
+def test_off_skips_cleanly_when_runtime_service_is_absent(tmp_path: Path):
+    result, events, _root = _run(tmp_path, "telegram_deploy_common.sh", {
+        "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_ALLOWED_USER_IDS": "", "SERVICE_MISSING": "1",
+    })
+    assert result.returncode == 0
+    assert "absent" in result.stdout
+    assert not any(event[0] in {"disable", "gcloud"} and "--remove-env-vars" in event for event in events)
 
 
 @pytest.mark.parametrize("script", ["deploy_telegram.sh", "local_deploy_telegram.sh"])

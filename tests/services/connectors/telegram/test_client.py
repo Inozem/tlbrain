@@ -57,6 +57,32 @@ def test_send_edit_and_get_file_use_fixed_origin_and_single_http_attempts():
     assert requests[0].content == b'{"chat_id":10,"text":"hello","message_thread_id":7}'
 
 
+@pytest.mark.parametrize("result", [True, False])
+def test_delete_webhook_confirms_true_result_without_dropping_pending_updates(result):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True, "result": result})
+
+    async def run():
+        client, http = _client(handler)
+        try:
+            return await client.delete_webhook()
+        finally:
+            await http.aclose()
+
+    if result:
+        assert asyncio.run(run()) == {"ok": True, "result": True}
+    else:
+        with pytest.raises(TelegramAPIError) as caught:
+            asyncio.run(run())
+        assert caught.value.category == "invalid_response"
+    assert len(requests) == 1
+    assert requests[0].url.path == f"/bot{TOKEN}/deleteWebhook"
+    assert requests[0].content == b"{}"
+
+
 def test_download_uses_only_validated_get_file_path_and_returns_memory_payload():
     requests = []
 

@@ -275,6 +275,8 @@ def create_app(
     queue_worker: Any = None, notification_publisher: Any = None,
     status_check_worker: Any = None,
     oidc_verifier: Any = None,
+    telegram_client: Any = None,
+    telegram_enabled: bool | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.state.telegram_intake = intake
@@ -283,6 +285,8 @@ def create_app(
     app.state.telegram_notification_publisher = notification_publisher
     app.state.telegram_status_check_worker = status_check_worker
     app.state.telegram_oidc_verifier = oidc_verifier
+    app.state.telegram_client = telegram_client
+    app.state.telegram_enabled = telegram_enabled
 
     async def authenticate(request: Request):
         authorization = request.headers.get("authorization", "")
@@ -305,6 +309,27 @@ def create_app(
         if not identity.authorized:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
         return None
+
+    async def deployment_identity(request: Request):
+        """Verify the same audience while authorizing only the dedicated deployer."""
+        authorization = request.headers.get("authorization", "")
+        scheme, separator, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not separator or not token.strip():
+            return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
+        try:
+            verifier = app.state.telegram_oidc_verifier
+            if verifier is None:
+                from core.integrations.google_auth.oidc import verify_google_id_token
+                verifier = verify_google_id_token
+            identity = await _offload_sync(verifier, token.strip())
+        except Exception:
+            return None, JSONResponse({"error": "Authentication unavailable"}, status_code=503)
+        if identity is None:
+            return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
+        deployer_email = os.environ.get("TELEGRAM_DISABLE_OIDC_SERVICE_ACCOUNT_EMAIL", "")
+        if not deployer_email or getattr(identity, "email", None) != deployer_email:
+            return None, JSONResponse({"error": "Forbidden"}, status_code=403)
+        return identity, None
 
     async def task_payload_from(request: Request):
         try:
@@ -337,6 +362,11 @@ def create_app(
 
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
+        enabled = app.state.telegram_enabled
+        if enabled is False or (enabled is None and (
+            not os.environ.get("TELEGRAM_BOT_TOKEN") or not os.environ.get("TELEGRAM_ALLOWED_USER_IDS")
+        )):
+            return JSONResponse({"detail": "webhook unavailable"}, status_code=503)
         secret = app.state.telegram_webhook_secret
         if secret is None:
             try:
@@ -364,6 +394,40 @@ def create_app(
         except Exception:
             return JSONResponse({"detail": "intake unavailable"}, status_code=503)
         return {"ok": True}
+
+    @app.post("/internal/disable-webhook")
+    async def disable_webhook(request: Request):
+        _identity, auth_error = await deployment_identity(request)
+        if auth_error is not None:
+            return auth_error
+        client = app.state.telegram_client
+        if client is None:
+            try:
+                from services.connectors.telegram.client import TelegramClient
+                token = os.environ.get("TELEGRAM_BOT_TOKEN")
+                if not token:
+                    return JSONResponse({"error": "Webhook disable unavailable"}, status_code=503)
+                client = TelegramClient(token)
+            except Exception:
+                return JSONResponse({"error": "Webhook disable unavailable"}, status_code=503)
+        try:
+            result = client.delete_webhook()
+            if asyncio.iscoroutine(result):
+                result = await result
+            if not isinstance(result, dict) or result.get("ok") is not True or result.get("result") is not True:
+                raise RuntimeError("delete webhook was not confirmed")
+        except Exception:
+            return JSONResponse({"error": "Webhook disable failed"}, status_code=502)
+        finally:
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                try:
+                    closed = close()
+                    if asyncio.iscoroutine(closed):
+                        await closed
+                except Exception:
+                    pass
+        return {"status": "disabled"}
 
     @app.post("/internal/dispatch")
     async def dispatch(request: Request):

@@ -241,6 +241,7 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         "if [[ -n \"${env_file}\" ]]; then \"$ROUTE_PYTHON\" -c 'import json,os,sys; data=json.load(open(sys.argv[1],encoding=\"utf-8\"));\n"
         "if \"TELEGRAM_ALLOWED_USER_IDS\" in data: open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"telegram-env-file\",data.get(\"TELEGRAM_ALLOWED_USER_IDS\"),bool(data.get(\"TELEGRAM_BOT_TOKEN\"))])+\"\\n\")' \"${env_file}\"; fi\n"
         "case \"$*\" in *'projects describe'*) printf '123456789012\\n' ;; "
+        "*'auth print-identity-token'*) printf 'synthetic-deployer-id-token\\n' ;; "
         "*'run services describe'*'spec.template.spec.serviceAccountName'*) printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\\n' ;; "
         "*'run services describe'*'status.url'*) "
         "service=\"$4\"; url=\"https://$service-uc.a.run.app\"; printf '%s\\n' \"$url\"; "
@@ -263,6 +264,7 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     python3.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "\"$ROUTE_PYTHON\" -c 'import json,os,sys; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"python3-child\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\")),sys.argv[1:]])+\"\\n\")' \"$@\"\n"
+        "if [[ -n \"${TELEGRAM_DISABLE_URL:-}\" ]]; then \"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"telegram-disable\",os.environ.get(\"TELEGRAM_DISABLE_URL\")])+\"\\n\")'; exit 0; fi\n"
         "case \"$*\" in *register_telegram_webhook*) echo 'Telegram webhook registration succeeded'; exit 0 ;; esac\n"
         "exec \"$ROUTE_PYTHON\" \"$@\"\n",
         encoding="utf-8",
@@ -429,6 +431,9 @@ def test_top_level_route_hands_only_validated_sources_and_images_forward(
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert "Cancelled." not in result.stdout
     assert not list(root.rglob(".env"))
+    disable = next(event for event in events if event[0] == "telegram-disable")
+    removal = next(event for event in events if event[0] == "gcloud" and "--remove-env-vars" in event[1])
+    assert events.index(disable) < events.index(removal)
 
     validated_functions = [event for event in events if event[0] == "validated-function"]
     assert {(event[1], Path(event[2]).name) for event in validated_functions} == {

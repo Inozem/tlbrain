@@ -204,6 +204,8 @@ if [[ "${TELEGRAM_ENABLED}" == "1" ]]; then
   TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN_VALUE}" \
     TELEGRAM_ALLOWED_USER_IDS="${TELEGRAM_ALLOWED_USER_IDS_VALUE}" \
     bash infra/deploy/connectors/local_deploy_telegram.sh
+else
+  bash infra/deploy/connectors/telegram_deploy_common.sh off
 fi
 
 # =========================

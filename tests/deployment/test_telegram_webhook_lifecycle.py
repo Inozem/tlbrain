@@ -252,6 +252,7 @@ def test_disable_uses_runtime_telegram_identity_without_deploy_token_and_preserv
     from services.connectors.telegram.app.main import create_app
 
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("TELEGRAM_DISABLE_OIDC_SERVICE_ACCOUNT_EMAIL", "telegram-deployer@example.test")
     monkeypatch.setattr(asyncio, "to_thread", lambda func, /, *args, **kwargs: func(*args, **kwargs))
     client = firestore_fake.client_class()
     client.collection("documents").document("saved-doc").set(
@@ -272,13 +273,13 @@ def test_disable_uses_runtime_telegram_identity_without_deploy_token_and_preserv
         def __init__(self):
             self.delete_calls = 0
 
-        def delete_webhook(self, **kwargs):
+        def delete_webhook(self):
             self.delete_calls += 1
             return {"ok": True, "result": True}
 
     telegram_client = RuntimeTelegramIdentity()
     app = create_app(
-        oidc_verifier=lambda token: type("Identity", (), {"authorized": token == "valid"})(),
+        oidc_verifier=lambda token: type("Identity", (), {"email": "telegram-deployer@example.test", "authorized": False})(),
         telegram_client=telegram_client,
     )
     endpoint = _route(app, "/internal/disable-webhook")
@@ -286,6 +287,7 @@ def test_disable_uses_runtime_telegram_identity_without_deploy_token_and_preserv
 
     assert getattr(response, "status_code", 200) < 400
     assert telegram_client.delete_calls == 1
+    assert response == {"status": "disabled"}
     after = json.dumps(firestore_fake.documents, sort_keys=True, separators=(",", ":")).encode()
     assert after == before
 
@@ -296,14 +298,15 @@ def test_disable_reports_telegram_api_failure_without_claiming_success(
     from services.connectors.telegram.app.main import create_app
 
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("TELEGRAM_DISABLE_OIDC_SERVICE_ACCOUNT_EMAIL", "telegram-deployer@example.test")
     monkeypatch.setattr(asyncio, "to_thread", lambda func, /, *args, **kwargs: func(*args, **kwargs))
 
     class UnavailableTelegramClient:
-        def delete_webhook(self, **kwargs):
-            raise RuntimeError("synthetic Telegram API outage")
+        def delete_webhook(self):
+            raise RuntimeError("synthetic-bot-token-do-not-log synthetic Telegram API outage")
 
     app = create_app(
-        oidc_verifier=lambda token: type("Identity", (), {"authorized": token == "valid"})(),
+        oidc_verifier=lambda token: type("Identity", (), {"email": "telegram-deployer@example.test", "authorized": False})(),
         telegram_client=UnavailableTelegramClient(),
     )
     response = _run(_route(app, "/internal/disable-webhook")(
@@ -312,12 +315,14 @@ def test_disable_reports_telegram_api_failure_without_claiming_success(
 
     assert getattr(response, "status_code", 200) >= 400
     assert "success" not in _response_text(response).lower()
+    assert "synthetic-bot-token-do-not-log" not in _response_text(response)
 
 
 def test_disable_rejects_unauthorized_oidc_before_calling_telegram(monkeypatch):
     from services.connectors.telegram.app.main import create_app
 
     monkeypatch.setattr(asyncio, "to_thread", lambda func, /, *args, **kwargs: func(*args, **kwargs))
+    monkeypatch.setenv("TELEGRAM_DISABLE_OIDC_SERVICE_ACCOUNT_EMAIL", "telegram-deployer@example.test")
 
     class TelegramClient:
         def __init__(self):
@@ -329,7 +334,7 @@ def test_disable_rejects_unauthorized_oidc_before_calling_telegram(monkeypatch):
 
     telegram_client = TelegramClient()
     app = create_app(
-        oidc_verifier=lambda token: type("Identity", (), {"authorized": False})(),
+        oidc_verifier=lambda token: type("Identity", (), {"email": "other@example.test", "authorized": True})(),
         telegram_client=telegram_client,
     )
     response = _run(_route(app, "/internal/disable-webhook")(
@@ -338,3 +343,43 @@ def test_disable_rejects_unauthorized_oidc_before_calling_telegram(monkeypatch):
 
     assert getattr(response, "status_code", 200) == 403
     assert telegram_client.delete_calls == 0
+
+
+def test_disable_rejects_task_invoker_even_when_task_authorized(monkeypatch):
+    from services.connectors.telegram.app.main import create_app
+
+    monkeypatch.setenv("TELEGRAM_DISABLE_OIDC_SERVICE_ACCOUNT_EMAIL", "telegram-deployer@example.test")
+    telegram_client = type("TelegramClient", (), {"delete_webhook": lambda self: pytest.fail("called")})()
+    app = create_app(
+        oidc_verifier=lambda _token: type("Identity", (), {
+            "email": "telegram-task@example.test", "authorized": True,
+        })(),
+        telegram_client=telegram_client,
+    )
+    response = _run(_route(app, "/internal/disable-webhook")(
+        _request("/internal/disable-webhook")
+    ))
+
+    assert getattr(response, "status_code", 200) == 403
+
+
+def test_disabled_webhook_does_not_read_or_store_body(monkeypatch):
+    from services.connectors.telegram.app.main import create_app
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    app = create_app(intake=type("Intake", (), {"handle_update": lambda *_: pytest.fail("intake called")})(),
+                     webhook_secret="synthetic-secret")
+    body_reads = []
+
+    async def receive():
+        body_reads.append(True)
+        return {"type": "http.request", "body": b'{"message":"private"}', "more_body": False}
+
+    request = Request({"type": "http", "method": "POST", "path": "/telegram/webhook",
+                       "headers": [(b"X-Telegram-Bot-Api-Secret-Token", b"synthetic-secret")],
+                       "query_string": b""}, receive)
+    response = _run(_route(app, "/telegram/webhook")(request))
+
+    assert getattr(response, "status_code", 200) == 503
+    assert body_reads == []

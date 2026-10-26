@@ -5,7 +5,7 @@ set -euo pipefail
 umask 077
 
 MODE=${1:?deployment mode required}
-if [[ "${MODE}" != normal && "${MODE}" != local ]]; then
+if [[ "${MODE}" != normal && "${MODE}" != local && "${MODE}" != off ]]; then
   echo "Unknown Telegram deployment mode" >&2
   exit 2
 fi
@@ -29,8 +29,8 @@ ALLOWED_USER_IDS=${TELEGRAM_ALLOWED_USER_IDS:-}
 export -n TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USER_IDS 2>/dev/null || true
 BOT_TOKEN_CHECK=${BOT_TOKEN//[[:space:]]/}
 ALLOWED_USER_IDS_CHECK=${ALLOWED_USER_IDS//[[:space:]]/}
-if [[ -n "${BOT_TOKEN_CHECK}" && -z "${ALLOWED_USER_IDS_CHECK}" ]] || \
-  [[ -z "${BOT_TOKEN_CHECK}" && -n "${ALLOWED_USER_IDS_CHECK}" ]]; then
+if [[ "${MODE}" != off && -n "${BOT_TOKEN_CHECK}" && -z "${ALLOWED_USER_IDS_CHECK}" ]] || \
+  [[ "${MODE}" != off && -z "${BOT_TOKEN_CHECK}" && -n "${ALLOWED_USER_IDS_CHECK}" ]]; then
   echo "TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_IDS must be configured together" >&2
   exit 1
 fi
@@ -41,10 +41,56 @@ SERVICE_NAME=${TELEGRAM_SERVICE_NAME:-tlbrain-telegram}
 REPOSITORY=${TELEGRAM_IMAGE_REPOSITORY:-inozem/tlbrain-telegram}
 TASK_INVOKER_ACCOUNT_ID=${TELEGRAM_TASK_INVOKER_ACCOUNT_ID:-tlbrain-telegram-task-invoker}
 TASK_INVOKER_EMAIL="${TASK_INVOKER_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+DEPLOYER_ACCOUNT_ID=tlbrain-telegram-deployer
+DEPLOYER_EMAIL="${DEPLOYER_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 CORE_QUEUE=tlbrain-dialog-operations
 CONTROL_QUEUE=tlbrain-telegram-control
 RUNTIME_TARGET=services.connectors.telegram.app.main:app
 PLATFORM=linux/amd64
+
+if [[ "${MODE}" == off ]]; then
+  if ! SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" \
+    --region "${REGION}" --format='value(status.url)' 2>&1); then
+    case "${SERVICE_URL}" in
+      *NOT_FOUND*|*not\ found*|*does\ not\ exist*)
+        echo "Telegram service is absent; nothing to disable"
+        exit 0 ;;
+      *)
+        echo "Could not determine whether the Telegram service exists" >&2
+        exit 1 ;;
+    esac
+  fi
+  if [[ ! "${SERVICE_URL}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+    echo "Could not determine a valid deployed Telegram service URL" >&2
+    exit 1
+  fi
+  if ! ID_TOKEN=$(gcloud auth print-identity-token --include-email --audiences="${SERVICE_URL}" \
+    --impersonate-service-account="${DEPLOYER_EMAIL}" 2>/dev/null) || [[ -z "${ID_TOKEN}" ]]; then
+    echo "Could not authenticate as the Telegram deployment identity; credentials were retained" >&2
+    exit 1
+  fi
+  if ! TELEGRAM_DISABLE_ID_TOKEN="${ID_TOKEN}" TELEGRAM_DISABLE_URL="${SERVICE_URL}/internal/disable-webhook" \
+    python3 -c 'import json, os, urllib.error, urllib.request
+request = urllib.request.Request(os.environ["TELEGRAM_DISABLE_URL"], data=b"{}", method="POST", headers={"Authorization": "Bearer " + os.environ["TELEGRAM_DISABLE_ID_TOKEN"], "Content-Type": "application/json"})
+try:
+ response = urllib.request.urlopen(request, timeout=20)
+ body = response.read(65537)
+ if len(body) > 65536 or response.status >= 300: raise ValueError()
+ result = json.loads(body.decode("utf-8"))
+ if not isinstance(result, dict) or result.get("status") != "disabled": raise ValueError()
+except Exception:
+ raise SystemExit(1)'; then
+    echo "Telegram webhook disable was not confirmed; credentials were retained" >&2
+    exit 1
+  fi
+  if ! gcloud run services update "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" \
+    --remove-env-vars TELEGRAM_BOT_TOKEN,TELEGRAM_ALLOWED_USER_IDS >/dev/null; then
+    echo "Webhook deletion was confirmed, but Telegram credentials could not be removed" >&2
+    exit 1
+  fi
+  echo "Telegram webhook disabled and runtime credentials removed"
+  exit 0
+fi
 
 TEMP_ENV_FILE=""
 cleanup() {
@@ -110,6 +156,19 @@ if ! gcloud iam service-accounts describe "${TASK_INVOKER_EMAIL}" --project "${P
   gcloud iam service-accounts create "${TASK_INVOKER_ACCOUNT_ID}" --project "${PROJECT_ID}" \
     --display-name="TLBrain Telegram task invoker"
 fi
+if ! gcloud iam service-accounts describe "${DEPLOYER_EMAIL}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "${DEPLOYER_ACCOUNT_ID}" --project "${PROJECT_ID}" \
+    --display-name="TLBrain Telegram deployment disable identity"
+fi
+DEPLOY_CALLER=$(gcloud config get-value account 2>/dev/null)
+if [[ -z "${DEPLOY_CALLER}" || "${DEPLOY_CALLER}" == "(unset)" ]]; then
+  echo "Could not determine the deployment caller identity" >&2
+  exit 1
+fi
+case "${DEPLOY_CALLER}" in
+  *@*.iam.gserviceaccount.com) DEPLOY_CALLER_MEMBER="serviceAccount:${DEPLOY_CALLER}" ;;
+  *) DEPLOY_CALLER_MEMBER="user:${DEPLOY_CALLER}" ;;
+esac
 
 for queue_spec in "${CORE_QUEUE}:2" "${CONTROL_QUEUE}:4"; do
   queue=${queue_spec%%:*}
@@ -128,6 +187,10 @@ done
 # its two required queues and can act as only this task identity.
 gcloud run services add-iam-policy-binding "${SERVICE_NAME}" --project "${PROJECT_ID}" \
   --region "${REGION}" --member="serviceAccount:${TASK_INVOKER_EMAIL}" --role=roles/run.invoker
+gcloud run services add-iam-policy-binding "${SERVICE_NAME}" --project "${PROJECT_ID}" \
+  --region "${REGION}" --member="serviceAccount:${DEPLOYER_EMAIL}" --role=roles/run.invoker
+gcloud iam service-accounts add-iam-policy-binding "${DEPLOYER_EMAIL}" --project "${PROJECT_ID}" \
+  --member="${DEPLOY_CALLER_MEMBER}" --role=roles/iam.serviceAccountTokenCreator
 gcloud iam service-accounts add-iam-policy-binding "${TASK_INVOKER_EMAIL}" \
   --project "${PROJECT_ID}" --member="serviceAccount:${TASKS_SERVICE_AGENT}" \
   --role=roles/iam.serviceAccountTokenCreator
@@ -149,7 +212,8 @@ SETTINGS=("TELEGRAM_CONTROL_URL=${SERVICE_URL}/internal/dispatch"
   "CLOUD_TASKS_OIDC_AUDIENCE=${OIDC_AUDIENCE}"
   "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=${TASK_INVOKER_EMAIL}"
   "OIDC_AUDIENCE=${OIDC_AUDIENCE}"
-  "OIDC_SERVICE_ACCOUNT_EMAIL=${TASK_INVOKER_EMAIL}")
+  "OIDC_SERVICE_ACCOUNT_EMAIL=${TASK_INVOKER_EMAIL}"
+  "TELEGRAM_DISABLE_OIDC_SERVICE_ACCOUNT_EMAIL=${DEPLOYER_EMAIL}")
 TZ_VALUE=${TZ:-}
 TZ_CHECK=${TZ_VALUE//[[:space:]]/}
 if [[ -n "${TZ_CHECK}" ]]; then

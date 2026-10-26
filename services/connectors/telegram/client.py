@@ -71,6 +71,22 @@ class TelegramClient:
             payload["parse_mode"] = parse_mode
         return await self._call("sendMessage", payload)
 
+    async def delete_webhook(self) -> dict[str, Any]:
+        """Delete this bot's webhook while retaining Telegram's pending updates."""
+        url = f"{_API_ORIGIN}/bot{self._bot_token}/deleteWebhook"
+        response = await self._request("POST", url, json={})
+        if response.status_code >= 300:
+            raise self._http_error(response)
+        try:
+            envelope = response.json()
+        except (ValueError, UnicodeDecodeError):
+            raise TelegramAPIError("invalid_response") from None
+        if not isinstance(envelope, dict) or envelope.get("ok") is not True:
+            raise TelegramAPIError("provider_error")
+        if envelope.get("result") is not True:
+            raise TelegramAPIError("invalid_response")
+        return {"ok": True, "result": True}
+
     async def edit_message_text(
         self,
         chat_id: int | str,
