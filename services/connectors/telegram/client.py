@@ -175,6 +175,10 @@ class TelegramClient:
             raise TelegramAPIError("timeout") from None
         except httpx.HTTPError:
             raise TelegramAPIError("transport") from None
+        except Exception:
+            # Custom transports and provider adapters can include request URLs,
+            # response bodies, or credentials in their exception text.
+            raise TelegramAPIError("transport") from None
         if not self._is_api_origin(response.url) or response.history:
             raise TelegramAPIError("invalid_response")
         return response

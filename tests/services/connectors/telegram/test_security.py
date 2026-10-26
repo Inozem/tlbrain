@@ -11,6 +11,7 @@ import httpx
 import pytest
 from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record, task_payload
 from services.connectors.telegram.app.main import create_app
+from services.connectors.telegram.client import TelegramAPIError, TelegramClient
 
 
 pytestmark = pytest.mark.offline
@@ -367,4 +368,60 @@ def test_real_oidc_verifier_accepts_exact_audience_and_configuration_failure_is_
     assert "token-with-missing-config" not in unavailable.text + caplog.text
     assert "Authentication unavailable" in unavailable.text
     assert firestore_fake.documents == state_before_unavailable
+
+
+def test_telegram_provider_exception_and_token_url_are_redacted_at_client_boundary(caplog):
+    bot_token = "123456:synthetic-bot-token-do-not-leak"
+    raw_provider_detail = "provider supplied a credential-bearing request URL"
+
+    class FailingTransport:
+        async def request(self, method, url, **kwargs):
+            raise RuntimeError(f"{raw_provider_detail}: {url}")
+
+    async def send():
+        client = TelegramClient(bot_token, http_client=FailingTransport())
+        await client.delete_webhook()
+
+    with pytest.raises(TelegramAPIError) as caught:
+        asyncio.run(send(), loop_factory=_selector_loop)
+
+    assert caught.value.category == "transport"
+    assert raw_provider_detail not in str(caught.value)
+    assert bot_token not in str(caught.value)
+    assert "api.telegram.org" not in str(caught.value)
+    assert raw_provider_detail + bot_token not in caplog.text
+
+
+def test_disable_webhook_response_and_logs_do_not_expose_provider_exception_details(
+    monkeypatch, caplog,
+):
+    from core.integrations.google_auth.oidc import OIDCIdentity
+
+    bot_token = "123456:synthetic-disable-token-do-not-leak"
+    raw_provider_detail = "upstream failure included secret request URL"
+
+    class FailingTransport:
+        async def request(self, method, url, **kwargs):
+            raise RuntimeError(f"{raw_provider_detail}: {url}")
+
+    monkeypatch.setenv(
+        "TELEGRAM_DISABLE_OIDC_SERVICE_ACCOUNT_EMAIL", "deployer@example.test",
+    )
+    client = TelegramClient(bot_token, http_client=FailingTransport())
+    app = create_app(
+        telegram_client=client,
+        oidc_verifier=lambda _token: OIDCIdentity("deployer@example.test", True),
+    )
+    response = _request(
+        app,
+        "/internal/disable-webhook",
+        {},
+        headers={"Authorization": "Bearer valid-synthetic-deployer-token"},
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"error": "Webhook disable failed"}
+    assert bot_token not in response.text + caplog.text
+    assert "api.telegram.org" not in response.text + caplog.text
+    assert raw_provider_detail not in response.text + caplog.text
 
