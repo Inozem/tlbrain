@@ -280,6 +280,184 @@ def _resolve_target(
         return None, None, "error"
 
 
+async def _request_route(
+    *, text: str, model: Any, cards: tuple[dict[str, Any], ...],
+    operation_candidates: Mapping[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str]:
+    """Ask the model for one structured route, with sanitized save targets."""
+    try:
+        if operation_candidates:
+            raw = await model.route(
+                text=text, candidates=cards,
+                operation_candidates=tuple(operation_candidates.values()),
+            )
+        else:
+            raw = await model.route(text=text, candidates=cards)
+    except Exception:
+        return None, "error"
+    return _valid_response(raw)
+
+
+async def _run_search_route(
+    *, text: str, context: Any, store: Any, search: Any,
+) -> dict[str, Any]:
+    """Search in isolation and record the result session without switching focus."""
+    error = None
+    try:
+        refs = list(await search.search(text))
+    except Exception:
+        refs, error = [], "search unavailable"
+    session_id = store.create_search_session(
+        context_id=context.context_id, query=text, result_refs=refs, error=error,
+    )
+    return {
+        "status": "ok", "kind": "search", "result_refs": refs,
+        "search_session_id": session_id,
+    }
+
+
+def _confirm_save_decision(
+    *, context: Any, store: Any, operation_id: str | None, owner: str | None,
+    fence: int | None, now: datetime | None,
+) -> dict[str, Any]:
+    """Confirm a model-selected save through the fenced repository boundary."""
+    confirmed = confirm_save_route(
+        store, context_id=context.context_id, operation_id=operation_id,
+        owner=owner, fence=fence, now=now,
+        route_result={"kind": "save"},
+    )
+    return {
+        "status": "ok" if confirmed else "unconfirmed", "kind": "save",
+        "confirmed": confirmed,
+    }
+
+
+def _resolved_target(
+    target: str, number: int, conversation_id: str,
+    dependency_operation_id: str | None = None,
+) -> dict[str, Any]:
+    """Package a validated target and its optional operation dependency."""
+    result = {
+        "target_doc_id": target,
+        "dialog_number": number,
+        "conversation_id": conversation_id,
+    }
+    if dependency_operation_id is not None:
+        result["target_operation_id"] = dependency_operation_id
+        result["dependency_operation_id"] = dependency_operation_id
+    return result
+
+
+def _resolve_route_target(
+    decision: Mapping[str, Any], *, context: Any, store: Any,
+    candidates: tuple[str, ...],
+    operation_candidates: Mapping[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve explicit numbers, semantic targets, and confirmed save targets."""
+    target_operation_id = decision["target_operation_id"]
+    if target_operation_id is not None and decision["dialog_number"] is not None:
+        target, number, failure = _resolve_target(
+            decision, context=context, store=store, candidates=candidates,
+        )
+        if failure:
+            return None, failure
+        fixed_target = operation_candidates.get(target_operation_id)
+        if (fixed_target is not None and fixed_target["doc_id"] == target
+                and fixed_target["dialog_number"] == number):
+            conversation_id = fixed_target["conversation_id"]
+            dependency_operation_id = target_operation_id
+        else:
+            metadata = _metadata(store, target)
+            conversation_id = metadata.get("conversation_id") if metadata else None
+            if not isinstance(conversation_id, str) or not conversation_id:
+                return None, "invalid_route"
+            dependency_operation_id = None
+        return _resolved_target(
+            target, number, conversation_id, dependency_operation_id,
+        ), None
+
+    if target_operation_id is not None:
+        fixed_target = operation_candidates.get(target_operation_id)
+        if fixed_target is None:
+            return None, "invalid_route"
+        concrete_ref = decision["target_ref"]
+        if concrete_ref is not None and concrete_ref not in {
+            "last", fixed_target["doc_id"],
+        }:
+            return None, "invalid_route"
+        return _resolved_target(
+            fixed_target["doc_id"], fixed_target["dialog_number"],
+            fixed_target["conversation_id"], target_operation_id,
+        ), None
+
+    target, number, failure = _resolve_target(
+        decision, context=context, store=store, candidates=candidates,
+    )
+    if failure:
+        return None, failure
+    metadata = _metadata(store, target)
+    conversation_id = metadata.get("conversation_id") if metadata is not None else None
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return None, "invalid_route"
+    if type(number) is not int or number < 1:
+        return None, "invalid_route"
+    return _resolved_target(target, number, conversation_id), None
+
+
+def _action_matches_target(decision: Mapping[str, Any], target: str) -> bool:
+    """Check that an operation's explicit document agrees with the route target."""
+    choice = decision["tool_choice"]
+    if decision["kind"] != "substantive" or choice is None:
+        return True
+    argument_doc_id = choice["arguments"].get("doc_id")
+    return argument_doc_id is None or argument_doc_id == target
+
+
+async def _finish_targeted_route(
+    decision: Mapping[str, Any], *, target: Mapping[str, Any],
+    context: Any, notices: Any, actions: Any,
+) -> dict[str, Any]:
+    """Build a targeted result, notify focus changes, then run its action."""
+    kind = decision["kind"]
+    target_doc_id = target["target_doc_id"]
+    number = target["dialog_number"]
+    conversation_id = target["conversation_id"]
+    changed_focus = context.active_conversation_id != conversation_id
+    result = {
+        "status": "ok", "kind": kind,
+        "target_doc_id": target_doc_id,
+        "dialog_number": number,
+        "conversation_id": conversation_id,
+        "substantive_text": (
+            None if kind == "pure_switch" else decision["substantive_text"]
+        ),
+        "tool_choice": decision["tool_choice"],
+        "link_requested": bool(
+            decision["tool_choice"] and decision["tool_choice"]["link_requested"]
+        ),
+    }
+    dependency_operation_id = target.get("dependency_operation_id")
+    if dependency_operation_id is not None:
+        result["target_operation_id"] = dependency_operation_id
+        result["dependency_operation_id"] = dependency_operation_id
+    result["selection_changed"] = changed_focus
+    if not _action_matches_target(decision, target_doc_id):
+        return _failure("invalid_route", kind=kind)
+    if kind in {"pure_switch", "substantive"} and changed_focus:
+        notices.send_switch_notice(doc_id=target_doc_id, dialog_number=number)
+    if kind == "substantive" and decision["tool_choice"] is not None:
+        choice = decision["tool_choice"]
+        try:
+            result["action_result"] = await actions.execute(
+                name=choice["name"], arguments=choice["arguments"],
+                target_doc_id=target_doc_id,
+                link_requested=choice["link_requested"],
+            )
+        except Exception:
+            return _failure("error", kind=kind)
+    return result
+
+
 async def route_message(
     *, text: str, context: Any, model: Any, store: Any, search: Any,
     notices: Any, actions: Any, operation_id: str | None = None,
@@ -297,118 +475,33 @@ async def route_message(
     cards = _candidate_cards(store)
     candidates = tuple(card["doc_id"] for card in cards)
     operation_candidates = _safe_save_candidates(save_candidates)
-    try:
-        if operation_candidates:
-            raw = await model.route(
-                text=text, candidates=cards,
-                operation_candidates=tuple(operation_candidates.values()),
-            )
-        else:
-            raw = await model.route(text=text, candidates=cards)
-    except Exception:
-        return _failure("error")
-    decision, status = _valid_response(raw)
+    decision, status = await _request_route(
+        text=text, model=model, cards=cards,
+        operation_candidates=operation_candidates,
+    )
     if decision is None:
         return _failure(status)
     kind = decision["kind"]
     if kind == "search":
-        error = None
-        try:
-            refs = list(await search.search(text))
-        except Exception:
-            refs, error = [], "search unavailable"
-        session_id = store.create_search_session(
-            context_id=context.context_id, query=text, result_refs=refs, error=error,
+        return await _run_search_route(
+            text=text, context=context, store=store, search=search,
         )
-        return {"status": "ok", "kind": kind, "result_refs": refs,
-                "search_session_id": session_id}
 
-    # Saving is bound to the accepted command's captured candidate, never to
-    # the model's document target or a stale context.last_doc_id hint.
     if kind == "save":
-        confirmed = confirm_save_route(
-            store, context_id=context.context_id, operation_id=operation_id,
+        return _confirm_save_decision(
+            context=context, store=store, operation_id=operation_id,
             owner=owner, fence=fence, now=now,
-            route_result={"kind": "save"},
         )
-        return {"status": "ok" if confirmed else "unconfirmed", "kind": kind,
-                "confirmed": confirmed}
 
-    target_operation_id = decision["target_operation_id"]
-    dependency_operation_id = None
-    if target_operation_id is not None and decision["dialog_number"] is not None:
-        # A concrete dialog number has priority over an unavailable operation
-        # candidate. It can still carry the dependency if both resolve to the
-        # exact same fixed save target.
-        target, number, failure = _resolve_target(
-            decision, context=context, store=store, candidates=candidates,
-        )
-        if failure:
-            return _failure(failure, kind=kind)
-        fixed_target = operation_candidates.get(target_operation_id)
-        if (fixed_target is not None and fixed_target["doc_id"] == target
-                and fixed_target["dialog_number"] == number):
-            conversation_id = fixed_target["conversation_id"]
-            dependency_operation_id = target_operation_id
-        else:
-            metadata = _metadata(store, target)
-            conversation_id = metadata.get("conversation_id") if metadata else None
-            if not isinstance(conversation_id, str) or not conversation_id:
-                return _failure("invalid_route", kind=kind)
-    elif target_operation_id is not None:
-        fixed_target = operation_candidates.get(target_operation_id)
-        if fixed_target is None:
-            return _failure("invalid_route", kind=kind)
-        concrete_ref = decision["target_ref"]
-        if concrete_ref is not None and concrete_ref not in {"last", fixed_target["doc_id"]}:
-            return _failure("invalid_route", kind=kind)
-        target = fixed_target["doc_id"]
-        number = fixed_target["dialog_number"]
-        conversation_id = fixed_target["conversation_id"]
-        dependency_operation_id = target_operation_id
-    else:
-        target, number, failure = _resolve_target(
-            decision, context=context, store=store, candidates=candidates,
-        )
-        if failure:
-            return _failure(failure, kind=kind)
-        metadata = _metadata(store, target)
-        conversation_id = metadata.get("conversation_id") if metadata is not None else None
-        if not isinstance(conversation_id, str) or not conversation_id:
-            return _failure("invalid_route", kind=kind)
-        if type(number) is not int or number < 1:
-            return _failure("invalid_route", kind=kind)
-    result = {
-        "status": "ok", "kind": kind, "target_doc_id": target,
-        "dialog_number": number, "conversation_id": conversation_id,
-        "substantive_text": (None if kind == "pure_switch"
-                              else decision["substantive_text"]),
-        "tool_choice": decision["tool_choice"],
-        "link_requested": bool(decision["tool_choice"] and
-                                decision["tool_choice"]["link_requested"]),
-    }
-    if dependency_operation_id is not None:
-        result["target_operation_id"] = dependency_operation_id
-        result["dependency_operation_id"] = dependency_operation_id
-    changed_focus = context.active_conversation_id != conversation_id
-    result["selection_changed"] = changed_focus
-    choice = decision["tool_choice"]
-    if kind == "substantive" and choice is not None:
-        argument_doc_id = choice["arguments"].get("doc_id")
-        if argument_doc_id is not None and argument_doc_id != target:
-            return _failure("invalid_route", kind=kind)
-    if kind == "pure_switch" or kind == "substantive":
-        if changed_focus:
-            notices.send_switch_notice(doc_id=target, dialog_number=number)
-    if kind == "substantive" and choice is not None:
-        try:
-            result["action_result"] = await actions.execute(
-                name=choice["name"], arguments=choice["arguments"],
-                target_doc_id=target, link_requested=choice["link_requested"],
-            )
-        except Exception:
-            return _failure("error", kind=kind)
-    return result
+    target, failure = _resolve_route_target(
+        decision, context=context, store=store, candidates=candidates,
+        operation_candidates=operation_candidates,
+    )
+    if failure:
+        return _failure(failure, kind=kind)
+    return await _finish_targeted_route(
+        decision, target=target, context=context, notices=notices, actions=actions,
+    )
 
 
 def confirm_save_route(
