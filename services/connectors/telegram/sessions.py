@@ -723,24 +723,96 @@ def _substantive_route_text(route: Any, kind: str) -> str | None:
 async def _confirm_selection_change(
     *, route: Any, operation_id: str, target_doc_id: str,
     conversation_id: str, number: int, context: Any, notifications: Any,
-    selection_publisher: Callable[..., Any] | None,
-) -> bool | None:
+    selection_publisher: Callable[..., Any] | None, repository: Any = None,
+    owner: str | None = None, fence: int | None = None,
+    now: datetime | None = None,
+) -> bool | str | None:
     """Confirm the notice before publishing a changed selection, unless already sent."""
-    if context.active_conversation_id == conversation_id:
-        return False
-    already_notified = isinstance(route, Mapping) and route.get("notice_sent") is True
-    if not already_notified:
+    context_id = getattr(context, "context_id", None)
+    set_notice_state = getattr(repository, "set_switch_notice_state", None)
+    prior_notice_state = None
+    getter = getattr(repository, "get_switch_notice_state", None)
+    if callable(getter) and isinstance(context_id, str):
         try:
-            notice_result = await notifications.send_switch_notice(
+            prior_notice_state = getter(context_id, operation_id)
+        except Exception:
+            prior_notice_state = None
+    records = getattr(repository, "route_records", None)
+    if prior_notice_state is None and isinstance(records, Mapping):
+        prior = records.get(operation_id)
+        if isinstance(prior, Mapping):
+            prior_notice_state = prior.get("switch_notice_state")
+    if (context.active_conversation_id == conversation_id
+            and prior_notice_state != "pending"):
+        return False
+    def remember_notice_state(value: str) -> None:
+        records = getattr(repository, "route_records", None)
+        if isinstance(records, dict) and isinstance(records.get(operation_id), dict):
+            records[operation_id]["switch_notice_state"] = value
+        states = getattr(repository, "switch_notice_states", None)
+        if not isinstance(states, dict):
+            try:
+                states = {}
+                setattr(repository, "switch_notice_states", states)
+            except Exception:
+                states = None
+        if isinstance(states, dict):
+            states[operation_id] = value
+    if prior_notice_state == "delivered":
+        notice_result = "confirmed"
+    elif callable(set_notice_state) and isinstance(context_id, str):
+        if isinstance(owner, str) and type(fence) is int and isinstance(now, datetime):
+            persisted = set_notice_state(
+                context_id, operation_id, "pending", owner=owner, fence=fence, now=now,
+            )
+            if persisted is False:
+                return "pending"
+        else:
+            # Lightweight repositories used by offline callers may not expose
+            # the fenced Firestore seam.
+            remember_notice_state("pending")
+    notification_id = f"switch-{operation_id}"
+    if prior_notice_state != "delivered":
+        try:
+            notice_result = notifications.send_switch_notice(
+                context_id=context_id,
                 operation_id=operation_id,
-                notification_id=f"switch-{operation_id}",
+                notification_id=notification_id,
                 target_doc_id=target_doc_id,
                 dialog_number=number,
             )
+            if inspect.isawaitable(notice_result):
+                notice_result = await notice_result
         except Exception:
-            return None
-        if notice_result != "confirmed":
-            return None
+            # An exception does not prove a terminal ledger outcome. Keep the
+            # route pinned and let the same operation resume through its notice ID.
+            remember_notice_state("pending")
+            return "pending"
+    if notice_result in {"busy", "retry", "pending", "sending"}:
+        remember_notice_state("pending")
+        return "pending"
+    if notice_result in {"failed", "delivery_unknown"}:
+        disposition = notice_result
+        if callable(set_notice_state) and isinstance(context_id, str) and isinstance(owner, str) and type(fence) is int and isinstance(now, datetime):
+            persisted = set_notice_state(context_id, operation_id, disposition, owner=owner, fence=fence, now=now)
+            if persisted is False:
+                return "pending"
+        else:
+            remember_notice_state(disposition)
+        return None
+    if notice_result != "confirmed":
+        remember_notice_state("pending")
+        return "pending"
+    if callable(set_notice_state) and isinstance(context_id, str) and isinstance(owner, str) and type(fence) is int and isinstance(now, datetime):
+        persisted = set_notice_state(
+            context_id, operation_id, "delivered", owner=owner, fence=fence, now=now,
+        )
+        if persisted is False:
+            return "pending"
+    else:
+        remember_notice_state("delivered")
+    if context.active_conversation_id == conversation_id:
+        return False
     if selection_publisher is not None:
         published = selection_publisher(
             operation_id, conversation_id=conversation_id,
@@ -811,34 +883,108 @@ async def _process_substantive_turn(
     }
 
 
-async def process_operation(
-    *, operation_id: str, context: Any, text: str, repository: Any,
-    router: Any, agent: Any, notifications: Any, queue: Any = None,
-    selection_publisher: Callable[..., Any] | None = None,
-    owner: str | None = None, fence: int | None = None,
-    now: datetime | None = None,
-) -> dict[str, Any]:
-    """Route first, persist safe metadata, then finish controls or the pinned turn."""
+def _load_operation_replay_state(
+    repository: Any, *, context_id: str, operation_id: str,
+) -> tuple[Any, Any]:
+    """Load the saved route and switch-notice disposition for an operation replay."""
+    get_route = getattr(repository, "get_route_control", None)
+    existing_route = None
+    if callable(get_route):
+        try:
+            existing_route = get_route(context_id, operation_id)
+        except Exception:
+            existing_route = None
+    else:
+        records = getattr(repository, "route_records", None)
+        if isinstance(records, Mapping):
+            existing_route = records.get(operation_id)
+
+    notice_states = getattr(repository, "switch_notice_states", None)
+    notice_state = notice_states.get(operation_id) if isinstance(notice_states, Mapping) else None
+    if notice_state is None and isinstance(existing_route, Mapping):
+        notice_state = existing_route.get("switch_notice_state")
+    if notice_state is None:
+        getter = getattr(repository, "get_switch_notice_state", None)
+        if callable(getter):
+            try:
+                notice_state = getter(context_id, operation_id)
+            except Exception:
+                notice_state = None
+    return existing_route, notice_state
+
+
+async def _route_operation_replay(
+    *, operation_id: str, context: Any, text: str, router: Any,
+    existing_route: Any, notice_state: Any,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Reuse pinned routes where possible and reject replay target changes."""
+    if notice_state in {"failed", "delivery_unknown"}:
+        return None, {
+            "status": "switch_notice_undelivered",
+            "kind": (existing_route or {}).get("kind"),
+        }
+    if (notice_state == "pending" and isinstance(existing_route, Mapping)
+            and existing_route.get("kind") == "pure_switch"):
+        # A pure switch has all the route data needed to resume from the
+        # pinned control record, so it can retry without consulting the router.
+        return dict(existing_route), None
+
     route = await _invoke_operation_router(
         router=router, operation_id=operation_id, context=context, text=text,
     )
-    state = _persist_operation_route(
-        route, operation_id=operation_id, context=context, repository=repository,
-        owner=owner, fence=fence, now=now,
-    )
-    if state is None:
-        return {"status": "error"}
-    failure = _route_failure_result(state)
-    if failure is not None:
-        return failure
+    if isinstance(existing_route, Mapping):
+        old_target = _conversation_route_target(existing_route)
+        new_target = _conversation_route_target(_control_route_record(route))
+        if old_target is not None and new_target != old_target:
+            return None, {"status": "invalid_route", "kind": existing_route.get("kind")}
+        if notice_state == "pending" and old_target is None:
+            return None, {"status": "switch_notice_pending", "kind": existing_route.get("kind")}
+    return route, None
 
-    kind = state.route_record.get("kind")
-    control_result = _handle_control_route(
-        state, kind=kind, operation_id=operation_id,
+
+async def _release_notice_waiter(queue: Any, operation_id: str) -> None:
+    """Release the queue lease when a switch notice needs a later replay."""
+    if queue is None:
+        return
+    release = getattr(queue, "release_head", None)
+    if not callable(release):
+        return
+    released = release(operation_id)
+    if inspect.isawaitable(released):
+        await released
+
+
+async def _wait_for_switch_notice(
+    *, route: Any, operation_id: str, target_doc_id: str,
+    conversation_id: str, number: int, context: Any, notifications: Any,
+    selection_publisher: Callable[..., Any] | None, repository: Any,
+    queue: Any, owner: str | None, fence: int | None, now: datetime | None,
+    kind: Any,
+) -> dict[str, Any] | None:
+    """Return a retry/error result until the notice barrier allows selection."""
+    changed_focus = await _confirm_selection_change(
+        route=route, operation_id=operation_id,
+        target_doc_id=target_doc_id, conversation_id=conversation_id,
+        number=number, context=context, notifications=notifications,
+        selection_publisher=selection_publisher, repository=repository,
         owner=owner, fence=fence, now=now,
     )
-    if control_result is not None:
-        return control_result
+    if changed_focus is None:
+        await _release_notice_waiter(queue, operation_id)
+        return {"status": "switch_notice_undelivered", "kind": kind}
+    if changed_focus == "pending":
+        await _release_notice_waiter(queue, operation_id)
+        return {"status": "switch_notice_pending", "kind": kind}
+    return None
+
+
+async def _finish_conversation_route(
+    *, state: _PersistedOperationRoute, kind: Any, operation_id: str,
+    context: Any, repository: Any, agent: Any, notifications: Any,
+    queue: Any, selection_publisher: Callable[..., Any] | None,
+    owner: str | None, fence: int | None, now: datetime | None,
+) -> dict[str, Any]:
+    """Enforce the switch notice barrier before a pure switch or conversation turn."""
     target = _conversation_route_target(state.route_record)
     if target is None:
         return {"status": "invalid_route", **({"kind": kind} if kind else {})}
@@ -847,14 +993,16 @@ async def process_operation(
     if kind == "substantive" and substantive_text is None:
         return {"status": "invalid_route", "kind": kind}
 
-    changed_focus = await _confirm_selection_change(
+    notice_result = await _wait_for_switch_notice(
         route=state.route, operation_id=operation_id,
         target_doc_id=target_doc_id, conversation_id=conversation_id,
         number=number, context=context, notifications=notifications,
-        selection_publisher=selection_publisher,
+        selection_publisher=selection_publisher, repository=repository,
+        queue=queue, owner=owner, fence=fence, now=now, kind=kind,
     )
-    if changed_focus is None:
-        return {"status": "error", "kind": kind}
+    if notice_result is not None:
+        return notice_result
+
     if kind == "pure_switch":
         if not _clear_command_candidate(
             state, operation_id=operation_id, owner=owner, fence=fence, now=now,
@@ -872,6 +1020,48 @@ async def process_operation(
         substantive_text=substantive_text, target_doc_id=target_doc_id,
         conversation_id=conversation_id, number=number, repository=repository,
         agent=agent, state=state, owner=owner, fence=fence, now=now,
+    )
+
+
+async def process_operation(
+    *, operation_id: str, context: Any, text: str, repository: Any,
+    router: Any, agent: Any, notifications: Any, queue: Any = None,
+    selection_publisher: Callable[..., Any] | None = None,
+    owner: str | None = None, fence: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Route first, persist safe metadata, then finish controls or the pinned turn."""
+    existing_route, notice_state = _load_operation_replay_state(
+        repository, context_id=context.context_id, operation_id=operation_id,
+    )
+    route, replay_result = await _route_operation_replay(
+        operation_id=operation_id, context=context, text=text, router=router,
+        existing_route=existing_route, notice_state=notice_state,
+    )
+    if replay_result is not None:
+        return replay_result
+    state = _persist_operation_route(
+        route, operation_id=operation_id, context=context, repository=repository,
+        owner=owner, fence=fence, now=now,
+    )
+    if state is None:
+        return {"status": "error"}
+    failure = _route_failure_result(state)
+    if failure is not None:
+        return failure
+
+    kind = state.route_record.get("kind")
+    control_result = _handle_control_route(
+        state, kind=kind, operation_id=operation_id,
+        owner=owner, fence=fence, now=now,
+    )
+    if control_result is not None:
+        return control_result
+    return await _finish_conversation_route(
+        state=state, kind=kind, operation_id=operation_id, context=context,
+        repository=repository, agent=agent, notifications=notifications,
+        queue=queue, selection_publisher=selection_publisher,
+        owner=owner, fence=fence, now=now,
     )
 
 

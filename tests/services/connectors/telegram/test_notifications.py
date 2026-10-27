@@ -356,6 +356,62 @@ def test_default_thread_zero_is_persisted_as_no_thread_for_ack_and_new_notice(fi
     assert telegram.sent == [(-10042, "switched", None)]
 
 
+def test_numbered_switch_notice_uses_the_durable_ledger_and_server_authored_body(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=_Clock())
+
+    result = _run(publisher.send_switch_notice(
+        context_id=accepted.context_id,
+        operation_id="switch-operation",
+        notification_id="switch-notification",
+        target_doc_id="doc-target",
+        dialog_number=12,
+    ))
+
+    assert result == "confirmed"
+    row = repo.get_notification("switch-notification")
+    assert row["kind"] == "switch_notice"
+    assert row["operation_id"] == "switch-operation"
+    assert row["dialog_number"] == 12
+    assert row["body"] == "Starting to process dialog #12."
+    assert row["state"] == "delivered"
+    assert telegram.sent == [(-10042, "Starting to process dialog #12.", 5)]
+
+
+@pytest.mark.parametrize("terminal", ["failed", "delivery_unknown", "delivered"])
+def test_persisted_switch_notice_state_is_monotonic(firestore_fake, terminal):
+    from core.integrations.firestore.operation_queue import claim_head
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.repository import SESSIONS
+
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_command(
+        1, chat_id=42, user_id=7, command=parse_command("open dialog 2"), now=NOW,
+    )
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="switch-worker", now=NOW)
+    assert lease is not None
+    assert repo.persist_route(
+        lease.operation_id,
+        {"status": "ok", "kind": "pure_switch", "target_doc_id": "doc-2",
+         "conversation_id": "conversation-2", "dialog_number": 2},
+        context_id=accepted.context_id, owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is True
+    set_state = lambda state: repo.set_switch_notice_state(
+        accepted.context_id, lease.operation_id, state,
+        owner=lease.owner, fence=lease.fence, now=NOW,
+    )
+
+    assert set_state("pending") is True
+    assert set_state(terminal) is True
+    assert set_state("pending") is False
+    assert set_state("delivered" if terminal != "delivered" else "failed") is False
+    assert repo.get_switch_notice_state(accepted.context_id, lease.operation_id) == terminal
+
+
 def test_revision_keeps_active_attempt_and_stale_send_is_followed_by_edit(firestore_fake):
     repo = TelegramRepository(firestore_fake.client_class())
     accepted = _accepted(repo)

@@ -155,4 +155,53 @@ class TelegramNotificationPublisher:
             return "stale"
         return str(settled["state"])
 
+    async def send_switch_notice(
+        self, *, context_id: str, operation_id: str, notification_id: str,
+        target_doc_id: str, dialog_number: int,
+    ) -> str:
+        """Create and deliver the server-authored notice for a pinned target."""
+        if not isinstance(target_doc_id, str) or not target_doc_id:
+            raise ValueError("target_doc_id is invalid")
+        if type(dialog_number) is not int or dialog_number < 1:
+            raise ValueError("dialog_number must be positive")
+        await _offload_repository_call(
+            self.repository.create_notification,
+            notification_id,
+            context_id=context_id,
+            kind="switch_notice",
+            body=f"Starting to process dialog #{dialog_number}.",
+            dialog_number=dialog_number,
+            operation_id=operation_id,
+            now=self.clock(),
+        )
+        return await self._deliver_switch_notice(notification_id)
+
+    async def _deliver_switch_notice(self, notification_id: str) -> str:
+        """Retry one durable notice within the ledger's bounded send budget.
+
+        Reuse the notification ID so the ledger enforces its maximum of three
+        physical sends. After a retry or a busy reservation, re-read the row
+        and wait until its persisted retry time or active attempt lease expires.
+        Poll at most five times, returning pending if the row remains active.
+        """
+        for _ in range(5):
+            disposition = await self.publish(notification_id)
+            if disposition != "retry":
+                if disposition != "busy":
+                    return "confirmed" if disposition == "delivered" else disposition
+            row = await _offload_repository_call(self.repository.get_notification, notification_id)
+            if row is None:
+                return "not_found"
+            if row.get("state") in {"delivered", "failed", "delivery_unknown"}:
+                return "confirmed" if row["state"] == "delivered" else str(row["state"])
+            retry_at = row.get("retry_not_before")
+            expiry = row.get("attempt_expires_at")
+            wait_until = retry_at if isinstance(retry_at, datetime) else expiry
+            if not isinstance(wait_until, datetime):
+                return "pending"
+            delay = max(0.0, (wait_until - self.clock()).total_seconds())
+            if delay:
+                await asyncio.sleep(delay)
+        return "pending"
+
 __all__ = ["TelegramNotificationPublisher", "build_lifecycle_body"]

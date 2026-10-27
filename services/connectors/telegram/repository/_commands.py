@@ -418,6 +418,69 @@ class _TelegramCommandMixin:
 
         return _txn(self.client.transaction(max_attempts=5))
 
+    def get_route_control(self, context_id: str, operation_id: str) -> dict[str, Any] | None:
+        """Read the allowlisted pinned route for safe operation replay."""
+        context_id = _identifier(context_id, "context_id")
+        operation_id = _identifier(operation_id, "operation_id")
+        ref = self.client.collection(SESSIONS).document(context_id).collection("operations").document(operation_id)
+        snapshot = ref.get()
+        if not snapshot.exists:
+            return None
+        value = (snapshot.to_dict() or {}).get("route_control")
+        return dict(value) if isinstance(value, Mapping) else None
+
+    def get_switch_notice_state(self, context_id: str, operation_id: str) -> str | None:
+        """Read the durable switch-notice disposition for transport replay."""
+        context_id = _identifier(context_id, "context_id")
+        operation_id = _identifier(operation_id, "operation_id")
+        ref = self.client.collection(SESSIONS).document(context_id).collection("operations").document(operation_id)
+        snapshot = ref.get()
+        state = (snapshot.to_dict() or {}).get("switch_notice_state") if snapshot.exists else None
+        return state if state in {"pending", "delivered", "failed", "delivery_unknown"} else None
+
+    def set_switch_notice_state(
+        self, context_id: str, operation_id: str, state: str, *,
+        owner: str, fence: int, now: datetime,
+    ) -> bool:
+        """Persist terminal notice disposition without changing the pinned target."""
+        if state not in {"pending", "delivered", "failed", "delivery_unknown"}:
+            raise ValueError("switch notice state is invalid")
+        context_id = _identifier(context_id, "context_id")
+        operation_id = _identifier(operation_id, "operation_id")
+        owner = _identifier(owner, "owner")
+        fence, now = _integer(fence, "fence", minimum=1), _aware(now, "now")
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        operation_ref = context_ref.collection("operations").document(operation_id)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> bool:
+            context_snapshot = context_ref.get(transaction=transaction)
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            if not context_snapshot.exists or not operation_snapshot.exists:
+                return False
+            context = context_snapshot.to_dict() or {}
+            operation = operation_snapshot.to_dict() or {}
+            if (operation.get("operation_id") != operation_id
+                    or operation.get("state") != "running"
+                    or not validate_context_queue_lease(
+                        context, operation_id, owner=owner, fence=fence, now=now,
+                        expiry=context.get("lock_expires_at"),
+                    )):
+                return False
+            if not isinstance(operation.get("route_control"), Mapping):
+                return False
+            previous = operation.get("switch_notice_state")
+            if previous in {"failed", "delivery_unknown"}:
+                return state == previous
+            if previous == "delivered" and state != "delivered":
+                return False
+            if previous == state:
+                return True
+            transaction.update(operation_ref, {"switch_notice_state": state, "updated_at": now})
+            return True
+
+        return _txn(self.client.transaction(max_attempts=5))
+
     def clear_command_candidate(
         self, context_id: str, operation_id: str, *, owner: str, fence: int,
         now: datetime,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -134,21 +135,26 @@ class _Notifications:
         self.events = events
 
     async def send_switch_notice(
-        self, *, operation_id, notification_id, target_doc_id, dialog_number,
+        self, *, context_id=None, operation_id, notification_id, target_doc_id, dialog_number,
     ):
-        self.attempts.append({
-            "operation_id": operation_id,
-            "notification_id": notification_id,
-            "target_doc_id": target_doc_id,
-            "dialog_number": dialog_number,
-        })
-        self.events.append(("notice_attempt", operation_id, notification_id))
-        outcome = self.outcomes.pop(0) if self.outcomes else "confirmed"
-        if isinstance(outcome, Exception):
-            raise outcome
-        if outcome == "confirmed":
-            self.events.append(("notice_confirmed", operation_id, notification_id))
-        return outcome
+        while True:
+            self.attempts.append({
+                "operation_id": operation_id,
+                "notification_id": notification_id,
+                "target_doc_id": target_doc_id,
+                "dialog_number": dialog_number,
+                "context_id": context_id,
+                "body": f"Starting to process dialog #{dialog_number}.",
+            })
+            self.events.append(("notice_attempt", operation_id, notification_id))
+            outcome = self.outcomes.pop(0) if self.outcomes else "confirmed"
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome == "confirmed":
+                self.events.append(("notice_confirmed", operation_id, notification_id))
+                return outcome
+            if outcome != "retry" or len(self.attempts) >= 3:
+                return outcome
 
 
 class _Queue:
@@ -271,6 +277,7 @@ def test_pure_switch_changes_focus_only_after_confirmed_notice_and_never_enters_
     assert agent.prompts == []
     assert [row[0] for row in repository.writes] == ["route", "selection"]
     assert notifications.attempts[0]["target_doc_id"] == "doc-target"
+    assert notifications.attempts[0]["body"] == "Starting to process dialog #2."
     kinds = [event[0] for event in repository.events]
     assert kinds.index("notice_confirmed") < kinds.index("selection")
     assert "agent" not in kinds and "append" not in kinds
@@ -549,7 +556,7 @@ def test_successful_save_route_records_draft_target_without_command_text():
     assert "private route payload" not in repr(repository.route_records["op-save-route"])
 
 
-def test_route_message_notice_marker_prevents_a_second_notice_in_operation_seam():
+def test_route_message_notice_marker_does_not_bypass_durable_operation_barrier():
     route = _route("substantive", substantive_text="target request")
     route["selection_changed"] = True
     route["notice_sent"] = True
@@ -560,16 +567,35 @@ def test_route_message_notice_marker_prevents_a_second_notice_in_operation_seam(
         "raw route envelope",
     )
 
-    assert notifications.attempts == []
+    assert len(notifications.attempts) == 1
+    assert notifications.attempts[0]["body"] == "Starting to process dialog #2."
     assert repository.selection["active_conversation_id"] == "conversation:target"
     assert agent.prompts[0]["prompt"]["request"] == "target request"
+
+
+def test_same_current_target_does_not_send_a_switch_notice():
+    context, repository, router, agent, notifications, queue = _harness(
+        _route("substantive", substantive_text="already here"),
+    )
+    context = replace(
+        context, active_conversation_id="conversation:target",
+        selected_dialog_number=2,
+    )
+
+    result = _call(
+        "op-same-target", context, repository, router, agent, notifications, queue,
+        "already here",
+    )
+
+    assert result["status"] == "completed"
+    assert notifications.attempts == []
 
 
 def test_three_unknown_notice_sends_release_head_and_same_operation_replay_is_suppressed():
     control = "open dialog 2"
     context, repository, router, agent, notifications, queue = _harness(
         _route("pure_switch"),
-        outcomes=[_UnknownDelivery(), _UnknownDelivery(), _UnknownDelivery()],
+        outcomes=["retry", "retry", "delivery_unknown"],
     )
     before = repository.snapshot()
 
@@ -593,6 +619,26 @@ def test_three_unknown_notice_sends_release_head_and_same_operation_replay_is_su
     assert retry["status"] in {"switched", "completed"}
     assert len(notifications.attempts) == 4
     assert notifications.attempts[-1]["notification_id"] != notifications.attempts[0]["notification_id"]
+
+
+def test_busy_notice_releases_head_and_replay_resumes_pinned_route():
+    context, repository, router, agent, notifications, queue = _harness(
+        _route("pure_switch"), outcomes=["busy"],
+    )
+    first = _call("op-busy", context, repository, router, agent, notifications, queue, "open dialog 2")
+    assert first["status"] == "switch_notice_pending"
+    assert queue.released == ["op-busy"]
+    assert repository.selection["active_conversation_id"] == "conversation:old"
+    replay = _call("op-busy", context, repository, router, agent, notifications, queue, "open dialog 2")
+
+    assert replay["status"] == "switched"
+    assert [row["notification_id"] for row in notifications.attempts] == [
+        "switch-op-busy", "switch-op-busy",
+    ]
+    assert len(router.calls) == 1
+    assert queue.released == ["op-busy"]
+    assert repository.selection["active_conversation_id"] == "conversation:target"
+    assert agent.prompts == []
 
 
 def test_late_completion_preserves_newer_focus_and_older_operation_pinned_target():
