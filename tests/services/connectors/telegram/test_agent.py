@@ -7,8 +7,13 @@ inside helpers so this module can be collected while those modules are absent.
 from __future__ import annotations
 
 import importlib
+import asyncio
+import hashlib
 import json
 import logging
+import os
+import socket
+import time
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -18,6 +23,45 @@ import pytest
 pytestmark = pytest.mark.offline
 
 MODEL = "gemini-3.5-flash-lite"
+
+
+def _run_async(awaitable):
+    """Avoid Windows Proactor self-pipe creation in the offline test harness."""
+    if os.name != "nt":
+        return asyncio.run(awaitable)
+    old_socketpair = socket.socketpair
+    local_pairs = []
+
+    def local_datagram_pair(*_args, **_kwargs):
+        reader = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        writer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            reader.bind(("127.0.0.1", 0))
+            writer.bind(("127.0.0.1", 0))
+            writer.connect(reader.getsockname())
+            reader.connect(writer.getsockname())
+            local_pairs.append((reader, writer))
+            return reader, writer
+        except BaseException:
+            reader.close()
+            writer.close()
+            raise
+
+    socket.socketpair = local_datagram_pair
+    try:
+        loop = asyncio.SelectorEventLoop()
+    finally:
+        socket.socketpair = old_socketpair
+    try:
+        async def run_with_thread_wakeup_polling():
+            task = asyncio.ensure_future(awaitable)
+            while not task.done():
+                await asyncio.wait({task}, timeout=0.01)
+            return await task
+
+        return loop.run_until_complete(run_with_thread_wakeup_polling())
+    finally:
+        loop.close()
 
 
 def _gemini_agent():
@@ -330,6 +374,653 @@ def test_model_response_and_ordered_validated_calls_are_persisted_before_mutatio
         ledger.events.index(next(event for event in ledger.events if event[0] == "mutate"))
     assert [event[2] for event in executor.calls] == [0, 1]
     assert len(ledger.events) >= 1 + len(executor.calls)
+
+
+def test_routed_tool_loop_binds_executor_to_fixed_target_per_invocation():
+    executor = FakeExecutor()
+    bindings = []
+
+    def bind(target_doc_id, delivery_id, execution_context):
+        bindings.append((target_doc_id, delivery_id, deepcopy(execution_context)))
+        return executor
+
+    agent = _agent(model=SequenceModel([
+        {"parts": [_tool_call(name="get_transcript", arguments={"doc_id": "doc-pinned"})]},
+        {"parts": [], "text": "synthetic answer"},
+    ]))
+    result = agent.run(
+        conversation_id="conversation-pinned", delivery_id="operation-pinned",
+        history=[{"role": "user", "parts": [{"text": "synthetic command"}]}],
+        target_doc_id="doc-pinned", executor_factory=bind,
+        execution_context={"owner": "worker", "fence": 3},
+    )
+
+    assert result["status"] == "ok"
+    assert bindings == [("doc-pinned", "operation-pinned", {"owner": "worker", "fence": 3})]
+    assert executor.calls == [("get_transcript", {"doc_id": "doc-pinned"}, 0)]
+
+
+def test_invalid_or_conflicting_model_tool_call_fails_without_effects():
+    executor = FakeExecutor()
+    bindings = []
+
+    def bind(target_doc_id, delivery_id, execution_context):
+        bindings.append(target_doc_id)
+        return executor
+
+    agent = _agent(model=SequenceModel([
+        {"parts": [_tool_call(name="get_transcript", arguments={"doc_id": "doc-other"})]},
+    ]))
+    result = agent.run(
+        conversation_id="conversation-pinned", delivery_id="operation-pinned",
+        history=[{"role": "user", "parts": [{"text": "synthetic command"}]}],
+        target_doc_id="doc-pinned", executor_factory=bind,
+    )
+
+    assert result["status"] == "failed"
+    assert bindings == ["doc-pinned"]
+    assert executor.calls == []
+    assert executor.effects == []
+
+
+def test_structured_route_choice_uses_validated_allowlisted_tool_and_pinned_target():
+    executor = FakeExecutor()
+    bindings = []
+
+    def bind(target_doc_id, delivery_id, execution_context):
+        bindings.append((target_doc_id, delivery_id, execution_context))
+        return executor
+
+    model = SequenceModel([{"parts": [], "text": "Here are the folders."}])
+    agent = _agent(model=model, executor=executor)
+    result = agent.dispatch_tool_choice(
+        name="get_transcript", arguments={"doc_id": "doc-pinned"},
+        target_doc_id="doc-pinned", conversation_id="conversation-pinned",
+        delivery_id="operation-pinned",
+        executor_factory=bind, execution_context={"fence": 1},
+    )
+
+    assert result["operation"] == "get_transcript"
+    assert bindings == [("doc-pinned", "operation-pinned", {"fence": 1})]
+    assert executor.calls == [("get_transcript", {"doc_id": "doc-pinned"}, 0)]
+    replay = agent.dispatch_tool_choice(
+        name="get_transcript", arguments={"doc_id": "doc-pinned"},
+        target_doc_id="doc-pinned", conversation_id="conversation-pinned",
+        delivery_id="operation-pinned", executor_factory=bind,
+        execution_context={"fence": 1},
+    )
+    assert replay == result
+    assert executor.calls == [("get_transcript", {"doc_id": "doc-pinned"}, 0)]
+
+    history = [{"role": "user", "parts": [{"text": "show this transcript"}]}]
+    answer = agent.run(
+        conversation_id="conversation-pinned", delivery_id="operation-pinned",
+        history=history, target_doc_id="doc-pinned", executor_factory=bind,
+        execution_context={"fence": 1},
+    )
+    assert answer["answer"] == "Here are the folders."
+    assert model.calls[0]["contents"][0] == history[0]
+    assert model.calls[0]["contents"][1]["role"] == "model"
+    function_response = _field(model.calls[0]["contents"][2]["parts"][0], "function_response")
+    assert _field(function_response, "response") == result
+
+    replayed_answer = agent.run(
+        conversation_id="conversation-pinned", delivery_id="operation-pinned",
+        history=history, target_doc_id="doc-pinned", executor_factory=bind,
+        execution_context={"fence": 1},
+    )
+    assert replayed_answer == answer
+    assert len(model.calls) == 1
+    assert executor.calls == [("get_transcript", {"doc_id": "doc-pinned"}, 0)]
+    assert agent.dispatch_tool_choice(
+        name="get_transcript", arguments={"doc_id": "doc-pinned"},
+        target_doc_id="doc-pinned", conversation_id="conversation-pinned",
+        delivery_id="operation-pinned", executor_factory=bind,
+        execution_context={"fence": 1},
+    ) == result
+    with pytest.raises(ValueError, match="persisted tool choice"):
+        agent.dispatch_tool_choice(
+            name="query", arguments={"query": "different operation"},
+            target_doc_id="doc-pinned", conversation_id="conversation-pinned",
+            delivery_id="operation-pinned", executor_factory=bind,
+        )
+    assert executor.calls == [("get_transcript", {"doc_id": "doc-pinned"}, 0)]
+
+    with pytest.raises(ValueError):
+        agent.dispatch_tool_choice(
+            name="get_transcript", arguments={"doc_id": "doc-other"},
+            target_doc_id="doc-pinned", conversation_id="conversation-pinned",
+            delivery_id="operation-pinned",
+            executor_factory=bind,
+        )
+    with pytest.raises(ValueError):
+        agent.dispatch_tool_choice(
+            name="unknown_tool", arguments={}, target_doc_id="doc-pinned",
+            conversation_id="conversation-pinned", delivery_id="operation-pinned",
+            executor_factory=bind,
+        )
+    assert len(executor.calls) == 1
+
+
+class _CommandRepository:
+    def __init__(self):
+        self.routes = {}
+        self.turns = {}
+        self.cleared = set()
+
+    def get_route_control(self, _context_id, operation_id):
+        return self.routes.get(operation_id)
+
+    def get_switch_notice_state(self, *_args):
+        return "delivered"
+
+    def persist_route(self, operation_id, route, **_lease):
+        self.routes[operation_id] = deepcopy(route)
+        return True
+
+    def list_turns(self, _context_id, conversation_id):
+        return deepcopy(self.turns.get(conversation_id, []))
+
+    def append_turn(self, _context_id, conversation_id, **turn):
+        turns = self.turns.setdefault(conversation_id, [])
+        if not any(existing.get("turn_id") == turn.get("turn_id") for existing in turns):
+            turns.append(deepcopy(turn))
+
+    def clear_command_candidate(self, _context_id, operation_id, **_lease):
+        self.cleared.add(operation_id)
+        return True
+
+
+class _CommandExecutor:
+    def __init__(self, *, on_execute=None):
+        self.calls = []
+        self.on_execute = on_execute
+
+    def execute(self, *, name, arguments, call_ordinal):
+        if self.on_execute is not None:
+            self.on_execute()
+        self.calls.append((name, deepcopy(arguments), call_ordinal))
+        return {"ok": True, "operation": name}
+
+
+def test_queue_command_processor_persists_structured_route_then_dispatches_pinned_target():
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from services.connectors.telegram.commands import parse_command
+    from core.operations.queue import QueueOperationState
+
+    context = SimpleNamespace(
+        context_id="42_default", active_conversation_id="conversation:target",
+        selected_dialog_number=2, selection_sequence=5,
+    )
+    repository = _CommandRepository()
+    events = []
+    executor = _CommandExecutor(on_execute=lambda: setattr(
+        context, "active_conversation_id", "conversation:newer",
+    ))
+    model = SequenceModel([{"parts": [], "text": "The folders are ready."}])
+    telegram_agent = _agent(model=model, executor=executor)
+
+    async def router(**kwargs):
+        events.append(("route", kwargs["text"]))
+        return {
+            "status": "ok", "kind": "substantive",
+            "target_doc_id": "doc-pinned", "conversation_id": "conversation:target",
+            "dialog_number": 2, "substantive_text": "show folders",
+            "tool_choice": {
+                "name": "list_folders", "arguments": {}, "link_requested": False,
+            },
+        }
+
+    def bind(target_doc_id, delivery_id, execution_context):
+        events.append(("bind", target_doc_id, delivery_id, deepcopy(execution_context)))
+        return executor
+
+    processor = TelegramCommandProcessor(
+        context_loader=lambda *_args: context, router=router,
+        repository=repository, agent=telegram_agent,
+        notifications=SimpleNamespace(), executor_factory=bind,
+    )
+    operation = {
+        "operation_id": "operation-1", "dependency_operation_id": "operation-parent",
+    }
+    lease = SimpleNamespace(operation_id="operation-1", owner="worker", fence=7)
+    result = _run_async(processor(
+        "42_default", operation, lease,
+        command=parse_command("show folders"),
+    ))
+
+    assert result is QueueOperationState.COMPLETED
+    assert repository.routes["operation-1"] == {
+        "status": "ok", "kind": "substantive",
+        "target_doc_id": "doc-pinned", "conversation_id": "conversation:target",
+        "dialog_number": 2,
+        "tool_choice": {
+            "name": "list_folders", "arguments": {}, "link_requested": False,
+        },
+    }
+    assert executor.calls == [("list_folders", {}, 0)]
+    assert events[0] == ("route", "show folders")
+    assert events[1][0:3] == ("bind", "doc-pinned", "operation-1")
+    assert events[1][3]["dependency_operation_id"] == "operation-parent"
+    assert events[2][0:3] == ("bind", "doc-pinned", "operation-1")
+    assert model.calls[0]["contents"][-1]["role"] == "user"
+    tool_response = _field(model.calls[0]["contents"][-1]["parts"][0], "function_response")
+    assert _field(tool_response, "response") == {"ok": True, "operation": "list_folders"}
+    assert context.active_conversation_id == "conversation:newer"
+    assert repository.turns["conversation:target"][-1]["parts"] == [
+        {"text": "The folders are ready."},
+    ]
+
+
+def test_cleared_candidate_replays_from_pinned_route_and_saved_operation_turn():
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from core.operations.queue import QueueOperationState
+
+    context = SimpleNamespace(context_id="42_default", active_conversation_id="conversation:newer")
+    repository = _CommandRepository()
+    repository.routes["operation-replay"] = {
+        "status": "ok", "kind": "substantive", "target_doc_id": "doc-pinned",
+        "conversation_id": "conversation:pinned", "dialog_number": 2,
+        "tool_choice": {
+            "name": "list_folders", "arguments": {}, "link_requested": False,
+        },
+    }
+    repository.turns["conversation:pinned"] = [{
+        "turn_id": "telegram-" + hashlib.sha256(
+            b"operation-replay:user"
+        ).hexdigest(),
+        "operation_id": "operation-replay", "role": "user",
+        "parts": [{"text": "show folders"}],
+    }]
+    bindings = []
+    executor = _CommandExecutor()
+    model = SequenceModel([{"parts": [], "text": "Pinned folders are ready."}])
+    telegram_agent = _agent(model=model, executor=executor)
+
+    async def forbidden_router(**_kwargs):
+        raise AssertionError("replay must use the persisted route")
+
+    def bind(target_doc_id, delivery_id, execution_context):
+        bindings.append((target_doc_id, delivery_id, deepcopy(execution_context)))
+        return executor
+
+    processor = TelegramCommandProcessor(
+        context_loader=lambda *_args: context, router=forbidden_router,
+        repository=repository, agent=telegram_agent,
+        notifications=SimpleNamespace(), executor_factory=bind,
+    )
+    operation = {"operation_id": "operation-replay", "dependency_operation_id": "parent-pinned"}
+    lease = SimpleNamespace(operation_id="operation-replay", owner="worker", fence=9)
+
+    result = _run_async(processor("42_default", operation, lease, command=None))
+    assert result is QueueOperationState.COMPLETED
+    assert bindings[0][0:2] == ("doc-pinned", "operation-replay")
+    assert bindings[0][2]["dependency_operation_id"] == "parent-pinned"
+    assert context.active_conversation_id == "conversation:newer"
+    assert len(model.calls) == 1
+    assert [turn["role"] for turn in repository.turns["conversation:pinned"]] == [
+        "user", "model",
+    ]
+
+    # A subsequent delivery observes the operation's saved model turn and does no work.
+    terminal = _run_async(processor("42_default", operation, lease, command=None))
+    assert terminal is QueueOperationState.COMPLETED
+    assert len(model.calls) == 1
+    assert len(bindings) == 2
+    assert executor.calls == [("list_folders", {}, 0)]
+
+
+def test_route_choice_survives_cleanup_and_is_dispatched_once_after_replay():
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from services.connectors.telegram.commands import parse_command
+    from core.operations.queue import QueueOperationState
+
+    context = SimpleNamespace(context_id="42_default", active_conversation_id="conversation:newer")
+    repository = _CommandRepository()
+    executor = _CommandExecutor()
+    model = SequenceModel([{"parts": [], "text": "Pinned folders are ready."}])
+    telegram_agent = _agent(model=model, executor=executor)
+    original_dispatch = telegram_agent.dispatch_tool_choice
+    dispatch_count = 0
+
+    def interrupt_before_dispatch(**kwargs):
+        nonlocal dispatch_count
+        dispatch_count += 1
+        if dispatch_count == 1:
+            raise RuntimeError("synthetic interruption after route cleanup")
+        return original_dispatch(**kwargs)
+
+    telegram_agent.dispatch_tool_choice = interrupt_before_dispatch
+
+    async def router(**_kwargs):
+        return {
+            "status": "ok", "kind": "substantive",
+            "target_doc_id": "doc-pinned", "conversation_id": "conversation:pinned",
+            "dialog_number": 2, "substantive_text": "show folders",
+            "tool_choice": {
+                "name": "list_folders", "arguments": {}, "link_requested": False,
+            },
+        }
+
+    processor = TelegramCommandProcessor(
+        context_loader=lambda *_args: context, router=router, repository=repository,
+        agent=telegram_agent, notifications=SimpleNamespace(),
+        executor_factory=lambda *_args: executor,
+    )
+    operation = {"operation_id": "operation-replay-choice"}
+    lease = SimpleNamespace(operation_id="operation-replay-choice", owner="worker", fence=4)
+    first = _run_async(processor(
+        "42_default", operation, lease, command=parse_command("show folders"),
+    ))
+    assert first is QueueOperationState.FAILED
+    assert "operation-replay-choice" in repository.cleared
+    assert repository.routes["operation-replay-choice"]["tool_choice"] == {
+        "name": "list_folders", "arguments": {}, "link_requested": False,
+    }
+    assert "substantive_text" not in repository.routes["operation-replay-choice"]
+    assert executor.calls == []
+
+    replay = _run_async(processor(
+        "42_default", operation, lease, command=None,
+    ))
+    assert replay is QueueOperationState.COMPLETED
+    assert executor.calls == [("list_folders", {}, 0)]
+    assert dispatch_count == 2
+    assert len(model.calls) == 1
+    assert repository.turns["conversation:pinned"][-1]["parts"] == [
+        {"text": "Pinned folders are ready."},
+    ]
+
+
+def test_cleared_candidate_replay_rejects_malformed_pinned_tool_choice():
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from core.operations.queue import QueueOperationState
+
+    context = SimpleNamespace(context_id="42_default", active_conversation_id="conversation:newer")
+    repository = _CommandRepository()
+    repository.routes["operation-bad-choice"] = {
+        "status": "ok", "kind": "substantive", "target_doc_id": "doc-pinned",
+        "conversation_id": "conversation:pinned", "dialog_number": 2,
+        "tool_choice": {"name": "unknown", "arguments": {}, "link_requested": False},
+    }
+    repository.turns["conversation:pinned"] = [{
+        "operation_id": "operation-bad-choice", "role": "user",
+        "parts": [{"text": "do it"}],
+    }]
+    executor = _CommandExecutor()
+    model = SequenceModel([])
+    processor = TelegramCommandProcessor(
+        context_loader=lambda *_args: context,
+        router=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("router called")),
+        repository=repository, agent=_agent(model=model, executor=executor),
+        notifications=SimpleNamespace(), executor_factory=lambda *_args: executor,
+    )
+    result = _run_async(processor(
+        "42_default", {"operation_id": "operation-bad-choice"},
+        SimpleNamespace(operation_id="operation-bad-choice", owner="worker", fence=1),
+        command=None,
+    ))
+    assert result is QueueOperationState.FAILED
+    assert executor.calls == []
+    assert model.calls == []
+
+
+def test_cleared_search_replay_returns_saved_refs_without_rerouting():
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from services.connectors.telegram.commands import parse_command
+    from core.operations.queue import QueueOperationState
+
+    context = SimpleNamespace(context_id="42_default", active_conversation_id=None)
+    repository = _CommandRepository()
+    routes = []
+
+    async def router(**_kwargs):
+        routes.append("called")
+        return {
+            "status": "ok", "kind": "search", "result_refs": ["doc-a", "doc-b"],
+            "search_session_id": "search-session-1",
+        }
+
+    processor = TelegramCommandProcessor(
+        context_loader=lambda *_args: context, router=router, repository=repository,
+        agent=_agent(model=SequenceModel([]), executor=_CommandExecutor()),
+        notifications=SimpleNamespace(), executor_factory=lambda *_args: _CommandExecutor(),
+    )
+    operation = {"operation_id": "operation-search"}
+    lease = SimpleNamespace(operation_id="operation-search", owner="worker", fence=2)
+    first = _run_async(processor(
+        "42_default", operation, lease, command=parse_command("find meetings"),
+    ))
+    assert first is QueueOperationState.COMPLETED
+    assert repository.routes["operation-search"] == {
+        "status": "ok", "kind": "search", "result_refs": ["doc-a", "doc-b"],
+        "search_session_id": "search-session-1",
+    }
+
+    replay = _run_async(processor(
+        "42_default", operation, lease, command=None,
+    ))
+    assert replay is QueueOperationState.COMPLETED
+    assert routes == ["called"]
+
+
+def test_command_processor_offloads_slow_sync_collaborators_for_heartbeat_progress():
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from services.connectors.telegram.commands import parse_command
+    from core.operations.queue import QueueOperationState
+
+    context = SimpleNamespace(context_id="42_default", active_conversation_id="conversation:pinned")
+    repository = _CommandRepository()
+    calls = []
+
+    def router(**_kwargs):
+        time.sleep(0.06)
+        calls.append("router")
+        return {
+            "status": "ok", "kind": "substantive", "target_doc_id": "doc-pinned",
+            "conversation_id": "conversation:pinned", "dialog_number": 1,
+            "substantive_text": "show folders",
+            "tool_choice": {
+                "name": "list_folders", "arguments": {}, "link_requested": False,
+            },
+        }
+
+    class SlowAgent:
+        def dispatch_tool_choice(self, **_kwargs):
+            time.sleep(0.06)
+            calls.append("dispatch")
+
+        def run(self, **_kwargs):
+            time.sleep(0.06)
+            calls.append("agent")
+            return {"status": "ok", "answer": "done"}
+
+    processor = TelegramCommandProcessor(
+        context_loader=lambda *_args: context, router=router, repository=repository,
+        agent=SlowAgent(), notifications=SimpleNamespace(),
+        executor_factory=lambda *_args: _CommandExecutor(),
+    )
+    lease = SimpleNamespace(operation_id="operation-heartbeat", owner="worker", fence=3)
+
+    async def run_with_heartbeat():
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            for _ in range(12):
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        result, _ = await asyncio.gather(
+            processor(
+                "42_default", {"operation_id": "operation-heartbeat"}, lease,
+                command=parse_command("show folders"),
+            ),
+            heartbeat(),
+        )
+        return result, ticks
+
+    result, ticks = _run_async(run_with_heartbeat())
+    assert result is QueueOperationState.COMPLETED
+    assert calls == ["router", "dispatch", "agent"]
+    assert ticks >= 8
+
+
+def test_command_processor_offloads_sync_replay_reads_for_heartbeat_progress():
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from core.operations.queue import QueueOperationState
+
+    operation_id = "operation-slow-replay"
+    context_id = "42_default"
+    conversation_id = "conversation:pinned"
+    context = SimpleNamespace(context_id=context_id, active_conversation_id="conversation:newer")
+    repository = _CommandRepository()
+    repository.routes[operation_id] = {
+        "status": "ok", "kind": "substantive", "target_doc_id": "doc-pinned",
+        "conversation_id": conversation_id, "dialog_number": 2,
+    }
+    repository.turns[conversation_id] = [{
+        "operation_id": operation_id, "role": "user", "parts": [{"text": "show folders"}],
+    }]
+
+    class SlowDocument:
+        def get(self):
+            time.sleep(0.04)
+            return SimpleNamespace(
+                exists=True,
+                to_dict=lambda: {"operation_id": operation_id},
+            )
+
+        def collection(self, _name):
+            return self
+
+        def document(self, _name):
+            return self
+
+    class SlowClient:
+        def collection(self, _name):
+            return SlowDocument()
+
+    repository.client = SlowClient()
+    original_get_route = repository.get_route_control
+    original_list_turns = repository.list_turns
+
+    def slow_get_route(*args):
+        time.sleep(0.04)
+        return original_get_route(*args)
+
+    def slow_list_turns(*args):
+        time.sleep(0.04)
+        return original_list_turns(*args)
+
+    repository.get_route_control = slow_get_route
+    repository.list_turns = slow_list_turns
+
+    def slow_context_loader(*_args):
+        time.sleep(0.04)
+        return context
+
+    processor = TelegramCommandProcessor(
+        context_loader=slow_context_loader,
+        router=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("router called on replay")),
+        repository=repository,
+        agent=_agent(model=SequenceModel([{"parts": [], "text": "done"}]),
+                     executor=_CommandExecutor()),
+        notifications=SimpleNamespace(),
+        executor_factory=lambda *_args: _CommandExecutor(),
+    )
+    operation = {"operation_id": operation_id}
+    lease = SimpleNamespace(operation_id=operation_id, owner="worker", fence=3)
+
+    async def run_with_heartbeat():
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        result, _ = await asyncio.gather(
+            processor(context_id, operation, lease, command=None), heartbeat(),
+        )
+        return result, ticks
+
+    result, ticks = _run_async(run_with_heartbeat())
+    assert result is QueueOperationState.COMPLETED
+    assert ticks >= 12
+
+
+@pytest.mark.parametrize("route,turns", [
+    ({"status": "ok", "kind": "substantive", "target_doc_id": "",
+      "conversation_id": "conversation:pinned", "dialog_number": 2}, [
+        {"operation_id": "operation-replay", "role": "user", "parts": [{"text": "show"}]},
+    ]),
+    ({"status": "ok", "kind": "substantive", "target_doc_id": "doc-pinned",
+      "conversation_id": "conversation:pinned", "dialog_number": 2}, []),
+    ({"status": "ok", "kind": "substantive", "target_doc_id": "doc-pinned",
+      "conversation_id": "conversation:pinned", "dialog_number": 2,
+      "dependency_operation_id": "different-parent"}, [
+        {"operation_id": "operation-replay", "role": "user", "parts": [{"text": "show"}]},
+    ]),
+])
+def test_cleared_candidate_with_incomplete_pinned_replay_fails_closed(route, turns):
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from core.operations.queue import QueueOperationState
+
+    context = SimpleNamespace(context_id="42_default", active_conversation_id="conversation:newer")
+    repository = _CommandRepository()
+    repository.routes["operation-replay"] = route
+    repository.turns["conversation:pinned"] = turns
+    executor = _CommandExecutor()
+    model = SequenceModel([])
+    processor = TelegramCommandProcessor(
+        context_loader=lambda *_args: context,
+        router=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("router called")),
+        repository=repository, agent=_agent(model=model, executor=executor),
+        notifications=SimpleNamespace(), executor_factory=lambda *_args: executor,
+    )
+    result = _run_async(processor(
+        "42_default", {
+            "operation_id": "operation-replay", "dependency_operation_id": "expected-parent",
+        },
+        SimpleNamespace(operation_id="operation-replay", owner="worker", fence=9),
+        command=None,
+    ))
+    assert result is QueueOperationState.FAILED
+    assert model.calls == []
+    assert executor.calls == []
+
+
+def test_queue_command_processor_does_not_dispatch_after_router_failure():
+    from services.connectors.telegram.agent import TelegramCommandProcessor
+    from services.connectors.telegram.commands import parse_command
+    from core.operations.queue import QueueOperationState
+
+    context = SimpleNamespace(context_id="42_default", active_conversation_id=None)
+    repository = _CommandRepository()
+    executor = _CommandExecutor()
+    telegram_agent = _agent(model=SequenceModel([]), executor=executor)
+
+    async def failed_router(**_kwargs):
+        raise RuntimeError("synthetic model failure")
+
+    processor = TelegramCommandProcessor(
+        context_loader=lambda *_args: context, router=failed_router,
+        repository=repository, agent=telegram_agent,
+        notifications=SimpleNamespace(),
+        executor_factory=lambda *_args: executor,
+    )
+    result = _run_async(processor(
+        "42_default", {"operation_id": "operation-failed"},
+        SimpleNamespace(operation_id="operation-failed", owner="worker", fence=1),
+        command=parse_command("move the last transcript"),
+    ))
+
+    assert result is QueueOperationState.FAILED
+    assert executor.calls == []
+    assert repository.routes["operation-failed"]["status"] == "error"
+    assert repository.turns == {}
 
 
 def test_duplicate_delivery_reuses_persisted_results_without_repeating_tool_effects():

@@ -515,7 +515,7 @@ async def route_message(
 
 
 def _control_route_record(route: Any) -> dict[str, Any]:
-    """Keep only target and status metadata in the operation control ledger."""
+    """Keep allowlisted, validated replay metadata in the operation control ledger."""
     if not isinstance(route, Mapping):
         return {"status": "invalid_route"}
     safe: dict[str, Any] = {}
@@ -538,6 +538,42 @@ def _control_route_record(route: Any) -> dict[str, Any]:
     number = route.get("dialog_number")
     if type(number) is int and number > 0:
         safe["dialog_number"] = number
+    if route.get("kind") == "substantive":
+        choice = route.get("tool_choice")
+        if choice is not None:
+            if not isinstance(choice, Mapping) or set(choice) - {
+                "name", "arguments", "link_requested",
+            }:
+                safe["status"] = "invalid_route"
+                return safe
+            name = choice.get("name")
+            link_requested = choice.get("link_requested", False)
+            try:
+                arguments = validate_arguments(name, choice.get("arguments"))
+            except (TypeError, ValueError):
+                safe["status"] = "invalid_route"
+                return safe
+            if (not isinstance(name, str) or name not in OPERATIONS
+                    or not isinstance(link_requested, bool)
+                    or (link_requested and name != "get_transcript")
+                    or (arguments.get("doc_id") is not None
+                        and arguments["doc_id"] != safe.get("target_doc_id"))):
+                safe["status"] = "invalid_route"
+                return safe
+            safe["tool_choice"] = {
+                "name": name, "arguments": arguments,
+                "link_requested": link_requested,
+            }
+    if route.get("kind") == "search":
+        refs = route.get("result_refs")
+        session_id = route.get("search_session_id")
+        if (not isinstance(refs, list)
+                or any(not isinstance(ref, str) or not ref for ref in refs)
+                or not isinstance(session_id, str) or not session_id):
+            safe["status"] = "invalid_route"
+            return safe
+        safe["result_refs"] = list(refs)
+        safe["search_session_id"] = session_id
     safe.setdefault("status", "error")
     return safe
 
@@ -557,6 +593,12 @@ def _operation_route_status(route: Any) -> str:
     }:
         return "invalid_route"
     if kind == "search":
+        refs = route.get("result_refs")
+        session_id = route.get("search_session_id")
+        if (not isinstance(refs, list)
+                or any(not isinstance(ref, str) or not ref for ref in refs)
+                or not isinstance(session_id, str) or not session_id):
+            return "invalid_route"
         return "ok"
     if kind == "save":
         if type(route.get("confirmed")) is not bool:
@@ -575,6 +617,24 @@ def _operation_route_status(route: Any) -> str:
         value = route.get("substantive_text")
         if not isinstance(value, str) or not value.strip():
             return "invalid_route"
+        choice = route.get("tool_choice")
+        if choice is not None:
+            if not isinstance(choice, Mapping) or set(choice) - {
+                "name", "arguments", "link_requested",
+            }:
+                return "invalid_route"
+            name = choice.get("name")
+            link_requested = choice.get("link_requested", False)
+            try:
+                arguments = validate_arguments(name, choice.get("arguments"))
+            except (TypeError, ValueError):
+                return "invalid_route"
+            if (not isinstance(name, str) or name not in OPERATIONS
+                    or not isinstance(link_requested, bool)
+                    or (link_requested and name != "get_transcript")
+                    or (arguments.get("doc_id") is not None
+                        and arguments["doc_id"] != route.get("target_doc_id"))):
+                return "invalid_route"
     return "ok"
 
 

@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from google.cloud import firestore
 
+from core.operations.registry import OPERATIONS, validate_arguments
 from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record_in_transaction
 from core.integrations.firestore.operation_queue import (
     register_operation_in_transaction,
@@ -345,6 +346,39 @@ class _TelegramCommandMixin:
             if type(number) is not int or number < 1:
                 raise ValueError("dialog_number is invalid")
             safe["dialog_number"] = number
+        choice = route.get("tool_choice")
+        if choice is not None:
+            if kind != "substantive" or not isinstance(choice, Mapping) or set(choice) - {
+                "name", "arguments", "link_requested",
+            }:
+                raise ValueError("tool_choice is invalid")
+            name = choice.get("name")
+            link_requested = choice.get("link_requested", False)
+            try:
+                arguments = validate_arguments(name, choice.get("arguments"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("tool_choice is invalid") from exc
+            if (not isinstance(name, str) or name not in OPERATIONS
+                    or not isinstance(link_requested, bool)
+                    or (link_requested and name != "get_transcript")
+                    or (arguments.get("doc_id") is not None
+                        and arguments["doc_id"] != safe.get("target_doc_id"))):
+                raise ValueError("tool_choice is invalid")
+            safe["tool_choice"] = {
+                "name": name, "arguments": arguments,
+                "link_requested": link_requested,
+            }
+        refs = route.get("result_refs")
+        if refs is not None:
+            if (kind != "search" or not isinstance(refs, list)
+                    or any(not isinstance(ref, str) or not ref for ref in refs)):
+                raise ValueError("result_refs is invalid")
+            safe["result_refs"] = list(refs)
+        session_id = route.get("search_session_id")
+        if session_id is not None:
+            if kind != "search" or not isinstance(session_id, str) or not session_id:
+                raise ValueError("search_session_id is invalid")
+            safe["search_session_id"] = session_id
         return safe
 
     def _command_for_operation(

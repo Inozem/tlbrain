@@ -414,7 +414,9 @@ def test_search_route_stays_in_its_separate_session_without_target_history_chang
     assert repository.snapshot() == before
     assert repository.route_records["op-search"] == {
         "status": "ok", "kind": "search",
+        "result_refs": ["doc-target"], "search_session_id": "search-1",
     }
+    assert "find the target document" not in repr(repository.route_records["op-search"])
     assert agent.prompts == []
     assert notifications.attempts == []
 

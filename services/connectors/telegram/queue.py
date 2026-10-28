@@ -33,6 +33,7 @@ from core.integrations.firestore.outbox import (
 )
 from core.operations.queue import OperationLease, QueueOperationState
 from core.operations.retries import RetryGovernor, RetryBudgetExceeded, UnknownOutcome
+from services.connectors.telegram.commands import TelegramCommand, parse_command
 from services.connectors.telegram.repository import NOTIFICATIONS, SESSIONS, TelegramRepository
 from services.connectors.telegram.repository._common import _document_ref
 
@@ -226,18 +227,70 @@ class TelegramQueueWorker:
 
     async def _process(self, context_id: str, operation: Any, lease: OperationLease,
                        retry_governor: RetryGovernor) -> QueueOperationState:
-        """Pass durable attempt context to processors that opt into the seam."""
+        """Pass durable attempt context and, when requested, the separate command input."""
         try:
             parameters = inspect.signature(self.processor).parameters.values()
+            parameters = tuple(parameters)
             supports_governor = any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == "retry_governor"
                 for parameter in parameters
             )
+            supports_command = any(
+                parameter.name == "command"
+                and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+                for parameter in parameters
+            )
         except (TypeError, ValueError):
             supports_governor = False
+            supports_command = False
+        kwargs: dict[str, Any] = {}
         if supports_governor:
-            return await self.processor(context_id, operation, lease, retry_governor=retry_governor)
+            kwargs["retry_governor"] = retry_governor
+        if supports_command:
+            kwargs["command"] = await _offload_sync(
+                self._load_command_candidate, context_id, operation,
+            )
+        if kwargs:
+            return await self.processor(context_id, operation, lease, **kwargs)
         return await self.processor(context_id, operation, lease)
+
+    def _load_command_candidate(self, context_id: str, operation: Any) -> TelegramCommand | None:
+        """Load the accepted command, or signal that a pinned routed replay is needed."""
+        operation_id = getattr(operation, "operation_id", None)
+        input_ref = getattr(operation, "input_ref", None)
+        if isinstance(operation, Mapping):
+            operation_id = operation.get("operation_id", operation_id)
+            input_ref = operation.get("input_ref", input_ref)
+        parts = input_ref.split("/") if isinstance(input_ref, str) else []
+        if (not isinstance(operation_id, str) or not operation_id
+                or len(parts) != 4 or parts[:3] != [SESSIONS, context_id, "commands"]
+                or not parts[3].isdigit()):
+            raise ValueError("queued command input reference is invalid")
+        snapshot = _document_ref(self.client, input_ref).get()
+        command_data = snapshot.to_dict() or {} if snapshot.exists else {}
+        if (command_data.get("context_id") != context_id
+                or command_data.get("operation_id") != operation_id
+                or command_data.get("kind") != "freeform"):
+            raise ValueError("queued command candidate is unavailable")
+        candidate = command_data.get("candidate")
+        if candidate is None:
+            operation_ref = self.client.collection(SESSIONS).document(context_id).collection(
+                "operations"
+            ).document(operation_id)
+            operation_snapshot = operation_ref.get()
+            operation_data = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
+            route = operation_data.get("route_control")
+            if (operation_data.get("operation_id") != operation_id
+                    or not isinstance(route, Mapping)
+                    or route.get("status") not in {"ok", "success"}
+                    or route.get("kind") not in {
+                        "pure_switch", "substantive", "search", "save", "retry",
+                    }):
+                raise ValueError("queued command candidate is unavailable")
+            return None
+        if not isinstance(candidate, str):
+            raise ValueError("queued command candidate is unavailable")
+        return parse_command(candidate)
 
     async def handle_task(self, payload: Mapping[str, Any]) -> bool:
         """Handle a schema-versioned task body; return whether processing settled."""

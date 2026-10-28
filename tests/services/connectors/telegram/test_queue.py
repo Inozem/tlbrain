@@ -7,6 +7,7 @@ import socket
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from google.cloud import firestore
 
 from core.integrations.firestore.outbox import (
     OUTBOX_COLLECTION,
@@ -35,6 +36,7 @@ from core.operations.models import OperationOrigin
 from services.connectors.telegram.commands import parse_command
 from services.connectors.telegram.queue import TelegramQueueWorker
 from services.connectors.telegram.repository import SESSIONS, TelegramRepository
+from services.connectors.telegram.repository._commands import _TelegramCommandMixin
 
 
 NOW = datetime(2026, 5, 1, tzinfo=timezone.utc)
@@ -296,6 +298,123 @@ def test_arbitrary_command_text_preserves_only_queue_lineage_without_classifying
     assert "dependency_operation_id" not in operation
     assert operation.get("target_doc_id") is None
 
+
+def test_command_aware_processor_receives_only_owned_command_candidate(firestore_fake):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id = "42_default"
+    client.collection(SESSIONS).document(context_id).set({"active_draft_id": "draft-private"})
+    client.collection(SESSIONS).document(context_id).collection("drafts").document(
+        "draft-private"
+    ).set({"state": "collecting", "private_transcript": "must never enter command routing"})
+    accepted = repository.accept_command(
+        990, chat_id=42, user_id=7,
+        command=parse_command("show folders and sync status"), now=NOW,
+    )
+    operation = get_operation(
+        client.collection(SESSIONS).document(context_id), accepted.operation_id,
+    )
+    payload = task_payload(get_outbox_record(client, accepted.outbox_id))
+    seen = []
+
+    async def processor(context_id, operation, lease, *, command):
+        seen.append((context_id, command.kind, command.text))
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    assert _run(worker.handle_task(payload)) is True
+    assert seen == [(context_id, "freeform", "show folders and sync status")]
+    assert "must never enter command routing" not in repr(seen)
+    assert operation.input_ref == f"{SESSIONS}/{context_id}/commands/990"
+
+
+def test_command_candidate_ownership_mismatch_fails_before_command_processor(firestore_fake):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id = "42_default"
+    accepted = repository.accept_command(
+        991, chat_id=42, user_id=7, command=parse_command("run a tool"), now=NOW,
+    )
+    command_ref = client.collection(SESSIONS).document(context_id).collection(
+        "commands"
+    ).document("991")
+    command_ref.update({"operation_id": "foreign-operation"})
+    operation = get_operation(
+        client.collection(SESSIONS).document(context_id), accepted.operation_id,
+    )
+    calls = []
+
+    async def processor(context_id, operation, lease, *, command):
+        calls.append(command)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    with pytest.raises(ValueError, match="candidate is unavailable"):
+        worker._load_command_candidate(context_id, operation)
+    assert calls == []
+
+
+def test_cleared_command_candidate_requires_successful_pinned_route(firestore_fake):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id = "42_default"
+    accepted = repository.accept_command(
+        992, chat_id=42, user_id=7, command=parse_command("show folders"), now=NOW,
+    )
+    context_ref = client.collection(SESSIONS).document(context_id)
+    operation_ref = context_ref.collection("operations").document(accepted.operation_id)
+    command_ref = context_ref.collection("commands").document("992")
+    command_ref.update({"candidate": firestore.DELETE_FIELD})
+    worker = TelegramQueueWorker(client, lambda *_args: None, clock=lambda: NOW)
+    operation = get_operation(context_ref, accepted.operation_id)
+
+    with pytest.raises(ValueError, match="candidate is unavailable"):
+        worker._load_command_candidate(context_id, operation)
+    operation_ref.update({"route_control": {
+        "status": "ok", "kind": "substantive", "target_doc_id": "doc-pinned",
+        "conversation_id": "conversation-pinned", "dialog_number": 2,
+    }})
+    assert worker._load_command_candidate(context_id, operation) is None
+
+    seen = []
+
+    async def processor(_context_id, _operation, _lease, *, command):
+        seen.append(command)
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW)
+    payload = task_payload(get_outbox_record(client, accepted.outbox_id))
+    assert _run(worker.handle_task(payload)) is True
+    assert seen == [None]
+
+    operation_ref.update({"route_control": {
+        "status": "ok", "kind": "substantive", "target_doc_id": "",
+        "conversation_id": "conversation-pinned", "dialog_number": 2,
+    }})
+    # The queue passes pinned records onward; the command processor validates full shape.
+    assert worker._load_command_candidate(context_id, operation) is None
+
+
+def test_route_control_serializer_keeps_validated_choice_and_rejects_malformed_choice():
+    route = {
+        "status": "ok", "kind": "substantive", "target_doc_id": "doc-a",
+        "conversation_id": "conversation-a", "dialog_number": 1,
+        "substantive_text": "private user request",
+        "tool_choice": {
+            "name": "get_transcript", "arguments": {"doc_id": "doc-a"},
+            "link_requested": True,
+        },
+    }
+    saved = _TelegramCommandMixin._route_control_data(route)
+    assert saved["tool_choice"] == route["tool_choice"]
+    assert "substantive_text" not in saved
+    assert "raw command" not in saved
+
+    with pytest.raises(ValueError, match="tool_choice is invalid"):
+        _TelegramCommandMixin._route_control_data({
+            **route,
+            "tool_choice": {"name": "get_transcript", "arguments": {"doc_id": "doc-b"}},
+        })
 
 def test_all_command_candidates_persist_predecessor_without_save_classification(firestore_fake):
     client = firestore_fake.client_class()
