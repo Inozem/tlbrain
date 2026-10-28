@@ -97,14 +97,15 @@ def invoke_tool(
     This ordering makes unknown operations and model-supplied capability fields
     fail closed.
     """
-    validated = registry.validate_arguments(name, arguments)
     metadata = _context_metadata(context)
 
-    if name == "get_transcript" and "doc_id" not in validated:
+    if (name in {"get_transcript", "move_transcript", "rename_transcript"}
+            and isinstance(arguments, dict) and "doc_id" not in arguments):
         last_doc_id = metadata.get("last_doc_id")
         if isinstance(last_doc_id, str) and last_doc_id:
-            validated["doc_id"] = last_doc_id
-            validated = registry.validate_arguments(name, validated)
+            arguments = {**arguments, "doc_id": last_doc_id}
+
+    validated = registry.validate_arguments(name, arguments)
 
     trusted_context = execution_context
     if trusted_context is None and isinstance(context, (WriteContext, registry.AddDialogContext)):

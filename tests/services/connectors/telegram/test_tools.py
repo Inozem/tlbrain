@@ -145,6 +145,24 @@ def test_last_dialog_uses_context_last_doc_id_for_direct_transcript_lookup(monke
     assert all(name != "query" for name, _, _ in calls)
 
 
+@pytest.mark.parametrize(("name", "arguments"), [
+    ("move_transcript", {"folder_path": ["Archive"]}),
+    ("rename_transcript", {"new_title": "Renamed"}),
+])
+def test_last_dialog_is_used_for_direct_move_and_rename(monkeypatch, name, arguments):
+    calls = []
+
+    def dispatch(operation, supplied, *, context=None):
+        calls.append((operation, deepcopy(supplied), context))
+        return {"ok": True}
+
+    monkeypatch.setattr(registry, "invoke_operation", dispatch)
+    result = _adapter().invoke_tool(name, arguments, context={"last_doc_id": "doc-last"})
+
+    assert result == {"ok": True}
+    assert calls == [(name, {**arguments, "doc_id": "doc-last"}, None)]
+
+
 def test_read_preserves_provider_neutral_filters_segments_and_truncation_metadata(monkeypatch):
     raw = (
         [

@@ -337,6 +337,28 @@ def test_last_target_uses_context_id_without_semantic_search():
     assert search.calls == []
 
 
+@pytest.mark.parametrize(("operation", "arguments"), [
+    ("move_transcript", {"doc_id": "doc-last", "folder_path": ["Archive"]}),
+    ("rename_transcript", {"doc_id": "doc-last", "new_title": "Renamed"}),
+])
+def test_last_target_move_and_rename_route_directly_to_last_document(operation, arguments):
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision(
+            "substantive", target_ref="last", substantive_text="apply this change",
+            tool_choice={"name": operation, "arguments": arguments},
+        ),
+        docs={"doc-current": {}, "doc-last": {}}, current="doc-current", last="doc-last",
+        numbers={"doc-current": 3, "doc-last": 6},
+    )
+
+    result = _call("apply this to the last document", context=context, store=store,
+                   model=model, search=search, notices=notices, actions=actions)
+
+    assert result["target_doc_id"] == "doc-last"
+    assert actions.calls == [(operation, arguments, "doc-last", False)]
+    assert search.calls == []
+
+
 def _saved_predecessor(operation_id="op-save", *, predecessor=None):
     route = {
         "kind": "save", "target_doc_id": "doc-saved",
