@@ -855,6 +855,7 @@ def test_operation_result_and_immutable_completion_certificate_commit_atomically
         _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
     assert firestore_fake.documents[operation_path].get("result") is None
     assert firestore_fake.documents[operation_path].get("state") != "completed"
+    assert firestore_fake.documents[operation_path].get("input_cleanup_state") is None
     assert firestore_fake.documents[intent_path].get("completion_certificate") is None
 
     content = "DATE: 2026-03-04\nPROVIDER: tldv\n---\nSpeaker A :: Completed synthetic transcript."
@@ -880,6 +881,8 @@ def test_operation_result_and_immutable_completion_certificate_commit_atomically
     first_intent = firestore_fake.documents[intent_path]
     certificate = first_intent["completion_certificate"]
     assert first_operation["state"] == "completed"
+    assert first_operation["input_cleanup_state"] == "pending"
+    assert first_operation["cleanup_authorization"] == first_intent["cleanup_authorization"]
     assert first_operation["result"]["document_id"] == DOC_ID
     assert first_operation["result"]["skipped_utterances"] == [2, 7]
     assert certificate["save_intent_id"] == save_intent_id

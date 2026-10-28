@@ -502,6 +502,8 @@ def test_firestore_index_helper_adds_declared_indexes_and_exemptions_idempotentl
     assert any("--collection-group task_outbox" in text and "target_kind" in text and "schedule_at" in text for text in as_text)
     assert any("--collection-group dialog_operations" in text and "origin" in text and "updated_at" in text for text in as_text)
     assert any("--collection-group drafts" in text and "cleanup_state" in text and "updated_at" in text for text in as_text)
+    # input_cleanup_state is a single-field equality query and uses Firestore's default index.
+    assert not any("--collection-group dialog_operations" in text and "input_cleanup_state" in text for text in as_text)
     exemptions = [event for event in events if event[:4] == ["firestore", "indexes", "fields", "update"]]
     assert len(exemptions) == 9
     assert {event[4] for event in exemptions} == {

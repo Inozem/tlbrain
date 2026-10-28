@@ -215,6 +215,38 @@ def test_missing_or_mismatched_recovery_config_skips_sweep_and_keeps_checker_run
     )
 
 
+def test_input_cleanup_runs_without_mcp_target_and_failure_does_not_block_drive(
+    checker_main, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_SYNC_URL", "https://sync.synthetic.test")
+    monkeypatch.delenv("INTERNAL_DIALOG_OPERATIONS_URL", raising=False)
+    calls = []
+
+    def fail_cleanup(db):
+        calls.append(("cleanup", db))
+        raise RuntimeError("synthetic cleanup failure")
+
+    monkeypatch.setattr(checker_main, "cleanup_completed_input_parts", fail_cleanup)
+    monkeypatch.setattr(checker_main, "enqueue_stale_mcp_save_recoveries", lambda *args, **kwargs: pytest.fail(
+        "missing MCP target must skip task recovery"
+    ))
+    monkeypatch.setattr(checker_main, "publish_due_outbox_records", lambda *args, **kwargs: pytest.fail(
+        "missing MCP target must skip task publication"
+    ))
+    monkeypatch.setattr(checker_main, "enqueue_expired_telegram_queue_recoveries", lambda *args, **kwargs: None)
+    monkeypatch.setattr(checker_main, "get_stale_syncing", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_error_docs", lambda db=None: [])
+    monkeypatch.setattr(checker_main, "get_drive_sync_token", lambda: "page-token")
+    monkeypatch.setattr(checker_main, "get_drive_changes", lambda token: ([], "next-token"))
+    monkeypatch.setattr(checker_main, "set_drive_sync_token", lambda token: calls.append(("drive", token)))
+
+    assert checker_main.checker(_request()) == (
+        {"queued": 0, "stale_syncing": 0, "error_docs": 0}, 200
+    )
+    assert calls[0][0] == "cleanup"
+    assert calls[-1] == ("drive", "next-token")
+
+
 def test_nonexpired_drive_provider_error_propagates(checker_main, monkeypatch):
     monkeypatch.setenv("VECTOR_SYNC_URL", "https://sync.synthetic.test")
     monkeypatch.setattr(checker_main, "get_stale_syncing", lambda db=None: [])

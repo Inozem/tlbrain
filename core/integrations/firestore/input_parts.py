@@ -11,6 +11,8 @@ from core.integrations.firestore.client import get_client
 OPERATIONS_COLLECTION = "dialog_operations"
 INPUT_PARTS_COLLECTION = "input_parts"
 MAX_PART_BYTES = 512 * 1024
+MAX_INPUT_CLEANUP_OPERATIONS = 50
+MAX_INPUT_CLEANUP_PARTS = 400
 
 
 def _db(client: Any | None) -> Any:
@@ -95,3 +97,81 @@ def read_input_parts(client: Any | None, input_ref: str) -> bytes:
     if len(payload) != length or hashlib.sha256(payload).hexdigest() != expected_digest:
         raise ValueError("immutable input manifest does not verify")
     return payload
+
+
+def _has_matching_completion_certificate(
+    client: Any, operation_id: str, operation: dict[str, Any],
+) -> bool:
+    """Require the save intent's immutable certificate before deleting input bytes."""
+    save_intent_id = operation.get("save_intent_id")
+    doc_id = operation.get("doc_id")
+    authorization = operation.get("cleanup_authorization")
+    if (operation.get("state") != "completed" or not save_intent_id or not doc_id
+            or not isinstance(authorization, dict)):
+        return False
+    intent_snapshot = client.collection("dialog_save_intents").document(save_intent_id).get()
+    if not intent_snapshot.exists:
+        return False
+    intent = intent_snapshot.to_dict() or {}
+    certificate = intent.get("completion_certificate")
+    intent_authorization = intent.get("cleanup_authorization")
+    if not isinstance(certificate, dict) or not isinstance(intent_authorization, dict):
+        return False
+    return (
+        intent.get("save_intent_id") == save_intent_id
+        and intent.get("doc_id") == doc_id
+        and intent.get("dispatch_operation_id") == operation_id
+        and intent_authorization == authorization
+        and certificate.get("certificate_id") == authorization.get("certificate_id")
+        and certificate.get("operation_id") == operation_id
+        and certificate.get("save_intent_id") == save_intent_id
+        and certificate.get("doc_id") == doc_id
+        and certificate.get("origin_binding") == authorization.get("origin_binding")
+        and bool(certificate.get("certificate_id"))
+    )
+
+
+def cleanup_completed_input_parts(
+    client: Any | None = None,
+    *,
+    operation_limit: int = MAX_INPUT_CLEANUP_OPERATIONS,
+    part_limit: int = MAX_INPUT_CLEANUP_PARTS,
+) -> int:
+    """Delete one bounded page of parts for each certificate-authorized save.
+
+    Pending operations are selected only by the marker written atomically with
+    their completion certificate. Deleting a page leaves the first remaining
+    page at the start of the subcollection query, so a later Checker run resumes
+    after process failure without a cursor or historical migration.
+    """
+    if (isinstance(operation_limit, bool) or not isinstance(operation_limit, int)
+            or not 1 <= operation_limit <= MAX_INPUT_CLEANUP_OPERATIONS):
+        raise ValueError(f"operation_limit must be from 1 to {MAX_INPUT_CLEANUP_OPERATIONS}")
+    if (isinstance(part_limit, bool) or not isinstance(part_limit, int)
+            or not 1 <= part_limit <= MAX_INPUT_CLEANUP_PARTS):
+        raise ValueError(f"part_limit must be from 1 to {MAX_INPUT_CLEANUP_PARTS}")
+
+    db = _db(client)
+    operations = db.collection(OPERATIONS_COLLECTION)
+    candidates = operations.where("input_cleanup_state", "==", "pending").limit(operation_limit).stream()
+    deleted_count = 0
+    for snapshot in candidates:
+        operation = snapshot.to_dict() or {}
+        if not _has_matching_completion_certificate(db, snapshot.id, operation):
+            continue
+        part_collection = operations.document(snapshot.id).collection(INPUT_PARTS_COLLECTION)
+        # The manifest has no index field and is retained as the input tombstone.
+        parts = part_collection.where("index", ">=", 0).limit(part_limit).stream()
+        batch = db.batch()
+        page_count = 0
+        for part in parts:
+            batch.delete(part.reference)
+            page_count += 1
+        if page_count:
+            batch.commit()
+            deleted_count += page_count
+
+        remaining = part_collection.where("index", ">=", 0).limit(1).stream()
+        if not next(iter(remaining), None):
+            operations.document(snapshot.id).update({"input_cleanup_state": "complete"})
+    return deleted_count

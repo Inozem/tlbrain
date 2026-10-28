@@ -712,6 +712,7 @@ def _write_completed_save(
     operation.update({
         "state": "completed", "doc_id": result.document_id, "result": _result_data(result),
         "document_finalized": True, "cleanup_authorization": cleanup_authorization,
+        "input_cleanup_state": "pending",
         "finished_at": commit_now, "status_updated_at": commit_now, "updated_at": commit_now,
     })
     for field in ("finalization_reservation_id", "finalization_operation_id",

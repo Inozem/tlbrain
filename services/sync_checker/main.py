@@ -27,6 +27,7 @@ from core.integrations.firestore.transcripts import (
     update_index,
 )
 from core.integrations.firestore.sync_state import get_drive_sync_token, set_drive_sync_token
+from core.integrations.firestore.input_parts import cleanup_completed_input_parts
 from core.integrations.cloud_tasks.client import enqueue_task
 from core.integrations.firestore.outbox import OutboxTargetKind
 from core.integrations.firestore.telegram_recovery import FirestoreTelegramQueueRecoveryStore
@@ -86,6 +87,13 @@ def _mcp_recovery_target() -> TaskTargetConfig | None:
 
 
 def _run_mcp_recovery_sweep(db: firestore.Client) -> None:
+    try:
+        cleaned_parts = cleanup_completed_input_parts(db)
+        if cleaned_parts:
+            logger.info("Completed dialog input cleanup: deleted=%d part(s)", cleaned_parts)
+    except Exception:
+        # Cleanup is additive maintenance; never let it block recovery or Drive sync.
+        logger.warning("Completed dialog input cleanup failed; Checker will continue")
     targets = {}
     mcp_target = _mcp_recovery_target()
     telegram_target = _telegram_recovery_target()
