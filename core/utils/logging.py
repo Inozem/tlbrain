@@ -22,6 +22,7 @@ _SENSITIVE_TEXT = re.compile(
     re.IGNORECASE,
 )
 _BEARER_TEXT = re.compile(r"\bBearer\s+[^\s,;\]}'\"]+", re.IGNORECASE)
+_HTTP_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _QUERY_VALUE = re.compile(r"([?&][^=&#\s]+=)[^&#\s]*")
 _QUOTED_ASSIGNED_SECRET = re.compile(
     r"([\"'])(access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|"
@@ -59,6 +60,7 @@ def _is_sensitive_field(key: str) -> bool:
 
 
 def _sanitize_text(value: str) -> str:
+    value = _HTTP_URL.sub("[REDACTED_URL]", value)
     value = _QUERY_VALUE.sub(r"\1[REDACTED]", value)
     value = _BEARER_TEXT.sub("Bearer [REDACTED]", value)
     value = _QUOTED_ASSIGNED_SECRET.sub(r"\1\2\1\3\4[REDACTED]\4", value)

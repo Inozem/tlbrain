@@ -756,8 +756,6 @@ def _handle_query(request: JSONRPCRequest, arguments: dict) -> dict:
         "tool call: query",
         extra={
             "tool": "query",
-            "query": query,
-            "folder_path": folder_path,
             "hits_total": meta.get("total_matches", 0),
             "docs_returned": docs_returned,
             "segments_returned": meta.get("returned_segments", 0),

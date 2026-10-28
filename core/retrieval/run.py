@@ -82,7 +82,7 @@ def _find_pinned_summaries(
             pinned_hits.extend(
                 search_summaries_for_doc(doc_id, query, top_k=min(hit_count * 5, 20))
             )
-        logger.info("query=%r user_fact_pins=%d", query, len(hits_by_doc))
+        logger.info("retrieval user_fact_pins=%d", len(hits_by_doc))
     return pinned_hits
 
 
@@ -152,8 +152,8 @@ def run_retrieval(
     pinned_hits = _find_pinned_summaries(query, folder_ids, date_from, date_to)
 
     logger.info(
-        "query=%r semantic_hits=%d keyword_hits=%d",
-        query, len(semantic_hits), len(keyword_hits),
+        "retrieval semantic_hits=%d keyword_hits=%d",
+        len(semantic_hits), len(keyword_hits),
     )
     threshold = get_retrieval_score_threshold()
     semantic_hits = [hit for hit in semantic_hits if hit["score"] >= threshold]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 from types import SimpleNamespace
 
 import google.api_core.exceptions
@@ -27,11 +28,33 @@ def _task_events(sdk_fakes):
     ]
 
 
-def test_missing_meeting_id_returns_contract_error_without_side_effects(webhook, sdk_fakes):
-    response = webhook.tldv_webhook(_request({"data": {}}))
+def test_missing_meeting_id_returns_contract_error_without_side_effects(webhook, sdk_fakes, caplog):
+    payload_marker = "synthetic-webhook-missing-id-payload"
+    caplog.set_level(logging.WARNING, logger=webhook.__name__)
+    response = webhook.tldv_webhook(_request({"data": {"transcript": payload_marker}}))
 
     assert response == ({"error": "missing meetingId"}, 400)
     assert _task_events(sdk_fakes) == []
+    assert payload_marker not in caplog.text
+    assert "TL;DV webhook missing meeting_id" in caplog.text
+
+
+def test_webhook_logs_exclude_raw_payload_and_preserve_safe_meeting_id(
+    webhook, sdk_fakes, monkeypatch, caplog
+):
+    payload_marker = "synthetic-webhook-client-payload-marker"
+    meeting_id = "synthetic-meeting-log-safe"
+    monkeypatch.setenv("TLDV_IMPORT_SERVICE_URL", "https://import.synthetic.test")
+    caplog.set_level(logging.INFO, logger=webhook.__name__)
+
+    response = webhook.tldv_webhook(_request({
+        "data": {"meetingId": meeting_id, "transcript": payload_marker},
+        "clientSecret": payload_marker,
+    }))
+
+    assert response == ({"ok": True}, 200)
+    assert payload_marker not in caplog.text
+    assert meeting_id in caplog.text
 
 
 def test_missing_import_service_url_returns_ok_without_task_or_placeholder(
