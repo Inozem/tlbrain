@@ -8,6 +8,8 @@ TLBrain indexes meeting transcripts from TL;DV, stores everything in Google Driv
 graph LR
     A[TL;DV] -->|transcripts| B[Google Drive]
     B -->|incremental sync| C[TLBrain]
+    T[Telegram (optional)] -->|dialog intake| C
+    C -->|saves new dialog as Google Drive Doc| B
     C -->|MCP retrieval| D[Claude]
     C -->|MCP retrieval| E[ChatGPT]
     C -->|MCP retrieval| F[Codex]
@@ -161,6 +163,8 @@ ALLOWED_EMAIL=first@example.com,second@example.com
 
 `ALLOWED_EMAIL` accepts a single email or a comma-separated list. Use no spaces in `.env`; matching is case-insensitive. Every listed account has access to the same TLBrain knowledge base and tools. Leave it empty to skip OAuth — anyone with the MCP URL then gets access to your transcripts.
 
+With a nonempty `ALLOWED_EMAIL`, MCP access uses OAuth and the listed email allowlist. An empty value means open MCP access; it does not protect the MCP endpoint.
+
 ### 8. Get a Gemini API Key
 
 Open https://aistudio.google.com/apikey, create an API key.
@@ -194,6 +198,12 @@ VECTOR_SYNC_MAX_INSTANCES=2
 MCP_MAX_INSTANCES=1
 TLDV_IMPORT_MAX_INSTANCES=2
 
+# Optional connectors and installation timezone
+TLDV_API_KEY=your-tldv-api-key
+TELEGRAM_BOT_TOKEN=your-telegram-bot-token
+TELEGRAM_ALLOWED_USER_IDS=111111111,222222222  # synthetic example IDs
+TZ=UTC
+
 # Cloud Tasks
 VECTOR_SYNC_QUEUE=tlbrain-vector-sync-queue
  
@@ -222,9 +232,9 @@ If `GOOGLE_REFRESH_TOKEN` is not set, deployment opens a browser for Google Driv
 - If you see a "Google hasn't verified this app" warning — click **Advanced → Go to TLBrain MCP (unsafe)**
 - On the permissions screen, make sure all checkboxes are selected, then click **Continue**
 
-Deploys the three Cloud Run services (`mcp`, `vector_sync`, `tldv_import`) and three HTTP Cloud Functions gen2 (`sync_checker`, `tldv_webhook`, `tldv_reconciliation`), along with their Cloud Tasks queues and scheduled checker/reconciliation jobs. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
+Deploys the three shared runtime targets and any enabled optional connector targets, along with their required Cloud Tasks queues and scheduled checker/reconciliation jobs. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
 
-When finished, the script prints the MCP URL and TL;DV webhook URL — copy them, you'll need them in the next steps.
+When finished, the script prints the MCP URL and URLs for enabled connectors. Copy the relevant URLs for the next steps.
 
 The ordinary deployment uses already-published versioned images for Cloud Run services and deploys Functions from source/preflight artifacts. To build local service images before deployment, use `bash infra/deploy/local_deploy.sh`; this route requires Docker. Neither route adds a migration or reindex step.
 
@@ -384,7 +394,16 @@ As long as you stay within the free tier limits, you only pay for syncing new tr
  
 ### Runtime targets
 
-The deployment has six targets: three ASGI Cloud Run services (`mcp`, `vector_sync`, and `tldv_import`) and three HTTP Cloud Functions gen2 (`sync_checker`, deployed as target `checker`; `tldv_webhook`; and `tldv_reconciliation`). The MCP service provides remote tools and retrieval; vector sync indexes Google Docs; the TL;DV import service creates transcript documents. The checker processes Drive changes, the webhook accepts TL;DV events, and reconciliation checks for missed imports.
+The service manifest defines seven possible runtime targets: three shared targets (`mcp`, `vector_sync`, and `sync_checker`), three TL;DV targets (`tldv_import`, `tldv_webhook`, and `tldv_reconciliation`), and optional Telegram (`telegram`). Four targets are ASGI Cloud Run services: `mcp`, `vector_sync`, `tldv_import`, and `telegram`. The other three are HTTP Cloud Functions gen2: `sync_checker` (deployed under target name `checker`), `tldv_webhook`, and `tldv_reconciliation`. The deployment count depends on connector configuration:
+
+| TL;DV (`TLDV_API_KEY`) | Telegram credential pair | Runtime targets |
+|---|---|---:|
+| Off | Off | 3 |
+| On | Off | 6 |
+| Off | On | 4 |
+| On | On | 7 |
+
+These counts include Cloud Run services and HTTP functions only. Cloud Tasks queues and scheduled jobs are supporting infrastructure, not runtime targets. The MCP service provides remote tools and retrieval; vector sync indexes Google Docs; the TL;DV import service creates transcript documents. The checker processes Drive changes, the webhook accepts TL;DV events, reconciliation checks for missed imports, and Telegram accepts private-chat updates for the configured user allowlist.
 
 `ALLOWED_EMAIL` may contain multiple approved accounts. Those accounts share one corpus; TLBrain does not isolate data by user or tenant. Google OAuth and the server-side `GOOGLE_REFRESH_TOKEN` Drive credential keep their existing roles.
 
@@ -495,6 +514,7 @@ Drive folder association is stored in the `parent_id` payload field. The current
 | `add_fact` | Attach a fact to a transcript using `doc_id` and `text`. |
 | `list_recent_transcripts` | List recent transcripts; supports folder/date filters and `limit`/`offset`. |
 | `rename_transcript` | Rename a transcript using `doc_id` and `new_title`. |
+| `add_dialog` | Save a validated dialog through the durable MCP operation and indexing pipeline. |
  
 ### Repository Structure
  
@@ -519,7 +539,9 @@ tlbrain/
 │   ├── mcp/
 │   ├── vector_sync/
 │   ├── sync_checker/
-│   └── connectors/tldv/      # import_service, webhook, reconciliation
+│   └── connectors/
+│       ├── tldv/             # import_service, webhook, reconciliation
+│       └── telegram/         # webhook, FIFO operations, status checks, notifications
 ├── infra/
 │   ├── build/                # Runtime assembly and validation
 │   ├── deploy/
@@ -552,10 +574,10 @@ python3.12 -m venv ../.venv-test
 
 The offline test suite uses synthetic fixtures and boundaries; it does not call cloud or paid APIs.
 
-Assemble all six runtime packages from the application root with Python 3.12 (PowerShell):
+Assemble all seven manifest runtime targets from the application root with Python 3.12 (PowerShell):
 
 ```powershell
-$serviceIds = 'mcp', 'vector_sync', 'tldv_import', 'sync_checker', 'tldv_webhook', 'tldv_reconciliation'
+$serviceIds = 'mcp', 'vector_sync', 'tldv_import', 'sync_checker', 'tldv_webhook', 'tldv_reconciliation', 'telegram'
 foreach ($serviceId in $serviceIds) {
     python infra/build/assemble.py --service $serviceId --output ".build/$serviceId"
     if ($LASTEXITCODE -ne 0) { throw "Assembly failed: $serviceId" }
@@ -568,7 +590,22 @@ Optional Docker image builds (Docker is required for these local image builds an
 docker build -f infra/docker/Dockerfile.mcp -t tlbrain-mcp:2.0.1-check .
 docker build -f infra/docker/Dockerfile.vector_sync -t tlbrain-vector-sync:2.0.1-check .
 docker build -f infra/docker/Dockerfile.tldv_import -t tlbrain-tldv-import:2.0.1-check .
+docker build -f infra/docker/Dockerfile.telegram -t tlbrain-telegram:2.0.1-check .
 ```
+
+CI validates source artifacts for all seven targets. It builds and validates final images for the four ASGI targets: MCP, Vector Sync, TL;DV Import, and Telegram. Telegram image publication runs on pushes only after regression, source and image validation, and native bootstrap checks pass. The normal Telegram deploy route verifies an image digest with compile, import, and startup evidence; the local route builds and preflights the Docker image.
+
+### Optional Telegram lifecycle and route access
+
+Telegram is enabled only when both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_IDS` are nonblank. The allowed IDs are comma-separated positive decimal Telegram user IDs. A partial or blank pair fails preflight before Cloud or Docker mutations. `TLDV_API_KEY` independently enables TL;DV. `TZ` must be an IANA timezone and defaults to UTC. The Telegram webhook secret is generated and reused in Firestore; it is not an environment setting.
+
+The public `POST /telegram/webhook` route checks the generated Firestore webhook secret and accepts only private chats from the configured user allowlist. Each context processes one agent operation at a time through a durable FIFO queue. Accepted operations schedule status checks relative to acceptance at 60, 120, and 300 seconds. Failed drafts and already-created Docs are retained; recovery requires an explicit numbered retry. Source cleanup is restartable and requires proof from the completed save certificate.
+
+The internal `POST /internal/dispatch`, `/internal/status-check`, and `/internal/deliver` routes require signed task OIDC identity. `POST /internal/disable-webhook` has a separate trusted deployer OIDC identity. MCP `POST /mcp` follows its OAuth/open access mode; its `POST /internal/dialog-operations` recovery callback has its own OIDC identity.
+
+Turning Telegram off first calls the existing service's disable route and requires confirmed `deleteWebhook` before runtime bot credentials are removed. If credentials are unavailable or deletion is unconfirmed, the deploy does not claim the webhook is disabled and retains credentials. This transition does not delete pending updates, Docs, failed drafts, mappings, or operation/save-intent records. Re-enabling resumes recoverable nonterminal work from checkpoints.
+
+Core rollout is compatibility-first: deploy readers that understand both legacy and `json-string-v1` transcript formats, then compatible guards and fences. MCP's new writer readiness remains deferred until an operator confirms old workers and external I/O have drained or stopped. The new fence does not constrain an unchanged old binary. No Firestore or Qdrant migration or mass reindex is required. For rollback, keep the `json-string-v1` decoder and guard/fence enforcement while new-format Docs or managed operations remain; settle or quiesce unfinished work safely, and never replay an unknown Doc create. A pre-feature binary is not a safe generic rollback target.
  
 ### Google Doc format:
  
