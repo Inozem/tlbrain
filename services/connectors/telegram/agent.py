@@ -208,8 +208,11 @@ class TelegramAgent:
             raise ValueError("operation target does not match the routed target")
         if not isinstance(link_requested, bool) or (link_requested and name != "get_transcript"):
             raise ValueError("requested link is invalid")
-        if link_requested and isinstance(execution_context, Mapping):
-            execution_context = {**execution_context, "include_link": True}
+        if link_requested:
+            execution_context = {
+                **(execution_context if isinstance(execution_context, Mapping) else {}),
+                "include_link": True,
+            }
         executor = executor_factory(target_doc_id, delivery_id, execution_context)
         execute = getattr(executor, "execute", None)
         if not callable(execute):

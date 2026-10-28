@@ -187,6 +187,40 @@ def test_links_are_omitted_by_default_and_included_only_when_requested(monkeypat
     assert requested_result["link"] == raw["link"]
 
 
+def test_structured_transcript_link_request_survives_missing_execution_context():
+    from services.connectors.telegram.agent import TelegramAgent
+
+    class Ledger:
+        def load_turn(self, *_args):
+            return None
+
+        def save_turn(self, *_args, **_kwargs):
+            pass
+
+        def save_tool_result(self, *_args):
+            pass
+
+    received_contexts = []
+
+    class Executor:
+        def execute(self, **_kwargs):
+            return {"link": "https://docs.invalid/doc-1"}
+
+    def executor_factory(_target_doc_id, _delivery_id, context):
+        received_contexts.append(context)
+        return Executor()
+
+    agent = TelegramAgent(model=None, ledger=Ledger(), tool_executor=Executor())
+    result = agent.dispatch_tool_choice(
+        name="get_transcript", arguments={"doc_id": "doc-1"}, target_doc_id="doc-1",
+        conversation_id="conversation-1", delivery_id="delivery-1",
+        executor_factory=executor_factory, link_requested=True,
+    )
+
+    assert received_contexts == [{"include_link": True}]
+    assert result == {"link": "https://docs.invalid/doc-1"}
+
+
 def test_sync_status_preserves_reported_status_and_path(monkeypatch):
     reported = {
         "status": "synced",
