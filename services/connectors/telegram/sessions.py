@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from core.operations.registry import OPERATIONS, validate_arguments
-from services.connectors.telegram.conversations import TurnRole, build_agent_prompt
+from services.connectors.telegram.context import build_document_context
+from services.connectors.telegram.conversations import TurnRole
 
 
 _ROUTE_KINDS = frozenset({"pure_switch", "search", "substantive", "save", "retry"})
@@ -831,10 +832,6 @@ async def _process_substantive_turn(
 ) -> dict[str, Any]:
     """Append the substantive question once, skip completed replays, and run its pinned target."""
     history = repository.list_turns(context_id, conversation_id)
-    prompt_history = [
-        turn for turn in history
-        if not isinstance(turn, Mapping) or turn.get("operation_id") != operation_id
-    ]
     completed = any(
         isinstance(turn, Mapping)
         and turn.get("operation_id") == operation_id
@@ -852,7 +849,10 @@ async def _process_substantive_turn(
             "conversation_id": conversation_id,
             "dialog_number": number,
         }
-    prompt = build_agent_prompt(prompt_history, substantive_text)
+    prompt = build_document_context(
+        history, substantive_text,
+        conversation_id=conversation_id, operation_id=operation_id,
+    )
     turn_now = now or datetime.now(timezone.utc)
     turn_id = lambda role: "telegram-" + hashlib.sha256(
         f"{operation_id}:{role}".encode("utf-8")

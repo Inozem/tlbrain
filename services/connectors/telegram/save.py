@@ -14,10 +14,8 @@ from core.config import get_default_dialog_date
 from core.operations.models import OperationError
 from core.operations.retries import ConfirmedStageFailure, UnknownOutcome
 from core.dialogs.classification import FolderSelectionResult
-from services.connectors.telegram.preprocessing import (
-    context_word_capacity,
-    preprocess_messages,
-)
+from services.connectors.telegram.context import build_save_analysis_context
+from services.connectors.telegram.preprocessing import preprocess_messages
 
 
 def _get(value: Any, name: str, default: Any = None) -> Any:
@@ -289,14 +287,10 @@ class TelegramSaveWorkflow:
         if not isinstance(prepared, Sequence) or isinstance(prepared, (str, bytes)):
             raise ValueError("prepared utterances are malformed")
         prepared_rows = [_prepared_row(row) for row in prepared]
-        context = {
-            "provider": "telegram",
-            "context_id": context_id,
-            "draft_id": draft_id,
-            "dialog_date": dialog_date,
-            "messages": prepared_rows,
-            "word_capacity": context_word_capacity(len(prepared_rows)),
-        }
+        context = build_save_analysis_context(
+            prepared_rows, context_id=context_id, draft_id=draft_id,
+            dialog_date=dialog_date,
+        )
         self._stage("analysis")
         analyze = lambda: self.analyze(prepared_rows, context=context)
         if retry_governor is None or operation_lease is None:
