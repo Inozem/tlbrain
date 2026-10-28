@@ -118,7 +118,7 @@ def test_real_image_preflight_validates_runtime_cache_and_binds_evidence(
             (artifact / record["runtime_path"]).read_text(encoding="utf-8")
             for record in report["requirements_graph"]["files"]
         ).lower()
-        assert ("fastembed" in requirements) is (service in {"mcp", "vector_sync"})
+        assert ("fastembed" in requirements) is (service in {"mcp", "vector_sync", "telegram"})
         assert report["runtime_target"] == config["runtime"]["target"]
 
         class FakeDocker:

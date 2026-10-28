@@ -29,6 +29,10 @@ from urllib.parse import urlsplit
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORMS = {"windows", "macos", "linux"}
 _ARCHITECTURES = {"x86_64"}
+_SUPPORTED_PREFLIGHT_SERVICES = {
+    "mcp", "vector_sync", "tldv_import", "sync_checker", "tldv_webhook",
+    "tldv_reconciliation", "telegram",
+}
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
@@ -773,8 +777,7 @@ def _native_architecture() -> str:
 
 def run_preflight(service: str, source_root: os.PathLike[str] | str, output: os.PathLike[str] | str) -> int:
     """Assemble once, check dependencies, and validate without publishing."""
-    supported = {"mcp", "vector_sync", "tldv_import", "sync_checker", "tldv_webhook", "tldv_reconciliation"}
-    if service not in supported:
+    if service not in _SUPPORTED_PREFLIGHT_SERVICES:
         raise ValueError(f"unsupported service: {service}")
     root, artifact = _validate_preflight_paths(Path(source_root), Path(output))
     build_tools = Path(__file__).resolve().parent

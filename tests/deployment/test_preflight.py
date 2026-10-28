@@ -120,6 +120,24 @@ def test_cli_requires_explicit_paths_and_rejects_output_outside_build(tmp_path: 
         module._validate_preflight_paths(Path("relative-root"), Path("relative-output"))
 
 
+def test_preflight_supports_every_ci_source_matrix_service_and_rejects_unknown() -> None:
+    import yaml
+
+    module = _module()
+    workflow = yaml.load(
+        (APP_ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    matrix_services = set(workflow["jobs"]["source-validation"]["strategy"]["matrix"]["service"])
+    manifest = json.loads((BUILD_TOOLS / "service-manifests.json").read_text(encoding="utf-8"))
+
+    assert "telegram" in manifest["services"]
+    assert matrix_services <= module._SUPPORTED_PREFLIGHT_SERVICES
+    assert "telegram" in module._SUPPORTED_PREFLIGHT_SERVICES
+    with pytest.raises(ValueError, match="unsupported service: unknown_service"):
+        module.run_preflight("unknown_service", "relative-root", "relative-output")
+
+
 def test_preflight_assembles_once_uses_external_harness_and_gates_on_fingerprint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

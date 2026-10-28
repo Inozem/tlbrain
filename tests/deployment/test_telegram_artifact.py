@@ -81,16 +81,24 @@ def test_telegram_assembles_to_a_minimal_runtime_artifact() -> None:
 
         assert set(report["provider_roots"]) == {
             "core/integrations/cloud_tasks/requirements.txt",
+            "core/integrations/fastembed/requirements.txt",
             "core/integrations/firestore/requirements.txt",
+            "core/integrations/gemini/requirements.txt",
             "core/integrations/google_auth/requirements.txt",
+            "core/integrations/google_docs/requirements.txt",
+            "core/integrations/qdrant/requirements.txt",
         }
         requirement_paths = {
             item["runtime_path"] for item in report["requirements_graph"]["files"]
         }
         assert requirement_paths == {
             ".requirements/core/integrations/cloud_tasks/requirements.txt",
+            ".requirements/core/integrations/fastembed/requirements.txt",
             ".requirements/core/integrations/firestore/requirements.txt",
+            ".requirements/core/integrations/gemini/requirements.txt",
             ".requirements/core/integrations/google_auth/requirements.txt",
+            ".requirements/core/integrations/google_docs/requirements.txt",
+            ".requirements/core/integrations/qdrant/requirements.txt",
             ".requirements/requirements-common.txt",
             f".requirements/{REQUIREMENTS_ROOT}",
         }
