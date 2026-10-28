@@ -341,11 +341,20 @@ class _TelegramCommandMixin:
                 if not isinstance(value, str) or not value:
                     raise ValueError(f"{field} is invalid")
                 safe[field] = value
+        retry_request_operation_id = route.get("retry_request_operation_id")
+        if retry_request_operation_id is not None:
+            if kind != "retry":
+                raise ValueError("retry_request_operation_id is only valid for retry routes")
+            safe["retry_request_operation_id"] = _identifier(
+                retry_request_operation_id, "retry_request_operation_id",
+            )
         number = route.get("dialog_number")
         if number is not None:
             if type(number) is not int or number < 1:
                 raise ValueError("dialog_number is invalid")
             safe["dialog_number"] = number
+        if retry_request_operation_id is not None and number is None:
+            raise ValueError("retry work routes require a dialog_number")
         choice = route.get("tool_choice")
         if choice is not None:
             if kind != "substantive" or not isinstance(choice, Mapping) or set(choice) - {
@@ -401,6 +410,63 @@ class _TelegramCommandMixin:
             return None, None
         return command_ref, command
 
+    def _retry_work_route_is_pinned(
+        self, transaction: Any, *, context_id: str, operation_id: str,
+        operation: Mapping[str, Any], route: Mapping[str, Any],
+    ) -> bool:
+        """Validate a retry work replay against its immutable source command."""
+        request_operation_id = operation.get("retry_request_operation_id")
+        input_ref = operation.get("input_ref")
+        parts = input_ref.split("/") if isinstance(input_ref, str) else []
+        pinned = operation.get("route_control")
+        number = route.get("dialog_number")
+        if (
+            operation.get("operation_id") != operation_id
+            or not isinstance(request_operation_id, str) or not request_operation_id
+            or len(parts) != 4 or parts[:3] != [SESSIONS, context_id, "commands"]
+            or not parts[3].isdigit()
+            or route.get("kind") != "retry"
+            or route.get("status") not in {"ok", "success"}
+            or route.get("retry_request_operation_id") != request_operation_id
+            or type(number) is not int or number < 1
+            or not isinstance(pinned, Mapping) or dict(pinned) != dict(route)
+        ):
+            return False
+
+        source_ref = _document_ref(self.client, input_ref)
+        source_snapshot = source_ref.get(transaction=transaction)
+        source_command = source_snapshot.to_dict() or {} if source_snapshot.exists else {}
+        source_operation_ref = self.client.collection(SESSIONS).document(context_id).collection(
+            "operations"
+        ).document(request_operation_id)
+        source_operation_snapshot = source_operation_ref.get(transaction=transaction)
+        source_operation = (
+            source_operation_snapshot.to_dict() or {}
+            if source_operation_snapshot.exists else {}
+        )
+        receipt_ref = _document_ref(
+            self.client, f"{SESSIONS}/{context_id}/updates/{parts[3]}",
+        )
+        receipt_snapshot = receipt_ref.get(transaction=transaction)
+        receipt = receipt_snapshot.to_dict() or {} if receipt_snapshot.exists else {}
+        source_route = source_operation.get("route_control")
+        return bool(
+            source_command.get("context_id") == context_id
+            and source_command.get("operation_id") == request_operation_id
+            and source_command.get("kind") == "freeform"
+            and source_command.get("update_id") == int(parts[3])
+            and source_operation.get("operation_id") == request_operation_id
+            and source_operation.get("input_ref") == input_ref
+            and isinstance(source_route, Mapping)
+            and source_route.get("status") in {"ok", "success"}
+            and source_route.get("kind") == "retry"
+            and type(source_route.get("dialog_number")) is int
+            and source_route.get("dialog_number") == number
+            and receipt.get("accepted") is True
+            and receipt.get("context_id") == context_id
+            and receipt.get("operation_id") == request_operation_id
+        )
+
     def persist_route(
         self, operation_id: str, route: Mapping[str, Any], *, context_id: str,
         owner: str, fence: int, now: datetime,
@@ -438,7 +504,15 @@ class _TelegramCommandMixin:
                 operation_id=operation_id, operation=operation,
             )
             if command is None:
-                return False
+                existing_route = operation.get("route_control")
+                if (not isinstance(existing_route, Mapping)
+                        or not self._retry_work_route_is_pinned(
+                            transaction, context_id=context_id,
+                            operation_id=operation_id, operation=operation,
+                            route=safe_route,
+                        )):
+                    return False
+                return dict(existing_route) == safe_route
             existing_route = operation.get("route_control")
             if isinstance(existing_route, Mapping) and existing_route.get("status") in {
                 "ok", "success",

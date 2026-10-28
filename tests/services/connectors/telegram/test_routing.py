@@ -298,6 +298,33 @@ def test_unknown_explicit_number_is_not_found_without_any_target_fallback():
     assert store.get_calls == []
 
 
+def test_retry_requires_an_explicit_structured_number_and_never_resolves_last_target():
+    docs = {"doc-current": {}, "doc-last": {}}
+    context, store, model, search, notices, actions = _harness(
+        decision=_decision("retry"), docs=docs, current="doc-current",
+        last="doc-last", numbers={"doc-current": 1, "doc-last": 2},
+    )
+    missing = _call("please retry", context=context, store=store, model=model,
+                    search=search, notices=notices, actions=actions)
+    assert missing["status"] == "invalid_route"
+    assert store.get_calls == []
+    assert notices.sent == []
+
+    model.response = _decision("retry", dialog_number=2)
+    explicit = _call("please retry", context=context, store=store, model=model,
+                     search=search, notices=notices, actions=actions)
+    assert explicit == {"status": "ok", "kind": "retry", "dialog_number": 2}
+    assert store.get_calls == []
+    assert notices.sent == []
+
+    model.response = _decision("retry", dialog_number=99)
+    invalid_number = _call("please retry", context=context, store=store, model=model,
+                           search=search, notices=notices, actions=actions)
+    assert invalid_number["status"] == "ok"
+    assert invalid_number["dialog_number"] == 99
+    assert store.get_calls == []
+
+
 def test_last_target_uses_context_id_without_semantic_search():
     context, store, model, search, notices, actions = _harness(
         decision=_decision("substantive", target_ref="last", substantive_text="continue"),
@@ -511,9 +538,9 @@ def test_search_results_empty_results_and_errors_remain_search_results(
     ("save this", _decision("save", target_ref="doc-a"), "save", None),
     ("\u0441\u043e\u0445\u0440\u0430\u043d\u0438 \u044d\u0442\u043e",
      _decision("save", target_ref="doc-a"), "save", None),
-    ("please retry this", _decision("retry", target_ref="doc-a"), "retry", None),
+    ("please retry this", _decision("retry", target_ref="doc-a", dialog_number=1), "retry", None),
     ("\u043f\u043e\u0432\u0442\u043e\u0440\u0438 \u043e\u043f\u0435\u0440\u0430\u0446\u0438\u044e",
-     _decision("retry", target_ref="doc-a"), "retry", None),
+     _decision("retry", target_ref="doc-a", dialog_number=1), "retry", None),
     ("switch to another dialog", _decision("pure_switch", target_ref="doc-b"),
      "pure_switch", None),
     ("\u043f\u0435\u0440\u0435\u0439\u0434\u0438 \u043a \u0434\u0440\u0443\u0433\u043e\u043c\u0443 \u0434\u0438\u0430\u043b\u043e\u0433\u0443",

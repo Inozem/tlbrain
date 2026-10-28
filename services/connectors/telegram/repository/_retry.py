@@ -442,13 +442,16 @@ def _persist_retry(
     command_ref: Any,
     receipt_ref: Any,
     now: datetime,
+    request_operation_id: str | None = None,
+    request_ref: Any = None,
+    accepted_command_ref: str | None = None,
 ) -> TelegramIntakeResult:
     """Append queue and outbox records, then persist the retry's immutable envelope."""
     retry_manifest_ref = state.draft_ref.collection("save_manifests").document(operation_id)
     retry_manifest_path = (
         f"{SESSIONS}/{context_id}/drafts/{state.draft_id}/save_manifests/{operation_id}"
     )
-    command_path = f"{SESSIONS}/{context_id}/commands/{update_id}"
+    command_path = accepted_command_ref or f"{SESSIONS}/{context_id}/commands/{update_id}"
     command_data = {
         "update_id": update_id, "context_id": context_id, "kind": "retry",
         "dialog_number": state.dialog_number, "draft_id": state.draft_id,
@@ -456,6 +459,13 @@ def _persist_retry(
         "doc_id": state.doc_id, "manifest_digest": state.digest,
         "cutoff_message_ids": list(state.ordered_ids), "created_at": now,
     }
+    if request_operation_id is not None:
+        command_data.update({
+            "source_operation_id": request_operation_id,
+            "route_control": {"status": "ok", "kind": "retry",
+                              "dialog_number": state.dialog_number,
+                              "retry_request_operation_id": request_operation_id},
+        })
     input_digest = hashlib.sha256(json.dumps(
         command_data, sort_keys=True, separators=(",", ":"), default=str,
     ).encode()).hexdigest()
@@ -475,9 +485,15 @@ def _persist_retry(
         operation_fields={
             "draft_id": state.draft_id, "dialog_number": state.dialog_number,
             "save_intent_id": state.intent_id, "doc_id": state.doc_id,
+            **({"route_control": {"status": "ok", "kind": "retry",
+                                   "dialog_number": state.dialog_number,
+                                   "retry_request_operation_id": request_operation_id},
+                "retry_request_operation_id": request_operation_id}
+               if request_operation_id is not None else {}),
         },
     )
-    transaction.set(command_ref, command_data)
+    if request_operation_id is None:
+        transaction.set(command_ref, command_data)
     shared_ref = client.collection(OPERATIONS_COLLECTION).document(operation_id)
     transaction.set(shared_ref, _retry_operation_data(
         operation_id=operation_id, context_id=context_id, draft_id=state.draft_id,
@@ -522,7 +538,24 @@ def _persist_retry(
         "operation_id": operation_id, "queue_position": queue_operation.sequence,
         "snapshot_message_ids": list(state.ordered_ids), "created_at": now,
     }
-    transaction.set(receipt_ref, receipt)
+    if request_operation_id is None:
+        transaction.set(receipt_ref, receipt)
+    elif request_ref is not None:
+        transaction.set(request_ref, {
+            "accepted": True,
+            "request_operation_id": request_operation_id,
+            "context_id": context_id,
+            "draft_id": state.draft_id,
+            "dialog_number": state.dialog_number,
+            "message_id": None,
+            "intake_sequence": None,
+            "notification_id": None,
+            "operation_id": operation_id,
+            "outbox_id": outbox_id,
+            "queue_position": queue_operation.sequence,
+            "snapshot_message_ids": list(state.ordered_ids),
+            "created_at": now,
+        })
     return TelegramIntakeResult(
         True, context_id, state.draft_id, state.dialog_number, outbox_id=outbox_id,
         operation_id=operation_id, queue_position=queue_operation.sequence,
@@ -629,6 +662,74 @@ class _TelegramRetryMixin:
                 self.client, transaction, state=state, context_id=context_id,
                 update_id=update_id, operation_id=operation_id, outbox_id=outbox_id,
                 command_ref=command_ref, receipt_ref=receipt_ref, now=now,
+            )
+
+        return _txn(self.client.transaction(max_attempts=5))
+
+    def retry_failed_draft_for_command(
+        self,
+        context_id: str,
+        dialog_number: int,
+        *,
+        request_operation_id: str,
+        now: datetime,
+    ) -> TelegramIntakeResult:
+        """Queue one retry for an already accepted command identity.
+
+        The source Telegram update remains the queue input. Its command and
+        receipt are immutable; a separate request ledger makes redelivery
+        idempotent without inventing another Telegram update ID.
+        """
+        context_id = _identifier(context_id, "context_id")
+        dialog_number = _integer(dialog_number, "dialog_number", minimum=1)
+        request_operation_id = _identifier(request_operation_id, "request_operation_id")
+        now = _aware(now, "now")
+        identity = hashlib.sha256(
+            f"{context_id}:{request_operation_id}:{dialog_number}:retry".encode()
+        ).hexdigest()
+        operation_id = "tgretry-" + identity
+        outbox_id = "tgretrytask-" + identity
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        request_ref = _document_ref(
+            self.client,
+            f"{SESSIONS}/{context_id}/retry_requests/{request_operation_id}",
+        )
+        source_operation_ref = context_ref.collection("operations").document(request_operation_id)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> TelegramIntakeResult:
+            request_snapshot = request_ref.get(transaction=transaction)
+            if request_snapshot.exists:
+                return _receipt_result(request_snapshot.to_dict() or {}, context_id)
+            source_snapshot = source_operation_ref.get(transaction=transaction)
+            source_operation = source_snapshot.to_dict() or {} if source_snapshot.exists else {}
+            input_ref = source_operation.get("input_ref")
+            prefix = f"{SESSIONS}/{context_id}/commands/"
+            update_text = input_ref[len(prefix):] if isinstance(input_ref, str) and input_ref.startswith(prefix) else ""
+            if (source_operation.get("operation_id") != request_operation_id
+                    or not update_text.isdigit()):
+                return TelegramIntakeResult(False, context_id)
+            command_ref = _document_ref(self.client, input_ref)
+            command_snapshot = command_ref.get(transaction=transaction)
+            command = command_snapshot.to_dict() or {} if command_snapshot.exists else {}
+            if (command.get("context_id") != context_id
+                    or command.get("operation_id") != request_operation_id
+                    or command.get("kind") != "freeform"):
+                return TelegramIntakeResult(False, context_id)
+            state = _load_retry_state(
+                self.client, transaction, context_ref=context_ref, context_id=context_id,
+                dialog_ref=_document_ref(
+                    self.client, f"{SESSIONS}/{context_id}/dialogs/{dialog_number}"
+                ), dialog_number=dialog_number,
+            )
+            if state is None:
+                return TelegramIntakeResult(False, context_id)
+            return _persist_retry(
+                self.client, transaction, state=state, context_id=context_id,
+                update_id=int(update_text), operation_id=operation_id, outbox_id=outbox_id,
+                command_ref=command_ref, receipt_ref=request_ref, now=now,
+                request_operation_id=request_operation_id, request_ref=request_ref,
+                accepted_command_ref=input_ref,
             )
 
         return _txn(self.client.transaction(max_attempts=5))

@@ -25,5 +25,19 @@ class TelegramRetryService:
             context_id, dialog_number, update_id=update_id, now=now,
         )
 
+    def retry_failed_draft_for_command(
+        self,
+        context_id: str,
+        dialog_number: int,
+        *,
+        request_operation_id: str,
+        now: datetime,
+    ) -> Any:
+        """Queue one idempotent retry for an already accepted Telegram command."""
+        return self.repository.retry_failed_draft_for_command(
+            context_id, dialog_number,
+            request_operation_id=request_operation_id, now=now,
+        )
+
 
 __all__ = ["TelegramRetryService"]

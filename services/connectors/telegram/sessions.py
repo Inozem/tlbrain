@@ -88,6 +88,8 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
     if kind == "substantive":
         if not isinstance(text, str) or not text.strip():
             return None, "invalid_route"
+    if kind == "retry" and type(dialog_number) is not int:
+        return None, "invalid_route"
     return {
         "kind": kind,
         "target_ref": target_ref,
@@ -502,6 +504,10 @@ async def route_message(
             owner=owner, fence=fence, now=now,
         )
 
+    if kind == "retry":
+        return {"status": "ok", "kind": "retry",
+                "dialog_number": decision["dialog_number"]}
+
     target, failure = _resolve_route_target(
         decision, context=context, store=store, candidates=candidates,
         operation_candidates=operation_candidates,
@@ -527,6 +533,7 @@ def _control_route_record(route: Any) -> dict[str, Any]:
     for field in (
         "status", "kind", "target_doc_id", "conversation_id",
         "target_draft_id", "target_operation_id", "dependency_operation_id",
+        "retry_request_operation_id",
     ):
         value = route.get(field)
         if field == "status" and (not isinstance(value, str) or value not in allowed_statuses):
@@ -604,6 +611,9 @@ def _operation_route_status(route: Any) -> str:
         if type(route.get("confirmed")) is not bool:
             return "invalid_route"
         return "ok" if route.get("confirmed") else "unconfirmed"
+    if kind == "retry":
+        number = route.get("dialog_number")
+        return "ok" if type(number) is int and number > 0 else "invalid_route"
     if (
         not isinstance(route.get("target_doc_id"), str)
         or not route.get("target_doc_id")
@@ -646,6 +656,7 @@ class _PersistedOperationRoute:
     route_record: dict[str, Any]
     context_id: Any
     clear_candidate: Callable[..., Any] | None
+    repository: Any
 
 
 async def _invoke_operation_router(
@@ -669,9 +680,8 @@ def _persist_operation_route(
     route_record = _control_route_record(route)
     route_record["status"] = validation_status
     clear_candidate = getattr(repository, "clear_command_candidate", None)
-    context_id = None
+    context_id = getattr(context, "context_id", None)
     if callable(clear_candidate):
-        context_id = getattr(context, "context_id", None)
         if (
             not isinstance(context_id, str) or not context_id
             or not isinstance(owner, str) or not owner
@@ -690,6 +700,7 @@ def _persist_operation_route(
     return _PersistedOperationRoute(
         route=route, route_record=route_record, context_id=context_id,
         clear_candidate=clear_candidate if callable(clear_candidate) else None,
+        repository=repository,
     )
 
 
@@ -719,6 +730,12 @@ def _clear_command_candidate(
     ))
 
 
+def _is_retry_work_replay(route_record: Mapping[str, Any]) -> bool:
+    """Identify a retry work operation by its persisted source-command marker."""
+    request_operation_id = route_record.get("retry_request_operation_id")
+    return isinstance(request_operation_id, str) and bool(request_operation_id)
+
+
 def _handle_control_route(
     state: _PersistedOperationRoute, *, kind: Any, operation_id: str,
     owner: str | None, fence: int | None, now: datetime | None,
@@ -739,13 +756,36 @@ def _handle_control_route(
             return {"status": "error", "kind": "search"}
         return result
     if kind in {"save", "retry"}:
+        if kind == "save":
+            if not _clear_command_candidate(
+                state, operation_id=operation_id, owner=owner, fence=fence, now=now,
+            ):
+                return {"status": "error", "kind": kind}
+            return {"status": "ok", "kind": "save", "confirmed": True}
+        if _is_retry_work_replay(state.route_record):
+            return {"status": "ok", "kind": kind,
+                    "dialog_number": state.route_record.get("dialog_number")}
+        number = state.route_record.get("dialog_number")
+        if type(number) is not int or number < 1:
+            return {"status": "invalid_route", "kind": kind}
+        from services.connectors.telegram.retry import TelegramRetryService
+
+        result = TelegramRetryService(state.repository).retry_failed_draft_for_command(
+            state.context_id, number, request_operation_id=operation_id, now=now,
+        )
+        if not getattr(result, "accepted", False):
+            if not _clear_command_candidate(
+                state, operation_id=operation_id, owner=owner, fence=fence, now=now,
+            ):
+                return {"status": "error", "kind": kind}
+            return {"status": "not_found", "kind": kind,
+                    "dialog_number": number}
         if not _clear_command_candidate(
             state, operation_id=operation_id, owner=owner, fence=fence, now=now,
         ):
             return {"status": "error", "kind": kind}
-        if kind == "save":
-            return {"status": "ok", "kind": "save", "confirmed": True}
-        return {"status": "ok", "kind": kind}
+        return {"status": "ok", "kind": kind, "dialog_number": number,
+                "retry_operation_id": getattr(result, "operation_id", None)}
     return None
 
 

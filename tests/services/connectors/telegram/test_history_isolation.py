@@ -6,6 +6,7 @@ import asyncio
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,6 +43,9 @@ class _Repository:
         self.search_index = {"doc-old": ["old-index"], "doc-target": ["target-index"]}
         self.route_records = {}
         self.writes = []
+        self.retry_requests = []
+        self.retry_accepted = True
+        self.retry_operations = []
 
     def snapshot(self):
         return deepcopy((self.selection, self.conversations, self.docs, self.search_index))
@@ -52,6 +56,15 @@ class _Repository:
     def persist_route(self, operation_id, route):
         self.route_records[operation_id] = deepcopy(route)
         self.writes.append(("route", operation_id, deepcopy(route)))
+
+    def retry_failed_draft_for_command(
+        self, context_id, dialog_number, *, request_operation_id, now,
+    ):
+        self.retry_requests.append((context_id, dialog_number, request_operation_id))
+        if not self.retry_accepted:
+            return SimpleNamespace(accepted=False, operation_id=None)
+        self.retry_operations.append("retry-operation")
+        return SimpleNamespace(accepted=True, operation_id="retry-operation")
 
     def list_turns(self, context_id, conversation_id):
         assert context_id == self.context_id
@@ -533,6 +546,74 @@ def test_non_conversation_routes_pass_through_without_turns(route):
     assert notifications.attempts == []
     assert agent.prompts == []
     assert "control command" not in repr(repository.route_records["op-control"])
+
+
+def test_retry_route_uses_exact_number_and_command_identity_and_retry_work_replay_does_not_enqueue():
+    context, repository, router, agent, notifications, queue = _harness({
+        "kind": "retry", "dialog_number": 7,
+    })
+    before = deepcopy(repository.conversations)
+    selection_before = deepcopy(repository.selection)
+
+    result = _call(
+        "accepted-command-operation", context, repository, router, agent,
+        notifications, queue, "raw retry request",
+    )
+
+    assert result == {
+        "status": "ok", "kind": "retry", "dialog_number": 7,
+        "retry_operation_id": "retry-operation",
+    }
+    assert repository.retry_requests == [
+        (context.context_id, 7, "accepted-command-operation"),
+    ]
+    assert repository.conversations == before
+    assert repository.selection == selection_before
+
+
+def test_rejected_numbered_retry_clears_candidate_without_registering_retry_operation():
+    context, base, router, agent, notifications, queue = _harness({
+        "kind": "retry", "dialog_number": 99,
+    })
+    repository = _EnvelopeRepository(context, base.conversations, base.events)
+    repository.retry_accepted = False
+    router.repository = repository
+
+    result = _process(
+        operation_id="accepted-command-operation", context=context,
+        text="raw retry request", repository=repository, router=router,
+        agent=agent, notifications=notifications, queue=queue,
+        owner="worker", fence=3, now=datetime.now().astimezone(),
+    )
+
+    assert result == {"status": "not_found", "kind": "retry", "dialog_number": 99}
+    assert repository.retry_requests == [
+        (context.context_id, 99, "accepted-command-operation"),
+    ]
+    assert repository.retry_operations == []
+    assert ("candidate_cleared", "accepted-command-operation") in repository.events
+    assert repository.conversations == base.conversations
+    assert repository.selection == base.selection
+    assert agent.prompts == []
+    assert notifications.attempts == []
+
+    replay = _route("retry")
+    replay.update({
+        "status": "ok", "retry_request_operation_id": "accepted-command-operation",
+    })
+    context, repository, router, agent, notifications, queue = _harness(replay)
+    before = deepcopy(repository.conversations)
+    selection_before = deepcopy(repository.selection)
+    replay_result = _call(
+        "retry-work-operation", context, repository, router, agent,
+        notifications, queue, "retry operation replay",
+    )
+
+    assert replay_result["status"] == "ok"
+    assert replay_result["kind"] == "retry"
+    assert repository.retry_requests == []
+    assert repository.conversations == before
+    assert repository.selection == selection_before
 
 
 def test_successful_save_route_records_draft_target_without_command_text():

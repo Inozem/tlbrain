@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from core.integrations.firestore.operation_queue import (
 from core.operations.models import OperationOrigin, OperationState
 from core.operations.retries import RetryBudgetExceeded, RetryGovernor
 from services.connectors.telegram.commands import parse_command
-from services.connectors.telegram.models import PreparedUtterance
+from services.connectors.telegram.models import PreparedUtterance, TelegramContext
 from services.connectors.telegram.repository import SESSIONS, TelegramRepository
 from services.connectors.telegram.save import TelegramCompletionCertificate
 
@@ -257,6 +258,109 @@ def test_manual_retry_replay_for_same_update_adds_no_records(firestore_fake):
     assert replay == first
     assert set(firestore_fake.documents) == paths_after_first
     assert firestore_fake.documents == documents_after_first
+
+
+def test_retry_from_accepted_command_uses_command_identity_and_preserves_input(firestore_fake):
+    repository, client, context_id, _draft_id, _old_operation_id, _intent_id = (
+        _seed_failed_draft(firestore_fake)
+    )
+    accepted = repository.accept_command(
+        1900, chat_id=42, thread_id=11, user_id=7,
+        command=parse_command("retry this dialog"), now=NOW,
+    )
+    command_path = f"{SESSIONS}/{context_id}/commands/1900"
+    command_ref = _document(client, command_path)
+    command_before = command_ref.get().to_dict()
+
+    first = repository.retry_failed_draft_for_command(
+        context_id, 1, request_operation_id=accepted.operation_id, now=NOW,
+    )
+    replay = repository.retry_failed_draft_for_command(
+        context_id, 1, request_operation_id=accepted.operation_id, now=NOW,
+    )
+
+    assert first.accepted is True
+    assert replay == first
+    assert first.operation_id != accepted.operation_id
+    assert command_ref.get().to_dict() == command_before
+    queued = get_queued_operation(
+        client.collection(SESSIONS).document(context_id), first.operation_id,
+    )
+    assert queued is not None
+    assert queued.input_ref == command_path
+    retry_data = client.collection(SESSIONS).document(context_id).collection(
+        "operations"
+    ).document(first.operation_id).get().to_dict()
+    assert retry_data["route_control"] == {
+        "status": "ok", "kind": "retry", "dialog_number": 1,
+        "retry_request_operation_id": accepted.operation_id,
+    }
+    assert retry_data["retry_request_operation_id"] == accepted.operation_id
+
+
+def test_retry_work_replay_persists_its_pinned_route_with_real_repository(firestore_fake):
+    from services.connectors.telegram.sessions import process_operation
+
+    repository, client, context_id, _draft_id, _old_operation_id, _intent_id = (
+        _seed_failed_draft(firestore_fake)
+    )
+    accepted = repository.accept_command(
+        1901, chat_id=42, thread_id=11, user_id=7,
+        command=parse_command("please retry dialog"), now=NOW,
+    )
+    context_ref = client.collection(SESSIONS).document(context_id)
+    source_lease = claim_head(client, context_ref, owner="retry-request", now=NOW)
+    assert source_lease is not None and source_lease.operation_id == accepted.operation_id
+    context = TelegramContext(chat_id=42, thread_id=11)
+
+    async def source_router(*, operation_id, **_kwargs):
+        assert operation_id == accepted.operation_id
+        return {"kind": "retry", "dialog_number": 1}
+
+    accepted_result = asyncio.run(process_operation(
+        operation_id=accepted.operation_id, context=context,
+        text="please retry dialog", repository=repository, router=source_router,
+        agent=lambda **_kwargs: "unused", notifications=SimpleNamespace(),
+        owner=source_lease.owner, fence=source_lease.fence, now=NOW,
+    ))
+    assert accepted_result["status"] == "ok"
+    retry_operation_id = accepted_result["retry_operation_id"]
+    assert complete_head(
+        client, context_ref, operation_id=accepted.operation_id,
+        owner=source_lease.owner, fence=source_lease.fence, now=NOW,
+    )
+
+    retry_lease = claim_head(client, context_ref, owner="retry-work", now=NOW)
+    assert retry_lease is not None and retry_lease.operation_id == retry_operation_id
+
+    model_calls = []
+
+    async def underlying_model_router(**kwargs):
+        model_calls.append(kwargs)
+        raise AssertionError("a pinned retry-work route must bypass the model")
+
+    async def production_replay_router(*, operation_id, **kwargs):
+        pinned = repository.get_route_control(context_id, operation_id)
+        if pinned is not None:
+            return pinned
+        return await underlying_model_router(operation_id=operation_id, **kwargs)
+
+    replay_result = asyncio.run(process_operation(
+        operation_id=retry_operation_id, context=context,
+        text="please retry dialog", repository=repository, router=production_replay_router,
+        agent=lambda **_kwargs: "unused", notifications=SimpleNamespace(),
+        owner=retry_lease.owner, fence=retry_lease.fence, now=NOW,
+    ))
+    assert replay_result["status"] == "ok"
+    assert replay_result["kind"] == "retry"
+    assert model_calls == []
+    retry_operation = client.collection(SESSIONS).document(context_id).collection(
+        "operations"
+    ).document(retry_operation_id).get().to_dict()
+    assert retry_operation["route_control"] == {
+        "status": "ok", "kind": "retry", "dialog_number": 1,
+        "retry_request_operation_id": accepted.operation_id,
+    }
 
 
 def test_unknown_dialog_retry_allocates_no_operation_or_outbox_and_preserves_selection(

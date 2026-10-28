@@ -254,6 +254,20 @@ class TelegramQueueWorker:
             return await self.processor(context_id, operation, lease, **kwargs)
         return await self.processor(context_id, operation, lease)
 
+    @staticmethod
+    def _is_retry_work_operation(operation_data: Mapping[str, Any]) -> bool:
+        """Recognize a pinned retry work item that reuses its source input ref."""
+        route = operation_data.get("route_control")
+        return (
+            isinstance(route, Mapping)
+            and route.get("status") in {"ok", "success"}
+            and route.get("kind") == "retry"
+            and type(route.get("dialog_number")) is int
+            and route["dialog_number"] > 0
+            and isinstance(operation_data.get("retry_request_operation_id"), str)
+            and bool(operation_data["retry_request_operation_id"])
+        )
+
     def _load_command_candidate(self, context_id: str, operation: Any) -> TelegramCommand | None:
         """Load the accepted command, or signal that a pinned routed replay is needed."""
         operation_id = getattr(operation, "operation_id", None)
@@ -268,9 +282,19 @@ class TelegramQueueWorker:
             raise ValueError("queued command input reference is invalid")
         snapshot = _document_ref(self.client, input_ref).get()
         command_data = snapshot.to_dict() or {} if snapshot.exists else {}
-        if (command_data.get("context_id") != context_id
-                or command_data.get("operation_id") != operation_id
-                or command_data.get("kind") != "freeform"):
+        if command_data.get("context_id") != context_id:
+            raise ValueError("queued command candidate is unavailable")
+        if command_data.get("operation_id") != operation_id:
+            operation_ref = self.client.collection(SESSIONS).document(context_id).collection(
+                "operations"
+            ).document(operation_id)
+            operation_snapshot = operation_ref.get()
+            operation_data = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
+            if (command_data.get("kind") != "freeform"
+                    or not self._is_retry_work_operation(operation_data)):
+                raise ValueError("queued command candidate is unavailable")
+            return None
+        if command_data.get("kind") != "freeform":
             raise ValueError("queued command candidate is unavailable")
         candidate = command_data.get("candidate")
         if candidate is None:
