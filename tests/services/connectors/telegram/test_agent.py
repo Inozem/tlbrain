@@ -7,6 +7,7 @@ inside helpers so this module can be collected while those modules are absent.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 from copy import deepcopy
 from types import SimpleNamespace
@@ -229,8 +230,10 @@ class FakeLedger:
         return deepcopy(self.turns.get((conversation_id, delivery_id)))
 
     def save_turn(self, conversation_id, delivery_id, *, model_response, tool_calls):
+        previous = self.turns.get((conversation_id, delivery_id), {})
         record = {"model_response": deepcopy(model_response),
-                  "tool_calls": deepcopy(tool_calls), "tool_results": {}}
+                  "tool_calls": deepcopy(tool_calls),
+                  "tool_results": deepcopy(previous.get("tool_results", {}))}
         self.turns[(conversation_id, delivery_id)] = record
         self.events.append(("save_turn", deepcopy(record)))
         return deepcopy(record)
@@ -276,7 +279,10 @@ class SequenceModel:
         self.calls.append({"contents": deepcopy(contents), "mode": mode})
         if not self.responses:
             raise AssertionError("unexpected model round")
-        return deepcopy(self.responses.pop(0))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return deepcopy(response)
 
 
 def _tool_call(call_id="call-1", name="query", arguments=None):
@@ -310,11 +316,12 @@ def test_model_response_and_ordered_validated_calls_are_persisted_before_mutatio
                            _tool_call("b", arguments={"query": "second"})]}
     ledger = FakeLedger()
     executor = FakeExecutor()
-    agent = _agent(model=SequenceModel([response]), ledger=ledger, executor=executor)
+    agent = _agent(model=SequenceModel([response, {"parts": [], "text": "synthetic answer"}]),
+                   ledger=ledger, executor=executor)
 
     _run(agent)
 
-    saved = ledger.turns[("conversation-1", "delivery-1")]
+    saved = next(event[1] for event in ledger.events if event[0] == "save_turn")
     assert saved["model_response"] == response
     assert [call["id"] for call in saved["tool_calls"]] == ["a", "b"]
     assert [call["ordinal"] for call in saved["tool_calls"]] == [0, 1]
@@ -328,22 +335,34 @@ def test_model_response_and_ordered_validated_calls_are_persisted_before_mutatio
 def test_duplicate_delivery_reuses_persisted_results_without_repeating_tool_effects():
     ledger = FakeLedger()
     executor = FakeExecutor()
-    model = SequenceModel([{"parts": [_tool_call()]}])
+    model = SequenceModel([
+        {"parts": [_tool_call()], "usage_metadata": {
+            "prompt_token_count": 10, "candidates_token_count": 1, "total_token_count": 11,
+        }},
+        {"parts": [], "text": "synthetic answer", "usage_metadata": {
+            "prompt_token_count": 20, "candidates_token_count": 2, "total_token_count": 22,
+        }},
+    ])
     agent = _agent(model=model, ledger=ledger, executor=executor)
 
     first = _run(agent)
     second = _run(agent)
 
     assert len(executor.calls) == 1
-    assert len(model.calls) == 1
+    assert len(model.calls) == 2
     assert second == first
+    assert first["usage"] == {
+        "prompt_token_count": 30,
+        "candidates_token_count": 3,
+        "total_token_count": 33,
+    }
     assert ledger.turns[("conversation-1", "delivery-1")]["tool_results"][0] == first["tool_results"][0]
 
 
 def test_tool_retry_uses_same_persisted_ordinal_and_does_not_repeat_effect():
     ledger = FakeLedger()
     executor = FakeExecutor(fail_first=True)
-    model = SequenceModel([{"parts": [_tool_call()]}])
+    model = SequenceModel([{"parts": [_tool_call()]}, {"parts": [], "text": "synthetic answer"}])
     agent = _agent(model=model, ledger=ledger, executor=executor)
 
     with pytest.raises(RuntimeError, match="synthetic response lost"):
@@ -352,8 +371,55 @@ def test_tool_retry_uses_same_persisted_ordinal_and_does_not_repeat_effect():
 
     assert [call[2] for call in executor.calls] == [0, 0]
     assert executor.effects == [("query", 0)]
-    assert len(model.calls) == 1
+    assert len(model.calls) == 2
     assert retried["tool_results"][0]["ordinal"] == 0
+
+
+def test_restart_rebuilds_multiple_persisted_tool_rounds_without_repeating_results():
+    ledger = FakeLedger()
+    executor = FakeExecutor()
+    first_model = SequenceModel([
+        {"parts": [_tool_call("first-id", arguments={"query": "first"})]},
+        {"parts": [_tool_call("second-id", arguments={"query": "second"})]},
+        RuntimeError("synthetic process restart"),
+    ])
+    first_agent = _agent(model=first_model, ledger=ledger, executor=executor)
+
+    with pytest.raises(RuntimeError, match="synthetic process restart"):
+        _run(first_agent)
+
+    restarted_model = SequenceModel([{"parts": [], "text": "answer after restart"}])
+    restarted_agent = _agent(model=restarted_model, ledger=ledger, executor=executor)
+    result = _run(restarted_agent)
+
+    assert result["answer"] == "answer after restart"
+    assert executor.effects == [("query", 0), ("query", 1)]
+    assert [call[2] for call in executor.calls] == [0, 1]
+    request = restarted_model.calls[0]["contents"]
+    assert [item["role"] for item in request] == ["user", "model", "user", "model", "user"]
+    assert request[1]["parts"][0]["id"] == "first-id"
+    assert request[1]["parts"][0]["thought_signature"] == "opaque-loop-signature"
+    assert _field(_field(request[2]["parts"][0], "function_response"), "id") == "first-id"
+    assert request[3]["parts"][0]["id"] == "second-id"
+    assert request[3]["parts"][0]["thought_signature"] == "opaque-loop-signature"
+    assert _field(_field(request[4]["parts"][0], "function_response"), "id") == "second-id"
+
+
+def test_sdk_model_response_is_json_safe_when_persisted():
+    ledger = FakeLedger()
+    response = _response(_function_call("sdk-id", signature="sdk-signature"))
+    model = SequenceModel([response, _response(SimpleNamespace(text="SDK answer"),
+                                               usage={"prompt_token_count": 7}, text="SDK answer")])
+    agent = _agent(model=model, ledger=ledger)
+
+    result = _run(agent)
+    saved = next(event[1]["model_response"] for event in ledger.events if event[0] == "save_turn")
+
+    assert result["answer"] == "SDK answer"
+    assert isinstance(saved, dict)
+    assert saved["candidates"][0]["content"]["parts"][0]["id"] == "sdk-id"
+    assert saved["candidates"][0]["content"]["parts"][0]["thought_signature"] == "sdk-signature"
+    json.dumps(saved)
 
 
 def test_sixteen_round_limit_fails_visibly_and_preserves_original_history():
