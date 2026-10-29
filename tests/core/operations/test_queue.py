@@ -217,4 +217,3 @@ def test_concurrent_claims_issue_exactly_one_live_lease(firestore_fake):
 
     assert sum(lease is not None for lease in leases) == 1
     assert context.get().to_dict()["active_operation_id"] == "op-a"
-

@@ -505,4 +505,3 @@ class _TelegramDraftMixin:
             return number
 
         return _txn(self.client.transaction(max_attempts=5))
-

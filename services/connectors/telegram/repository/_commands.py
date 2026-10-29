@@ -745,4 +745,3 @@ class _TelegramCommandMixin:
             )
 
         return _txn(self.client.transaction(max_attempts=5))
-

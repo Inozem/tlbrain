@@ -224,4 +224,3 @@ class TelegramClient:
             segment not in ("", ".", "..") and _FILE_PATH_SEGMENT.fullmatch(segment)
             for segment in segments
         )
-

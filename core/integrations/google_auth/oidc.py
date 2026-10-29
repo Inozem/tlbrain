@@ -51,4 +51,3 @@ def verify_google_id_token(token: str | None) -> OIDCIdentity | None:
     if claims.get("email_verified") is not True or not isinstance(email, str):
         return None
     return OIDCIdentity(email=email, authorized=email == expected_email)
-

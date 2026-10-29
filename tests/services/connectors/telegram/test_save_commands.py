@@ -333,4 +333,3 @@ def test_matching_legacy_seal_binds_missing_route_without_rewriting_progress(fir
     assert operation["route_result"] == {"kind": "save", "target_draft_id": draft_id}
     assert operation["target_doc_id"] == "existing-doc"
     assert context_ref.get().to_dict()["pending_save_operation_id"] == lease.operation_id
-

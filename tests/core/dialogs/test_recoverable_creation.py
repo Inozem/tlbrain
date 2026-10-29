@@ -565,4 +565,3 @@ def test_unresolved_docs_insert_response_remains_unknown_without_retry(sdk_fakes
     assert result.state == "fill_outcome_unknown"
     operations = [event["operation"] for event in sdk_fakes.trace if event["operation"] != "build"]
     assert operations == ["documents.get", "documents.batchUpdate", "documents.get"]
-

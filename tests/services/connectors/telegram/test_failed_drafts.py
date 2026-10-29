@@ -560,4 +560,3 @@ def test_old_retry_completion_cannot_replace_a_newer_collecting_draft(firestore_
     assert repository.get_draft(context_id, old_draft_id)["dialog_number"] == 1
     assert repository.get_draft(context_id, newer.draft_id)["state"] == "collecting"
     assert repository.list_messages(context_id, newer.draft_id) == newer_messages
-

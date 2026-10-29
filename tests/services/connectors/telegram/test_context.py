@@ -86,5 +86,3 @@ def test_document_context_uses_selected_history_and_keeps_permitted_tool_shape()
         "request": "current substantive question",
     }
     assert history == original
-
-

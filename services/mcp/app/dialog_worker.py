@@ -124,4 +124,3 @@ def process_dialog_operation(client, payload: object) -> RecoveryResult:
             )
         except Exception:
             pass
-

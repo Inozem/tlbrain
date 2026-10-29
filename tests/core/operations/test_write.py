@@ -590,4 +590,3 @@ def test_fact_embedding_expiry_stops_before_qdrant_upsert(
                 if event["boundary"] == "gemini" and event["operation"] == "embed_content"]) == 1
     assert not [event for event in sdk_fakes.trace
                 if event["boundary"] == "qdrant" and event["operation"] == "upsert"]
-

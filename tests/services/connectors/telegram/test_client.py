@@ -186,4 +186,3 @@ def test_redirect_is_not_followed_and_error_does_not_expose_location_url():
     assert len(requests) == 1
     assert caught.value.category == "provider_error"
     assert "evil.test" not in str(caught.value)
-

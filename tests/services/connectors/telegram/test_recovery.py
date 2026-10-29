@@ -1245,4 +1245,3 @@ def test_stage_retry_store_updates_stage_without_rewriting_context_queue_documen
     assert result == {"title": "synthetic"}
     assert context_ref.get().to_dict() == before
     assert governor.get_stage(accepted.operation_id, "telegram.analysis").result == result
-

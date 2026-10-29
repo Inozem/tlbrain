@@ -424,4 +424,3 @@ def test_disable_webhook_response_and_logs_do_not_expose_provider_exception_deta
     assert bot_token not in response.text + caplog.text
     assert "api.telegram.org" not in response.text + caplog.text
     assert raw_provider_detail not in response.text + caplog.text
-

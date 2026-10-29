@@ -514,4 +514,3 @@ def test_firestore_index_helper_adds_declared_indexes_and_exemptions_idempotentl
     trace = " ".join(" ".join(event) for event in events)
     assert "delete" not in trace and "clear" not in trace and "indexes import" not in trace
     assert "ALREADY_EXISTS" not in result.stderr
-

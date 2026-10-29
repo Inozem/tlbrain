@@ -34,4 +34,3 @@ while IFS=$'\t' read -r collection_group field_path; do
   field_path=${field_path%$'\r'}
   gcloud firestore indexes fields update "${field_path}" --project "${PROJECT_ID}" --database='(default)' --collection-group="${collection_group}" --disable-indexes
 done <<< "${EXEMPTION_ROWS}"
-

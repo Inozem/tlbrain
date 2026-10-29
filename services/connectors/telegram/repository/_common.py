@@ -278,4 +278,3 @@ def _receipt_result(saved: Mapping[str, Any], context_id: str) -> "TelegramIntak
         saved.get("operation_id"), saved.get("queue_position"),
         tuple(saved.get("snapshot_message_ids", ())),
     )
-

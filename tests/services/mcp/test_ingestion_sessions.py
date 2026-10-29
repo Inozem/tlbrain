@@ -347,4 +347,3 @@ def test_distinct_sessions_with_same_request_id_create_independent_operations(
     second = _payload(_call("session-independent", _dialog(), second_session))
     assert first["operation_id"] != second["operation_id"]
     assert first["doc_id"] != second["doc_id"]
-

@@ -481,4 +481,3 @@ class _TelegramNotificationMixin:
                 transaction.set(linkage.save_ref, linkage.save_operation)
         transaction.set(state.context_ref, context)
         return action
-

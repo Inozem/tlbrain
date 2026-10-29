@@ -478,4 +478,3 @@ class _TelegramIntakeMixin:
         context_id = _identifier(context_id, "context_id")
         snapshot = self.client.collection(SESSIONS).document(context_id).get()
         return snapshot.to_dict() if snapshot.exists else None
-
