@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_deploy_routes import _bash, _run_route
+from test_deploy_routes import _bash, _bash_path, _run_route
 
 
 TOP_ROUTES = ("deploy.sh", "local_deploy.sh")
@@ -400,25 +401,60 @@ def _run_deploy_helper(tmp_path: Path, helper: str, *args: str, **overrides: str
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "\"$ROUTE_PYTHON\" -c 'import json,os,sys; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps(sys.argv[1:])+\"\\n\")' \"$@\"\n"
         "case \"$*\" in\n"
+        "  *'firestore indexes composite list'*) \"$ROUTE_PYTHON\" -c 'import json,os; log=[json.loads(x) for x in open(os.environ[\"ROUTE_EVENT_LOG\"],encoding=\"utf-8\")]; data=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); done=any(x[:4]==[\"firestore\",\"indexes\",\"composite\",\"create\"] for x in log); print(json.dumps([dict(i,name=\"projects/example-project/databases/(default)/collectionGroups/\"+i[\"collectionGroup\"]+\"/indexes/fake\",state=\"READY\") for i in data[\"indexes\"]] if done else []))' ;;\n"
+        "  *'firestore indexes fields list'*) \"$ROUTE_PYTHON\" -c 'import json,os,sys; log=[json.loads(x) for x in open(os.environ[\"ROUTE_EVENT_LOG\"],encoding=\"utf-8\")]; data=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); group=next(x.split(\"=\",1)[1] for x in sys.argv[1:] if x.startswith(\"--collection-group=\")); done=any(x[:4]==[\"firestore\",\"indexes\",\"fields\",\"update\"] for x in log); rows=[o for o in data[\"fieldOverrides\"] if o[\"collectionGroup\"]==group and o[\"indexes\"]==[]]; print(json.dumps([dict(name=\"projects/example-project/databases/(default)/collectionGroups/\"+o[\"collectionGroup\"]+\"/fields/\"+o[\"fieldPath\"],indexConfig={\"indexes\":[],\"usesAncestorConfig\":False}) for o in rows] if done else []))' \"$@\" ;;\n"
+        "  *'firestore operations list'*) \"$ROUTE_PYTHON\" -c 'import json,os; log=[json.loads(x) for x in open(os.environ[\"ROUTE_EVENT_LOG\"],encoding=\"utf-8\")]; done=any(x[:4] in ([\"firestore\",\"indexes\",\"composite\",\"create\"],[\"firestore\",\"indexes\",\"fields\",\"update\"]) for x in log); print(json.dumps([dict(name=\"operations/index-async\",done=True,metadata={\"state\":\"SUCCESSFUL\"})] if done else []))' ;;\n"
+        "  *'firestore operations describe'*) echo '{\"name\":\"operations/index-async\",\"done\":true,\"metadata\":{\"state\":\"SUCCESSFUL\"}}' ;;\n"
         "  *'run services describe'*) echo \"${FAKE_RUNTIME_SERVICE_ACCOUNT-mcp-runtime@example-project.iam.gserviceaccount.com}\" ;;\n"
         "  *'projects describe'*) echo '123456789' ;;\n"
         "  *'iam service-accounts describe'*) echo 'NOT_FOUND: service account missing' >&2; exit 1 ;;\n"
         "  *'tasks queues describe'*) if [[ \"${FAKE_QUEUE_EXISTS:-0}\" == 1 ]]; then exit 0; else echo 'NOT_FOUND: queue missing' >&2; exit 1; fi ;;\n"
         "  *'firestore indexes composite create'*'FAKE_INDEX_ERROR=1'*) echo 'PERMISSION_DENIED' >&2; exit 1 ;;\n"
-        "  *'firestore indexes composite create'*) echo 'ALREADY_EXISTS: index already exists' >&2; exit 1 ;;\n"
+        "  *'firestore indexes composite create'*) echo '{\"name\":\"operations/index-async\"}' ;;\n"
+        "  *'firestore indexes fields update'*) echo '{\"name\":\"operations/index-async\"}' ;;\n"
         "esac\n",
         encoding="utf-8",
     )
     fake_gcloud.chmod(0o755)
+    fake_gcloud_executable = fake_gcloud
+    if os.name == "nt":
+        cmd_shim = bin_dir / "gcloud.cmd"
+        cmd_shim.write_text(
+            f'@echo off\r\n"{_bash()}" "{fake_gcloud}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="utf-8",
+        )
+    safe_path = (
+        (str(bin_dir), str(Path(sys.executable).parent), "C:/Program Files/Git/bin",
+         "C:/Program Files/Git/usr/bin", str(Path(os.environ.get("SYSTEMROOT", "C:/Windows")) / "System32"))
+        if os.name == "nt" else
+        (str(bin_dir), str(Path(sys.executable).parent), "/usr/bin", "/bin")
+    )
     environment = {
         **{name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT") if name in os.environ},
-        "PATH": os.pathsep.join((str(bin_dir), str(Path(sys.executable).parent), os.environ.get("PATH", ""))),
+        "PATH": os.pathsep.join(safe_path),
         "ROUTE_PYTHON": sys.executable,
+        "PYTHON": sys.executable,
         "ROUTE_EVENT_LOG": str(log),
+        "ROUTE_GCLOUD_EXECUTABLE": str(fake_gcloud_executable),
+        "BASH_ENV": str(bin_dir / "fake-gcloud-hook.sh"),
+        "CLOUDSDK_CONFIG": str(tmp_path / "cloudsdk-config"),
+        "ROUTE_INDEX_FILE": str(Path(__file__).resolve().parents[2] / "infra" / "firestore" / "indexes.json"),
         "PROJECT_ID": "example-project",
         "REGION": "europe-west1",
         **overrides,
     }
+    (bin_dir / "fake-gcloud-hook.sh").write_text(
+        "if [[ -z \"${ROUTE_GCLOUD_GUARD_CHECKED:-}\" ]]; then\n"
+        "  resolved=\"$(PATH=\"${ROUTE_GCLOUD_BASH_PATH}:/usr/bin:/bin\" command -v gcloud)\"\n"
+        "  case \"$resolved\" in */gcloud|*/gcloud.cmd) ;; *) exit 96 ;; esac\n"
+        "  export ROUTE_GCLOUD_GUARD_CHECKED=1\n"
+        "fi\n"
+        "gcloud() { \"$ROUTE_GCLOUD_EXECUTABLE\" \"$@\"; }\n",
+        encoding="utf-8",
+    )
+    environment["ROUTE_GCLOUD_BASH_PATH"] = _bash_path(bin_dir)
+    expected_gcloud = bin_dir / ("gcloud.cmd" if os.name == "nt" else "gcloud")
+    assert Path(shutil.which("gcloud", path=environment["PATH"]) or "").resolve() == expected_gcloud.resolve()
     script = Path(__file__).resolve().parents[2] / "infra" / "deploy" / "core" / "helpers" / helper
     result = subprocess.run([bash, str(script), *args], cwd=script.parents[4], env=environment,
                             text=True, capture_output=True, check=False, timeout=30)
@@ -431,7 +467,8 @@ def test_dialog_operations_helper_uses_confirmed_url_and_scoped_iam(tmp_path: Pa
     result, events = _run_deploy_helper(tmp_path, "deploy_dialog_operations.sh", base_url)
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     output = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-    task_invoker = "tlbrain-dialog-operations-invoker@example-project.iam.gserviceaccount.com"
+    task_invoker_account_id = "tlbrain-dialog-ops-invoker"
+    task_invoker = f"{task_invoker_account_id}@example-project.iam.gserviceaccount.com"
     runtime = "mcp-runtime@example-project.iam.gserviceaccount.com"
     assert output == {
         "INTERNAL_DIALOG_OPERATIONS_URL": base_url + "/internal/dialog-operations",
@@ -445,7 +482,13 @@ def test_dialog_operations_helper_uses_confirmed_url_and_scoped_iam(tmp_path: Pa
     assert "--max-concurrent-dispatches=2" in queue
     assert "--location" in queue and queue[queue.index("--location") + 1] == "europe-west1"
     assert any(event[:3] == ["tasks", "queues", "describe"] for event in events)
-    assert any(event[:4] == ["iam", "service-accounts", "create", "tlbrain-dialog-operations-invoker"] for event in events)
+    created_accounts = [
+        event[3] for event in events
+        if event[:3] == ["iam", "service-accounts", "create"]
+    ]
+    assert created_accounts == [task_invoker_account_id]
+    assert all(6 <= len(account_id) <= 30 for account_id in created_accounts)
+    assert all(re.fullmatch(r"[a-z][a-z0-9-]*[a-z0-9]", account_id) for account_id in created_accounts)
 
     bindings = [event for event in events if "add-iam-policy-binding" in event]
     role_bindings = {
@@ -463,6 +506,38 @@ def test_dialog_operations_helper_uses_confirmed_url_and_scoped_iam(tmp_path: Pa
     assert "roles/owner" not in trace and "roles/editor" not in trace
     assert "roles/cloudtasks.admin" not in trace and "roles/datastore.owner" not in trace
     assert not any("remove-iam-policy-binding" in event or "set-iam-policy" in event for event in events)
+
+
+def test_dialog_operations_task_invoker_account_id_override_is_used_consistently(tmp_path: Path) -> None:
+    account_id = "custom-dialog-ops-7"
+    email = f"{account_id}@example-project.iam.gserviceaccount.com"
+    result, events = _run_deploy_helper(
+        tmp_path,
+        "deploy_dialog_operations.sh",
+        "https://synthetic-mcp-uc.a.run.app",
+        DIALOG_OPERATIONS_TASK_INVOKER_ACCOUNT_ID=account_id,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    output = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    assert output["CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL"] == email
+    assert output["OIDC_SERVICE_ACCOUNT_EMAIL"] == email
+
+    created_accounts = [
+        event[3] for event in events
+        if event[:3] == ["iam", "service-accounts", "create"]
+    ]
+    assert created_accounts == [account_id]
+    bindings = [event for event in events if "add-iam-policy-binding" in event]
+    assert any(
+        event[:3] == ["run", "services", "add-iam-policy-binding"]
+        and f"--member=serviceAccount:{email}" in event
+        for event in bindings
+    )
+    assert sum(
+        event[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]
+        and len(event) > 3 and event[3] == email
+        for event in bindings
+    ) == 2
 
 
 def test_dialog_operations_rejects_unconfirmed_or_non_base_urls_before_cloud_calls(tmp_path: Path) -> None:

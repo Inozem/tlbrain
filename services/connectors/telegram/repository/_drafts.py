@@ -454,7 +454,7 @@ class _TelegramDraftMixin:
 
     def bind_document(
         self, context_id: str, doc_id: str, conversation_id: str, *,
-        metadata: Mapping[str, Any], now: datetime,
+        metadata: Mapping[str, Any], now: datetime, update_last_doc: bool = True,
     ) -> int:
         context_id = _identifier(context_id, "context_id")
         if not isinstance(doc_id, str) or not doc_id or "/" in doc_id:
@@ -499,8 +499,9 @@ class _TelegramDraftMixin:
             transaction.set(binding_ref, {"doc_id": doc_id, "dialog_number": number,
                                            "conversation_id": conversation_id,
                                            "created_at": now, "updated_at": now})
-            context.update({"next_dialog_number": number + 1, "last_doc_id": doc_id,
-                            "updated_at": now})
+            context.update({"next_dialog_number": number + 1, "updated_at": now})
+            if update_last_doc:
+                context["last_doc_id"] = doc_id
             transaction.set(context_ref, context)
             return number
 

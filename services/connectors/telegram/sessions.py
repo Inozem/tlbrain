@@ -103,7 +103,7 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
 
 _CARD_FIELDS = (
     "title", "date", "dialog_date", "created_at", "folder", "folder_id",
-    "folder_path",
+    "folder_path", "dialog_number", "conversation_id",
 )
 
 

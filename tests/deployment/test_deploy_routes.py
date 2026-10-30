@@ -1,4 +1,4 @@
-"""Synthetic end-to-end coverage for ordinary and local deployment routes.
+﻿"""Synthetic end-to-end coverage for ordinary and local deployment routes.
 
 The shell scenarios run from an isolated checkout with fake cloud and Docker
 commands. The checkout contains no .env file, and the real source assembler,
@@ -36,6 +36,14 @@ def _bash() -> str:
     if not bash:
         pytest.skip("bash is unavailable")
     return bash
+
+
+def _bash_path(path: Path) -> str:
+    """Convert a Windows path to the POSIX form Git Bash searches."""
+    value = path.resolve().as_posix()
+    if len(value) >= 3 and value[1] == ":":
+        return "/" + value[0].lower() + value[2:]
+    return value
 
 
 def _copy_checkout(root: Path) -> None:
@@ -225,6 +233,7 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         "if [[ \"${1:-}\" == '--verify-source' ]]; then\n"
         "  exec \"$ROUTE_PYTHON\" \"${BASH_SOURCE[0]%/*}/bootstrap_runner.py\" \"$@\"\n"
         "fi\n"
+        "if [[ \"${1:-}\" == '--python-mode' ]]; then shift; exec \"$ROUTE_PYTHON\" \"$@\"; fi\n"
         "\"$ROUTE_PYTHON\" \"${BASH_SOURCE[0]%/*}/route_gate.py\" \"$@\"\n",
         encoding="utf-8",
     )
@@ -241,6 +250,9 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         "if [[ -n \"${env_file}\" ]]; then \"$ROUTE_PYTHON\" -c 'import json,os,sys; data=json.load(open(sys.argv[1],encoding=\"utf-8\"));\n"
         "if \"TELEGRAM_ALLOWED_USER_IDS\" in data: open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"telegram-env-file\",data.get(\"TELEGRAM_ALLOWED_USER_IDS\"),bool(data.get(\"TELEGRAM_BOT_TOKEN\"))])+\"\\n\")' \"${env_file}\"; fi\n"
         "case \"$*\" in *'config get-value account'*) printf 'synthetic-deployer@example.invalid\\n' ;; "
+        "*'firestore indexes composite list'*) \"$ROUTE_PYTHON\" -c 'import json,os; d=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); p=os.environ[\"PROJECT_ID\"]; rows=[];\nfor n,i in enumerate(d[\"indexes\"]): i=dict(i,name=\"projects/{}/databases/(default)/collectionGroups/{}/indexes/ready-{}\".format(p,i[\"collectionGroup\"],n),fields=i[\"fields\"]+[{\"fieldPath\":\"__name__\",\"order\":\"DESCENDING\"}],state=\"READY\"); rows.append(i)\nprint(json.dumps(rows))' ;; "
+        "*'firestore indexes fields list'*) \"$ROUTE_PYTHON\" -c 'import json,os,sys; d=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); g=next(x.split(\"=\",1)[1] for x in sys.argv[1:] if x.startswith(\"--collection-group=\")); p=os.environ[\"PROJECT_ID\"]; rows=[];\nfor x in d[\"fieldOverrides\"]:\n if x[\"collectionGroup\"]==g and x[\"indexes\"]==[]: rows.append(dict(name=\"projects/{}/databases/(default)/collectionGroups/{}/fields/{}\".format(p,x[\"collectionGroup\"],x[\"fieldPath\"]),indexConfig={\"indexes\":[]}))\nprint(json.dumps(rows))' \"$@\" ;; "
+        "*'firestore operations list'*) printf '[]\\n' ;; "
         "*'projects describe'*) printf '123456789012\\n' ;; "
         "*'auth print-identity-token'*) printf 'synthetic-deployer-id-token\\n' ;; "
         "*'run services describe'*'spec.template.spec.serviceAccountName'*) printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\\n' ;; "
@@ -252,6 +264,11 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     gcloud.chmod(0o755)
+    if os.name == "nt":
+        (bin_dir / "gcloud.cmd").write_text(
+            f'@echo off\r\n"{_bash()}" "{gcloud}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="utf-8",
+        )
     docker = bin_dir / "docker"
     docker.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
@@ -305,6 +322,12 @@ def _run_route(
     log = tmp_path / "route-events.jsonl"
     marker_hook = tmp_path / "route-marker-hook.sh"
     marker_hook.write_text(
+        "if [[ -z \"${ROUTE_GCLOUD_GUARD_CHECKED:-}\" ]]; then\n"
+        "  route_gcloud_resolved=\"$(PATH=\"${ROUTE_GCLOUD_BASH_PATH}:/usr/bin:/bin\" command -v gcloud)\"\n"
+        "  case \"$route_gcloud_resolved\" in */gcloud|*/gcloud.cmd) ;; *) exit 96 ;; esac\n"
+        "  export ROUTE_GCLOUD_GUARD_CHECKED=1\n"
+        "fi\n"
+        "gcloud() { \"$ROUTE_GCLOUD_EXECUTABLE\" \"$@\"; }\n"
         "_route_record_marker() {\n"
         "  case \"$*\" in\n"
         "    *rollout_phase:decoder_compatible*|*rollout_phase:guards_compatible*|"
@@ -317,17 +340,27 @@ def _run_route(
         encoding="utf-8",
     )
     python_dir = str(Path(sys.executable).parent)
+    safe_path = (
+        (str(bin_dir), python_dir, "C:/Program Files/Git/bin", "C:/Program Files/Git/usr/bin",
+         str(Path(os.environ.get("SYSTEMROOT", "C:/Windows")) / "System32"))
+        if os.name == "nt" else
+        (str(bin_dir), python_dir, "/usr/bin", "/bin")
+    )
     environment = {
         **{
             name: os.environ[name]
             for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")
             if name in os.environ
         },
-        "PATH": os.pathsep.join((str(bin_dir), python_dir, os.environ.get("PATH", ""))),
+        "PATH": os.pathsep.join(safe_path),
         "TEMP": str(tmp_path),
         "TMP": str(tmp_path),
         "ROUTE_PYTHON": sys.executable,
         "ROUTE_EVENT_LOG": str(log),
+        "ROUTE_GCLOUD_EXECUTABLE": str(bin_dir / "gcloud"),
+        "ROUTE_GCLOUD_BASH_PATH": _bash_path(bin_dir),
+        "CLOUDSDK_CONFIG": str(tmp_path / "cloudsdk-config"),
+        "ROUTE_INDEX_FILE": str(root / "infra" / "firestore" / "indexes.json"),
         "BASH_ENV": str(marker_hook),
         "ROUTE_FAIL_SERVICE": fail_service or "",
         "PROJECT_ID": "synthetic-project",
@@ -360,6 +393,8 @@ def _run_route(
         "TLDV_RECONCILIATION_SCHEDULE": "0 3 * * *",
         "DOCKER_CONFIG": str(tmp_path / "docker-config"),
     }
+    expected_gcloud = bin_dir / ("gcloud.cmd" if os.name == "nt" else "gcloud")
+    assert Path(shutil.which("gcloud", path=environment["PATH"]) or "").resolve() == expected_gcloud.resolve()
     environment.update(env_overrides or {})
     script = root / "infra" / "deploy" / command
     if stdin_answers is None:

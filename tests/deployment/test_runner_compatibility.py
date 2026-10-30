@@ -265,6 +265,35 @@ def test_sync_checker_route_uses_gcloud_bootstrap_fallback_before_cloud_send(
         assert not uploads
 
 
+def test_preflight_python_mode_uses_gcloud_interpreter_fallback(tmp_path: Path) -> None:
+    """The Python mode passes helper argv through the same interpreter discovery path."""
+    bash = _bash()
+    checkout = _copy_route(tmp_path)
+    events, isolated_path = _write_fakes(checkout, tmp_path, runner_status=0)
+    alias_dir = tmp_path / "WindowsApps"
+    alias_dir.mkdir()
+    alias = alias_dir / "python3"
+    alias.write_text("#!/usr/bin/env bash\necho alias-used >> \"$RUNNER_COMPAT_EVENTS\"\nexit 92\n", encoding="utf-8")
+    alias.chmod(0o755)
+    environment = {
+        **{name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT") if name in os.environ},
+        "PATH": os.pathsep.join((str(alias_dir), str(isolated_path))),
+        "RUNNER_COMPAT_EVENTS": str(events),
+        "RUNNER_COMPAT_INTERPRETER": _path_for_bash(tmp_path / "Build Area" / "bootstrap python"),
+        "RUNNER_COMPAT_STATUS": "0",
+    }
+    completed = subprocess.run(
+        [bash, str(checkout / "infra" / "build" / "preflight.sh"), "--python-mode",
+         str(tmp_path / "Build Area" / "bootstrap python"), "argument with spaces"],
+        cwd=checkout, env=environment, text=True, capture_output=True, check=False, timeout=30,
+    )
+    assert completed.returncode == 0, f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    log = events.read_text(encoding="utf-8").splitlines()
+    assert any(line == "gcloud\tinfo --format=value(basic.python_location)" for line in log)
+    assert any(line.startswith("bootstrap\t") and "argument with spaces" in line for line in log)
+    assert "alias-used" not in "\n".join(log)
+
+
 def test_runner_cold_warm_and_corrupt_cache_states_stay_in_private_cache(tmp_path: Path) -> None:
     """Exercise the ordinary runner API across all cache states with its synthetic archive."""
     helper_path = Path(__file__).with_name("test_runner_bootstrap.py")

@@ -6,7 +6,7 @@ PROJECT_ID=${PROJECT_ID:-tlbrain-prod}
 REGION=${REGION:-europe-west1}
 MCP_SERVICE_NAME=${MCP_SERVICE_NAME:-tlbrain-mcp}
 QUEUE_NAME=tlbrain-dialog-operations
-TASK_INVOKER_ACCOUNT_ID=${DIALOG_OPERATIONS_TASK_INVOKER_ACCOUNT_ID:-tlbrain-dialog-operations-invoker}
+TASK_INVOKER_ACCOUNT_ID=${DIALOG_OPERATIONS_TASK_INVOKER_ACCOUNT_ID:-tlbrain-dialog-ops-invoker}
 
 usage() {
   echo "Usage: $0 <deploy-confirmed-mcp-base-url>" >&2

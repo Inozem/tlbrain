@@ -734,7 +734,9 @@ def test_pure_switch_from_no_current_conversation_is_a_focus_change():
     assert result["selection_changed"] is True
     assert result["substantive_text"] is None
     assert notices.sent == [("doc-a", result["dialog_number"])]
-    assert model.calls[0]["candidates"] == ({"doc_id": "doc-a", "title": "A"},)
+    assert model.calls[0]["candidates"] == ({
+        "doc_id": "doc-a", "title": "A", "conversation_id": "conversation:doc-a",
+    },)
 
 
 def test_link_flag_is_rejected_for_operations_other_than_get_transcript():

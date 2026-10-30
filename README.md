@@ -234,11 +234,13 @@ If `GOOGLE_REFRESH_TOKEN` is not set, deployment opens a browser for Google Driv
 
 Deploys the three shared runtime targets and any enabled optional connector targets, along with their required Cloud Tasks queues and scheduled checker/reconciliation jobs. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
 
+Before deploying services, Firestore preparation compares the declared indexes and field exemptions with the database configuration. It skips ready settings, submits missing changes asynchronously so they can build concurrently, and reports pending progress. Existing operations are reused. Service deployment starts only after the operations succeed and the requested configuration is ready.
+
 When finished, the script prints the MCP URL and URLs for enabled connectors. Copy the relevant URLs for the next steps.
 
 The ordinary deployment uses already-published versioned images for Cloud Run services and deploys Functions from source/preflight artifacts. To build local service images before deployment, use `bash infra/deploy/local_deploy.sh`; this route requires Docker. Neither route adds a migration or reindex step.
 
-> The deploy takes ~7 minutes to complete.
+The first deployment can take longer while Firestore builds new indexes and applies field exemptions. Later deployments skip settings that are already ready; image build and deployment times depend on the enabled services.
  
 ### 11. Connect TL;DV
 
@@ -598,6 +600,12 @@ CI validates source artifacts for all seven targets. It builds and validates fin
 ### Optional Telegram lifecycle and route access
 
 Telegram is enabled only when both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_IDS` are nonblank. The allowed IDs are comma-separated positive decimal Telegram user IDs. A partial or blank pair fails preflight before Cloud or Docker mutations. `TLDV_API_KEY` independently enables TL;DV. `TZ` must be an IANA timezone and defaults to UTC. The Telegram webhook secret is generated and reused in Firestore; it is not an environment setting.
+
+Enabled Telegram deployments also reuse the existing Gemini, Drive, Qdrant and retrieval settings. The deployment passes these settings, the target project/region and confirmed shared-service URLs through a private temporary environment file. Local webhook registration uses Application Default Credentials with Firestore access; check for `Telegram webhook registration succeeded` at the end of deployment.
+
+`GET /` reports process liveness and whether Telegram credentials are configured. Verify message delivery separately: a real message must reach `POST /telegram/webhook`, enter the task queue and produce a reply. Cloud Run request logs show HTTP delivery; application logs include safe webhook event/stage and exception-type diagnostics without message contents, credentials or provider exception text.
+
+Production runtime corrections are in progress. The command adapters under `services/connectors/telegram/runtime/` are tested separately; default application/queue/save composition and shared-read retry integration still require their integration checks before Telegram processing can be considered ready.
 
 The public `POST /telegram/webhook` route checks the generated Firestore webhook secret and accepts only private chats from the configured user allowlist. Each context processes one agent operation at a time through a durable FIFO queue. Accepted operations schedule status checks relative to acceptance at 60, 120, and 300 seconds. Failed drafts and already-created Docs are retained; recovery requires an explicit numbered retry. Source cleanup is restartable and requires proof from the completed save certificate.
 

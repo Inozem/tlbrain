@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -13,10 +14,35 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from core.utils.logging import configure_logging
+
 from .terminal_notifications import (
     terminal_lifecycle_status as _terminal_lifecycle_status,
     update_terminal_notification as _update_terminal_notification,
 )
+
+configure_logging()
+logger = logging.getLogger(__name__)
+
+
+def _exception_types(exc: BaseException, *, limit: int = 4) -> list[str]:
+    """Return a bounded exception type chain without exposing exception text."""
+    result: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(result) < limit and id(current) not in seen:
+        seen.add(id(current))
+        result.append(type(current).__name__[:80])
+        current = current.__cause__ or current.__context__
+    return result
+
+
+def _log_webhook_failure(stage: str, exc: BaseException, update_id: int | None = None) -> None:
+    details = {"event": "webhook_failure", "stage": stage,
+               "error_type": type(exc).__name__[:80], "error_chain": _exception_types(exc)}
+    if update_id is not None:
+        details["update_id"] = update_id
+    logger.error("Telegram webhook processing failed", extra=details)
 
 
 def _firestore_secret() -> str | None:
@@ -56,8 +82,6 @@ def _default_intake() -> Any:
                 record_outbox_delivery_result,
                 task_payload,
             )
-            from core.operations.outbox import TaskTargetConfig
-
             record = get_outbox_record(self.client, outbox_id)
             if record is None or record.target_kind is not OutboxTargetKind.TELEGRAM_DISPATCH:
                 raise RuntimeError("accepted Telegram outbox row is unavailable")
@@ -68,9 +92,13 @@ def _default_intake() -> Any:
                 os.environ.get("TELEGRAM_DELIVERY_URL") if record.notification_id
                 else os.environ.get("TELEGRAM_CONTROL_URL")
             ) or os.environ.get("TELEGRAM_CONTROL_URL")
-            if not queue_name or not target_url:
+            expected_path = (
+                "/internal/deliver" if record.notification_id and
+                os.environ.get("TELEGRAM_DELIVERY_URL") else "/internal/dispatch"
+            )
+            target = _telegram_task_target(target_url, expected_path=expected_path)
+            if not queue_name or target is None:
                 raise RuntimeError("Telegram task target is not configured")
-            target = TaskTargetConfig(queue_name=queue_name, url=target_url)
             now = datetime.now(timezone.utc)
             try:
                 enqueue_task(
@@ -184,12 +212,11 @@ def _status_check_runtime(notification_publisher: Any = None) -> Any:
     return TelegramStatusChecks(get_client(), notification_publisher=publisher)
 
 
-def _telegram_status_check_target() -> Any:
-    """Build the status-check callback only from deploy-matched Telegram OIDC config."""
+def _telegram_task_target(callback_url: str | None, *, expected_path: str) -> Any:
+    """Build a Cloud Tasks target only from deploy-matched Telegram OIDC config."""
     from urllib.parse import urlsplit
     from core.operations.outbox import TaskTargetConfig
 
-    callback_url = os.environ.get("TELEGRAM_CONTROL_URL")
     queue_name = os.environ.get("TELEGRAM_CONTROL_QUEUE")
     audience = os.environ.get("CLOUD_TASKS_OIDC_AUDIENCE") or os.environ.get("TASK_OIDC_AUDIENCE")
     service_account = (
@@ -205,7 +232,7 @@ def _telegram_status_check_target() -> Any:
         valid_url = (
             parsed.scheme == "https" and bool(parsed.hostname)
             and parsed.username is None and parsed.password is None
-            and parsed.path == "/internal/dispatch"
+            and parsed.path == expected_path
             and not parsed.query and not parsed.fragment
         )
         if not (
@@ -217,12 +244,31 @@ def _telegram_status_check_target() -> Any:
             return None
         return TaskTargetConfig(
             queue_name=queue_name,
-            url=parsed._replace(path="/internal/status-check").geturl(),
+            url=parsed.geturl(),
             service_account_email=service_account,
             audience=audience,
         )
     except (TypeError, ValueError):
         return None
+
+
+def _telegram_status_check_target() -> Any:
+    """Build the status-check callback only from deploy-matched Telegram OIDC config."""
+    from urllib.parse import urlsplit
+
+    target = _telegram_task_target(
+        os.environ.get("TELEGRAM_CONTROL_URL"), expected_path="/internal/dispatch",
+    )
+    if target is None:
+        return None
+    parsed = urlsplit(target.url)
+    return target.__class__(
+        queue_name=target.queue_name,
+        url=parsed._replace(path="/internal/status-check").geturl(),
+        service_account_email=target.service_account_email,
+        audience=target.audience,
+        dispatch_deadline=target.dispatch_deadline,
+    )
 
 
 def _enqueue_status_check_records(records: Any) -> None:
@@ -356,7 +402,8 @@ def create_app(
             from core.config import get_connector_capabilities
 
             enabled = get_connector_capabilities().telegram_enabled
-        except (ValueError, Exception):
+        except Exception as exc:
+            _log_webhook_failure("capability_config", exc)
             enabled = False
         return {"status": "ok", "telegram_enabled": enabled}
 
@@ -371,28 +418,50 @@ def create_app(
         if secret is None:
             try:
                 secret = await _offload_sync(_firestore_secret)
-            except Exception:
+            except Exception as exc:
+                _log_webhook_failure("secret_load", exc)
                 return JSONResponse({"detail": "webhook unavailable"}, status_code=503)
         supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if not secret or not hmac.compare_digest(supplied, secret):
+            logger.warning(
+                "Telegram webhook request denied",
+                extra={"event": "webhook_denied", "stage": "authorization"},
+            )
             return JSONResponse({"detail": "forbidden"}, status_code=403)
+        logger.info("Telegram webhook request received", extra={"event": "webhook_receipt"})
         try:
             update = await request.json()
         except Exception:
+            logger.warning(
+                "Telegram webhook request malformed",
+                extra={"event": "webhook_malformed", "stage": "json"},
+            )
             return JSONResponse({"detail": "malformed JSON"}, status_code=400)
         if not isinstance(update, dict):
+            logger.warning(
+                "Telegram webhook request malformed",
+                extra={"event": "webhook_malformed", "stage": "json_object"},
+            )
             return JSONResponse({"detail": "JSON object required"}, status_code=400)
+        raw_update_id = update.get("update_id")
+        update_id = raw_update_id if type(raw_update_id) is int and raw_update_id >= 0 else None
         intake_instance = app.state.telegram_intake
         if intake_instance is None:
             try:
                 intake_instance = await _offload_sync(_default_intake)
                 app.state.telegram_intake = intake_instance
-            except Exception:
+            except Exception as exc:
+                _log_webhook_failure("intake_init", exc, update_id)
                 return JSONResponse({"detail": "webhook unavailable"}, status_code=503)
         try:
             await _offload_sync(intake_instance.handle_update, update)
-        except Exception:
+        except Exception as exc:
+            _log_webhook_failure("handle_update", exc, update_id)
             return JSONResponse({"detail": "intake unavailable"}, status_code=503)
+        details = {"event": "webhook_completion"}
+        if update_id is not None:
+            details["update_id"] = update_id
+        logger.info("Telegram webhook request completed", extra=details)
         return {"ok": True}
 
     @app.post("/internal/disable-webhook")

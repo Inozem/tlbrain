@@ -37,6 +37,19 @@ fi
 
 PROJECT_ID=${PROJECT_ID:-tlbrain-prod}
 REGION=${REGION:-europe-west1}
+GOOGLE_CLOUD_PROJECT=${PROJECT_ID}
+ROOT_FOLDER_URL=${ROOT_FOLDER_URL:-}
+GEMINI_API_KEY=${GEMINI_API_KEY:-}
+QDRANT_URL=${QDRANT_URL:-}
+QDRANT_API_KEY=${QDRANT_API_KEY:-}
+QDRANT_COLLECTION=${QDRANT_COLLECTION:-}
+RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-15}
+RETRIEVAL_SCORE_THRESHOLD=${RETRIEVAL_SCORE_THRESHOLD:-0.6}
+GOOGLE_REFRESH_TOKEN=${GOOGLE_REFRESH_TOKEN:-}
+GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+VECTOR_SYNC_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}
+SYNC_CHECKER_NAME=${SYNC_CHECKER_NAME:-tlbrain-sync-checker}
 SERVICE_NAME=${TELEGRAM_SERVICE_NAME:-tlbrain-telegram}
 REPOSITORY=${TELEGRAM_IMAGE_REPOSITORY:-inozem/tlbrain-telegram}
 TASK_INVOKER_ACCOUNT_ID=${TELEGRAM_TASK_INVOKER_ACCOUNT_ID:-tlbrain-telegram-task-invoker}
@@ -92,6 +105,23 @@ except Exception:
   exit 0
 fi
 
+if [[ -n "${BOT_TOKEN_CHECK}" ]]; then
+  missing_runtime_config=()
+  for setting in REGION GOOGLE_CLOUD_PROJECT ROOT_FOLDER_URL GEMINI_API_KEY QDRANT_URL \
+    QDRANT_API_KEY QDRANT_COLLECTION RETRIEVAL_TOP_K RETRIEVAL_SCORE_THRESHOLD \
+    GOOGLE_REFRESH_TOKEN GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET; do
+    setting_value=${!setting}
+    setting_value=${setting_value//[[:space:]]/}
+    if [[ -z "${setting_value}" ]]; then
+      missing_runtime_config+=("${setting}")
+    fi
+  done
+  if ((${#missing_runtime_config[@]})); then
+    printf 'Telegram runtime configuration is missing: %s\n' "${missing_runtime_config[*]}" >&2
+    exit 1
+  fi
+fi
+
 TEMP_ENV_FILE=""
 cleanup() {
   if [[ -n "${TEMP_ENV_FILE}" ]]; then
@@ -99,6 +129,37 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+if [[ -n "${BOT_TOKEN_CHECK}" ]]; then
+  # Resolve shared service endpoints before any image build, push, or deployment.
+VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
+  --project "${PROJECT_ID}" --region "${REGION}" --format='value(status.url)')
+SYNC_CHECKER_URL=$(gcloud functions describe "${SYNC_CHECKER_NAME}" \
+  --project "${PROJECT_ID}" --region "${REGION}" --format='value(serviceConfig.uri)')
+if [[ ! "${VECTOR_SYNC_URL}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || \
+  [[ ! "${SYNC_CHECKER_URL}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+  echo "Could not determine configured shared service URLs" >&2
+  exit 1
+fi
+
+TEMP_ENV_FILE=$(mktemp "${TMPDIR:-/tmp}/tlbrain-telegram-env.XXXXXX")
+chmod 600 "${TEMP_ENV_FILE}"
+# All runtime settings travel through a private JSON env file. Bot credentials
+# are passed only to this writer and the later webhook-registration helper.
+REGION="${REGION}" GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT}" \
+  ROOT_FOLDER_URL="${ROOT_FOLDER_URL}" GEMINI_API_KEY="${GEMINI_API_KEY}" \
+  QDRANT_URL="${QDRANT_URL}" QDRANT_API_KEY="${QDRANT_API_KEY}" \
+  QDRANT_COLLECTION="${QDRANT_COLLECTION}" RETRIEVAL_TOP_K="${RETRIEVAL_TOP_K}" \
+  RETRIEVAL_SCORE_THRESHOLD="${RETRIEVAL_SCORE_THRESHOLD}" \
+  GOOGLE_REFRESH_TOKEN="${GOOGLE_REFRESH_TOKEN}" GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}" \
+  GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET}" VECTOR_SYNC_URL="${VECTOR_SYNC_URL}" \
+  SYNC_CHECKER_URL="${SYNC_CHECKER_URL}" DIALOG_OPERATIONS_QUEUE="${CORE_QUEUE}" \
+  TELEGRAM_BOT_TOKEN="${BOT_TOKEN}" \
+  TELEGRAM_ALLOWED_USER_IDS="${ALLOWED_USER_IDS}" \
+  python3 -c 'import json, os, sys; names = ("REGION", "GOOGLE_CLOUD_PROJECT", "ROOT_FOLDER_URL", "GEMINI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "RETRIEVAL_TOP_K", "RETRIEVAL_SCORE_THRESHOLD", "GOOGLE_REFRESH_TOKEN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "VECTOR_SYNC_URL", "SYNC_CHECKER_URL", "DIALOG_OPERATIONS_QUEUE"); data = {name: os.environ[name] for name in names};
+if os.environ.get("TELEGRAM_BOT_TOKEN"): data.update(TELEGRAM_BOT_TOKEN=os.environ["TELEGRAM_BOT_TOKEN"], TELEGRAM_ALLOWED_USER_IDS=os.environ["TELEGRAM_ALLOWED_USER_IDS"])
+json.dump(data, open(sys.argv[1], "w", encoding="utf-8"))' "${TEMP_ENV_FILE}"
+fi
 
 if [[ "${MODE}" == normal ]]; then
   IMAGE_DIGEST=$(bash "${REPO_ROOT}/infra/build/preflight.sh" --verify-mode \
@@ -113,15 +174,6 @@ else
   bash "${REPO_ROOT}/infra/build/preflight.sh" --image-mode --image "${IMAGE}" \
     --service telegram --platform "${PLATFORM}"
   docker push "${IMAGE}"
-fi
-
-if [[ -n "${BOT_TOKEN_CHECK}" ]]; then
-  TEMP_ENV_FILE=$(mktemp "${TMPDIR:-/tmp}/tlbrain-telegram-env.XXXXXX")
-  chmod 600 "${TEMP_ENV_FILE}"
-  # JSON is a valid YAML env-vars file. Values travel to the writer via its
-  # environment, never through argv or stdout.
-  TELEGRAM_BOT_TOKEN="${BOT_TOKEN}" TELEGRAM_ALLOWED_USER_IDS="${ALLOWED_USER_IDS}" \
-    python3 -c 'import json, os, sys; json.dump({"TELEGRAM_BOT_TOKEN": os.environ["TELEGRAM_BOT_TOKEN"], "TELEGRAM_ALLOWED_USER_IDS": os.environ["TELEGRAM_ALLOWED_USER_IDS"]}, open(sys.argv[1], "w", encoding="utf-8"))' "${TEMP_ENV_FILE}"
 fi
 
 DEPLOY_ARGS=(run deploy "${SERVICE_NAME}" --project "${PROJECT_ID}" --image "${IMAGE}"

@@ -52,12 +52,14 @@ set -euo pipefail
 if a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and os.environ.get("SERVICE_MISSING"): print("NOT_FOUND",file=sys.stderr); raise SystemExit(1)
 elif a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and "status.url" in " ".join(a): print("https://telegram.synthetic.invalid")
 elif a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and "serviceAccountName" in " ".join(a): print("telegram-runtime@synthetic-project.iam.gserviceaccount.com")
+elif a[:4]==["run","services","describe",os.environ["VECTOR_SYNC_SERVICE_NAME"]]: print("https://vector-sync.synthetic.invalid")
+elif a[:3]==["functions","describe",os.environ["SYNC_CHECKER_NAME"]]: print("https://sync-checker.synthetic.invalid")
 elif a[:2]==["projects","describe"]: print("123456789012")
 elif a[:3]==["iam","service-accounts","describe"]: raise SystemExit(1)
 elif a[:2]==["config","get-value"]: print("operator@example.test")
 elif a[:2]==["auth","print-identity-token"]: print("synthetic-deployer-id-token")
 if "--env-vars-file" in a:
- p=a[a.index("--env-vars-file")+1]; d=json.load(open(p)); mode=oct(os.stat(p).st_mode & 0o777); f.write(json.dumps(["env-file",d.get("TELEGRAM_BOT_TOKEN")=="synthetic-telegram-token-do-not-log",sorted(d),mode,p])+"\\n")' "$@"
+ p=a[a.index("--env-vars-file")+1]; d=json.load(open(p)); mode=oct(os.stat(p).st_mode & 0o777); shared=[d.get("REGION")=="synthetic-region",d.get("GOOGLE_CLOUD_PROJECT")=="synthetic-project",d.get("ROOT_FOLDER_URL")=="https://drive.synthetic.invalid/folders/root",d.get("GEMINI_API_KEY")=="synthetic-gemini-key",d.get("QDRANT_URL")=="https://qdrant.synthetic.invalid",d.get("QDRANT_API_KEY")=="synthetic-qdrant-key",d.get("QDRANT_COLLECTION")=="synthetic-collection",d.get("VECTOR_SYNC_URL")=="https://vector-sync.synthetic.invalid",d.get("SYNC_CHECKER_URL")=="https://sync-checker.synthetic.invalid",d.get("DIALOG_OPERATIONS_QUEUE")=="tlbrain-dialog-operations"]; f.write(json.dumps(["env-file",d.get("TELEGRAM_BOT_TOKEN")=="synthetic-telegram-token-do-not-log",sorted(d),mode,p,shared])+"\\n")' "$@"
 """, True)
     _write(bindir / "docker", """#!/usr/bin/env bash
 set -euo pipefail
@@ -85,8 +87,21 @@ esac
         "REAL_PYTHON": py,
         "EVENT_LOG": str(log),
         "PROJECT_ID": "synthetic-project",
+        "GOOGLE_CLOUD_PROJECT": "stale-project-must-not-win",
         "REGION": "synthetic-region",
         "VERSION": "v-synthetic-1",
+        "ROOT_FOLDER_URL": "https://drive.synthetic.invalid/folders/root",
+        "GEMINI_API_KEY": "synthetic-gemini-key",
+        "QDRANT_URL": "https://qdrant.synthetic.invalid",
+        "QDRANT_API_KEY": "synthetic-qdrant-key",
+        "QDRANT_COLLECTION": "synthetic-collection",
+        "RETRIEVAL_TOP_K": "15",
+        "RETRIEVAL_SCORE_THRESHOLD": "0.6",
+        "GOOGLE_REFRESH_TOKEN": "synthetic-refresh-token",
+        "GOOGLE_CLIENT_ID": "synthetic-client-id",
+        "GOOGLE_CLIENT_SECRET": "synthetic-client-secret",
+        "VECTOR_SYNC_SERVICE_NAME": "synthetic-vector-sync",
+        "SYNC_CHECKER_NAME": "synthetic-sync-checker",
         "TMPDIR": str(tmp_path),
         "TELEGRAM_SERVICE_NAME": "synthetic-telegram",
         "TELEGRAM_BOT_TOKEN": TOKEN,
@@ -94,6 +109,8 @@ esac
         "TZ": "Asia/Jerusalem",
         "SKIP_CONFIRM": "1",
     }
+    assert Path(env["PATH"].split(os.pathsep)[0]).resolve() == bindir.resolve()
+    assert (bindir / "gcloud").is_file()
     return root, log, env
 
 
@@ -153,7 +170,12 @@ def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_
         "TZ=Asia/Jerusalem",
     ):
         assert setting in settings
-    assert events.index(deploy) < next(i for i, e in enumerate(events) if e[0] == "gcloud" and "status.url" in " ".join(e)) < events.index(update)
+    service_url_lookup = next(
+        i for i, event in enumerate(events)
+        if event[:5] == ["gcloud", "run", "services", "describe", "synthetic-telegram"]
+        and "status.url" in " ".join(event)
+    )
+    assert events.index(deploy) < service_url_lookup < events.index(update)
     webhook = next(event for event in events if event[0] == "webhook")
     assert events.index(update) < events.index(webhook)
     assert webhook[1:3] == [True, "https://telegram.synthetic.invalid/telegram/webhook"]
@@ -176,7 +198,14 @@ def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_
     assert any("roles/datastore.user" in " ".join(e) for e in cloud)
     assert not any("roles/owner" in " ".join(e) or "roles/editor" in " ".join(e) for e in cloud)
     env_file = next(event for event in events if event[0] == "env-file")
-    assert env_file[1:3] == [True, ["TELEGRAM_ALLOWED_USER_IDS", "TELEGRAM_BOT_TOKEN"]]
+    assert env_file[1:3] == [True, sorted([
+        "TELEGRAM_ALLOWED_USER_IDS", "TELEGRAM_BOT_TOKEN", "REGION", "GOOGLE_CLOUD_PROJECT",
+        "ROOT_FOLDER_URL", "GEMINI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY",
+        "QDRANT_COLLECTION", "RETRIEVAL_TOP_K", "RETRIEVAL_SCORE_THRESHOLD",
+        "GOOGLE_REFRESH_TOKEN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+        "VECTOR_SYNC_URL", "SYNC_CHECKER_URL", "DIALOG_OPERATIONS_QUEUE",
+    ])]
+    assert env_file[5] == [True] * 10
     unrelated_env = [event for event in events if event[0] == "child-env"]
     assert unrelated_env
     assert all(event[2:4] == [False, False] for event in unrelated_env)
@@ -191,6 +220,33 @@ def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_
         assert env_file[3] == "0o600"
     assert TOKEN not in json.dumps(events) + result.stdout + result.stderr
     assert not list(root.parent.glob("tlbrain-telegram-env.*"))
+
+
+def test_enabled_deploy_rejects_missing_shared_runtime_config_before_mutation(tmp_path: Path):
+    result, events, _root = _run(tmp_path, "deploy_telegram.sh", {"QDRANT_API_KEY": ""})
+    assert result.returncode != 0
+    assert "QDRANT_API_KEY" in result.stderr
+    assert "synthetic-qdrant-key" not in result.stderr + result.stdout
+    assert not any(event[0] in {"docker", "preflight", "webhook"} for event in events)
+    assert not any(event[0] == "gcloud" for event in events)
+
+
+@pytest.mark.parametrize("script", ["deploy_telegram.sh", "local_deploy_telegram.sh"])
+def test_disabled_deploy_does_not_require_shared_runtime_config(tmp_path: Path, script: str):
+    result, events, _root = _run(tmp_path, script, {
+        "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_ALLOWED_USER_IDS": "",
+        "ROOT_FOLDER_URL": "", "GEMINI_API_KEY": "", "QDRANT_URL": "",
+        "QDRANT_API_KEY": "", "QDRANT_COLLECTION": "", "GOOGLE_REFRESH_TOKEN": "",
+        "GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "",
+        "VECTOR_SYNC_SERVICE_NAME": "synthetic-vector-sync",
+        "SYNC_CHECKER_NAME": "synthetic-sync-checker",
+    })
+    assert result.returncode == 0, f"stdout:\\n{result.stdout}\\nstderr:\\n{result.stderr}"
+    assert not any(event[0] == "env-file" for event in events)
+    assert not any(event[0] == "gcloud" and event[1:4] == ["run", "services", "describe"]
+                   and event[4] == "synthetic-vector-sync" for event in events)
+    assert not any(event[0] == "gcloud" and event[1:3] == ["functions", "describe"]
+                   and event[3] == "synthetic-sync-checker" for event in events)
 
 
 @pytest.mark.parametrize("failure", [False, True])
