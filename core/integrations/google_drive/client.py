@@ -11,6 +11,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from core.integrations.google_auth.credentials import credentials
+from core.utils.retry import LEGACY_RETRY_POLICY, RetryPolicy, SINGLE_ATTEMPT_RETRY_POLICY
 
 logger = logging.getLogger(__name__)
 
@@ -18,23 +19,53 @@ SCOPES_RO = ["https://www.googleapis.com/auth/drive.readonly"]
 SCOPES_RW = ["https://www.googleapis.com/auth/drive"]
 
 
-def _build_http(credentials) -> google_auth_httplib2.AuthorizedHttp:
+def _build_http(credentials, *, retry_policy: RetryPolicy = LEGACY_RETRY_POLICY) -> google_auth_httplib2.AuthorizedHttp:
+    if retry_policy == SINGLE_ATTEMPT_RETRY_POLICY:
+        from core.integrations.google_auth.transport import SingleAttemptHttp
+        return google_auth_httplib2.AuthorizedHttp(
+            credentials, http=SingleAttemptHttp(timeout=60), max_refresh_attempts=0,
+        )
     return google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http(timeout=60))
 
 
-def _build_credentials(scopes: list[str]):
+def _build_credentials(scopes: list[str], *, retry_policy: RetryPolicy = LEGACY_RETRY_POLICY):
     if os.environ.get("GOOGLE_REFRESH_TOKEN"):
         logger.info("Drive auth: using user OAuth (GOOGLE_REFRESH_TOKEN)")
-    return credentials(scopes)
+    return credentials(scopes, retry_policy=retry_policy)
 
 
-def build_drive_service():
+def _build_trusted_credentials(scopes: list[str], service_name: str):
+    """Attribute only trusted one-attempt credential failures to their API service."""
+    from core.utils.retry import ProviderBoundaryError, SINGLE_ATTEMPT_RETRY_POLICY
+    try:
+        return _build_credentials(scopes, retry_policy=SINGLE_ATTEMPT_RETRY_POLICY)
+    except Exception as error:
+        raise ProviderBoundaryError(service_name, error) from error
+
+
+def build_drive_service(*, retry_policy: RetryPolicy = LEGACY_RETRY_POLICY):
     logger.info("Building Google Drive service")
-    return build("drive", "v3", http=_build_http(_build_credentials(SCOPES_RO)))
+    kwargs = {"num_retries": 0} if retry_policy == SINGLE_ATTEMPT_RETRY_POLICY else {}
+    auth_credentials = (
+        _build_trusted_credentials(SCOPES_RO, "google_drive")
+        if retry_policy == SINGLE_ATTEMPT_RETRY_POLICY
+        else _build_credentials(SCOPES_RO, retry_policy=retry_policy)
+    )
+    return build("drive", "v3", http=_build_http(
+        auth_credentials, retry_policy=retry_policy,
+    ), **kwargs)
 
 
-def build_drive_service_rw():
-    return build("drive", "v3", http=_build_http(_build_credentials(SCOPES_RW)))
+def build_drive_service_rw(*, retry_policy: RetryPolicy = LEGACY_RETRY_POLICY):
+    kwargs = {"num_retries": 0} if retry_policy == SINGLE_ATTEMPT_RETRY_POLICY else {}
+    auth_credentials = (
+        _build_trusted_credentials(SCOPES_RW, "google_drive")
+        if retry_policy == SINGLE_ATTEMPT_RETRY_POLICY
+        else _build_credentials(SCOPES_RW, retry_policy=retry_policy)
+    )
+    return build("drive", "v3", http=_build_http(
+        auth_credentials, retry_policy=retry_policy,
+    ), **kwargs)
 
 
 _FOLDER_MIME = "application/vnd.google-apps.folder"

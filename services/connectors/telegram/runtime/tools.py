@@ -19,6 +19,7 @@ from core.operations.models import OperationOrigin, OperationResult, OperationSt
 from core.operations import registry
 from core.operations.write import WriteContext
 from services.connectors.telegram.tools import invoke_tool
+from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
 
 
 def direct_add_dialog_operation_id(parent_operation_id: str, ordinal: int,
@@ -64,7 +65,11 @@ class TelegramRegistryExecutor:
                            retry_governor=self.execution_context.get("retry_governor"))
         op = registry.OPERATIONS[name]
         if not op.write:
-            return invoke_tool(name, validated, context=self.context)
+            policy = (SINGLE_ATTEMPT_RETRY_POLICY if name in {
+                "query", "get_transcript", "list_recent_transcripts", "list_folders", "sync_status",
+            } else None)
+            return invoke_tool(name, validated, context=self.context,
+                               retry_policy=policy)
         return self._execute_write(name, validated, call_ordinal)
 
     def reconcile(self, *, name: str, arguments: Any, call_ordinal: int) -> Any:

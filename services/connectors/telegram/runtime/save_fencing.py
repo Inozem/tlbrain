@@ -5,22 +5,52 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from core.operations.retries import RetryGovernor, UnknownOutcome
+from core.operations.retries import RetryGovernor, UnknownOutcome, _provider_error_category
 
 
 def _provider_error_retryable(error: BaseException) -> bool:
     """Stop on definitive provider rejections while retrying transient responses."""
-    response = getattr(error, "response", None)
+    source = getattr(error, "original_error", error)
+    response = getattr(source, "response", None)
     status = getattr(response, "status_code", None)
     if status is None:
-        status = getattr(getattr(error, "resp", None), "status", None)
+        status = getattr(getattr(source, "resp", None), "status", None)
     if type(status) is int and 400 <= status < 500:
         return status in {408, 429}
     return True
 
 
+def telegram_error_classifier(error: BaseException, stage_key: str) -> tuple[str, str | None]:
+    """Map only trusted boundary markers and known SDK classes to provider fields."""
+    source = getattr(error, "original_error", error)
+    service = getattr(error, "service", None)
+    prefix = f"telegram.finalize."
+    if service is None and stage_key.startswith(prefix):
+        boundary = stage_key.rsplit(".", 1)[-1]
+        service = {"docs": "google_docs", "drive": "google_drive"}.get(boundary)
+    if service is None:
+        try:
+            from google.genai.errors import ClientError, ServerError
+            if isinstance(source, (ClientError, ServerError)):
+                service = "gemini"
+        except ImportError:
+            pass
+    if service is None:
+        try:
+            from qdrant_client.http.exceptions import UnexpectedResponse
+            if isinstance(source, UnexpectedResponse):
+                service = "qdrant"
+        except ImportError:
+            pass
+    return _provider_error_category(source), service
+
+
 class _TelegramSaveRetryGovernor(RetryGovernor):
     """Use the common stage ledger with Telegram's definitive HTTP failure policy."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        kwargs.setdefault("error_classifier", telegram_error_classifier)
+        super().__init__(*args, **kwargs)
 
     def run_stage(self, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("retryable", _provider_error_retryable)
@@ -42,7 +72,8 @@ class _ParentBoundRetryGovernor(_TelegramSaveRetryGovernor):
         super().__init__(source.client, clock=_RuntimeClock(clock),
                          max_failures=source.max_failures,
                          lease_seconds=source.lease_seconds,
-                         retry_store=source.retry_store)
+                         retry_store=source.retry_store,
+                         error_classifier=getattr(source, "error_classifier", None))
         self._assert_parent = assert_current
 
     def _current(self) -> None:

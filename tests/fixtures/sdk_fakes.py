@@ -253,8 +253,8 @@ class _DiscoveryService:
 def fake_discovery_build(api: str, version: str, **kwargs: Any) -> _DiscoveryService:
     if api not in {"drive", "docs"}:
         raise NotImplementedError(f"Unsupported discovery API: {api}")
-    if kwargs.keys() - {"http", "credentials", "cache_discovery"}:
-        raise TypeError(f"Unsupported discovery options: {', '.join(kwargs.keys() - {'http', 'credentials', 'cache_discovery'})}")
+    if kwargs.keys() - {"http", "credentials", "cache_discovery", "num_retries"}:
+        raise TypeError(f"Unsupported discovery options: {', '.join(kwargs.keys() - {'http', 'credentials', 'cache_discovery', 'num_retries'})}")
     return _DiscoveryService(sdk_fakes, api, version, kwargs)
 
 
@@ -343,9 +343,9 @@ class FakeGeminiClient:
 
 class FakeQdrantClient:
     def __init__(self, *, url: str, api_key: str | None = None, **kwargs: Any) -> None:
-        if kwargs:
+        if kwargs.keys() - {"check_compatibility"}:
             raise TypeError(f"Unsupported Qdrant client options: {', '.join(kwargs)}")
-        _record("qdrant", "client", url=url, api_key=api_key)
+        _record("qdrant", "client", url=url, api_key=api_key, **kwargs)
         _STATE.clients.append(self)
 
     def get_collections(self):
@@ -565,7 +565,7 @@ def install() -> dict[str, tuple[Any, str, Any, Any]]:
     originals: dict[str, tuple[Any, str, Any, Any]] = {}
     cache_snapshot: dict[tuple[str, str], tuple[Any, str, Any]] = {}
     cache_symbols = {
-        "core.integrations.qdrant.client": ("_client",),
+        "core.integrations.qdrant.client": ("_client", "_single_attempt_client"),
         "core.integrations.fastembed.bm25": ("_bm25_model",),
     }
     for module_name, attrs in cache_symbols.items():
@@ -679,6 +679,7 @@ def restore(originals: dict[str, tuple[Any, str, Any, Any]] | None) -> None:
         setattr(module, attr, value)
     for module_name, attr, fake_type in (
         ("core.integrations.qdrant.client", "_client", FakeQdrantClient),
+        ("core.integrations.qdrant.client", "_single_attempt_client", FakeQdrantClient),
         ("core.integrations.fastembed.bm25", "_bm25_model", FakeSparseTextEmbedding),
     ):
         module = sys.modules.get(module_name)

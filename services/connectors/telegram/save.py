@@ -636,6 +636,9 @@ def _error_code(error: Exception) -> str:
 
 def _core_save_retryable(client: Any, operation_id: str, error: Exception) -> bool:
     """Read shared-save outcome state without adding Telegram attempt accounting."""
+    explicit = getattr(error, "telegram_stage_retryable", None)
+    if isinstance(explicit, bool):
+        return explicit
     if client is not None:
         try:
             from core.integrations.firestore.operations import get_operation, get_stage

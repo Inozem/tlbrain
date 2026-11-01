@@ -14,18 +14,26 @@ from core.integrations.google_drive.folders import (
 )
 
 
-def resolve_registered_folder_path(path: list[str], db=None) -> list[str]:
+def resolve_registered_folder_path(path: list[str], db=None, *, single_attempt: bool = False) -> list[str]:
     """Resolve a path against the registered folder snapshot, including duplicates."""
     if not path:
         return []
     root_folder_id = get_root_folder_id()
-    all_folders = folder_repository.get_all_folders() if db is None else folder_repository.get_all_folders(db)
+    if single_attempt:
+        all_folders = (folder_repository.get_all_folders(single_attempt=True) if db is None
+                       else folder_repository.get_all_folders(db, single_attempt=True))
+    else:
+        all_folders = folder_repository.get_all_folders() if db is None else folder_repository.get_all_folders(db)
     return resolve_folder_path(path, all_folders, root_folder_id)
 
 
-def expand_registered_subtree(folder_id: str, db=None) -> list[str]:
+def expand_registered_subtree(folder_id: str, db=None, *, single_attempt: bool = False) -> list[str]:
     """Expand a registered folder subtree in breadth-first repository order."""
-    all_folders = folder_repository.get_all_folders() if db is None else folder_repository.get_all_folders(db)
+    if single_attempt:
+        all_folders = (folder_repository.get_all_folders(single_attempt=True) if db is None
+                       else folder_repository.get_all_folders(db, single_attempt=True))
+    else:
+        all_folders = folder_repository.get_all_folders() if db is None else folder_repository.get_all_folders(db)
     return expand_subtree(folder_id, all_folders)
 
 
@@ -86,9 +94,12 @@ def get_or_create_folder(drive: Any, parent_id: str, name: str) -> str:
     return folder["id"]
 
 
-def get_unassigned_folder_id(drive: Any, root_folder_id: str) -> str:
+def get_unassigned_folder_id(
+    drive: Any, root_folder_id: str, *, single_attempt: bool = False,
+) -> str:
     """Get or create the root ``_unassigned`` folder and register its Drive ID."""
-    all_folders = folder_repository.get_all_folders()
+    all_folders = (folder_repository.get_all_folders(single_attempt=True)
+                   if single_attempt else folder_repository.get_all_folders())
     for folder_id, data in all_folders.items():
         if data.get("name") == "_unassigned" and data.get("parent_id") == root_folder_id:
             return folder_id
@@ -109,11 +120,15 @@ def _resolve(path: list[str], role: str, db=None) -> str:
     return matches[0]
 
 
-def list_folders() -> dict[str, Any]:
+def list_folders(*, single_attempt: bool = False) -> dict[str, Any]:
     """Build the folder tree and transcript aggregates from Firestore."""
     root_folder_id = get_root_folder_id()
-    all_folders = folder_repository.get_all_folders()
-    aggregates = aggregate_transcripts_by_folder()
+    if single_attempt:
+        all_folders = folder_repository.get_all_folders(single_attempt=True)
+        aggregates = aggregate_transcripts_by_folder(single_attempt=True)
+    else:
+        all_folders = folder_repository.get_all_folders()
+        aggregates = aggregate_transcripts_by_folder()
     return build_folder_tree(all_folders, root_folder_id, aggregates)
 
 

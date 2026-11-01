@@ -104,10 +104,18 @@ def list_transcripts(
     date_to: str | None = None,
     limit: int = 20,
     offset: int = 0,
+    *,
+    single_attempt: bool = False,
 ) -> dict:
     """Return paginated, date-descending transcripts, excluding placeholders."""
     transcripts = []
-    for doc in get_client().collection(COLLECTION_NAME).stream():
+    query = get_client().collection(COLLECTION_NAME)
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        stream = single_attempt_read(lambda: list(query.stream(retry=None)))
+    else:
+        stream = query.stream()
+    for doc in stream:
         data = doc.to_dict() or {}
         if data.get("status") in ("queued", "downloading"):
             continue
@@ -160,12 +168,18 @@ def get_doc_ids_by_client(client_name: str) -> list[str]:
     return [doc.id for doc in docs]
 
 
-def aggregate_transcripts_by_folder() -> dict[str, dict]:
+def aggregate_transcripts_by_folder(*, single_attempt: bool = False) -> dict[str, dict]:
     """Return synced transcript counts and latest dates grouped by parent folder."""
     agg: dict[str, dict] = {}
-    for doc in get_client().collection(COLLECTION_NAME).where(
+    query = get_client().collection(COLLECTION_NAME).where(
         filter=firestore.FieldFilter("status", "==", "synced")
-    ).stream():
+    )
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        stream = single_attempt_read(lambda: list(query.stream(retry=None)))
+    else:
+        stream = query.stream()
+    for doc in stream:
         data = doc.to_dict() or {}
         parent_id = data.get("parent_id")
         if not parent_id:
@@ -456,14 +470,20 @@ def get_error_docs(db: firestore.Client | None = None) -> list[str]:
     return result
 
 
-def get_sync_status() -> dict:
+def get_sync_status(*, single_attempt: bool = False) -> dict:
     """Aggregate transcript_index counts by status in a single scan."""
     counts: dict[str, int] = {
         "queued": 0, "downloading": 0, "imported": 0,
         "syncing": 0, "synced": 0, "error": 0,
     }
     unassigned = 0
-    for doc in get_client().collection(COLLECTION_NAME).stream():
+    query = get_client().collection(COLLECTION_NAME)
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        stream = single_attempt_read(lambda: list(query.stream(retry=None)))
+    else:
+        stream = query.stream()
+    for doc in stream:
         data = doc.to_dict()
         status = data.get("status", "")
         if status in counts:

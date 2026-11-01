@@ -213,11 +213,13 @@ class TelegramSaveRuntime(_TelegramSharedSaveRuntime, _TelegramCommittedSaveRunt
         from core.integrations.firestore.folders import get_all_folders, get_folders_by_speaker
         from core.integrations.gemini.llm import call_gemini_json
 
-        folders = get_all_folders(self.repository.client)
+        folders = get_all_folders(self.repository.client, single_attempt=True)
         utterances = tuple(DialogUtterance(**row) for row in utterance_rows)
 
         def speaker_lookup(speaker: str):
-            return [row.id for row in get_folders_by_speaker(speaker, self.repository.client)]
+            return [row.id for row in get_folders_by_speaker(
+                speaker, self.repository.client, single_attempt=True,
+            )]
 
         cache: dict[tuple[Any, ...], Any] = {}
 
@@ -259,12 +261,17 @@ class TelegramSaveRuntime(_TelegramSharedSaveRuntime, _TelegramCommittedSaveRunt
         if selected_id is None and selection.requires_unassigned:
             from core.integrations.google_drive.client import build_drive_service_rw
             from core.integrations.google_drive.folder_service import get_unassigned_folder_id
+            from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
 
             if callable(assert_current):
                 assert_current()
             selected_id = get_unassigned_folder_id(
-                _GuardedGoogleProxy(build_drive_service_rw(), assert_current)
-                if callable(assert_current) else build_drive_service_rw(), get_root_folder_id(),
+                _GuardedGoogleProxy(build_drive_service_rw(
+                    retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+                ), assert_current)
+                if callable(assert_current) else build_drive_service_rw(
+                    retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+                ), get_root_folder_id(), single_attempt=True,
             )
         return selection, selected_id
 
@@ -393,6 +400,7 @@ class TelegramSaveRuntime(_TelegramSharedSaveRuntime, _TelegramCommittedSaveRunt
             context_id=context_id, draft_id="", parent_operation_id=operation_id,
             core_operation_id=stable_id, origin_operation_ref=input_ref,
             origin_binding=binding, lease=lease, classified=classified,
+            retry_governor=retry_governor,
         )
         return self._completed_dialog_result(
             stable_id, context_id, operation_id, call_ordinal, lease,

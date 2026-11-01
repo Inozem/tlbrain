@@ -569,6 +569,38 @@ def complete_stage_attempt(
     return _txn(db.transaction())
 
 
+def release_stage_attempt(
+    client: Any | None, operation_id: str, stage_key: str, *, owner: str, fence: int,
+    attempt_id: str, now: datetime,
+) -> bool:
+    """Release a successful volatile observation without completing its stage."""
+    now = _aware(now)
+    db = _db(client)
+    operation_ref = db.collection(OPERATIONS_COLLECTION).document(operation_id)
+    stage_ref = _stage_ref(db, operation_id, stage_key)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        operation_snapshot = operation_ref.get(transaction=transaction)
+        stage_snapshot = stage_ref.get(transaction=transaction)
+        if not operation_snapshot.exists or not stage_snapshot.exists:
+            return False
+        operation_data = operation_snapshot.to_dict() or {}
+        stage = _stage_from(stage_snapshot.to_dict() or {})
+        if not _valid_lease(operation_data, owner, fence, now) or stage.in_flight_attempt_id != attempt_id:
+            return False
+        released = OperationStageRecord(
+            stage_key=stage_key, state=StageState.PENDING, failures=stage.failures,
+            attempts_started=stage.attempts_started, checkpoint_refs=stage.checkpoint_refs,
+            updated_at=now, last_error=stage.last_error,
+        )
+        operation_data["updated_at"] = now
+        transaction.set(stage_ref, _stage_data(released, operation_id))
+        transaction.set(operation_ref, operation_data)
+        return True
+    return _txn(db.transaction())
+
+
 def fail_stage_attempt(
     client: Any | None,
     operation_id: str,

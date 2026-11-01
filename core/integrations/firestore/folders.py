@@ -51,10 +51,18 @@ def get_folder_by_id(folder_id: str, db: firestore.Client | None = None) -> dict
     return doc.to_dict() if doc.exists else None
 
 
-def get_all_folders(db: firestore.Client | None = None) -> dict[str, dict]:
+def get_all_folders(db: firestore.Client | None = None, *, single_attempt: bool = False) -> dict[str, dict]:
     """Return all folder records keyed by their stable Drive IDs."""
-    client = _db_or_client(db)
-    return {doc.id: (doc.to_dict() or {}) for doc in client.collection(FOLDERS_COLLECTION).stream()}
+    def read() -> dict[str, dict]:
+        client = _db_or_client(db)
+        query = client.collection(FOLDERS_COLLECTION)
+        rows = query.stream(retry=None) if single_attempt else query.stream()
+        return {doc.id: (doc.to_dict() or {}) for doc in rows}
+
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        return single_attempt_read(read)
+    return read()
 
 
 def folder_name_exists(
@@ -102,12 +110,21 @@ def delete_folder(folder_id: str, db: firestore.Client | None = None) -> None:
     logger.info("Deleted folder record: %s", folder_id)
 
 
-def get_folders_by_speaker(speaker: str, db: firestore.Client | None = None):
+def get_folders_by_speaker(speaker: str, db: firestore.Client | None = None, *,
+                           single_attempt: bool = False):
     """Query folder snapshots whose indexed count for speaker is positive."""
-    client = _db_or_client(db)
-    return client.collection(FOLDERS_COLLECTION).where(
-        filter=firestore.FieldFilter(f"speakers.{speaker_key(speaker)}", ">", 0)
-    ).stream()
+    def read():
+        client = _db_or_client(db)
+        query = client.collection(FOLDERS_COLLECTION).where(
+            filter=firestore.FieldFilter(f"speakers.{speaker_key(speaker)}", ">", 0)
+        )
+        rows = query.stream(retry=None) if single_attempt else query.stream()
+        return list(rows) if single_attempt else rows
+
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        return single_attempt_read(read)
+    return read()
 
 
 def increment_folder_speakers(

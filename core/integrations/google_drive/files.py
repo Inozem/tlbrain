@@ -3,6 +3,7 @@
 import logging
 
 from core.integrations.google_drive.client import build_drive_service, build_drive_service_rw
+from core.utils.retry import LEGACY_RETRY_POLICY, RetryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +111,9 @@ def read_native_doc_metadata(service, file_id: str) -> dict:
     return result
 
 
-def get_file_metadata(file_id: str) -> dict:
+def get_file_metadata(file_id: str, *, retry_policy: RetryPolicy = LEGACY_RETRY_POLICY) -> dict:
     """Return the minimal current metadata needed by guarded write read-back."""
-    service = build_drive_service()
+    service = build_drive_service(retry_policy=retry_policy)
     result = service.files().get(
         fileId=file_id,
         fields="id,name,mimeType,parents,trashed,appProperties",

@@ -182,10 +182,18 @@ def validate_arguments(name: str, arguments: Any) -> dict[str, Any]:
     return dict(arguments)
 
 
-def invoke_operation(name: str, arguments: Any, *, context: write.WriteContext | AddDialogContext | None = None) -> Any:
+def invoke_operation(name: str, arguments: Any, *, context: write.WriteContext | AddDialogContext | None = None,
+                     retry_policy: Any | None = None) -> Any:
     """Validate and invoke exactly one shared operation, returning its raw result."""
     validated = validate_arguments(name, arguments)
     operation = OPERATIONS[name]
+    if retry_policy is not None:
+        from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
+        if retry_policy is not SINGLE_ATTEMPT_RETRY_POLICY or name not in {
+            "query", "get_transcript", "list_recent_transcripts", "list_folders", "sync_status",
+        }:
+            _fail("retry policy is not accepted for this operation")
+        return operation.function(**validated, retry_policy=retry_policy)
     if name == "add_dialog":
         if not isinstance(context, AddDialogContext):
             _fail("a trusted dialog acceptance context is required")

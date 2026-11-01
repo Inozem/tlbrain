@@ -294,7 +294,10 @@ class _SearchPort:
         else:
             stage_key = "telegram-search-" + hashlib.sha256(query.encode("utf-8")).hexdigest()[:32]
             def retrieve() -> Any:
-                segments, metadata = read.query(query=query)
+                from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
+                segments, metadata = read.query(
+                    query=query, retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+                )
                 return {"segments": self._json_safe(segments),
                         "metadata": self._json_safe(metadata)}
             try:

@@ -972,6 +972,177 @@ def test_search_provider_failures_use_three_stage_budget_and_safe_error(monkeypa
     assert "private search provider details" not in bot.sent[-1][1]
 
 
+def test_search_route_uses_one_real_embedding_attempt_per_durable_retry(
+    monkeypatch, firestore_fake, sdk_fakes,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryGovernor
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
+                        _polling_offload)
+    monkeypatch.setenv("RETRIEVAL_TOP_K", "15")
+    monkeypatch.setenv("RETRIEVAL_SCORE_THRESHOLD", "0.5")
+    for _ in range(3):
+        sdk_fakes.gemini.queue(
+            "embed_content", error=ConnectionError("synthetic embedding outage"),
+        )
+        sdk_fakes.qdrant.queue(
+            "query_points", response=SimpleNamespace(points=[]),
+        )
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(
+            client, client.collection("telegram_sessions").document(context_id)),
+        error_classifier=telegram_error_classifier,
+    )
+    bot, model = _Bot(), _RuntimeModel(_search_route())
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model, clock=lambda: now)
+
+    states = [asyncio.run(runtime(
+        context_id, operation, lease, command=command,
+        retry_governor=governor,
+    ), loop_factory=_selector_loop) for _ in range(3)]
+
+    embedding_calls = [event for event in sdk_fakes.trace
+                       if event["boundary"] == "gemini"
+                       and event["operation"] == "embed_content"]
+    assert [state.value for state in states] == ["running", "running", "failed"]
+    assert len(embedding_calls) == 3
+    assert not any("synthetic embedding outage" in str(event)
+                   for event in sdk_fakes.trace)
+    assert "synthetic embedding outage" not in str(bot.sent)
+    search_stage_key = next(
+        path.rsplit("/", 1)[-1] for path in firestore_fake.documents
+        if path.startswith(
+            f"telegram_sessions/{context_id}/operations/{operation['operation_id']}/stages/"
+        ) and "telegram-search-" in path
+    )
+    assert governor.get_stage(
+        operation["operation_id"], search_stage_key,
+    ).last_error.service == "gemini"
+
+
+def test_search_route_governs_qdrant_failures_from_both_parallel_branches(
+    monkeypatch, firestore_fake, sdk_fakes,
+):
+    from types import SimpleNamespace
+    from google.genai import types
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryGovernor
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
+                        _polling_offload)
+    monkeypatch.setenv("RETRIEVAL_TOP_K", "15")
+    monkeypatch.setenv("RETRIEVAL_SCORE_THRESHOLD", "0.5")
+    embedding = types.EmbedContentResponse(
+        embeddings=[types.ContentEmbedding(values=[0.25] * 768)],
+    )
+    for _ in range(3):
+        sdk_fakes.gemini.queue("embed_content", response=embedding)
+        for _branch in range(2):
+            sdk_fakes.qdrant.queue(
+                "query_points", error=ConnectionError("synthetic qdrant outage"),
+            )
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(
+            client, client.collection("telegram_sessions").document(context_id)),
+        error_classifier=telegram_error_classifier,
+    )
+    bot, model = _Bot(), _RuntimeModel(_search_route())
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model, clock=lambda: now)
+
+    states = [asyncio.run(runtime(
+        context_id, operation, lease, command=command, retry_governor=governor,
+    ), loop_factory=_selector_loop) for _ in range(3)]
+
+    calls = [event for event in sdk_fakes.trace
+             if event["boundary"] == "qdrant" and event["operation"] == "query_points"]
+    assert [state.value for state in states] == ["running", "running", "failed"]
+    assert len(calls) == 6
+    search_stage_key = next(
+        path.rsplit("/", 1)[-1] for path in firestore_fake.documents
+        if path.startswith(
+            f"telegram_sessions/{context_id}/operations/{operation['operation_id']}/stages/"
+        ) and "telegram-search-" in path
+    )
+    stage = governor.get_stage(operation["operation_id"], search_stage_key)
+    assert stage.failures == 3
+    assert stage.last_error.service == "qdrant"
+    assert "synthetic qdrant outage" not in str(bot.sent)
+
+
+def test_default_telegram_search_constructs_qdrant_without_background_probe(
+    monkeypatch, firestore_fake, sdk_fakes,
+):
+    from types import SimpleNamespace
+    from google.genai import types
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryGovernor
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
+                        _polling_offload)
+    monkeypatch.setenv("RETRIEVAL_TOP_K", "15")
+    monkeypatch.setenv("RETRIEVAL_SCORE_THRESHOLD", "0.5")
+    monkeypatch.setenv("QDRANT_URL", "https://synthetic.invalid")
+    monkeypatch.setenv("QDRANT_API_KEY", "synthetic-qdrant-secret")
+    from core.integrations.qdrant import client as qdrant_client
+    monkeypatch.setattr(qdrant_client, "_single_attempt_client", None)
+    monkeypatch.setattr(qdrant_client, "_client", None)
+    empty_embedding = types.EmbedContentResponse(
+        embeddings=[types.ContentEmbedding(values=[0.25] * 768)],
+    )
+    sdk_fakes.gemini.queue("embed_content", response=empty_embedding)
+    sdk_fakes.gemini.queue("embed_content", response=empty_embedding)
+    for _ in range(3):
+        sdk_fakes.qdrant.queue("query_points", response=SimpleNamespace(points=[]))
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(
+            client, client.collection("telegram_sessions").document(context_id)),
+    )
+    bot, model = _Bot(), _RuntimeModel(_search_route())
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model, clock=lambda: now)
+
+    result = asyncio.run(runtime(
+        context_id, operation, lease, command=command, retry_governor=governor,
+    ), loop_factory=_selector_loop)
+
+    assert result.value == "completed"
+    client_events = [event for event in sdk_fakes.trace
+                     if event["boundary"] == "qdrant" and event["operation"] == "client"]
+    assert len(client_events) == 1
+    assert client_events[0]["arguments"].get("check_compatibility") is False
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "qdrant"
+                and event["operation"] == "query_points"]) == 3
+
+
 def test_agent_ledger_replays_saved_tool_result_and_rejects_stale_fence(firestore_fake):
     from services.connectors.telegram.repository import TelegramRepository
     from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger

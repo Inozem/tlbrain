@@ -91,6 +91,7 @@ def invoke_tool(
     *,
     context: Any = None,
     execution_context: WriteContext | registry.AddDialogContext | None = None,
+    retry_policy: Any = None,
 ) -> Any:
     """Validate and dispatch once, before resolving trusted context.
 
@@ -111,7 +112,12 @@ def invoke_tool(
     if trusted_context is None and isinstance(context, (WriteContext, registry.AddDialogContext)):
         trusted_context = context
 
-    result = registry.invoke_operation(name, validated, context=trusted_context)
+    if retry_policy is None:
+        result = registry.invoke_operation(name, validated, context=trusted_context)
+    else:
+        result = registry.invoke_operation(
+            name, validated, context=trusted_context, retry_policy=retry_policy,
+        )
     if metadata.get("include_link") is True:
         return result
     return _strip_unrequested_links(result)

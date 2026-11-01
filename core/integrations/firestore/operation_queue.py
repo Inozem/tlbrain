@@ -106,6 +106,28 @@ class QueueOperationRetryStore:
         return self._finish_attempt(operation_id, stage_key, owner, fence, attempt_id, now,
                                     error=error, retry_not_before=retry_not_before)
 
+    def release_attempt(self, *, operation_id: str, stage_key: str, owner: str, fence: int,
+                        attempt_id: str, now: datetime) -> bool:
+        """Return a successful observation to pending without caching its value."""
+        now = _aware(now)
+        stage_ref = _stage_ref(self.context_ref, operation_id, stage_key)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> bool:
+            stage_snapshot = stage_ref.get(transaction=transaction)
+            if (not stage_snapshot.exists or not self._valid(transaction, operation_id, owner, fence, now)):
+                return False
+            stage = _stage_from(stage_snapshot.to_dict() or {})
+            if stage.in_flight_attempt_id != attempt_id:
+                return False
+            updated = OperationStageRecord(
+                stage_key, StageState.PENDING, stage.failures, stage.attempts_started,
+                None, None, stage.last_error, stage.checkpoint_refs, now, None,
+            )
+            transaction.set(stage_ref, _stage_data(updated))
+            return True
+        return _txn(self.client.transaction())
+
     def _finish_attempt(self, operation_id: str, stage_key: str, owner: str, fence: int,
                         attempt_id: str, now: datetime, *, result: Any = None,
                         error: OperationError | None = None, retry_not_before: datetime | None = None,

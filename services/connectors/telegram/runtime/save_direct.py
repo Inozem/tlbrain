@@ -51,6 +51,32 @@ def _classification_failure_details(error: Any, failures: Any) -> dict[str, Any]
     }
 
 
+def _finalization_failure_details(
+    governor: Any, parent_operation_id: str, child_id: str, child: Any,
+) -> dict[str, Any] | None:
+    """Read an exhausted Docs/Drive finalizer stage after the child is terminal."""
+    for boundary, service in (("docs", "google_docs"), ("drive", "google_drive")):
+        stage_key = f"telegram.finalize.{child_id}.{boundary}"
+        final_stage = governor.get_stage(parent_operation_id, stage_key)
+        error = _get(final_stage, "last_error")
+        failures = _get(final_stage, "failures", 0)
+        if error is not None and (
+            not _get(error, "retryable", True)
+            or failures >= getattr(governor, "max_failures", 3)
+        ):
+            return {
+                "service": _get(error, "service") or service,
+                "stage": "finalization",
+                "code": _get(error, "code"),
+                "category": _get(error, "category"),
+                "failures": failures,
+                "occurred_at": _get(error, "occurred_at"),
+                "sanitized_message": _get(error, "sanitized_message")
+                or _get(error, "message"),
+            }
+    return None
+
+
 def _format_direct_failure(
     parent_operation_id: str, context_id: str, child_id: str | None,
     child: Any, details: Mapping[str, Any],
@@ -181,6 +207,17 @@ def direct_failure_reply(runtime, context_id: str, parent_operation_id: str,
                 return None
             if child.state is not OperationState.FAILED:
                 continue
+            if governor is not None:
+                try:
+                    finalizer_error = _finalization_failure_details(
+                        governor, parent_operation_id, child_id, child,
+                    )
+                except Exception:
+                    return None
+                if finalizer_error is not None:
+                    return _format_direct_failure(
+                        parent_operation_id, context_id, child_id, child, finalizer_error,
+                    )
             if error is None and not core_terminal:
                 return None
             # Stage ledger counts, rather than the operation error's retryable

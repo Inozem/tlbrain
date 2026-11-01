@@ -243,10 +243,12 @@ class TelegramQueueWorker:
 
     def _retry_governor(self, context_ref: Any) -> RetryGovernor:
         from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+        from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
 
         return RetryGovernor(
             self.client, clock=_WorkerClock(self),
             retry_store=QueueOperationRetryStore(self.client, context_ref),
+            error_classifier=telegram_error_classifier,
         )
 
     async def _process(self, context_id: str, operation: Any, lease: OperationLease,

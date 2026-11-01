@@ -19,6 +19,83 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
     return value.get(key, default) if isinstance(value, Mapping) else getattr(value, key, default)
 
 
+def _reconcile_finalization_read(governor: Any, stage_key: str, callback: Any) -> Any:
+    """Confirm a fresh idempotent read or charge its known provider failure."""
+    from core.operations.models import OperationError
+    from core.operations.retries import ConfirmedStageFailure, ConfirmedStageSuccess, UnknownOutcome
+    from services.connectors.telegram.runtime.save_fencing import _provider_error_retryable
+
+    try:
+        return ConfirmedStageSuccess(callback())
+    except UnknownOutcome:
+        raise
+    except Exception as error:
+        category, service = governor._classified_error(error, stage_key)
+        return ConfirmedStageFailure(OperationError(
+            code=type(error).__name__.lower(), category=category,
+            message=f"Stage execution failed ({type(error).__name__})",
+            retryable=_provider_error_retryable(error), service=service,
+            stage=stage_key,
+        ))
+
+
+def _run_finalization_read_boundary(
+    runtime: Any, *, client: Any, parent_operation_id: str, operation_id: str,
+    context_id: str, lease: Any, core_owner: str, core_fence: int,
+    retry_governor: Any, boundary: str, callback: Any,
+) -> Any:
+    """Govern a fresh finalization read on the queue ledger and settle exhaustion safely."""
+    from core.integrations.firestore.operations import fail_operation
+    from core.operations.models import OperationError
+    from core.operations.retries import UnknownOutcome
+
+    bound = _ParentBoundRetryGovernor(
+        retry_governor, clock=runtime.clock,
+        assert_current=lambda: runtime._assert_parent_lease(
+            context_id, parent_operation_id, lease,
+        ),
+    )
+    stage_key = f"telegram.finalize.{operation_id}.{boundary}"
+    try:
+        return bound.run_stage(
+            parent_operation_id, stage_key, callback, now=runtime.clock(),
+            owner=_get(lease, "owner"), fence=_get(lease, "fence"),
+            reconcile=lambda: _reconcile_finalization_read(bound, stage_key, callback),
+            checkpoint_success=False,
+        )
+    except UnknownOutcome:
+        raise
+    except Exception as error:
+        stage = bound.get_stage(parent_operation_id, stage_key)
+        terminal = bool(stage and stage.last_error and (
+            not stage.last_error.retryable or stage.failures >= bound.max_failures
+        ))
+        if not terminal:
+            raise
+        try:
+            runtime._assert_parent_lease(context_id, parent_operation_id, lease)
+        except Exception as stale:
+            raise UnknownOutcome("Telegram parent queue lease changed before finalizer settlement") from stale
+        safe_error = OperationError(
+            code=stage.last_error.code, category=stage.last_error.category,
+            message=stage.last_error.message, retryable=False,
+            service=stage.last_error.service, stage=stage_key,
+            sanitized_message=stage.last_error.sanitized_message,
+            occurred_at=stage.last_error.occurred_at or runtime.clock(),
+            failures=stage.failures,
+        )
+        if not fail_operation(
+            client, operation_id, owner=core_owner, fence=core_fence,
+            error=safe_error, now=runtime.clock(),
+        ):
+            raise RuntimeError("could not settle exhausted finalization read") from error
+        try:
+            error.telegram_stage_retryable = False
+        except Exception:
+            pass
+        raise
+
+
 def _accept_core_save(
     runtime: Any, *, context_id: str, draft_id: str, parent_operation_id: str,
     lease: Any, classified: Mapping[str, Any], operation_id: str,
@@ -73,7 +150,8 @@ class _TelegramSharedSaveRuntime:
                    lease: Any, classified: Mapping[str, Any], core_operation_id: str | None = None,
                    save_intent_id: str | None = None,
                    origin_binding: Mapping[str, str] | None = None,
-                   origin_operation_ref: str | None = None, **_kwargs: Any) -> Mapping[str, Any]:
+                   origin_operation_ref: str | None = None,
+                   retry_governor: Any = None, **_kwargs: Any) -> Mapping[str, Any]:
         """Advance one provenance-bound shared save through real index confirmation."""
         from core.config import get_root_folder_id
         from core.dialogs.saving import advance_save
@@ -81,8 +159,7 @@ class _TelegramSharedSaveRuntime:
         from core.integrations.firestore.folders import get_all_folders, get_folders_by_speaker
         from core.integrations.firestore.operations import claim_operation, get_operation, release_operation
         from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION, get_save_intent
-        from core.integrations.google_docs.client import build_docs_service
-        from core.integrations.google_drive.client import build_drive_service_rw
+        from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
         from core.operations.outbox import TaskTargetConfig, publish_due_outbox_records
         from core.integrations.firestore.outbox import OutboxTargetKind
 
@@ -111,21 +188,38 @@ class _TelegramSharedSaveRuntime:
             if core_op.state is not OperationState.COMPLETED:
                 self._assert_parent_lease(context_id, parent_operation_id, lease)
                 root = get_root_folder_id()
-                folders = get_all_folders(client)
-                drive = build_drive_service_rw()
-                docs = build_docs_service(["https://www.googleapis.com/auth/documents"])
+                folders = lambda: get_all_folders(client, single_attempt=True)
+
+                def drive_factory():
+                    from core.integrations.google_drive.client import build_drive_service_rw
+                    service = build_drive_service_rw(retry_policy=SINGLE_ATTEMPT_RETRY_POLICY)
+                    return _GuardedGoogleProxy(
+                        service,
+                        lambda: self._assert_parent_lease(context_id, parent_operation_id, lease),
+                    )
+
+                def docs_factory():
+                    from core.integrations.google_docs.client import build_docs_service
+                    service = build_docs_service(
+                        ["https://www.googleapis.com/auth/documents"],
+                        retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+                    )
+                    return _GuardedGoogleProxy(
+                        service,
+                        lambda: self._assert_parent_lease(context_id, parent_operation_id, lease),
+                    )
+
                 advance_save(
                     client, operation_id, owner=owner, fence=global_lease.fence, now=self.clock(),
                     folders=folders, root_folder_id=root,
                     speaker_index_lookup=lambda speaker: [
-                        row.id for row in get_folders_by_speaker(speaker, client)
+                        row.id for row in get_folders_by_speaker(
+                            speaker, client, single_attempt=True,
+                        )
                     ], suggestion=lambda *_args: None,
-                 drive=_GuardedGoogleProxy(
-                     drive, lambda: self._assert_parent_lease(context_id, parent_operation_id, lease),
-                 ),
-                 docs=_GuardedGoogleProxy(
-                     docs, lambda: self._assert_parent_lease(context_id, parent_operation_id, lease),
-                 ), governor=_ParentBoundRetryGovernor(
+                 drive=drive_factory,
+                 docs=docs_factory,
+                 governor=_ParentBoundRetryGovernor(
                      _TelegramSaveRetryGovernor(client, clock=_RuntimeClock(self.clock)),
                      clock=self.clock,
                      assert_current=lambda: self._assert_parent_lease(
@@ -145,11 +239,21 @@ class _TelegramSharedSaveRuntime:
                     audience=target_url,
                 )}, now=self.clock(), limit=20)
             self._assert_parent_lease(context_id, parent_operation_id, lease)
+
             result = finalize_save(
                 client, operation_id=operation_id, save_intent_id=save_intent_id,
                 owner=owner, fence=global_lease.fence,
                 origin_binding=binding,
                 now=self.clock(), clock=self.clock,
+                retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+                read_boundary=(
+                    (lambda boundary, callback: _run_finalization_read_boundary(
+                        self, client=client, parent_operation_id=parent_operation_id,
+                        operation_id=operation_id, context_id=context_id, lease=lease,
+                        core_owner=owner, core_fence=global_lease.fence,
+                        retry_governor=retry_governor, boundary=boundary, callback=callback,
+                    )) if retry_governor is not None else None
+                ),
             )
             if result is None:
                 raise TelegramSavePending(stage="indexing")

@@ -376,7 +376,7 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
                    if event["boundary"] == "docs" and event["operation"] == "documents.batchUpdate"]
     assert len(fill_events) == 1
     reader_text = fill_events[0]["arguments"]["body"]["requests"][0]["insertText"]["text"]
-    def read_saved_document(_doc_id):
+    def read_saved_document(_doc_id, **_kwargs):
         return reader_text
     monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
                         lambda _doc_id: ("folder-client", False, "A complete saved dialog"))

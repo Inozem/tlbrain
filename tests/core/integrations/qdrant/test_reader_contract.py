@@ -5,7 +5,7 @@ import pytest
 from qdrant_client.http.models import QueryResponse
 from qdrant_client.models import Record, ScoredPoint
 
-from core.integrations.qdrant import reader, writer
+from core.integrations.qdrant import client as qdrant_client, reader, writer
 from core.retrieval import pipeline, search, transcripts
 from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
 
@@ -238,6 +238,21 @@ def test_reader_consumes_explicit_retry_policy_at_decorated_boundary(sdk_fakes):
     [event] = _scroll_events(sdk_fakes)
     assert "retry_policy" not in event
     assert event["args"] == ()
+
+
+def test_telegram_profile_disables_probe_without_changing_legacy_client(sdk_fakes, monkeypatch):
+    monkeypatch.setenv("QDRANT_URL", "https://synthetic.invalid")
+    monkeypatch.setenv("QDRANT_API_KEY", "synthetic-secret")
+    monkeypatch.setattr(qdrant_client, "_single_attempt_client", None)
+    monkeypatch.setattr(qdrant_client, "_client", None)
+    qdrant_client.get_client(single_attempt=True)
+    qdrant_client.get_client()
+
+    events = [event for event in sdk_fakes.trace
+              if event["boundary"] == "qdrant" and event["operation"] == "client"]
+    assert len(events) == 2
+    assert events[0]["arguments"].get("check_compatibility") is False
+    assert "check_compatibility" not in events[1]["arguments"]
 
 
 def test_writer_single_attempt_policy_propagates_once_without_sdk_leakage(sdk_fakes):

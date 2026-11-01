@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from inspect import isawaitable
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from core.integrations.firestore.operations import (
@@ -16,6 +17,7 @@ from core.integrations.firestore.operations import (
     fail_stage_attempt,
     get_stage as repository_get_stage,
     release_operation,
+    release_stage_attempt,
     renew_operation_lease,
     reserve_stage_attempt,
     validate_operation_lease,
@@ -56,6 +58,91 @@ class ReconciledStageFailure(RuntimeError):
         self.error = error
 
 
+_BILLING_REASONS = frozenset({
+    "billing_disabled", "billing_not_active", "no_billing_account",
+    "billing_account_not_found", "payment_required", "insufficient_funds",
+})
+_QUOTA_REASONS = frozenset({
+    "quota_exceeded", "insufficient_quota", "daily_limit_exceeded",
+})
+
+
+def _error_reason_codes(error: BaseException) -> set[str]:
+    """Read only bounded machine reason fields, never provider message text."""
+    values: set[str] = set()
+    source_error = getattr(error, "original_error", error)
+    pending = [getattr(source_error, "response_json", None),
+               getattr(source_error, "error", None),
+               getattr(source_error, "details", None)]
+    visited = 0
+    while pending and visited < 32:
+        source = pending.pop()
+        visited += 1
+        if isinstance(source, Mapping):
+            for key in ("reason", "status"):
+                value = source.get(key)
+                if isinstance(value, str) and len(value) <= 80:
+                    values.add(value.lower())
+            # Provider SDKs expose ErrorInfo either as ``error.details`` or
+            # directly through ``exception.details``. Codes are HTTP/RPC
+            # status evidence, not billing/quota evidence.
+            code = source.get("code")
+            if isinstance(code, str) and len(code) <= 80:
+                values.add(code.lower())
+            for key in ("error", "details"):
+                nested = source.get(key)
+                if isinstance(nested, Mapping):
+                    pending.append(nested)
+                elif isinstance(nested, (list, tuple)):
+                    pending.extend(nested[:10])
+        elif isinstance(source, (list, tuple)):
+            pending.extend(source[:10])
+        else:
+            reason = getattr(source, "reason", None)
+            if isinstance(reason, str) and len(reason) <= 80:
+                values.add(reason.lower())
+            detail = getattr(source, "metadata", None)
+            if isinstance(detail, Mapping):
+                pending.append(detail)
+    content = getattr(error, "content", None)
+    if isinstance(content, bytes) and len(content) <= 65536:
+        try:
+            payload = json.loads(content)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, Mapping):
+            err = payload.get("error")
+            if isinstance(err, Mapping):
+                for key in ("status", "reason"):
+                    value = err.get(key)
+                    if isinstance(value, str) and len(value) <= 80:
+                        values.add(value.lower())
+                rows = err.get("errors")
+                if isinstance(rows, list):
+                    for row in rows[:10]:
+                        if isinstance(row, Mapping):
+                            reason = row.get("reason")
+                            if isinstance(reason, str) and len(reason) <= 80:
+                                values.add(reason.lower())
+    return values
+
+
+def _provider_error_category(error: BaseException) -> str:
+    reasons = _error_reason_codes(error)
+    if reasons & _BILLING_REASONS:
+        return "billing"
+    if reasons & _QUOTA_REASONS:
+        return "quota"
+    error = getattr(error, "original_error", error)
+    status = getattr(error, "code", None) or getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "resp", None), "status", None)
+    return "rate_limited" if status == 429 else "execution"
+
+
+ErrorClassifier = Callable[[BaseException, str], tuple[str, str | None]]
+
+
 class RetryGovernor:
     """Persist stage attempts before invoking callbacks and retain their outcomes."""
 
@@ -67,6 +154,7 @@ class RetryGovernor:
         max_failures: int = 3,
         lease_seconds: int | float = DEFAULT_LEASE_SECONDS,
         retry_store: Any | None = None,
+        error_classifier: ErrorClassifier | None = None,
     ) -> None:
         if max_failures < 1 or max_failures > 3:
             raise ValueError("max_failures must be between 1 and 3")
@@ -77,6 +165,19 @@ class RetryGovernor:
         self.max_failures = max_failures
         self.lease_seconds = lease_seconds
         self.retry_store = retry_store
+        self.error_classifier = error_classifier
+
+    def _classified_error(self, error: BaseException, stage_key: str) -> tuple[str, str | None]:
+        if self.error_classifier is None:
+            return "execution", None
+        category, service = self.error_classifier(error, stage_key)
+        if category not in {"execution", "rate_limited", "billing", "quota"}:
+            raise ValueError("error classifier returned an unsupported category")
+        if service is not None and service not in {
+            "gemini", "qdrant", "google_docs", "google_drive", "firestore", "telegram", "core",
+        }:
+            raise ValueError("error classifier returned an unsupported service")
+        return category, service
 
     def _store_call(self, name: str, fallback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         method = getattr(self.retry_store, name, None) if self.retry_store is not None else None
@@ -129,6 +230,7 @@ class RetryGovernor:
         reconcile: Callable[[], Any] | None = None,
         save_intent_id: str | None = None,
         checkpoint_refs: tuple[str, ...] = (),
+        checkpoint_success: bool = True,
         owner: str | None = None,
         fence: int | None = None,
     ) -> Any:
@@ -173,6 +275,7 @@ class RetryGovernor:
                 return self._reconcile_attempt(
                     operation_id, stage_key, attempt_id, reconcile,
                     owner=owner, fence=fence, checkpoint_refs=checkpoint_refs,
+                    checkpoint_success=checkpoint_success,
                 )
             reserved, attempt_id_or_result = self._reserve_attempt(
                 operation_id, stage_key, owner, fence, now,
@@ -182,6 +285,7 @@ class RetryGovernor:
             return self._execute_attempt(
                 operation_id, stage_key, attempt_id_or_result, callback, retryable,
                 owner=owner, fence=fence, checkpoint_refs=checkpoint_refs,
+                checkpoint_success=checkpoint_success,
             )
         finally:
             if not externally_owned:
@@ -275,10 +379,12 @@ class RetryGovernor:
         except UnknownOutcome:
             raise
         except Exception as error:
+            category, service = self._classified_error(error, stage_key)
             safe_error = OperationError(
-                code=type(error).__name__.lower(), category="execution",
+                code=type(error).__name__.lower(), category=category,
                 message=f"Stage execution failed ({type(error).__name__})",
-                retryable=bool(retryable(error) if retryable is not None else True), stage=stage_key,
+                retryable=bool(retryable(error) if retryable is not None else True),
+                service=service, stage=stage_key,
             )
             await self._run_blocking(
                 self._record_execution_failure, operation_id, stage_key, attempt_id, safe_error,
@@ -363,6 +469,7 @@ class RetryGovernor:
         self, operation_id: str, stage_key: str, attempt_id: str,
         reconcile: Callable[[], Any] | None, *, owner: str, fence: int,
         checkpoint_refs: tuple[str, ...],
+        checkpoint_success: bool = True,
     ) -> Any:
         if reconcile is None:
             raise UnknownOutcome("stage has an unresolved provider outcome")
@@ -378,10 +485,13 @@ class RetryGovernor:
             )
             raise ReconciledStageFailure(reconciled.error) from None
         result = reconciled.result if isinstance(reconciled, ConfirmedStageSuccess) else reconciled
-        self._complete_attempt(
-            operation_id, stage_key, attempt_id, result, owner=owner, fence=fence,
-            checkpoint_refs=checkpoint_refs, reconciled=True,
-        )
+        if checkpoint_success:
+            self._complete_attempt(
+                operation_id, stage_key, attempt_id, result, owner=owner, fence=fence,
+                checkpoint_refs=checkpoint_refs, reconciled=True,
+            )
+        else:
+            self._release_attempt(operation_id, stage_key, attempt_id, owner=owner, fence=fence)
         return result
 
     def _record_reconciled_failure(
@@ -401,6 +511,7 @@ class RetryGovernor:
         self, operation_id: str, stage_key: str, attempt_id: str,
         callback: Callable[[], Any], retryable: Callable[[BaseException], bool] | None,
         *, owner: str, fence: int, checkpoint_refs: tuple[str, ...],
+        checkpoint_success: bool = True,
     ) -> Any:
         try:
             result = callback()
@@ -408,21 +519,35 @@ class RetryGovernor:
             raise
         except Exception as error:
             should_retry = retryable(error) if retryable is not None else True
+            category, service = self._classified_error(error, stage_key)
             safe_error = OperationError(
-                code=type(error).__name__.lower(), category="execution",
+                code=type(error).__name__.lower(), category=category,
                 message=f"Stage execution failed ({type(error).__name__})",
-                retryable=bool(should_retry), stage=stage_key,
+                retryable=bool(should_retry), service=service,
+                stage=stage_key,
             )
             self._record_execution_failure(
                 operation_id, stage_key, attempt_id, safe_error, owner=owner, fence=fence,
                 original_error=error,
             )
             raise
-        self._complete_attempt(
-            operation_id, stage_key, attempt_id, result, owner=owner, fence=fence,
-            checkpoint_refs=checkpoint_refs, reconciled=False,
-        )
+        if checkpoint_success:
+            self._complete_attempt(
+                operation_id, stage_key, attempt_id, result, owner=owner, fence=fence,
+                checkpoint_refs=checkpoint_refs, reconciled=False,
+            )
+        else:
+            self._release_attempt(operation_id, stage_key, attempt_id, owner=owner, fence=fence)
         return result
+
+    def _release_attempt(self, operation_id: str, stage_key: str, attempt_id: str,
+                         *, owner: str, fence: int) -> None:
+        if not self._store_call(
+            "release_attempt", lambda **kw: release_stage_attempt(self.client, **kw),
+            operation_id=operation_id, stage_key=stage_key, owner=owner, fence=fence,
+            attempt_id=attempt_id, now=self._now(),
+        ):
+            raise RuntimeError("could not release volatile stage observation")
 
     def _record_execution_failure(
         self, operation_id: str, stage_key: str, attempt_id: str, error: OperationError,

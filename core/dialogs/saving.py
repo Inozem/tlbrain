@@ -238,13 +238,14 @@ def _reconcile_save_input(client: Any, operation_id: str, immutable_input_digest
 def _classify_save_folder(
     context: _SaveStageContext, intent: Any,
 ) -> dict[str, Any]:
+    folders = _resolve_stage_service(context.folders)
     accepted = context.accepted
     if intent.desired_parent_id is not None:
         request = FolderSelectionRequest(
             title=accepted["title"], utterances=(), folder_id=intent.desired_parent_id,
         )
         result = classify_dialog_folder(
-            request, context.folders, context.root_folder_id,
+            request, folders, context.root_folder_id,
             speaker_index_lookup=context.speaker_index_lookup, suggestion=context.suggestion,
         )
     else:
@@ -256,10 +257,10 @@ def _classify_save_folder(
             folder_id=accepted.get("folder_id"),
         )
         result = classify_dialog_folder(
-            request, context.folders, context.root_folder_id,
+            request, folders, context.root_folder_id,
             speaker_index_lookup=context.speaker_index_lookup, suggestion=context.suggestion,
         )
-    folder_snapshot = dict(context.folders)
+    folder_snapshot = dict(folders)
     folder_id = intent.desired_parent_id or result.folder_id
     registered_unassigned = next((key for key, value in folder_snapshot.items()
                                   if value.get("name") == "_unassigned"
@@ -295,6 +296,7 @@ def _classify_save_folder(
 
 
 def _reconcile_save_folder(context: _SaveStageContext) -> Any:
+    folders = _resolve_stage_service(context.folders)
     current = get_operation(context.client, context.operation_id)
     current_intent = get_save_intent(context.client, context.intent_id)
     if current is None or current_intent is None:
@@ -304,13 +306,13 @@ def _reconcile_save_folder(context: _SaveStageContext) -> Any:
         resolved = classify_dialog_folder(
             FolderSelectionRequest(
                 title=context.accepted["title"], utterances=(), folder_id=current_intent.desired_parent_id,
-            ), context.folders, context.root_folder_id,
+            ), folders, context.root_folder_id,
             speaker_index_lookup=context.speaker_index_lookup, suggestion=context.suggestion,
         )
         if selected_id is not None and selected_id != resolved.folder_id:
             raise ValueError("operation folder conflicts with immutable save-intent parent")
         selected_id = resolved.folder_id
-        path = _folder_path(selected_id, context.folders, context.root_folder_id)
+        path = _folder_path(selected_id, folders, context.root_folder_id)
         _store_selected_folder(
             context.client, context.operation_id, selected_id, path,
             owner=context.owner, fence=context.fence, now=context.now,
@@ -330,14 +332,15 @@ def _reconcile_save_folder(context: _SaveStageContext) -> Any:
     return {
         "folder_id": selected_id,
         "folder_path": list(current.selected_folder_path or _folder_path(
-            selected_id, context.folders, context.root_folder_id,
+            selected_id, folders, context.root_folder_id,
         )),
     }
 
 
 def _reconcile_save_create(context: _SaveStageContext, parent_id: str) -> Any:
+    drive = _resolve_stage_service(context.drive)
     found = reconcile_google_doc_by_marker(
-        context.drive, save_intent_id=context.intent_id, expected_parent_id=parent_id,
+        drive, save_intent_id=context.intent_id, expected_parent_id=parent_id,
     )
     if found.state != "confirmed":
         return None
@@ -358,11 +361,12 @@ def _create_save_document(context: _SaveStageContext, parent_id: str) -> dict[st
         if result is None:
             raise UnknownOutcome("document create outcome remains unresolved")
         return result
+    drive = _resolve_stage_service(context.drive)
     result = dispatch_save_intent(
         context.client, context.intent_id, operation_id=context.operation_id,
         owner=context.owner, fence=context.fence, now=context.now,
         create_callback=lambda: create_marked_google_doc(
-            context.drive, save_intent_id=context.intent_id,
+            drive, save_intent_id=context.intent_id,
             parent_id=parent_id, title=context.accepted["title"],
         ),
     )
@@ -380,12 +384,14 @@ def _fill_save_document(context: _SaveStageContext, document_id: str) -> dict[st
         if checkpoint.get("document_id") != document_id:
             raise ValueError("shared fill checkpoint belongs to a different document")
         return checkpoint
-    document = context.docs.documents().get(documentId=document_id).execute()
+    docs = _resolve_stage_service(context.docs)
+    drive = _resolve_stage_service(context.drive)
+    document = docs.documents().get(documentId=document_id).execute()
     revision = document.get("revisionId") if isinstance(document, dict) else None
     if not isinstance(revision, str) or not revision:
         raise RuntimeError("document revision is unavailable")
     outcome = fill_google_doc_safely(
-        context.docs, drive=context.drive, document_id=document_id, text=context.content,
+        docs, drive=drive, document_id=document_id, text=context.content,
         speaker_ranges=context.ranges, expected_revision_id=revision,
     )
     if outcome.state != "confirmed":
@@ -410,7 +416,7 @@ def _reconcile_save_fill(context: _SaveStageContext, document_id: str) -> Any:
 
 def _read_post_fill_metadata(context: _SaveStageContext, document_id: str, parent_id: str) -> dict[str, Any]:
     """Read metadata after the fill checkpoint so modifiedTime reflects the final write."""
-    value = read_native_doc_metadata(context.drive, document_id)
+    value = read_native_doc_metadata(_resolve_stage_service(context.drive), document_id)
     if value.get("mimeType") != "application/vnd.google-apps.document" or not value.get("modifiedTime"):
         raise RuntimeError("post-fill document metadata is unavailable")
     return {"modified_time": value["modifiedTime"], "parent_id": parent_id}
@@ -423,6 +429,11 @@ def _reconcile_post_fill_metadata(
         return _read_post_fill_metadata(context, document_id, parent_id)
     except Exception:
         return None
+
+
+def _resolve_stage_service(value: Any) -> Any:
+    """Create a provider client inside the active durable stage when given a factory."""
+    return value() if callable(value) else value
 
 
 def _dispatch_save_index(

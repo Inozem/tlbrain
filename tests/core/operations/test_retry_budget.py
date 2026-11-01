@@ -698,6 +698,179 @@ def test_explicit_fresh_operation_budget_can_reuse_same_save_intent(firestore_fa
     assert first.get_stage(OPERATION_ID, "create").failures == 1
 
 
+@pytest.mark.parametrize(
+    ("reason", "stage_key", "category", "service"),
+    [
+        ("billing_disabled", "telegram.finalize.drive", "billing", "google_drive"),
+        ("quota_exceeded", "telegram.finalize.docs", "quota", "google_docs"),
+        (None, "telegram.finalize.docs", "rate_limited", "google_docs"),
+    ],
+)
+def test_structured_provider_errors_are_bounded_and_never_store_provider_text(
+    firestore_fake, fake_clock, reason, stage_key, category, service,
+):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+
+    class ProviderFailure(RuntimeError):
+        status_code = 429
+
+        def __init__(self, reason):
+            super().__init__("synthetic-private-provider-body-secret")
+            self.response_json = {"error": {"reason": reason}} if reason else None
+
+    error = ProviderFailure(reason)
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+    classified_governor = RetryGovernor(
+        client, clock=fake_clock, max_failures=3,
+        error_classifier=telegram_error_classifier,
+    )
+    with pytest.raises(ProviderFailure):
+        classified_governor.run_stage(
+            OPERATION_ID, stage_key, lambda: (_ for _ in ()).throw(error),
+            now=fake_clock.now(),
+        )
+
+    stage = get_stage(client, OPERATION_ID, stage_key)
+    assert stage.failures == 1
+    assert stage.last_error.category == category
+    assert stage.last_error.service == service
+    assert stage.last_error.stage == stage_key
+    stored = client.collection("dialog_operations").document(OPERATION_ID).collection(
+        "stages").document(stage_key).get().to_dict()
+    assert "synthetic-private-provider-body-secret" not in repr(stored)
+
+
+@pytest.mark.parametrize(
+    ("code", "envelope", "category"),
+    [
+        (403, {"error": {"code": 403, "status": "PERMISSION_DENIED",
+                          "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                       "reason": "BILLING_DISABLED"}]}}, "billing"),
+        (429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+                          "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                       "reason": "RATE_LIMIT_EXCEEDED"}]}}, "rate_limited"),
+    ],
+)
+def test_installed_genai_client_error_uses_machine_fields_only(
+    firestore_fake, fake_clock, code, envelope, category,
+):
+    from google.genai.errors import ClientError
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    error = ClientError(code, envelope)
+    assert telegram_error_classifier(error, "telegram-tool-00") == (category, "gemini")
+    assert telegram_error_classifier(RuntimeError("unknown"), "telegram-tool-00") == (
+        "execution", None,
+    )
+
+
+def test_unconfigured_governor_preserves_legacy_generic_error_fields(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    with pytest.raises(RuntimeError):
+        _governor(client, fake_clock).run_stage(
+            OPERATION_ID, "legacy-stage", lambda: (_ for _ in ()).throw(
+                RuntimeError("synthetic billing_disabled body text")), now=fake_clock.now(),
+        )
+    stage = get_stage(client, OPERATION_ID, "legacy-stage")
+    assert stage.last_error.category == "execution"
+    assert stage.last_error.service is None
+
+
+def test_single_attempt_firestore_projection_tags_actual_sdk_failure_but_legacy_does_not(
+    firestore_fake, fake_clock, monkeypatch,
+):
+    from google.api_core.exceptions import ServiceUnavailable
+    from tests.fixtures.firestore_fake import FakeQuery
+    from core.operations import read
+    from core.utils.retry import ProviderBoundaryError, SINGLE_ATTEMPT_RETRY_POLICY
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    secret = "synthetic-firestore-secret-and-source"
+    provider_failure = ServiceUnavailable(secret)
+    calls = []
+
+    def fail_stream(self, **kwargs):
+        calls.append(dict(kwargs))
+        raise provider_failure
+
+    monkeypatch.setattr(FakeQuery, "stream", fail_stream)
+    governed = RetryGovernor(
+        client, clock=fake_clock, error_classifier=telegram_error_classifier,
+    )
+    with pytest.raises(ProviderBoundaryError) as raised:
+        governed.run_stage(
+            OPERATION_ID, "telegram-firestore-read",
+            lambda: read.list_folders(retry_policy=SINGLE_ATTEMPT_RETRY_POLICY),
+            now=fake_clock.now(),
+        )
+    stage = get_stage(client, OPERATION_ID, "telegram-firestore-read")
+    assert calls == [{"retry": None}]
+    assert raised.value.original_error is provider_failure
+    assert stage.last_error.service == "firestore"
+    assert secret not in repr(stage)
+
+    legacy_client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(legacy_client)
+    calls.clear()
+    with pytest.raises(ServiceUnavailable) as legacy_error:
+        _governor(legacy_client, fake_clock).run_stage(
+            OPERATION_ID, "legacy-firestore-read", read.list_folders,
+            now=fake_clock.now(),
+        )
+    legacy = get_stage(legacy_client, OPERATION_ID, "legacy-firestore-read")
+    assert calls == [{}]
+    assert legacy_error.value is provider_failure
+    assert legacy.last_error.service is None
+
+
+def test_single_attempt_speaker_folder_read_marks_lazy_stream_failure(
+    firestore_fake, fake_clock, monkeypatch,
+):
+    from google.api_core.exceptions import ServiceUnavailable
+    from tests.fixtures.firestore_fake import FakeQuery
+    from core.integrations.firestore.folders import get_folders_by_speaker
+    from core.utils.retry import ProviderBoundaryError
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    secret = "synthetic-speaker-stream-secret"
+    provider_failure = ServiceUnavailable(secret)
+    calls = []
+
+    def lazy_failure(self, **kwargs):
+        calls.append(dict(kwargs))
+        def rows():
+            raise provider_failure
+            yield None
+        return rows()
+
+    monkeypatch.setattr(FakeQuery, "stream", lazy_failure)
+    governed = RetryGovernor(
+        client, clock=fake_clock, error_classifier=telegram_error_classifier,
+    )
+    with pytest.raises(ProviderBoundaryError) as raised:
+        governed.run_stage(
+            OPERATION_ID, "telegram-speaker-folders",
+            lambda: get_folders_by_speaker("Ada", client, single_attempt=True),
+            now=fake_clock.now(),
+        )
+    stage = get_stage(client, OPERATION_ID, "telegram-speaker-folders")
+    assert calls == [{"retry": None}]
+    assert raised.value.original_error is provider_failure
+    assert stage.last_error.service == "firestore"
+    assert secret not in repr(stage)
+
+
 def test_durable_execution_makes_at_most_one_physical_provider_attempt(firestore_fake, fake_clock, sdk_fakes):
     client = firestore_fake.client_class()
     firestore_fake.set_clock(fake_clock)
@@ -712,11 +885,13 @@ def test_durable_execution_makes_at_most_one_physical_provider_attempt(firestore
             "doc-retry", "root-retry", [1], retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
         )
 
+    from core.utils.retry import ProviderBoundaryError
     for _ in range(3):
-        with pytest.raises(ConnectionError):
+        with pytest.raises(ProviderBoundaryError) as raised:
             _governor(client, fake_clock).run_stage(
                 OPERATION_ID, "provider", one_provider_call, now=fake_clock.now(),
             )
+        assert raised.value.original_error is not None
     assert physical_attempts == ["attempt"] * 3
     assert len([event for event in sdk_fakes.trace
                 if event["boundary"] == "qdrant" and event["operation"] == "scroll"]) == 3

@@ -126,7 +126,7 @@ class _TelegramCommittedSaveRuntime:
                 return await _offload(
                     self._save_core, context_id=context_id, draft_id=draft_id,
                     parent_operation_id=operation_id, lease=lease, classified=result,
-                    save_intent_id=intent_id,
+                    save_intent_id=intent_id, retry_governor=bound_governor,
                 )
 
             async def analyze(prepared: Any, *, context: Mapping[str, Any]) -> Any:
@@ -345,6 +345,8 @@ class _TelegramCommittedSaveRuntime:
             ("telegram.preparation", "telegram", "preparation"),
             ("telegram.analysis", "gemini", "metadata"),
             ("telegram.classification", "gemini", "classification"),
+            (f"telegram.finalize.{operation_id}.docs", "google_docs", "finalization"),
+            (f"telegram.finalize.{operation_id}.drive", "google_drive", "finalization"),
         ))
         for stage_key, service, stage_name in candidates:
             try:
@@ -397,8 +399,10 @@ class _TelegramCommittedSaveRuntime:
                 "failures": failures, "outcome": "failed",
             })
             return format_terminal_error(
-                dialog_number=number, operation_id=operation_id, service="core",
-                stage=_get(core_operation, "stage") or "save", code=_get(error, "code"),
+                dialog_number=number, operation_id=operation_id,
+                service=_get(error, "service") or "core",
+                stage=_get(error, "stage") or _get(core_operation, "stage") or "save",
+                code=_get(error, "code"),
                 category=_get(error, "category"),
                 sanitized_message=_get(error, "sanitized_message") or _get(error, "message"),
                 occurred_at=_get(error, "occurred_at"), failures=_get(error, "failures"),

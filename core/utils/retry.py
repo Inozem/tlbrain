@@ -2,6 +2,7 @@ import logging
 import time
 from dataclasses import dataclass
 from functools import wraps
+from inspect import signature
 from typing import Callable, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,17 @@ class RetryPolicy:
     def __post_init__(self) -> None:
         if self.attempts < 1:
             raise ValueError("retry policy attempts must be at least one")
+
+
+class ProviderBoundaryError(RuntimeError):
+    """Trusted adapter marker that identifies a provider without exposing its error text."""
+
+    def __init__(self, service: str, error: BaseException):
+        if service not in {"gemini", "qdrant", "google_docs", "google_drive", "firestore"}:
+            raise ValueError("provider boundary service is not supported")
+        self.service = service
+        self.original_error = error
+        super().__init__(f"{service} request failed ({type(error).__name__})")
 
 
 LEGACY_RETRY_POLICY = RetryPolicy(attempts=RETRIES)
@@ -71,6 +83,7 @@ def _is_rate_limit(exc: Exception) -> bool:
 
 def with_retry(fn: F) -> F:
     """Wrap provider calls; one-attempt calls omit retry warnings and exception text."""
+    accepts_policy = "retry_policy" in signature(fn).parameters
     @wraps(fn)
     def wrapper(*args, **kwargs):
         retry_policy = kwargs.pop("retry_policy", LEGACY_RETRY_POLICY)
@@ -79,7 +92,8 @@ def with_retry(fn: F) -> F:
         last_exc: Exception | None = None
         for attempt in range(retry_policy.attempts):
             try:
-                return fn(*args, **kwargs)
+                call_kwargs = {**kwargs, **({"retry_policy": retry_policy} if accepts_policy else {})}
+                return fn(*args, **call_kwargs)
             except Exception as exc:
                 if _is_rate_limit(exc):
                     backoffs = RATE_LIMIT_BACKOFFS

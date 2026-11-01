@@ -281,7 +281,7 @@ def test_direct_folder_classification_normalizes_speakers_and_recovers_interrupt
 
 
 @pytest.mark.parametrize(
-    "folder_mode", ["explicit", "automatic", "unassigned", "ambiguous"],
+    "folder_mode", ["explicit", "automatic", "unassigned", "ambiguous", "finalizer_failure"],
 )
 @pytest.mark.parametrize("flow_mode", ["route_tool", "agent"])
 def test_global_direct_save_waits_for_real_index_and_replays(
@@ -328,7 +328,7 @@ def test_global_direct_save_waits_for_real_index_and_replays(
                 function_call=types.FunctionCall(name="add_dialog", args=arguments),
             )]))],
         ))
-    if folder_mode in {"automatic", "ambiguous"}:
+    if folder_mode in {"automatic", "ambiguous", "finalizer_failure"}:
         sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
             candidates=[types.Candidate(content=types.Content(parts=[types.Part(
                 text='{"folder_name":"Client","confidence":0.95}',
@@ -390,11 +390,13 @@ def test_global_direct_save_waits_for_real_index_and_replays(
     fill = next(event for event in sdk_fakes.trace
                 if event["boundary"] == "docs" and event["operation"] == "documents.batchUpdate")
     reader_text = fill["arguments"]["body"]["requests"][0]["insertText"]["text"]
+    from core.integrations.google_docs import reader as docs_reader
+    original_docs_reader = docs_reader.read_google_doc
     monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
                         lambda _doc_id: (target_folder_id, False, "Direct Doc B"))
     monkeypatch.setattr("services.vector_sync.app.main.read_google_doc", lambda _doc_id: reader_text)
     monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc",
-                        lambda _doc_id: reader_text)
+                        lambda _doc_id, **_kwargs: reader_text)
     monkeypatch.setattr("core.indexing.processor.read_google_doc", lambda _doc_id: reader_text)
 
     async def sync_document():
@@ -418,12 +420,6 @@ def test_global_direct_save_waits_for_real_index_and_replays(
         ))
     indexed = asyncio.run(sync_document(), loop_factory=_selector_loop)
     assert indexed.status_code == 200, indexed.text
-    if flow_mode == "agent":
-        sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
-            candidates=[types.Candidate(content=types.Content(parts=[types.Part(
-                text="The direct-doc-b save is complete.",
-            )]))],
-        ))
     wake = next(item for item in runtime.task_requests
                 if item["body"].get("target_kind") == "telegram_dispatch"
                 and item["body"].get("operation_id") == task["operation_id"]
@@ -431,7 +427,82 @@ def test_global_direct_save_waits_for_real_index_and_replays(
     wake_record = get_outbox_record(runtime.db, wake["body"]["outbox_id"])
     core_operation_ref = runtime.db.collection("dialog_operations").document(
         index_task["body"]["operation_id"])
+    if folder_mode == "finalizer_failure":
+        secret = "synthetic-finalizer-provider-secret"
+        sdk_fakes.reset()
+        monkeypatch.setattr(docs_reader, "read_google_doc", original_docs_reader)
+        for _ in range(3):
+            sdk_fakes.docs.queue(
+                "documents.get", error=ConnectionError(secret + " source transcript"),
+            )
+        finalizer_stage_key = f"telegram.finalize.{index_task['body']['operation_id']}.docs"
+        from tests.fixtures import sdk_fakes as sdk_fake_module
+        original_sdk_script = sdk_fake_module._script
+        observed_finalizer_failures = []
 
+        def fail_common_settlement_after_third_docs_error(boundary, operation, **kwargs):
+            try:
+                return original_sdk_script(boundary, operation, **kwargs)
+            except ConnectionError:
+                if boundary == "docs" and operation == "documents.get":
+                    observed_finalizer_failures.append(True)
+                    if len(observed_finalizer_failures) == 3:
+                        firestore_fake.fail_next(
+                            "commit", path=f"dialog_operations/{index_task['body']['operation_id']}",
+                            exception=RuntimeError("synthetic common failure settlement outage"),
+                        )
+                raise
+
+        monkeypatch.setattr(sdk_fake_module, "_script", fail_common_settlement_after_third_docs_error)
+        for _ in range(2):
+            result = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+                                 loop_factory=_direct_save_selector_loop)
+        # The terminal provider stage is durable before common-operation failure
+        # settlement. Interrupt that settlement once; replay must repair it
+        # without issuing a fourth Docs read or returning a false terminal reply.
+        interrupted = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+                                  loop_factory=_direct_save_selector_loop)
+        assert interrupted.status_code in {200, 503}
+        assert core_operation_ref.get().to_dict()["state"] == "running"
+        assert not [payload for method, payload in runtime.sent
+                    if method == "sendMessage" and "google_docs/finalization" in payload.get("text", "")]
+        result = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+                             loop_factory=_direct_save_selector_loop)
+        queue_row = session.collection("operations").document(task["operation_id"]).get().to_dict()
+        core_row = core_operation_ref.get().to_dict()
+        parent_stages = session.collection("operations").document(
+            task["operation_id"]).collection("stages")
+        stage = next(row.to_dict() for row in parent_stages.stream()
+                     if row.id == finalizer_stage_key)
+        finalizer_calls = [event for event in sdk_fakes.trace
+                           if event["boundary"] == "docs"
+                           and event["operation"] == "documents.get"]
+        assert len(finalizer_calls) == 3
+        assert len(observed_finalizer_failures) == 3
+        assert stage["failures"] == 3 and stage["attempts_started"] == 3
+        assert queue_row["state"] == "failed"
+        assert core_row["state"] == "failed" and core_row["doc_id"] == "direct-doc-b"
+        assert core_row["origin_binding"]["draft_id"].endswith("tool-0")
+        assert result.status_code == 200
+        reported = [payload["text"] for method, payload in runtime.sent
+                    if method == "sendMessage" and "google_docs/finalization" in payload.get("text", "")]
+        assert len(reported) == 1
+        assert "failures=3" in reported[0] or "attempts=3" in reported[0]
+        assert "synthetic-finalizer-provider-secret" not in reported[0]
+        assert "A directly saved conversation." not in reported[0]
+        duplicate = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+                                loop_factory=_direct_save_selector_loop)
+        assert duplicate.status_code == 200
+        assert len([event for event in sdk_fakes.trace
+                    if event["boundary"] == "docs"
+                    and event["operation"] == "documents.get"]) == 3
+        return
+    if flow_mode == "agent":
+        sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+            candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+                text="The direct-doc-b save is complete.",
+            )]))],
+        ))
     # Simulate a single binding transaction outage after the real Vector Sync
     # receipt commits. The parent must stay pending and recover after the
     # accepted core input parts have been cleaned up.
@@ -999,7 +1070,7 @@ def test_document_function_call_pending_replay_preserves_selected_doc_a(
                         lambda _doc_id: ("folder-client", False, "Direct Doc B"))
     monkeypatch.setattr("services.vector_sync.app.main.read_google_doc", lambda _doc_id: reader_text)
     monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc",
-                        lambda _doc_id: reader_text)
+                        lambda _doc_id, **_kwargs: reader_text)
     monkeypatch.setattr("core.indexing.processor.read_google_doc", lambda _doc_id: reader_text)
 
     async def sync_document():

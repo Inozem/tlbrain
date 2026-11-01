@@ -385,7 +385,8 @@ class FakeQuery:
         return FakeQuery(self.collection, self.filters, self.projection, count)
 
     def stream(self, **kwargs: Any) -> list[FakeDocumentSnapshot]:
-        if kwargs:
+        retry = kwargs.pop("retry", None) if "retry" in kwargs else None
+        if kwargs or retry is not None:
             raise TypeError(f"Unsupported query options: {', '.join(kwargs)}")
         if self.max_results == 0:
             return []

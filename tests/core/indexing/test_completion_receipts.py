@@ -154,6 +154,317 @@ def _finalize(client, *, operation_id=OPERATION_ID, save_intent_id=None, owner=O
     )
 
 
+def test_telegram_finalizer_read_failure_counts_and_reloads_projection_under_queue_budget(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.integrations.firestore.operations import get_operation
+    from core.operations.retries import RetryGovernor
+    from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
+    from services.connectors.telegram.runtime.save_fencing import (
+        _ParentBoundRetryGovernor, telegram_error_classifier,
+    )
+
+    client = firestore_fake.client_class()
+    save_lease, intent_id, receipt, content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    context_id, queue_id, queue_owner, queue_fence = (
+        "synthetic-context", "telegram-finalizer-queue-op", "telegram-worker", 7,
+    )
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.set({
+        "active_operation_id": queue_id, "reserved_operation_id": queue_id,
+        "lock_owner": queue_owner, "fence": queue_fence,
+        "lock_expires_at": NOW + timedelta(minutes=2),
+    })
+    context_ref.collection("operations").document(queue_id).set({
+        "operation_id": queue_id, "state": "running", "sequence": 1,
+    })
+    source = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: NOW),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+        error_classifier=telegram_error_classifier,
+    )
+    bound = _ParentBoundRetryGovernor(
+        source, clock=lambda: NOW,
+        assert_current=lambda: None,
+    )
+
+    def read_boundary(boundary, callback):
+        return bound.run_stage(
+            queue_id, f"telegram.finalize.{OPERATION_ID}.{boundary}", callback,
+            now=NOW, owner=queue_owner, fence=queue_fence,
+            reconcile=callback, checkpoint_success=False,
+        )
+
+    sdk_fakes.reset()
+    sdk_fakes.docs.queue(
+        "documents.get", error=ConnectionError("synthetic docs read outage"),
+    )
+    with pytest.raises(ConnectionError):
+        _completion_module().finalize_save(
+            client, operation_id=OPERATION_ID, save_intent_id=intent_id,
+            owner=OWNER, fence=save_lease.fence,
+            origin_binding={
+                "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+                "manifest_digest": "sha256:synthetic-manifest",
+            },
+            now=NOW, clock=lambda: NOW,
+            retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+            read_boundary=read_boundary,
+        )
+
+    docs_stage_key = f"telegram.finalize.{OPERATION_ID}.docs"
+    docs_stage = source.get_stage(queue_id, docs_stage_key)
+    assert docs_stage.failures == 1 and docs_stage.attempts_started == 1
+    assert docs_stage.last_error.service == "google_docs"
+    assert docs_stage.result is None
+    assert get_operation(client, OPERATION_ID).state.value == "running"
+
+    # A manual edit does not change resource_epoch. The next attempt must read
+    # it again and remain pending while the index still names the old version.
+    edited_content = (
+        "DATE: 2026-03-04\nPROVIDER: tldv\n---\n"
+        "Speaker A :: Externally revised synthetic transcript."
+    )
+    def document_projection(value, revision):
+        return {
+            "revisionId": revision,
+            "body": {"content": [
+                {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
+                for line in value.splitlines()
+            ]},
+        }
+
+    sdk_fakes.docs.queue("documents.get", response=document_projection(
+        edited_content, "edited-revision",
+    ))
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": [PARENT_ID], "trashed": False,
+    })
+    pending = _completion_module().finalize_save(
+        client, operation_id=OPERATION_ID, save_intent_id=intent_id,
+        owner=OWNER, fence=save_lease.fence,
+        origin_binding={
+            "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+            "manifest_digest": "sha256:synthetic-manifest",
+        },
+        now=NOW, clock=lambda: NOW,
+        retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+        read_boundary=read_boundary,
+    )
+    assert pending is None
+    assert get_operation(client, OPERATION_ID).state.value == "running"
+    assert client.collection("dialog_save_intents").document(intent_id).get().to_dict().get(
+        "completion_certificate"
+    ) is None
+
+    # Restoring the source projection under the same grant and epoch permits
+    # completion with the original immutable intent and the same Doc.
+    sdk_fakes.docs.queue("documents.get", response=document_projection(
+        content, "restored-revision",
+    ))
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": [PARENT_ID], "trashed": False,
+    })
+    result = _completion_module().finalize_save(
+        client, operation_id=OPERATION_ID, save_intent_id=intent_id,
+        owner=OWNER, fence=save_lease.fence,
+        origin_binding={
+            "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+            "manifest_digest": "sha256:synthetic-manifest",
+        },
+        now=NOW, clock=lambda: NOW,
+        retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+        read_boundary=read_boundary,
+    )
+
+    assert result is not None and result.document_id == DOC_ID
+    certificate = client.collection("dialog_save_intents").document(intent_id).get().to_dict()[
+        "completion_certificate"
+    ]
+    assert certificate["content_hash"] == receipt["content_hash"]
+    docs_stage = source.get_stage(queue_id, docs_stage_key)
+    assert docs_stage.failures == 1 and docs_stage.attempts_started == 3
+    assert docs_stage.state.value == "pending" and docs_stage.result is None
+    assert docs_stage.last_error.service == "google_docs"
+    assert docs_stage.last_error.category == "execution"
+    drive_stage = source.get_stage(queue_id, f"telegram.finalize.{OPERATION_ID}.drive")
+    assert drive_stage.attempts_started == 2 and drive_stage.result is None
+    assert receipt["resource_epoch"] == 0
+    docs_calls = [event for event in sdk_fakes.trace
+                  if event["boundary"] == "docs"
+                  and event["operation"] == "documents.get"]
+    assert len(docs_calls) == 3
+    assert all(event["arguments"]["documentId"] == DOC_ID for event in docs_calls)
+    serialized_stages = repr([
+        client.collection("telegram_sessions").document(context_id)
+        .collection("operations").document(queue_id).collection("stages").document(key)
+        .get().to_dict()
+        for key in (docs_stage_key, f"telegram.finalize.{OPERATION_ID}.drive")
+    ])
+    assert edited_content not in serialized_stages
+    assert "synthetic docs read outage" not in serialized_stages
+
+
+def test_inflight_finalizer_reconciles_fresh_docs_read_and_charges_only_three_attempts(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryGovernor, UnknownOutcome, ReconciledStageFailure, RetryBudgetExceeded
+    from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
+    from services.connectors.telegram.runtime.save_core import _reconcile_finalization_read
+    from services.connectors.telegram.runtime.save_fencing import (
+        _ParentBoundRetryGovernor, telegram_error_classifier,
+    )
+
+    client = firestore_fake.client_class()
+    _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    context_id, queue_id = "reconcile-context", "telegram-reconcile-queue"
+    old_owner, new_owner, old_fence, new_fence = "old-worker", "current-worker", 4, 5
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.set({
+        "active_operation_id": queue_id, "reserved_operation_id": queue_id,
+        "lock_owner": old_owner, "fence": old_fence,
+        "lock_expires_at": NOW + timedelta(minutes=2),
+    })
+    context_ref.collection("operations").document(queue_id).set({
+        "operation_id": queue_id, "state": "running", "sequence": 1,
+    })
+    source = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: NOW),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+        error_classifier=telegram_error_classifier,
+    )
+    stage_key = f"telegram.finalize.{OPERATION_ID}.docs"
+    with pytest.raises(UnknownOutcome):
+        source.run_stage(
+            queue_id, stage_key,
+            lambda: (_ for _ in ()).throw(UnknownOutcome("unresolved first read")),
+            now=NOW, owner=old_owner, fence=old_fence,
+        )
+    assert source.get_stage(queue_id, stage_key).in_flight_attempt_id is not None
+    context_ref.update({
+        "lock_owner": new_owner, "fence": new_fence,
+        "lock_expires_at": NOW + timedelta(minutes=2),
+    })
+    current = lambda: (
+        context_ref.get().to_dict().get("lock_owner") == new_owner
+        and context_ref.get().to_dict().get("fence") == new_fence
+    )
+    bound = _ParentBoundRetryGovernor(
+        source, clock=lambda: NOW, assert_current=lambda: (
+            None if current() else (_ for _ in ()).throw(RuntimeError("stale queue owner"))
+        ),
+    )
+    sdk_fakes.reset()
+
+    def read_document():
+        from core.integrations.google_docs.reader import read_google_doc
+        return read_google_doc(DOC_ID, retry_policy=SINGLE_ATTEMPT_RETRY_POLICY)
+
+    reconcile = lambda: _reconcile_finalization_read(bound, stage_key, read_document)
+    for _ in range(3):
+        sdk_fakes.docs.queue(
+            "documents.get", error=ConnectionError("synthetic reconciliation read failure"),
+        )
+    with pytest.raises(ReconciledStageFailure):
+        bound.run_stage(
+            queue_id, stage_key, read_document, now=NOW, owner=new_owner,
+            fence=new_fence, reconcile=reconcile, checkpoint_success=False,
+        )
+    for _ in range(2):
+        with pytest.raises(ConnectionError):
+            bound.run_stage(
+                queue_id, stage_key, read_document, now=NOW, owner=new_owner,
+                fence=new_fence, reconcile=reconcile, checkpoint_success=False,
+            )
+    final_stage = bound.get_stage(queue_id, stage_key)
+    assert final_stage.failures == 3 and final_stage.attempts_started == 3
+    assert final_stage.last_error.service == "google_docs"
+    assert final_stage.in_flight_attempt_id is None and final_stage.result is None
+    docs_calls = [event for event in sdk_fakes.trace
+                  if event["boundary"] == "docs" and event["operation"] == "documents.get"]
+    assert len(docs_calls) == 3
+    with pytest.raises(RetryBudgetExceeded):
+        bound.run_stage(
+            queue_id, stage_key, lambda: pytest.fail("exhausted stage must not dispatch"),
+            now=NOW, owner=new_owner, fence=new_fence,
+            reconcile=reconcile, checkpoint_success=False,
+        )
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "docs" and event["operation"] == "documents.get"]) == 3
+
+
+def test_stale_parent_cannot_settle_common_save_from_an_old_terminal_finalizer_stage(
+    firestore_fake, sdk_fakes,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.integrations.firestore.operations import get_operation
+    from core.operations.retries import RetryGovernor, UnknownOutcome
+    from services.connectors.telegram.runtime.save_core import _run_finalization_read_boundary
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    core_lease, _intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    context_id, queue_id, owner, fence = "stale-finalize-context", "stale-finalize-op", "owner-a", 6
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.set({
+        "active_operation_id": queue_id, "reserved_operation_id": queue_id,
+        "lock_owner": owner, "fence": fence, "lock_expires_at": NOW + timedelta(minutes=2),
+    })
+    context_ref.collection("operations").document(queue_id).set({
+        "operation_id": queue_id, "state": "running", "sequence": 1,
+    })
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: NOW),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+        error_classifier=telegram_error_classifier,
+    )
+    stage_key = f"telegram.finalize.{OPERATION_ID}.docs"
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            governor.run_stage(
+                queue_id, stage_key,
+                lambda: (_ for _ in ()).throw(RuntimeError("synthetic read error")),
+                now=NOW, owner=owner, fence=fence,
+            )
+    assert governor.get_stage(queue_id, stage_key).failures == 3
+    context_ref.update({"lock_owner": "owner-b", "fence": fence + 1})
+    calls = []
+
+    class Runtime:
+        clock = staticmethod(lambda: NOW)
+
+        @staticmethod
+        def _assert_parent_lease(*_args):
+            raise PermissionError("the parent queue lease is stale")
+
+    before = get_operation(client, OPERATION_ID)
+    with pytest.raises(UnknownOutcome):
+        _run_finalization_read_boundary(
+            Runtime(), client=client, parent_operation_id=queue_id,
+            operation_id=OPERATION_ID, context_id=context_id,
+            lease=SimpleNamespace(owner=owner, fence=fence),
+            core_owner=core_lease.lease_owner, core_fence=core_lease.fence,
+            retry_governor=governor, boundary="docs",
+            callback=lambda: calls.append("provider") or "read",
+        )
+    after = get_operation(client, OPERATION_ID)
+    assert calls == []
+    assert after.state == before.state and after.error == before.error is None
+    assert after.lease_owner == before.lease_owner == core_lease.lease_owner
+    assert after.fence == before.fence == core_lease.fence
+
+
 def _synthetic_google_oauth(monkeypatch):
     monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-synthetic-refresh")
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-synthetic-client")

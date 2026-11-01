@@ -13,6 +13,7 @@ from core.integrations.firestore.mutations import (
     release_completion_guard,
 )
 from core.integrations.firestore.operations import OPERATIONS_COLLECTION, _result_from
+from core.utils.retry import LEGACY_RETRY_POLICY, RetryPolicy
 
 
 def _db(client: Any | None) -> Any:
@@ -73,6 +74,8 @@ def finalize_save(
     origin_binding: dict[str, str],
     now: datetime,
     clock: Callable[[], datetime] | None = None,
+    retry_policy: RetryPolicy = LEGACY_RETRY_POLICY,
+    read_boundary: Callable[[str, Callable[[], Any]], Any] | None = None,
 ):
     """Read the saved document under a shared resource guard, then certify it atomically."""
     now = _aware(now)
@@ -108,21 +111,41 @@ def finalize_save(
 
     try:
         from core.indexing import processor
+        from core.integrations.firestore.index_completions import get_completion
+
+        transcript_snapshot = db.collection("transcript_index").document(doc_id).get()
+        if not transcript_snapshot.exists:
+            return None
+        transcript = transcript_snapshot.to_dict() or {}
+        expected_hash = transcript.get("content_hash")
+        if not isinstance(expected_hash, str) or not expected_hash:
+            return None
+        receipt = get_completion(db, doc_id, expected_hash)
+        if not isinstance(receipt, dict) or receipt.get("status") != "completed":
+            return None
+
         from core.integrations.google_docs.reader import read_google_doc
         from core.integrations.google_drive.files import get_file_metadata
 
-        raw_text = read_google_doc(doc_id)
+        def read_doc() -> str:
+            if retry_policy == LEGACY_RETRY_POLICY:
+                return read_google_doc(doc_id)
+            return read_google_doc(doc_id, retry_policy=retry_policy)
+
+        def read_drive_metadata() -> dict[str, Any]:
+            if retry_policy == LEGACY_RETRY_POLICY:
+                return get_file_metadata(doc_id)
+            return get_file_metadata(doc_id, retry_policy=retry_policy)
+
+        raw_text = (read_boundary("docs", read_doc) if read_boundary is not None else read_doc())
         content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-        drive = get_file_metadata(doc_id)
+        drive = (read_boundary("drive", read_drive_metadata)
+                 if read_boundary is not None else read_drive_metadata())
         parents = drive.get("parents") or []
         if (drive.get("trashed") or drive.get("mimeType") != "application/vnd.google-apps.document"
                 or len(parents) != 1 or not isinstance(parents[0], str)):
             return None
         parent_id = parents[0]
-        transcript_snapshot = db.collection("transcript_index").document(doc_id).get()
-        if not transcript_snapshot.exists:
-            return None
-        transcript = transcript_snapshot.to_dict() or {}
         metadata, _ = processor.parse_document(raw_text)
         provider = metadata.get("provider", "")
         if (not provider or transcript.get("provider") != provider

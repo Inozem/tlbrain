@@ -840,7 +840,7 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
     monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
                         lambda _doc_id: ("folder-client", False, "Dialog A saved"))
     monkeypatch.setattr("services.vector_sync.app.main.read_google_doc", lambda _doc_id: reader_text)
-    monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc", lambda _doc_id: reader_text)
+    monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc", lambda _doc_id, **_kwargs: reader_text)
     monkeypatch.setattr("core.indexing.processor.read_google_doc", lambda _doc_id: reader_text)
     from services.vector_sync.app.main import app as vector_app
 
@@ -1027,7 +1027,7 @@ def test_committed_save_recovers_cleanup_after_source_and_request_are_gone(
     monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
                         lambda _doc_id: (target_folder_id, False, "Dialog saved"))
     monkeypatch.setattr("services.vector_sync.app.main.read_google_doc", lambda _doc_id: reader_text)
-    monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc", lambda _doc_id: reader_text)
+    monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc", lambda _doc_id, **_kwargs: reader_text)
     monkeypatch.setattr("core.indexing.processor.read_google_doc", lambda _doc_id: reader_text)
     from services.vector_sync.app.main import app as vector_app
 
@@ -3263,7 +3263,7 @@ def test_default_app_retry_reuses_real_doc_after_fill_403(
     monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
                         lambda _doc_id: ("folder-client", False, "Dialog A saved"))
     monkeypatch.setattr("services.vector_sync.app.main.read_google_doc", lambda _doc_id: reader_text)
-    monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc", lambda _doc_id: reader_text)
+    monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc", lambda _doc_id, **_kwargs: reader_text)
     monkeypatch.setattr("core.indexing.processor.read_google_doc", lambda _doc_id: reader_text)
     from services.vector_sync.app.main import app as vector_app
 
@@ -3336,3 +3336,332 @@ def test_default_app_retry_reuses_real_doc_after_fill_403(
         [path for path in requests_before_duplicate
          if path.startswith(f"telegram_sessions/{context_id}/operations/")]
     )
+
+
+def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuses_doc(
+    firestore_fake, sdk_fakes, monkeypatch, caplog,
+):
+    """Three real finalizer reads settle once; numbered replay certifies the same Doc and intent."""
+    from google.genai import types
+    from core.integrations.firestore.outbox import get_outbox_record, task_payload
+    from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION
+    from tests.services.connectors.telegram.test_production_runtime import _selector_loop
+
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    runtime.route_response("save")
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text=json.dumps({"title": "Dialog Finalize", "folder_path": ["Client"]}),
+        )]))],
+    ))
+    doc_id = "doc-finalizer-sealed-retry"
+    sdk_fakes.drive.queue("files.create", response={"id": doc_id})
+    empty_document = {"revisionId": "rev-empty", "body": {"content": [
+        {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
+    ]}}
+    for _ in range(12):
+        sdk_fakes.docs.queue("documents.get", response=empty_document)
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"revisionId": "rev-filled"})
+    for index in range(16):
+        sdk_fakes.drive.queue("files.get", response={
+            "id": doc_id, "mimeType": "application/vnd.google-apps.document",
+            "parents": ["folder-client"], "modifiedTime": f"initial-{index}",
+            "trashed": False,
+        })
+
+    source = "A sealed source line that must remain private."
+    forward = {"update_id": 18001, "message": {
+        "message_id": 101, "date": 1793320000,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Ada"},
+                           "date": 1793310000}, "text": source,
+    }}
+    assert asyncio.run(runtime.webhook(forward), loop_factory=_selector_loop).status_code == 200
+    ack = next(row["body"] for row in runtime.task_requests
+               if row["body"].get("notification_id"))
+    assert asyncio.run(runtime.deliver(ack), loop_factory=_selector_loop).status_code == 200
+    save_update = {"update_id": 18002, "message": {
+        "message_id": 102, "date": 1793320010,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "text": "save this dialog",
+    }}
+    assert asyncio.run(runtime.webhook(save_update), loop_factory=_selector_loop).status_code == 200
+    original_task = next(row["body"] for row in reversed(runtime.task_requests)
+                         if row["body"].get("target_kind") == "telegram_dispatch"
+                         and not row["body"].get("notification_id"))
+    context_id, operation_id = original_task["context_id"], original_task["operation_id"]
+    first = asyncio.run(runtime.dispatch(original_task), loop_factory=_selector_loop)
+    assert first.status_code == 200, first.text
+
+    index_task = next(row for row in runtime.task_requests
+                      if row["url"].endswith(f"/sync/doc/{doc_id}"))
+    fill_event = next(event for event in sdk_fakes.trace
+                      if event["boundary"] == "docs"
+                      and event["operation"] == "documents.batchUpdate")
+    inserted_text = fill_event["arguments"]["body"]["requests"][0]["insertText"]["text"]
+    monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
+                        lambda _doc_id: ("folder-client", False, "Dialog Finalize"))
+    monkeypatch.setattr("services.vector_sync.app.main.read_google_doc",
+                        lambda _doc_id: inserted_text)
+    from core.integrations.google_docs import reader as docs_reader
+    original_read_google_doc = docs_reader.read_google_doc
+    monkeypatch.setattr(docs_reader, "read_google_doc", lambda _doc_id, **_kwargs: inserted_text)
+    monkeypatch.setattr("core.indexing.processor.read_google_doc", lambda _doc_id: inserted_text)
+    from services.vector_sync.app.main import app as vector_app
+
+    async def sync_document():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=vector_app), base_url="http://vector.test",
+        ) as client:
+            return await client.post(index_task["url"].replace(
+                "https://vector-sync.pytest.invalid", "",
+            ), json=index_task["body"])
+
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text='{"summary":"Sealed dialog","facts":[]}',
+        )]))],
+    ))
+    for _ in range(5):
+        sdk_fakes.gemini.queue("embed_content", response=types.EmbedContentResponse(
+            embeddings=[types.ContentEmbedding(values=[0.125] * 768)],
+        ))
+    indexed = asyncio.run(sync_document(), loop_factory=_selector_loop)
+    assert indexed.status_code == 200, indexed.text
+
+    wake_request = next(
+        row["body"] for row in runtime.task_requests
+        if row["body"].get("target_kind") == "telegram_dispatch"
+        and row["body"].get("operation_id") == operation_id
+        and row["body"].get("outbox_id") != original_task.get("outbox_id")
+    )
+    wake = task_payload(get_outbox_record(runtime.db, wake_request["outbox_id"]))
+
+    # The finalizer must go back through the real Docs SDK after the managed receipt exists.
+    sdk_fakes.reset()
+    monkeypatch.setattr(docs_reader, "read_google_doc", original_read_google_doc)
+    provider_secret = "synthetic-finalizer-docs-body-secret"
+    for _ in range(3):
+        sdk_fakes.docs.queue(
+            "documents.get", error=ConnectionError(provider_secret + " private source"),
+        )
+    for _ in range(3):
+        settled = asyncio.run(runtime.dispatch(wake), loop_factory=_selector_loop)
+
+    session = runtime.db.collection("telegram_sessions").document(context_id)
+    operation_row = session.collection("operations").document(operation_id).get().to_dict()
+    draft_id = operation_row["target_draft_id"]
+    draft = session.collection("drafts").document(draft_id).get().to_dict()
+    common = runtime.db.collection("dialog_operations").document(operation_id).get().to_dict()
+    intent = runtime.db.collection(SAVE_INTENTS_COLLECTION).document(operation_id).get().to_dict()
+    stage_key = f"telegram.finalize.{operation_id}.docs"
+    finalizer_stage = next(
+        row.to_dict() for row in session.collection("operations").document(operation_id)
+        .collection("stages").stream()
+        if row.to_dict().get("stage_key") == stage_key
+    )
+    finalizer_calls = [event for event in sdk_fakes.trace
+                       if event["boundary"] == "docs"
+                       and event["operation"] == "documents.get"]
+    assert len(finalizer_calls) == 3
+    assert finalizer_stage["failures"] == finalizer_stage["attempts_started"] == 3
+    assert operation_row["state"] == "failed" and common["state"] == "failed"
+    assert common["doc_id"] == intent["doc_id"] == doc_id
+    assert draft["dialog_number"] == 1 and draft["state"] == "failed"
+    assert draft["immutable_save_intent_id"] == operation_id
+    assert intent["dispatch_operation_id"] == operation_id and intent["dispatch_token"]
+    assert settled.status_code == 200
+    terminal_messages = [payload["text"] for method, payload in runtime.sent
+                         if method == "sendMessage"
+                         and "google_docs/finalization" in payload.get("text", "")]
+    assert len(terminal_messages) == 1
+    assert "failures=3" in terminal_messages[0] and operation_id in terminal_messages[0]
+    assert "Automatic retries have stopped" in terminal_messages[0]
+    assert provider_secret not in terminal_messages[0] and source not in terminal_messages[0]
+    assert provider_secret not in caplog.text and source not in caplog.text
+    duplicate = asyncio.run(runtime.dispatch(wake), loop_factory=_selector_loop)
+    assert duplicate.status_code == 200
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "docs"
+                and event["operation"] == "documents.get"]) == 3
+
+    # Canonical dialog-number retry reuses the same intent and already-created document.
+    runtime.route_response("retry", dialog_number=1)
+    retry_update = {"update_id": 18003, "message": {
+        "message_id": 103, "date": 1793320020,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "text": "retry dialog 1",
+    }}
+    assert asyncio.run(runtime.webhook(retry_update), loop_factory=_selector_loop).status_code == 200
+    retry_request = next(row["body"] for row in reversed(runtime.task_requests)
+                         if row["body"].get("target_kind") == "telegram_dispatch"
+                         and not row["body"].get("notification_id"))
+    assert asyncio.run(runtime.dispatch(retry_request), loop_factory=_selector_loop).status_code == 200
+    retry_relation = session.collection("retry_requests").document(
+        retry_request["operation_id"]).get().to_dict()
+    assert retry_relation["accepted"] and retry_relation["draft_id"] == draft_id
+    retry_task = next(row["body"] for row in reversed(runtime.task_requests)
+                      if row["body"].get("target_kind") == "telegram_dispatch"
+                      and row["body"].get("operation_id") == retry_relation["operation_id"]
+                      and not row["body"].get("notification_id"))
+    for index in range(4):
+        sdk_fakes.docs.queue("documents.get", response={
+            "revisionId": f"retry-read-{index}", "body": {"content": [
+                {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
+                for line in inserted_text.splitlines()
+            ]},
+        })
+        sdk_fakes.drive.queue("files.get", response={
+            "id": doc_id, "mimeType": "application/vnd.google-apps.document",
+            "parents": ["folder-client"], "modifiedTime": f"retry-{index}",
+            "trashed": False,
+        })
+    retried = asyncio.run(runtime.dispatch(retry_task), loop_factory=_selector_loop)
+    assert retried.status_code == 200, retried.text
+    retry_core = runtime.db.collection("dialog_operations").document(
+        retry_task["operation_id"]).get().to_dict()
+    retry_intent = runtime.db.collection(SAVE_INTENTS_COLLECTION).document(operation_id).get().to_dict()
+    retry_draft = session.collection("drafts").document(draft_id).get().to_dict()
+    assert retry_core["doc_id"] == doc_id
+    assert retry_core["save_intent_id"] == operation_id
+    assert retry_intent["doc_id"] == doc_id
+    assert retry_intent["completion_certificate"]["operation_id"] == retry_task["operation_id"]
+    assert retry_draft["state"] == "cleaned" and retry_draft["dialog_number"] == 1
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "drive"
+                and event["operation"] == "files.create"]) == 0
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "docs"
+                and event["operation"] == "documents.batchUpdate"]) == 0
+    assert len([payload for method, payload in runtime.sent
+                if method == "sendMessage"
+                and "Dialog #1: Saved and indexed." in payload.get("text", "")]) == 1
+
+
+def test_default_save_oauth_failure_before_create_resumes_same_intent_once(
+    firestore_fake, sdk_fakes, monkeypatch, caplog,
+):
+    """A real token endpoint error before create is charged without unknown-create gating."""
+    import requests
+    from google.genai import types
+    from google.oauth2.credentials import Credentials
+    from core.integrations.firestore.operations import get_stage
+    from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION
+    from tests.fixtures.sdk_fakes import install
+    from tests.services.connectors.telegram.test_production_runtime import _selector_loop
+
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    runtime.route_response("save")
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text=json.dumps({"title": "OAuth Resume", "folder_path": ["Client"]}),
+        )]))],
+    ))
+
+    original_refresh = next(
+        original for obj, name, original, _replacement in install().values()
+        if obj is Credentials and name == "refresh"
+    )
+    monkeypatch.setattr(Credentials, "refresh", original_refresh)
+    token_calls = []
+
+    class SyntheticSession:
+        def __init__(self):
+            self.adapters = {}
+
+        def mount(self, prefix, adapter):
+            self.adapters[prefix] = adapter
+
+        def request(self, method, url, **_kwargs):
+            token_calls.append((method, url))
+            response = requests.Response()
+            response.status_code = 503 if len(token_calls) == 1 else 200
+            response.url = url
+            response.headers["content-type"] = "application/json"
+            response._content = (
+                b'{"error":"temporarily_unavailable","secret":"synthetic-token-secret"}'
+                if len(token_calls) == 1
+                else b'{"access_token":"synthetic-access-token","expires_in":3600,"token_type":"Bearer"}'
+            )
+            return response
+
+        def close(self):
+            pass
+
+    session = SyntheticSession()
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    doc_id = "doc-after-oauth-recovery"
+    sdk_fakes.drive.queue("files.create", response={"id": doc_id})
+    empty_document = {"revisionId": "rev-empty", "body": {"content": [
+        {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
+    ]}}
+    for _ in range(8):
+        sdk_fakes.docs.queue("documents.get", response=empty_document)
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"revisionId": "rev-filled"})
+    for index in range(8):
+        sdk_fakes.drive.queue("files.get", response={
+            "id": doc_id, "mimeType": "application/vnd.google-apps.document",
+            "parents": ["folder-client"], "modifiedTime": f"oauth-retry-{index}",
+            "trashed": False,
+        })
+
+    forward = {"update_id": 18011, "message": {
+        "message_id": 111, "date": 1793320100,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Ada"},
+                           "date": 1793310100}, "text": "OAuth recovery source line.",
+    }}
+    assert asyncio.run(runtime.webhook(forward), loop_factory=_selector_loop).status_code == 200
+    ack = next(row["body"] for row in runtime.task_requests if row["body"].get("notification_id"))
+    assert asyncio.run(runtime.deliver(ack), loop_factory=_selector_loop).status_code == 200
+    save_update = {"update_id": 18012, "message": {
+        "message_id": 112, "date": 1793320110,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7}, "text": "save this dialog",
+    }}
+    assert asyncio.run(runtime.webhook(save_update), loop_factory=_selector_loop).status_code == 200
+    task = next(row["body"] for row in reversed(runtime.task_requests)
+                if row["body"].get("target_kind") == "telegram_dispatch"
+                and not row["body"].get("notification_id"))
+    failed = asyncio.run(runtime.dispatch(task), loop_factory=_selector_loop)
+    assert failed.status_code == 200
+    context_id, operation_id = task["context_id"], task["operation_id"]
+    queue_op = (runtime.db.collection("telegram_sessions").document(context_id)
+                .collection("operations").document(operation_id).get().to_dict())
+    draft_id = queue_op["target_draft_id"]
+    common = runtime.db.collection("dialog_operations").document(operation_id).get().to_dict()
+    intent = runtime.db.collection(SAVE_INTENTS_COLLECTION).document(operation_id).get().to_dict()
+    create_stage = get_stage(runtime.db, operation_id, "create")
+    assert create_stage.failures == 1
+    assert create_stage.last_error.service == "google_drive"
+    assert token_calls == [("POST", "https://oauth2.googleapis.com/token")]
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.create"]
+    assert common["state"] == "running" and common["doc_id"] is None
+    assert intent["state"] not in {"unknown", "dispatched"}
+    assert queue_op["state"] == "running"
+
+    runtime.clock.advance()
+    replay = next((row["body"] for row in reversed(runtime.task_requests)
+                   if row["body"].get("target_kind") == "telegram_dispatch"
+                   and row["body"].get("operation_id") == operation_id
+                   and row["body"].get("outbox_id") != task.get("outbox_id")), task)
+    resumed = asyncio.run(runtime.dispatch(replay), loop_factory=_selector_loop)
+    assert resumed.status_code == 200
+    common_after = runtime.db.collection("dialog_operations").document(operation_id).get().to_dict()
+    intent_after = runtime.db.collection(SAVE_INTENTS_COLLECTION).document(operation_id).get().to_dict()
+    create_calls = [event for event in sdk_fakes.trace
+                    if event["boundary"] == "drive" and event["operation"] == "files.create"]
+    assert len(create_calls) == 1
+    assert common_after["doc_id"] == intent_after["doc_id"] == doc_id
+    assert intent_after["state"] == "confirmed"
+    assert get_stage(runtime.db, operation_id, "create").failures == 1
+    assert len(token_calls) >= 2
+    assert all(url == "https://oauth2.googleapis.com/token" for _, url in token_calls)
+    persisted = repr({"common": common_after, "intent": intent_after,
+                      "create_stage": get_stage(runtime.db, operation_id, "create"),
+                      "queue_operation": queue_op})
+    assert "synthetic-token-secret" not in persisted
+    assert "synthetic-access-token" not in persisted
+    assert "OAuth recovery source line." not in persisted
+    assert "synthetic-token-secret" not in caplog.text
+    assert "OAuth recovery source line." not in caplog.text
