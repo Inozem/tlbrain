@@ -211,6 +211,53 @@ def test_function_response_id_matches_call_and_thought_signature_round_trips_unc
     assert _field(sent_function_response, "id") == "call-7"
 
 
+@pytest.mark.parametrize("result", [
+    [{"doc_id": "doc-1", "segments": [{"text": "שלום"}]}, {"count": 1}],
+    "plain result",
+    7,
+    None,
+])
+def test_function_response_wraps_non_mapping_result_without_changing_result_data(result):
+    call = _function_call("call-list")
+
+    response_part = _gemini_agent().make_function_response(call=call, response=result)
+
+    function_response = _field(response_part, "function_response")
+    assert _field(function_response, "id") == "call-list"
+    assert _field(function_response, "name") == _field(call, "name")
+    assert _field(function_response, "response") == {"result": result}
+
+
+def test_source_call_correlates_idless_calls_by_name_and_arguments():
+    telegram_agent = _telegram_agent()
+    first = SimpleNamespace(name="query", args={"query": "first"},
+                            thought_signature="opaque:first")
+    second = SimpleNamespace(name="add_dialog", args={"title": "second"},
+                             thought_signature="opaque:second")
+    response = _response(SimpleNamespace(function_call=first),
+                         SimpleNamespace(function_call=second))
+
+    source = telegram_agent._source_call(response, {
+        "id": None, "name": "add_dialog", "arguments": {"title": "second"},
+    })
+
+    assert source.id is None
+    assert source.name == "add_dialog"
+    assert source.args == {"title": "second"}
+    assert source.thought_signature == "opaque:second"
+
+    identified = SimpleNamespace(id="first-id", name="add_dialog",
+                                 args={"title": "second"},
+                                 thought_signature="opaque:identified")
+    response = _response(SimpleNamespace(function_call=identified),
+                         SimpleNamespace(function_call=second))
+    source = telegram_agent._source_call(response, {
+        "id": None, "name": "add_dialog", "arguments": {"title": "second"},
+    })
+    assert source.id is None
+    assert source.thought_signature == "opaque:second"
+
+
 def test_gemini_agent_does_not_execute_python_tools_and_exposes_usage_without_model_text(caplog):
     caplog.set_level(logging.DEBUG)
     call = _function_call("no-execution", name="__import__")
@@ -424,6 +471,8 @@ def test_invalid_or_conflicting_model_tool_call_fails_without_effects():
 
 
 def test_structured_route_choice_uses_validated_allowlisted_tool_and_pinned_target():
+    from google.genai import types
+
     executor = FakeExecutor()
     bindings = []
 
@@ -461,8 +510,14 @@ def test_structured_route_choice_uses_validated_allowlisted_tool_and_pinned_targ
     assert answer["answer"] == "Here are the folders."
     assert model.calls[0]["contents"][0] == history[0]
     assert model.calls[0]["contents"][1]["role"] == "model"
+    types.Content.model_validate(model.calls[0]["contents"][1])
     function_response = _field(model.calls[0]["contents"][2]["parts"][0], "function_response")
     assert _field(function_response, "response") == result
+    saved_round = agent._load_state("conversation-pinned", "operation-pinned").rounds[0]["response"]
+    assert saved_round["parts"][0]["function_call"] == {
+        "id": "route-operation-pinned", "name": "get_transcript",
+        "args": {"doc_id": "doc-pinned"},
+    }
 
     replayed_answer = agent.run(
         conversation_id="conversation-pinned", delivery_id="operation-pinned",
@@ -500,6 +555,71 @@ def test_structured_route_choice_uses_validated_allowlisted_tool_and_pinned_targ
             executor_factory=bind,
         )
     assert len(executor.calls) == 1
+
+
+def test_legacy_routed_call_round_is_normalized_only_for_sdk_replay():
+    from google.genai import types
+
+    conversation_id, delivery_id = "conversation-legacy-route", "operation-legacy-route"
+    arguments = {"doc_id": "doc-legacy"}
+    legacy_response = {"parts": [{
+        "id": "route-operation-legacy-route", "name": "get_transcript",
+        "args": arguments, "thought_signature": "b3BhcXVlLWxlZ2FjeS1zaWduYXR1cmU=",
+    }]}
+    raw_result = [{"doc_id": "doc-legacy", "text": "first"}, {"count": 1}]
+    ledger = FakeLedger()
+    ledger.turns[(conversation_id, delivery_id)] = {
+        "model_response": deepcopy(legacy_response),
+        "tool_calls": [{
+            "id": "route-operation-legacy-route", "name": "get_transcript",
+            "arguments": deepcopy(arguments), "ordinal": 0, "round": 0,
+        }],
+        "tool_results": {},
+    }
+    executor = FakeExecutor()
+    model = SequenceModel([{"parts": [], "text": "legacy transcript answer"}])
+    agent = _agent(model=model, ledger=ledger, executor=executor)
+
+    dispatched = agent.dispatch_tool_choice(
+        name="get_transcript", arguments=arguments, target_doc_id="doc-legacy",
+        conversation_id=conversation_id, delivery_id=delivery_id,
+        executor_factory=lambda *_args: executor,
+    )
+    assert dispatched == executor.results_by_ordinal[0]
+    assert executor.calls == [("get_transcript", arguments, 0)]
+    # Model the real retrieval result's list shape and ensure replay preserves it.
+    ledger.turns[(conversation_id, delivery_id)]["tool_results"][0] = deepcopy(raw_result)
+
+    answer = agent.run(
+        conversation_id=conversation_id, delivery_id=delivery_id,
+        history=[{"role": "user", "parts": [{"text": "show the pinned transcript"}]}],
+        target_doc_id="doc-legacy", executor_factory=lambda *_args: executor,
+    )
+
+    assert answer["status"] == "ok"
+    assert executor.calls == [("get_transcript", arguments, 0)]
+    assert ledger.turns[(conversation_id, delivery_id)]["model_response"]["rounds"][0][
+        "response"] == legacy_response
+    assert ledger.turns[(conversation_id, delivery_id)]["tool_results"][0] == raw_result
+    replayed_model_message = model.calls[0]["contents"][1]
+    assert replayed_model_message["parts"][0] == {
+        "thought_signature": "b3BhcXVlLWxlZ2FjeS1zaWduYXR1cmU=",
+        "function_call": {
+            "id": "route-operation-legacy-route", "name": "get_transcript",
+            "args": arguments,
+        },
+    }
+    types.Content.model_validate(replayed_model_message)
+
+    native_part = types.Part(text="already native")
+    ordinary_text_part = {"text": "plain legacy text"}
+    mixed_contents = []
+    agent._append_model_response(mixed_contents, {"parts": [
+        native_part, ordinary_text_part, legacy_response["parts"][0],
+    ]})
+    assert mixed_contents[0]["parts"][0] is native_part
+    assert mixed_contents[0]["parts"][1] is ordinary_text_part
+    types.Content.model_validate(mixed_contents[0])
 
 
 class _CommandRepository:

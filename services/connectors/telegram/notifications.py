@@ -48,6 +48,7 @@ class _VerifiedTelegramLifecycle:
     occurred_at: datetime | None = None
     failures: int | None = None
     sanitized_message: str | None = None
+    title: str | None = None
 
 
 def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
@@ -63,7 +64,10 @@ def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
             raise ValueError(f"{name} is invalid")
     prefix = f"Dialog #{lifecycle.dialog_number}"
     if lifecycle.completion_confirmed:
-        path = " ".join(lifecycle.folder_path.split()) if lifecycle.folder_path else ""
+        path = (
+            " ".join(lifecycle.folder_path.split())
+            if isinstance(lifecycle.folder_path, str) else ""
+        )
         outcome = lifecycle.classification_outcome
         if outcome not in {None, "ambiguous", "unassigned"}:
             outcome = None
@@ -75,7 +79,9 @@ def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
             body = f"{prefix}: Saved and indexed. Folder: {path}."
         else:
             body = f"{prefix}: Saved and indexed."
-        return f"{body}{note}"[:4096]
+        title = _safe_verified_title(lifecycle.title)
+        title_note = f" Title: {title}." if title else ""
+        return f"{body}{title_note}{note}"[:4096]
     if lifecycle.reason in {"in_progress", "index_pending"}:
         return f"{prefix}: Processing or indexing is still in progress."
     from services.connectors.telegram.errors import format_terminal_error
@@ -91,6 +97,18 @@ def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
         occurred_at=lifecycle.occurred_at,
         failures=lifecycle.failures,
     )
+
+
+def _safe_verified_title(value: Any) -> str | None:
+    """Render a verified title as bounded single-line text."""
+    if not isinstance(value, str):
+        return None
+    title = " ".join(value.split())
+    title = "".join(char if ord(char) >= 32 else " " for char in title)
+    title = " ".join(title.split())
+    if not title:
+        return None
+    return title if len(title) <= 512 else title[:511].rstrip() + "…"
 
 
 class TelegramNotificationPublisher:
@@ -122,6 +140,7 @@ class TelegramNotificationPublisher:
         thread_id = reservation.get("thread_id")
         body = reservation["body"]
         revision = reservation["attempt_revision"]
+        retry_after = None
         try:
             if reservation["is_send"]:
                 response = await self.client.send_message(
@@ -136,9 +155,13 @@ class TelegramNotificationPublisher:
                 await self.client.edit_message_text(chat_id, reservation["message_id"], body)
                 outcome, message_id = "edited", None
         except TelegramAPIError as exc:
-            outcome = "unknown" if exc.category in {
-                "timeout", "transport", "unavailable", "invalid_response",
-            } else "rejected"
+            if exc.category == "rate_limited":
+                outcome = "rate_limited"
+            elif exc.category in {"timeout", "transport", "unavailable", "invalid_response"}:
+                outcome = "unknown"
+            else:
+                outcome = "rejected"
+            retry_after = exc.retry_after if exc.category == "rate_limited" else None
             message_id = None
         except Exception:
             # A timeout or connection drop does not prove whether Telegram accepted the send.
@@ -148,6 +171,7 @@ class TelegramNotificationPublisher:
             self.repository.settle_notification_attempt,
             notification_id, attempt_id=attempt_id, revision=revision,
             outcome=outcome, message_id=message_id, now=self.clock(),
+            retry_after=retry_after,
         )
         if settled is None:
             return "not_found"

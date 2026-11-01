@@ -305,6 +305,29 @@ class _GeminiFiles:
         return _script("gemini", "files.delete")
 
 
+class _AsyncGeminiModels:
+    """Async facade sharing the existing Gemini response queues and trace."""
+
+    def __init__(self, sync_models: _GeminiModels) -> None:
+        self._sync = sync_models
+
+    async def generate_content(self, **kwargs: Any):
+        return self._sync.generate_content(**kwargs)
+
+
+class _AsyncGeminiFiles:
+    """Async facade sharing the existing Gemini file queues and trace."""
+
+    def __init__(self, sync_files: _GeminiFiles) -> None:
+        self._sync = sync_files
+
+    async def upload(self, **kwargs: Any):
+        return self._sync.upload(**kwargs)
+
+    async def delete(self, **kwargs: Any):
+        return self._sync.delete(**kwargs)
+
+
 class FakeGeminiClient:
     def __init__(self, *, api_key: str, **kwargs: Any) -> None:
         if kwargs.keys() - {"http_options"}:
@@ -312,6 +335,10 @@ class FakeGeminiClient:
         _record("gemini", "client", api_key=api_key, **kwargs)
         self.models = _GeminiModels()
         self.files = _GeminiFiles()
+        self.aio = SimpleNamespace(
+            models=_AsyncGeminiModels(self.models),
+            files=_AsyncGeminiFiles(self.files),
+        )
 
 
 class FakeQdrantClient:

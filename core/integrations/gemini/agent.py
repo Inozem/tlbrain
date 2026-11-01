@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from google.genai import types
 
 from core.integrations.gemini import client as gemini_client
@@ -47,7 +49,9 @@ class GeminiAgent:
 
     @staticmethod
     def make_function_response(*, call, response):
-        """Build a Gemini function response associated with its source call."""
+        """Build a Gemini function response with the SDK-required object payload."""
+        if not isinstance(response, Mapping):
+            response = {"result": response}
         return types.Part(
             function_response=types.FunctionResponse(
                 id=call.id,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from inspect import isawaitable
@@ -81,6 +82,10 @@ class RetryGovernor:
         method = getattr(self.retry_store, name, None) if self.retry_store is not None else None
         return (method or fallback)(*args, **kwargs)
 
+    async def _run_blocking(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run a synchronous store operation without blocking the event loop."""
+        return await asyncio.to_thread(function, *args, **kwargs)
+
     def _now(self, supplied: datetime | None = None) -> datetime:
         value = supplied
         if value is None:
@@ -145,6 +150,11 @@ class RetryGovernor:
         stage = self.get_stage(operation_id, stage_key)
         if stage.state == StageState.COMPLETED:
             return stage.result
+        if self._is_terminal_stage(stage):
+            self._repair_terminal_stage(
+                operation_id, stage_key, stage, owner=owner, fence=fence,
+                externally_owned=externally_owned, now=now,
+            )
         self._check_retry_eligibility(stage, stage_key, now)
 
         if externally_owned:
@@ -192,20 +202,30 @@ class RetryGovernor:
     ) -> Any:
         """Async counterpart; reserves once and awaits exactly one callback."""
         now = self._now(now)
-        if not self._store_call("validate_lease",
-                lambda **kw: validate_operation_lease(self.client, **kw),
-                operation_id=operation_id, owner=owner, fence=fence, now=now):
+        valid = await self._run_blocking(
+            self._store_call, "validate_lease",
+            lambda **kw: validate_operation_lease(self.client, **kw),
+            operation_id=operation_id, owner=owner, fence=fence, now=now,
+        )
+        if not valid:
             raise RuntimeError("operation lease is unavailable")
-        stage = self.get_stage(operation_id, stage_key)
+        stage = await self._run_blocking(self.get_stage, operation_id, stage_key)
         if stage.state == StageState.COMPLETED:
             return stage.result
+        if self._is_terminal_stage(stage):
+            await self._run_blocking(
+                self._fail_operation_if_terminal, operation_id, stage_key,
+                owner=owner, fence=fence, error=stage.last_error, now=now,
+            )
         self._check_retry_eligibility(stage, stage_key, now)
         if stage.in_flight_attempt_id:
             return await self._reconcile_attempt_async(
                 operation_id, stage_key, stage.in_flight_attempt_id, reconcile,
                 owner=owner, fence=fence, checkpoint_refs=checkpoint_refs,
             )
-        reserved, attempt_id = self._reserve_attempt(operation_id, stage_key, owner, fence, now)
+        reserved, attempt_id = await self._run_blocking(
+            self._reserve_attempt, operation_id, stage_key, owner, fence, now,
+        )
         if not reserved:
             return attempt_id
         return await self._execute_attempt_async(
@@ -230,14 +250,15 @@ class RetryGovernor:
         if reconciled is None:
             raise UnknownOutcome("stage outcome remains unresolved")
         if isinstance(reconciled, ConfirmedStageFailure):
-            self._record_reconciled_failure(
+            await self._run_blocking(
+                self._record_reconciled_failure,
                 operation_id, stage_key, attempt_id, reconciled.error, owner=owner, fence=fence,
             )
             raise ReconciledStageFailure(reconciled.error) from None
         result = reconciled.result if isinstance(reconciled, ConfirmedStageSuccess) else reconciled
-        self._complete_attempt(
-            operation_id, stage_key, attempt_id, result, owner=owner, fence=fence,
-            checkpoint_refs=checkpoint_refs, reconciled=True,
+        await self._run_blocking(
+            self._complete_attempt, operation_id, stage_key, attempt_id, result,
+            owner=owner, fence=fence, checkpoint_refs=checkpoint_refs, reconciled=True,
         )
         return result
 
@@ -259,11 +280,15 @@ class RetryGovernor:
                 message=f"Stage execution failed ({type(error).__name__})",
                 retryable=bool(retryable(error) if retryable is not None else True), stage=stage_key,
             )
-            self._record_execution_failure(operation_id, stage_key, attempt_id, safe_error,
-                owner=owner, fence=fence, original_error=error)
+            await self._run_blocking(
+                self._record_execution_failure, operation_id, stage_key, attempt_id, safe_error,
+                owner=owner, fence=fence, original_error=error,
+            )
             raise
-        self._complete_attempt(operation_id, stage_key, attempt_id, result, owner=owner,
-            fence=fence, checkpoint_refs=checkpoint_refs, reconciled=False)
+        await self._run_blocking(
+            self._complete_attempt, operation_id, stage_key, attempt_id, result, owner=owner,
+            fence=fence, checkpoint_refs=checkpoint_refs, reconciled=False,
+        )
         return result
 
     def _check_retry_eligibility(
@@ -277,6 +302,42 @@ class RetryGovernor:
             raise RetryBudgetExceeded(f"stage {stage_key!r} has a permanent failure")
         if stage.retry_not_before is not None and stage.retry_not_before > now:
             raise RetryBudgetExceeded(f"stage {stage_key!r} is waiting for its retry time")
+
+    def _is_terminal_stage(self, stage: OperationStageRecord) -> bool:
+        return (stage.in_flight_attempt_id is None and stage.last_error is not None
+                and (not stage.last_error.retryable or stage.failures >= self.max_failures))
+
+    def _repair_terminal_stage(
+        self, operation_id: str, stage_key: str, stage: OperationStageRecord, *,
+        owner: str | None, fence: int | None, externally_owned: bool, now: datetime,
+    ) -> None:
+        """Settle a persisted terminal stage before returning its budget error."""
+        if externally_owned:
+            assert owner is not None and fence is not None and stage.last_error is not None
+            self._fail_operation_if_terminal(
+                operation_id, stage_key, owner=owner, fence=fence,
+                error=stage.last_error, now=now,
+            )
+            return
+
+        recovery_owner = f"retry-governor-{uuid4().hex}"
+        lease = claim_operation(
+            self.client, operation_id, owner=recovery_owner, now=now,
+            lease_seconds=self.lease_seconds,
+        )
+        if lease is None:
+            return
+        try:
+            assert stage.last_error is not None
+            self._fail_operation_if_terminal(
+                operation_id, stage_key, owner=recovery_owner, fence=lease.fence,
+                error=stage.last_error, now=now,
+            )
+        finally:
+            release_operation(
+                self.client, operation_id, owner=recovery_owner, fence=lease.fence,
+                now=self._now(),
+            )
 
     def _reserve_attempt(
         self, operation_id: str, stage_key: str, owner: str, fence: int, now: datetime,

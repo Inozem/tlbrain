@@ -6,6 +6,7 @@ only from Telegram's validated ``getFile`` response and are never returned.
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -118,9 +119,17 @@ class TelegramClient:
             raise TelegramAPIError("invalid_response")
         return TelegramFile(file_id=result_file_id, file_path=file_path, file_size=size)
 
-    async def download_audio(self, file_id: str) -> dict[str, Any]:
-        """Download by provider file ID and return the in-memory audio payload."""
+    async def download_audio(
+        self, file_id: str, *, assert_current: Any = None,
+    ) -> dict[str, Any]:
+        """Download one audio payload, checking an optional per-call parent fence.
+
+        The callback is never retained on this client, which may be shared by
+        concurrent Telegram updates.
+        """
+        await self._check_current(assert_current)
         file = await self.get_file(file_id)
+        await self._check_current(assert_current)
         url = f"{_API_ORIGIN}/file/bot{self._bot_token}/{file.file_path}"
         response = await self._request("GET", url)
         if response.status_code >= 300:
@@ -128,6 +137,14 @@ class TelegramClient:
         mime_type = response.headers.get("content-type", "application/octet-stream").split(";", 1)[0].strip()
         data = response.content
         return {"data": data, "mime_type": mime_type, "size": len(data)}
+
+    @staticmethod
+    async def _check_current(assert_current: Any) -> None:
+        if not callable(assert_current):
+            return
+        result = assert_current()
+        if inspect.isawaitable(result):
+            await result
 
     async def cleanup_download(self, item: Any) -> None:
         """Audio downloads are memory-only, so cleanup has no external work."""

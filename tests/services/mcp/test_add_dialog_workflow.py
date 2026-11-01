@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -219,8 +220,8 @@ def test_add_dialog_offline_workflow_replays_dispatch_and_becomes_queryable(
     assert task_json["operation_id"] == operation_id
     assert task_json["document_id"] == doc_id
     assert task_json["save_intent_id"] == files[doc_id]["appProperties"]["tlbrain_save_id"]
-    vector_path = "/sync/doc/" + doc_id
-    assert task_request["url"] == os.environ["VECTOR_SYNC_URL"]
+    vector_path = "/sync/doc/" + quote(doc_id, safe="")
+    assert task_request["url"] == os.environ["VECTOR_SYNC_URL"].rstrip("/") + vector_path
 
     # This is the supported post-Doc lost-ack case, not an HTTP request timeout:
     # the fake accepted one task and then withheld its acknowledgement.

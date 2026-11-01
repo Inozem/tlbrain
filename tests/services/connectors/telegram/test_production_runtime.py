@@ -1,0 +1,482 @@
+"""Offline composition checks for Telegram's real default runtime."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import socket
+from datetime import datetime, timezone
+
+import httpx
+import pytest
+
+
+pytestmark = pytest.mark.offline
+
+
+def test_create_app_selects_lazy_managed_default_without_provider_construction():
+    from services.connectors.telegram.app.main import create_app
+
+    app = create_app()
+
+    assert app.state.telegram_managed_runtime is True
+    assert app.state.telegram_queue_worker is None
+
+
+def test_explicit_none_queue_worker_keeps_injected_caller_contract():
+    from services.connectors.telegram.app.main import create_app
+
+    app = create_app(queue_worker=None)
+
+    assert app.state.telegram_managed_runtime is False
+    assert app.state.telegram_queue_worker is None
+
+
+def test_default_factory_builds_real_worker_command_runtime_and_save_workflow(firestore_fake):
+    from services.connectors.telegram.queue import TelegramQueueWorker
+    from services.connectors.telegram.runtime.factory import build_default_queue_worker
+    from services.connectors.telegram.runtime.runtime import TelegramCommandRuntime
+    from services.connectors.telegram.runtime.saving import TelegramSaveRuntime
+
+    client = firestore_fake.client_class()
+    worker = build_default_queue_worker(client)
+
+    assert isinstance(worker, TelegramQueueWorker)
+    assert isinstance(worker.processor, TelegramCommandRuntime)
+    assert isinstance(worker.processor.save_handler, TelegramSaveRuntime)
+    assert worker.client is client
+    # Factory construction remains lazy; no Gemini/Telegram client is created until work runs.
+    assert worker.processor.model is None
+    assert worker.processor.save_handler.model is None
+    assert worker.processor.save_handler.telegram_client is None
+
+
+def _selector_loop():
+    if os.name != "nt":
+        return asyncio.SelectorEventLoop()
+    original_socketpair = socket.socketpair
+
+    def local_pair(*_args, **_kwargs):
+        reader = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        writer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        reader.bind(("127.0.0.1", 0))
+        writer.bind(("127.0.0.1", 0))
+        writer.connect(reader.getsockname())
+        reader.connect(writer.getsockname())
+        return reader, writer
+
+    socket.socketpair = local_pair
+    try:
+        return asyncio.SelectorEventLoop()
+    finally:
+        socket.socketpair = original_socketpair
+
+
+def test_default_app_webhook_dispatch_routes_real_greeting_and_delivers_durable_reply(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """Exercise default intake, real queue processor/router/agent and Telegram transport."""
+    from google.genai import types
+    from core.integrations.firestore.outbox import get_outbox_record, task_payload
+    from services.connectors.telegram.app.main import create_app
+    from services.connectors.telegram.client import TelegramClient
+
+    db = firestore_fake.client_class()
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
+    monkeypatch.setattr("services.connectors.telegram.app.main._allowed_user_ids", lambda: {7})
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "pytest-telegram-control-queue")
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.pytest.invalid/internal/dispatch")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+
+    task_requests = []
+    enqueue_fake = lambda **kwargs: task_requests.append(kwargs)
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
+    # The shared index publisher binds this SDK seam at module import time.
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
+    sent = []
+
+    def bot_response(request):
+        payload = json.loads(request.content)
+        sent.append((request.url.path.rsplit("/", 1)[-1], payload))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 900 + len(sent)}})
+
+    def telegram_client_init(self, token, *, http_client=None, timeout=30.0):
+        transport = httpx.MockTransport(bot_response)
+        return TelegramClient.__original_init__(
+            self, token, http_client=httpx.AsyncClient(transport=transport), timeout=timeout,
+        )
+
+    original_init = TelegramClient.__init__
+    monkeypatch.setattr(TelegramClient, "__original_init__", original_init, raising=False)
+    monkeypatch.setattr(TelegramClient, "__init__", telegram_client_init)
+
+    route = {
+        "kind": "substantive", "target_ref": None, "target_operation_id": None,
+        "dialog_number": None, "result_refs": [], "substantive_text": "Hello!",
+        "tool_choice": None, "certainty": "certain",
+    }
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            function_call=types.FunctionCall(name="route_command", args=route),
+        )]))],
+    ))
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(text="Hello there!")]))],
+    ))
+    app = create_app(
+        webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+        oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})(),
+    )
+    assert app.state.telegram_queue_worker is None
+    update = {"update_id": 14001, "message": {
+        "message_id": 61, "date": 1793320000,
+        "chat": {"id": 77, "type": "private"},
+        "from": {"id": 7, "first_name": "Tester"},
+        "text": "Hello",
+    }}
+
+    async def request_webhook():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            return await client.post(
+                "/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"},
+                json=update,
+            )
+
+    response = asyncio.run(request_webhook(), loop_factory=_selector_loop)
+    assert response.status_code == 200
+    assert app.state.telegram_queue_worker is None
+    dispatch = next(item for item in task_requests
+                    if item["body"].get("target_kind") == "telegram_dispatch")
+    body = dispatch["body"]
+    persisted_record = get_outbox_record(db, body["outbox_id"])
+    assert persisted_record is not None, (body, task_requests)
+    assert task_payload(persisted_record) == body, (task_payload(persisted_record), body)
+
+    async def dispatch_task():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            return await client.post(
+                "/internal/dispatch", headers={"Authorization": "Bearer fake-task"}, json=body,
+            )
+
+    result = asyncio.run(dispatch_task(), loop_factory=_selector_loop)
+    assert result.status_code == 200, result.text
+    assert result.json() == {"status": "processed"}
+    assert app.state.telegram_queue_worker is not None
+    assert len([row for row in sdk_fakes.trace
+                if row["boundary"] == "gemini" and row["operation"] == "generate_content"]) == 2
+    assert [payload["text"] for method, payload in sent if method == "sendMessage"] == ["Hello there!"]
+    context_id, operation_id = body["context_id"], body["operation_id"]
+    operation = (db.collection("telegram_sessions").document(context_id)
+                 .collection("operations").document(operation_id).get().to_dict())
+    assert operation["state"] == "completed"
+    assert operation["notification_id"]
+    notification = db.collection("notification_outbox").document(
+        operation["notification_id"]
+    ).get().to_dict()
+    assert notification["state"] == "delivered"
+
+
+def test_default_save_repository_roundtrips_large_stage_payload_as_bounded_parts(firestore_fake):
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.queue import claim_head
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.save_repository import FirestoreTelegramSaveRepository
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    forward = repository.accept_forward(5101, chat_id=77, thread_id=None,
+        message={"message_id": 41, "text": "source", "transcription_state": "not_required"},
+        now=datetime.now(timezone.utc))
+    accepted = repository.accept_command(5102, chat_id=77, thread_id=None, user_id=7,
+        command=parse_command("save"), now=datetime.now(timezone.utc))
+    context_ref = client.collection("telegram_sessions").document(forward.context_id)
+    lease = claim_head(client, context_ref, owner="large-stage-worker", now=datetime.now(timezone.utc))
+    assert lease is not None and lease.operation_id == accepted.operation_id
+    assert repository.confirm_save_command(
+        forward.context_id, accepted.operation_id, owner=lease.owner, fence=lease.fence,
+        now=datetime.now(timezone.utc),
+    ) is True
+    ledger = FirestoreAgentLedger(
+        client, context_id=forward.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: datetime.now(timezone.utc),
+    )
+    save_repository = FirestoreTelegramSaveRepository(
+        repository, context_id=forward.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: datetime.now(timezone.utc),
+        ledger=ledger,
+    )
+    value = {"utterances": [{"speaker": "Speaker", "text": f"{index}:" + "x" * 2600}
+                            for index in range(430)]}
+    assert len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 1_000_000
+
+    async def roundtrip():
+        ref = await save_repository.store_retry_stage_payload(accepted.operation_id, "analysis", value)
+        return ref, await save_repository.load_retry_stage_payload(ref)
+
+    reference, restored = asyncio.run(roundtrip(), loop_factory=_selector_loop)
+    assert restored == value
+    assert isinstance(reference.get("_input_ref"), str)
+    assert reference["_input_ref"].endswith("/input_parts/manifest")
+    stored_sizes = [len(json.dumps(row, ensure_ascii=False, default=str).encode("utf-8"))
+                    for path, row in firestore_fake.documents.items()
+                    if path.startswith(f"telegram_sessions/{forward.context_id}/operations/")]
+    assert stored_sizes and max(stored_sizes) < 1_000_000
+
+
+def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_real_index_receipt(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """Run the default app through a real managed save and Vector Sync endpoint."""
+    from google.genai import types
+    from core.integrations.firestore.outbox import get_outbox_record, task_payload
+    from core.integrations.firestore.folders import upsert_folder
+    from services.connectors.telegram.app.main import create_app
+
+    db = firestore_fake.client_class()
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
+    monkeypatch.setattr("services.connectors.telegram.app.main._allowed_user_ids", lambda: {7})
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "pytest-telegram-control-queue")
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.pytest.invalid/internal/dispatch")
+    monkeypatch.setenv("TELEGRAM_DELIVERY_URL", "https://telegram.pytest.invalid/internal/deliver")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("DIALOG_OPERATIONS_QUEUE", "pytest-dialog-operations-queue")
+    monkeypatch.setenv("VECTOR_SYNC_URL", "https://vector-sync.pytest.invalid")
+    monkeypatch.setenv("ROOT_FOLDER_URL", "https://drive.google.com/drive/folders/pytest-synthetic-root")
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-synthetic-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-synthetic-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-synthetic-secret")
+
+    task_requests = []
+    enqueue_fake = lambda **kwargs: task_requests.append(kwargs)
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
+    sent = []
+    def bot_response(request):
+        payload = json.loads(request.content)
+        sent.append((request.url.path.rsplit("/", 1)[-1], payload))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 900 + len(sent)}})
+    from services.connectors.telegram.client import TelegramClient
+    original_init = TelegramClient.__init__
+    def telegram_client_init(self, token, *, http_client=None, timeout=30.0):
+        return original_init(self, token, http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(bot_response)), timeout=timeout)
+    monkeypatch.setattr(TelegramClient, "__init__", telegram_client_init)
+
+    upsert_folder("pytest-synthetic-root", "Root", None, db)
+    upsert_folder("folder-client", "Client", "pytest-synthetic-root", db)
+    route = {"kind": "save", "target_ref": None, "target_operation_id": None,
+             "dialog_number": None, "result_refs": [], "substantive_text": None,
+             "tool_choice": None, "certainty": "certain"}
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            function_call=types.FunctionCall(name="route_command", args=route),
+        )]))],
+    ))
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text=json.dumps({"title": "A complete saved dialog", "folder_path": ["Client"]}),
+        )]))],
+    ))
+    # The summary stage may safely classify a short one-turn dialog as skipped.
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[]))],
+    ))
+    sdk_fakes.drive.queue("files.create", response={"id": "doc-default-save"})
+    empty_document = {"revisionId": "rev-empty", "body": {"content": [
+        {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
+    ]}}
+    for _ in range(12):
+        sdk_fakes.docs.queue("documents.get", response=empty_document)
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"revisionId": "rev-filled"})
+    for modified in ("fill-time", "post-fill-time", *(f"readback-{i}" for i in range(10))):
+        sdk_fakes.drive.queue("files.get", response={
+            "id": "doc-default-save", "mimeType": "application/vnd.google-apps.document",
+            "parents": ["folder-client"], "modifiedTime": modified,
+        })
+    app = create_app(webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+                     oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})())
+
+    async def post(path, payload, *, secret=False):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            headers = {"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"} if secret else {
+                "Authorization": "Bearer fake-task",
+            }
+            return await client.post(path, headers=headers, json=payload)
+
+    forward = {"update_id": 15001, "message": {
+        "message_id": 61, "date": 1793320000,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Ada"},
+                           "date": 1793310000},
+        "text": "The exact forwarded source line.",
+    }}
+    forward_response = asyncio.run(post("/telegram/webhook", forward, secret=True),
+                                   loop_factory=_selector_loop)
+    assert forward_response.status_code == 200, forward_response.text
+    forward_tasks = [item["body"] for item in task_requests
+                     if item["body"].get("target_kind") == "telegram_dispatch"]
+    forward_ack = next(body for body in forward_tasks if body.get("notification_id"))
+    ack_done = asyncio.run(post("/internal/deliver", forward_ack),
+                           loop_factory=_selector_loop)
+    assert ack_done.status_code == 200, ack_done.text
+    assert any(method == "sendMessage" for method, _ in sent)  # durable forward acknowledgement
+
+    command = {"update_id": 15002, "message": {
+        "message_id": 62, "date": 1793320010,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7}, "text": "save this dialog",
+    }}
+    command_response = asyncio.run(post("/telegram/webhook", command, secret=True),
+                                   loop_factory=_selector_loop)
+    assert command_response.status_code == 200, command_response.text
+    command_tasks = [item["body"] for item in task_requests
+                     if item["body"].get("target_kind") == "telegram_dispatch"]
+    save_dispatch = command_tasks[-1]
+    if save_dispatch.get("notification_id"):
+        ack = save_dispatch
+        ack_done = asyncio.run(post("/internal/deliver", ack), loop_factory=_selector_loop)
+        assert ack_done.status_code == 200, ack_done.text
+        save_dispatch = next((body for body in command_tasks if not body.get("notification_id")), None)
+        assert save_dispatch is not None, command_tasks
+    first_slice = asyncio.run(post("/internal/dispatch", save_dispatch),
+                              loop_factory=_selector_loop)
+    assert first_slice.status_code == 200, first_slice.text
+    assert first_slice.json() == {"status": "noop"}  # the index receipt is still pending
+    operation = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+                 .collection("operations").document(save_dispatch["operation_id"]).get().to_dict())
+    assert operation["state"] == "running"
+    assert operation["route_control"]["kind"] == "save"
+    core_operation = db.collection("dialog_operations").document(save_dispatch["operation_id"]).get().to_dict()
+    assert core_operation["doc_id"] == "doc-default-save"
+    index_task = next(item for item in task_requests
+                      if item["url"].startswith("https://vector-sync.pytest.invalid/sync/doc/"))
+    assert index_task["url"] == "https://vector-sync.pytest.invalid/sync/doc/doc-default-save"
+    index_record = get_outbox_record(db, index_task["body"]["outbox_id"])
+    assert index_record is not None and task_payload(index_record) == index_task["body"]
+
+    # Feed the exact published payload to the actual Vector Sync endpoint. Only
+    # its Google Docs/Drive boundary is faked; the managed index and receipt path
+    # remain real, including Qdrant and canonical completion publication.
+    from services.vector_sync.app.main import app as vector_app
+
+    fill_events = [event for event in sdk_fakes.trace
+                   if event["boundary"] == "docs" and event["operation"] == "documents.batchUpdate"]
+    assert len(fill_events) == 1
+    reader_text = fill_events[0]["arguments"]["body"]["requests"][0]["insertText"]["text"]
+    def read_saved_document(_doc_id):
+        return reader_text
+    monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
+                        lambda _doc_id: ("folder-client", False, "A complete saved dialog"))
+    monkeypatch.setattr("services.vector_sync.app.main.read_google_doc", read_saved_document)
+    monkeypatch.setattr("core.integrations.google_docs.reader.read_google_doc", read_saved_document)
+    monkeypatch.setattr("core.indexing.processor.read_google_doc", read_saved_document)
+
+    async def sync_document():
+        transport = httpx.ASGITransport(app=vector_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://vector.test") as client:
+            return await client.post(
+                "/sync/doc/doc-default-save", json=index_task["body"],
+            )
+    indexed = asyncio.run(sync_document(), loop_factory=_selector_loop)
+    assert indexed.status_code == 200, indexed.text
+    assert indexed.json()["status"] == "ok"
+    receipt = db.collection("index_completions").document("doc-default-save").collection(
+        "generations").document(core_operation["desired_content_hash"]).get().to_dict()
+    assert receipt["status"] == "completed"
+
+    # The real queue worker resumes after the verified index receipt exists.
+    wake_task_kwargs = next(item for item in task_requests
+                            if item["body"].get("target_kind") == "telegram_dispatch"
+                            and item["body"].get("operation_id") == save_dispatch["operation_id"]
+                            and item["body"].get("outbox_id") != save_dispatch["outbox_id"])
+    wake = get_outbox_record(db, wake_task_kwargs["body"]["outbox_id"])
+    assert wake is not None and wake.operation_id == save_dispatch["operation_id"]
+    assert wake.schedule_at > wake.created_at
+    wake_task = task_payload(wake)
+    completed = asyncio.run(post("/internal/dispatch", wake_task),
+                            loop_factory=_selector_loop)
+    assert completed.status_code == 200, completed.text
+    queue_operation = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+                       .collection("operations").document(save_dispatch["operation_id"]).get().to_dict())
+    shared_after_wake = db.collection("dialog_operations").document(save_dispatch["operation_id"]).get().to_dict()
+    draft_after_wake = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+                        .collection("drafts").document(queue_operation["target_draft_id"]).get().to_dict())
+    assert completed.json() == {"status": "processed"}, (
+        completed.json(), queue_operation.get("state"), shared_after_wake.get("state"),
+        shared_after_wake.get("result"), shared_after_wake.get("stage"),
+        draft_after_wake.get("state"), draft_after_wake.get("completion_certificate"),
+    )
+    assert queue_operation["state"] == "completed"
+    assert queue_operation["save_operation_id"] == save_dispatch["operation_id"]
+    assert queue_operation["route_result"]["kind"] == "save"
+    assert queue_operation.get("doc_id") == "doc-default-save", {
+        key: queue_operation.get(key) for key in (
+            "state", "save_operation_id", "route_result", "doc_id", "target_doc_id",
+            "dialog_number", "target_dialog_number", "conversation_id", "target_conversation_id",
+        )
+    }
+    draft_ref = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+                 .collection("drafts").document(queue_operation["target_draft_id"]))
+    assert draft_ref.collection("messages").stream() == []
+    assert draft_ref.collection("prepared").stream() == []
+    assert draft_ref.collection("save_manifests").document(save_dispatch["operation_id"]).get().exists
+    stages = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+              .collection("operations").document(save_dispatch["operation_id"])
+              .collection("stages"))
+    for stage_key in ("telegram.preparation", "telegram.analysis", "telegram.classification"):
+        stage = stages.document(stage_key).get().to_dict()
+        assert stage is not None and stage["state"] == "completed"
+        assert stage["result"]["purged"] is True
+    request = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+               .collection("operations").document(save_dispatch["operation_id"])
+               .collection("agent_requests").document("request").get().to_dict())
+    assert request["request"]["purged"] is True
+    assert "save this dialog" not in str(request["request"])
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+    runtime_store = TelegramRuntimeStore(
+        TelegramRepository(db), context_id=save_dispatch["context_id"],
+    )
+    assert runtime_store.resolve_dialog_number(save_dispatch["context_id"], 1) == "doc-default-save"
+    assert runtime_store.get_or_assign_dialog_number(
+        save_dispatch["context_id"], "doc-default-save",
+    ) == 1
+    saved_conversation = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+                          .collection("conversations").document(draft_after_wake["conversation_id"])
+                          .get().to_dict())
+    assert saved_conversation["kind"] == "document"
+    assert saved_conversation["doc_id"] == "doc-default-save"
+    assert saved_conversation["dialog_number"] == 1
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.create"]) == 1
+    save_finals = [payload for method, payload in sent
+                   if method == "sendMessage"
+                   and "Dialog #1: Saved and indexed. Folder: Client." in payload.get("text", "")]
+    assert len(save_finals) == 1, sent
+    final_notices = [row for path, row in firestore_fake.documents.items()
+                     if path.startswith("notification_outbox/")
+                     and row.get("operation_id") == save_dispatch["operation_id"]
+                     and row.get("kind") in {"final", "error"}]
+    assert len(final_notices) == 1, final_notices
+    assert final_notices[0]["notification_id"] == queue_operation["notification_id"]
+
+    # Replaying the canonical wake dispatch must reuse the delivered ledger row.
+    duplicate = asyncio.run(post("/internal/dispatch", wake_task),
+                            loop_factory=_selector_loop)
+    assert duplicate.status_code == 200, duplicate.text
+    assert len([payload for method, payload in sent
+                if method == "sendMessage"
+                and "Dialog #1: Saved and indexed. Folder: Client." in payload.get("text", "")]) == 1

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import re
+from collections.abc import Callable
 from typing import Any
 
 from core.integrations.firestore.client import get_client
+from core.integrations.firestore.save_intents import _completion_operation_binding_matches
 
 
 OPERATIONS_COLLECTION = "dialog_operations"
@@ -35,7 +38,10 @@ def _parts_collection(client: Any, input_ref: str) -> Any:
     return client.collection(OPERATIONS_COLLECTION).document(parts[1]).collection(INPUT_PARTS_COLLECTION)
 
 
-def write_input_parts(client: Any | None, input_ref: str, payload: bytes) -> dict[str, Any]:
+def write_input_parts(
+    client: Any | None, input_ref: str, payload: bytes, *,
+    write_document: Callable[[Any, dict[str, Any]], Any] | None = None,
+) -> dict[str, Any]:
     """Write immutable bytes as numbered parts, publishing a ready manifest last."""
     if not isinstance(payload, bytes):
         raise TypeError("payload must be bytes")
@@ -46,6 +52,9 @@ def write_input_parts(client: Any | None, input_ref: str, payload: bytes) -> dic
     parts = [payload[i:i + MAX_PART_BYTES] for i in range(0, len(payload), MAX_PART_BYTES)] or [b""]
     expected = {"input_ref": input_ref, "ready": True, "part_count": len(parts),
                 "byte_length": len(payload), "sha256": digest}
+    write = write_document if write_document is not None else (
+        lambda reference, data: reference.set(data)
+    )
     current = manifest_ref.get()
     if current.exists:
         data = current.to_dict() or {}
@@ -56,11 +65,12 @@ def write_input_parts(client: Any | None, input_ref: str, payload: bytes) -> dic
     for index, part in enumerate(parts):
         if len(part) > MAX_PART_BYTES:
             raise ValueError("input part exceeds the safe Firestore payload bound")
-        parts_collection.document(f"part-{index:06d}").set(
-            {"input_ref": input_ref, "index": index, "payload": part}
+        write(
+            parts_collection.document(f"part-{index:06d}"),
+            {"input_ref": input_ref, "index": index, "payload": part},
         )
     # The ready marker is the publication point: readers never consume partial writes.
-    manifest_ref.set(expected)
+    write(manifest_ref, expected)
     return expected
 
 
@@ -117,10 +127,9 @@ def _has_matching_completion_certificate(
     intent_authorization = intent.get("cleanup_authorization")
     if not isinstance(certificate, dict) or not isinstance(intent_authorization, dict):
         return False
-    return (
+    if not (
         intent.get("save_intent_id") == save_intent_id
         and intent.get("doc_id") == doc_id
-        and intent.get("dispatch_operation_id") == operation_id
         and intent_authorization == authorization
         and certificate.get("certificate_id") == authorization.get("certificate_id")
         and certificate.get("operation_id") == operation_id
@@ -128,7 +137,73 @@ def _has_matching_completion_certificate(
         and certificate.get("doc_id") == doc_id
         and certificate.get("origin_binding") == authorization.get("origin_binding")
         and bool(certificate.get("certificate_id"))
+    ):
+        return False
+    dispatch_operation_id = intent.get("dispatch_operation_id")
+    if dispatch_operation_id == operation_id:
+        return True
+    origin_binding = certificate.get("origin_binding")
+    return (
+        isinstance(origin_binding, dict)
+        and _completion_operation_binding_matches(
+            operation, intent, operation_id=operation_id, origin_binding=origin_binding,
+        )
     )
+
+
+def _input_operation_id(input_ref: Any) -> str | None:
+    if not isinstance(input_ref, str):
+        return None
+    match = re.fullmatch(r"dialog_operations/([^/]+)/input_parts/manifest", input_ref)
+    return match.group(1) if match else None
+
+
+def _cleanup_source_operation_id(
+    client: Any, operation_id: str, operation: dict[str, Any],
+) -> str | None:
+    """Resolve only the operation's own accepted input or its authorized create-gate input."""
+    input_ref = operation.get("immutable_input_ref")
+    if input_ref is None:
+        return operation_id
+    source_operation_id = _input_operation_id(input_ref)
+    digest = operation.get("immutable_input_digest")
+    if (source_operation_id is None or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+        return None
+    if source_operation_id != operation_id:
+        save_intent_id = operation.get("save_intent_id")
+        if not save_intent_id:
+            return None
+        intent_snapshot = client.collection("dialog_save_intents").document(save_intent_id).get()
+        if not intent_snapshot.exists:
+            return None
+        intent = intent_snapshot.to_dict() or {}
+        if intent.get("dispatch_operation_id") != source_operation_id:
+            return None
+        source_snapshot = client.collection(OPERATIONS_COLLECTION).document(source_operation_id).get()
+        if not source_snapshot.exists:
+            return None
+        source_operation = source_snapshot.to_dict() or {}
+        origin_binding = operation.get("origin_binding")
+        if (not isinstance(origin_binding, dict)
+                or source_operation.get("immutable_input_ref") != input_ref
+                or source_operation.get("immutable_input_digest") != digest
+                or not _completion_operation_binding_matches(
+                    source_operation, intent, operation_id=source_operation_id,
+                    origin_binding=origin_binding,
+                )):
+            return None
+    elif input_ref != f"{OPERATIONS_COLLECTION}/{operation_id}/{INPUT_PARTS_COLLECTION}/manifest":
+        return None
+
+    manifest = input_manifest_ref(client, input_ref).get()
+    if not manifest.exists:
+        return None
+    data = manifest.to_dict() or {}
+    if (data.get("input_ref") != input_ref or data.get("ready") is not True
+            or data.get("sha256") != digest):
+        return None
+    return source_operation_id
 
 
 def cleanup_completed_input_parts(
@@ -159,7 +234,10 @@ def cleanup_completed_input_parts(
         operation = snapshot.to_dict() or {}
         if not _has_matching_completion_certificate(db, snapshot.id, operation):
             continue
-        part_collection = operations.document(snapshot.id).collection(INPUT_PARTS_COLLECTION)
+        source_operation_id = _cleanup_source_operation_id(db, snapshot.id, operation)
+        if source_operation_id is None:
+            continue
+        part_collection = operations.document(source_operation_id).collection(INPUT_PARTS_COLLECTION)
         # The manifest has no index field and is retained as the input tombstone.
         parts = part_collection.where("index", ">=", 0).limit(part_limit).stream()
         batch = db.batch()

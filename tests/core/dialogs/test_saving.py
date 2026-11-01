@@ -47,6 +47,24 @@ def test_acceptance_is_side_effect_free_and_replay_is_stable(firestore_fake, sdk
     assert get_operation(client, first.operation.operation_id).save_intent_id == first.save_intent_id
 
 
+def test_accept_save_forwards_optional_input_document_writer(firestore_fake):
+    client = firestore_fake.client_class()
+    writes = []
+
+    def write_document(reference, data):
+        writes.append(reference.id)
+        reference.set(data)
+
+    accepted = accept_save(
+        client, ARGUMENTS, operation_id="callback-save", caller_binding="caller-1",
+        origin=OperationOrigin.MCP, now=NOW, write_document=write_document,
+    )
+
+    assert writes[-1] == "manifest"
+    assert writes == ["part-000000", "manifest"]
+    assert read_input_parts(client, accepted.immutable_input_ref)
+
+
 def test_replayed_request_keeps_original_acceptance_defaults(firestore_fake):
     client = firestore_fake.client_class()
     accepted_at = datetime(2026, 1, 2, 20, 30, tzinfo=timezone.utc)
@@ -183,7 +201,14 @@ def test_advance_resolves_folder_fills_once_updates_index_additively_and_dispatc
     assert get_stage(client, retry.operation.operation_id, "index_dispatch").state.value == "completed"
     outbox_after_retry = get_outbox_record(client, outbox_ids[0])
     assert outbox_after_retry.operation_id == accepted.operation.operation_id
-    assert len([row for row in firestore_fake.documents if row.startswith("task_outbox/")]) == 1
+    outbox_rows = [key.split("/", 1)[1] for key in firestore_fake.documents
+                   if key.startswith("task_outbox/")]
+    assert len(outbox_rows) == 2
+    retry_outbox_id = next(item for item in outbox_rows if item != outbox_ids[0])
+    retry_outbox = get_outbox_record(client, retry_outbox_id)
+    assert retry_outbox.operation_id == retry.operation.operation_id
+    assert retry_outbox.document_id == document_id
+    assert retry_outbox.save_intent_id == accepted.save_intent_id
     assert len([row for row in sdk_fakes.trace if row["operation"] == "files.create"]) == 1
     event_count = len([row for row in sdk_fakes.trace if row["operation"] != "build"])
     replay = advance_save(

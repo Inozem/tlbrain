@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Mapping, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from core.integrations.cloud_tasks.client import enqueue_task
 from core.integrations.firestore.outbox import (
@@ -132,10 +132,22 @@ def _publish_record(
     if target is None:
         return _PublicationOutcome.SKIPPED
 
+    target_url = target.url
+    if record.target_kind is OutboxTargetKind.INDEX_DISPATCH:
+        if not isinstance(record.document_id, str) or not record.document_id:
+            _record_enqueue_failure(client, record, now=now)
+            return _PublicationOutcome.FAILED
+        parsed = urlsplit(target.url)
+        target_url = urlunsplit((
+            parsed.scheme, parsed.netloc,
+            parsed.path.rstrip("/") + "/sync/doc/" + quote(record.document_id, safe=""),
+            parsed.query, parsed.fragment,
+        ))
+
     try:
         created = enqueue_task(
             queue_name=target.queue_name,
-            url=target.url,
+            url=target_url,
             task_id=record.task_name,
             body=task_payload(record),
             schedule_time=record.schedule_at,

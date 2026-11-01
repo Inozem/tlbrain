@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import inspect
 import json
 from collections.abc import Mapping, Sequence
@@ -12,7 +13,7 @@ from typing import Any, Callable
 
 from core.config import get_default_dialog_date
 from core.operations.models import OperationError
-from core.operations.retries import ConfirmedStageFailure, UnknownOutcome
+from core.operations.retries import ConfirmedStageFailure, ConfirmedStageSuccess, UnknownOutcome
 from core.dialogs.classification import FolderSelectionResult
 from services.connectors.telegram.context import build_save_analysis_context
 from services.connectors.telegram.preprocessing import preprocess_messages
@@ -186,6 +187,14 @@ class TelegramSaveError(RuntimeError):
         super().__init__(f"Telegram save failed during {stage} ({error_code})")
 
 
+class TelegramSavePending(RuntimeError):
+    """Control signal for a durably accepted save that is awaiting indexing."""
+
+    def __init__(self, *, stage: str = "indexing") -> None:
+        self.stage = stage
+        super().__init__("Telegram save is still running")
+
+
 class TelegramSaveWorkflow:
     """Coordinate transcription, preparation, analysis, shared save, and receipt."""
 
@@ -278,12 +287,44 @@ class TelegramSaveWorkflow:
                     raise ValueError("prepared utterances are malformed")
                 return prepared
             rows = [_prepared_row(row) for row in prepared]
+            persist_prepared = getattr(self.repository, "save_prepared_utterances", None)
+            if callable(persist_prepared):
+                from services.connectors.telegram.models import PreparedUtterance
+                persisted_rows = [PreparedUtterance(
+                    order_index=row["order_index"], speaker=row["speaker"],
+                    reliable_author_key=row.get("reliable_author_key"), text=row["text"],
+                    word_count=row["word_count"],
+                    source_message_ids=tuple(row["source_message_ids"]),
+                ) for row in rows]
+                audio_rows = [row for row in messages if _get(row, "audio_file_id")]
+                completed_audio_ids = [
+                    _get(row, "message_id") for row in audio_rows
+                    if isinstance(_get(row, "transcription"), str)
+                    or (getattr(_get(row, "transcription_state"), "value",
+                                _get(row, "transcription_state")) == "completed"
+                        and isinstance(_get(row, "transcription_text"), str))
+                ]
+                preparation_digest = hashlib.sha256(json.dumps(
+                    rows, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                await _await(persist_prepared(
+                    draft_id, persisted_rows, required_audio_count=len(audio_rows),
+                    completed_audio_ids=completed_audio_ids,
+                    context_capacity=max(30, len(rows) + 20),
+                    preparation_digest=preparation_digest,
+                ))
             if retry_governor is not None and operation_lease is not None:
-                return [_checkpoint_analysis(row) for row in rows]
+                rows = [_checkpoint_analysis(row) for row in rows]
+                return await self._pack_large_stage_result("preparation", rows, operation_id)
             return rows
 
+        async def reconcile_preparation():
+            return ConfirmedStageSuccess(await prepare_for_checkpoint())
+
         prepared = await _run_telegram_stage(retry_governor, operation_id, operation_lease,
-            "telegram.preparation", prepare_for_checkpoint)
+            "telegram.preparation", prepare_for_checkpoint,
+            reconcile=reconcile_preparation)
+        prepared = await self._unpack_large_stage_result(prepared)
         if not isinstance(prepared, Sequence) or isinstance(prepared, (str, bytes)):
             raise ValueError("prepared utterances are malformed")
         prepared_rows = [_prepared_row(row) for row in prepared]
@@ -297,10 +338,27 @@ class TelegramSaveWorkflow:
             return await _await(analyze())
 
         async def analyze_for_checkpoint():
-            return _checkpoint_analysis(await _await(analyze()))
+            value = _checkpoint_analysis(await _await(analyze()))
+            return await self._pack_large_stage_result("analysis", value, operation_id)
 
-        return await _run_telegram_stage(retry_governor, operation_id, operation_lease,
+        result = await _run_telegram_stage(retry_governor, operation_id, operation_lease,
             "telegram.analysis", analyze_for_checkpoint)
+        return await self._unpack_large_stage_result(result)
+
+    async def _pack_large_stage_result(self, stage: str, value: Any, operation_id: str) -> Any:
+        store = getattr(self.repository, "store_retry_stage_payload", None)
+        if not callable(store):
+            return value
+        ref = await _await(store(operation_id, stage, value))
+        return {"__telegram_save_stage_payload__": ref}
+
+    async def _unpack_large_stage_result(self, value: Any) -> Any:
+        if not isinstance(value, Mapping) or set(value) != {"__telegram_save_stage_payload__"}:
+            return value
+        load = getattr(self.repository, "load_retry_stage_payload", None)
+        if not callable(load):
+            raise ValueError("prepared checkpoint payload is unavailable")
+        return await _await(load(value["__telegram_save_stage_payload__"]))
 
     async def _transcribe_analyze_and_classify(
         self,
@@ -344,6 +402,9 @@ class TelegramSaveWorkflow:
         if folder_path is not None and folder_id is not None:
             raise ValueError("specify either folder_path or folder_id, not both")
         classify_args = {"draft_id": sealed.draft_id}
+        assert_current = getattr(self.repository, "_assert_current", None)
+        if callable(assert_current) and _call_supports(self.classify, "assert_current"):
+            classify_args["assert_current"] = assert_current
         if folder_path is not None and not _call_supports(self.classify, "folder_path"):
             raise TypeError("classify callback does not support explicit folder_path")
         if folder_id is not None and not _call_supports(self.classify, "folder_id"):
@@ -360,12 +421,15 @@ class TelegramSaveWorkflow:
             classified = await _await(self.classify(result, **classify_args))
             if retry_governor is None or operation_lease is None:
                 return classified
-            return _checkpoint_classified(classified)
+            return await self._pack_large_stage_result(
+                "classification", _checkpoint_classified(classified), operation_id,
+            )
 
         classified = await _run_telegram_stage(retry_governor, operation_id, operation_lease,
             "telegram.classification", classify_for_checkpoint,
             retryable=lambda error: not isinstance(error, (ValueError, TypeError, KeyError)))
         if retry_governor is not None and operation_lease is not None:
+            classified = await self._unpack_large_stage_result(classified)
             classified = _restore_classified(classified)
         outcome = None
         if isinstance(classified, TelegramClassifiedDialog):
@@ -479,6 +543,13 @@ class TelegramSaveWorkflow:
             )
             self.status = {"stage": "complete", "state": "completed", "error_code": None}
             return certificate
+        except TelegramSavePending as pending:
+            self.status = {
+                "stage": pending.stage,
+                "state": "running",
+                "error_code": None,
+            }
+            raise
         except TelegramSaveError as error:
             stage = self.status["stage"] or "load"
             code = _error_code(error)
@@ -487,7 +558,9 @@ class TelegramSaveWorkflow:
                 "state": "failed",
                 "error_code": code,
             }
-            raise TelegramSaveError(stage, code) from None
+            raise TelegramSaveError(
+                stage, code, retryable_stage=error.retryable_stage,
+            ) from None
         except Exception as error:
             stage = self.status["stage"] or "load"
             code = _error_code(error)
@@ -510,6 +583,7 @@ async def _run_telegram_stage(
     callback: Callable[[], Any],
     *,
     retryable: Callable[[BaseException], bool] | None = None,
+    reconcile: Callable[[], Any] | None = None,
 ) -> Any:
     if governor is None or lease is None:
         return await _await(callback())
@@ -517,20 +591,20 @@ async def _run_telegram_stage(
         return await governor.run_stage_async(
             operation_id, stage_key, callback, owner=lease.owner, fence=lease.fence,
             retryable=retryable or (lambda error: not isinstance(error, (ValueError, TypeError, KeyError))),
-            reconcile=lambda: ConfirmedStageFailure(OperationError(
+            reconcile=reconcile or (lambda: ConfirmedStageFailure(OperationError(
                 code="unknown_outcome",
                 category="execution",
                 message="Telegram stage outcome was not durably recorded",
                 retryable=True,
                 stage=stage_key,
-            )),
+            ))),
         )
     except Exception as error:
         if isinstance(error, UnknownOutcome):
             error.telegram_stage_retryable = True
             raise
         try:
-            stage = governor.get_stage(operation_id, stage_key)
+            stage = await asyncio.to_thread(governor.get_stage, operation_id, stage_key)
             last_error = stage.last_error
             error.telegram_stage_retryable = (
                 True if last_error is None else bool(
@@ -544,6 +618,8 @@ async def _run_telegram_stage(
 
 
 def _with_save_metadata(value: Any, dialog_date: str) -> Any:
+    if isinstance(value, TelegramClassifiedDialog):
+        value = value.payload
     if isinstance(value, Mapping):
         result = dict(value)
         result["provider"] = "telegram"

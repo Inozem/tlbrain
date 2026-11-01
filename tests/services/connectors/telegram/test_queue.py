@@ -34,7 +34,7 @@ from core.integrations.firestore.operations import (
 from core.operations.queue import QueueOperationState
 from core.operations.models import OperationOrigin
 from services.connectors.telegram.commands import parse_command
-from services.connectors.telegram.queue import TelegramQueueWorker
+from services.connectors.telegram.queue import TelegramQueueWorker, resolve_current_head_wakeup
 from services.connectors.telegram.repository import SESSIONS, TelegramRepository
 from services.connectors.telegram.repository._commands import _TelegramCommandMixin
 
@@ -1194,6 +1194,29 @@ def test_queue_injected_governor_caps_physical_stage_failures_and_advances_only_
     assert stage_rows[0]["failures"] == 3
     assert stage_rows[0]["attempts_started"] == 3
     assert context_ref.get().to_dict()["reserved_operation_id"] == "op-b"
+
+
+def test_default_publisher_helper_resolves_same_head_then_next_head_wakeup(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, operation_ids=("op-a", "op-b"))
+    outcomes = iter((QueueOperationState.RUNNING, QueueOperationState.COMPLETED))
+
+    async def processor(_context_id, _operation, _lease):
+        return next(outcomes)
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW,
+                                 owner_factory=lambda: "worker", same_head_delay_seconds=5)
+    assert _run(worker.handle_task(payloads["op-a"])) is False
+    same_head = resolve_current_head_wakeup(client, "ctx")
+    assert same_head is not None
+    assert same_head.operation_id == "op-a"
+    assert same_head.schedule_at == NOW + timedelta(seconds=5)
+
+    assert _run(worker.handle_task(payloads["op-a"])) is True
+    next_head = resolve_current_head_wakeup(client, "ctx")
+    assert next_head is not None
+    assert next_head.operation_id == "op-b"
+    assert next_head.schedule_at == NOW
 
 
 async def _fail_provider(calls):

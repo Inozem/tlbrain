@@ -308,6 +308,37 @@ def test_gemini_audio_files_and_function_call_signatures_are_preserved(sdk_fakes
     assert traced_contents[2].parts[0].function_response.id == "call-synthetic-1"
 
 
+def test_fake_gemini_async_boundary_shares_sync_queues_and_trace(sdk_fakes):
+    async def run():
+        from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+        client = FakeGeminiClient(api_key="pytest-synthetic-gemini-key")
+        upload = await client.aio.files.upload(
+            file="synthetic-audio.wav",
+            config=types.UploadFileConfig(mime_type="audio/wav"),
+        )
+        result = await client.aio.models.generate_content(
+            model="gemini-3.5-transcribe", contents=[],
+            config=types.GenerateContentConfig(),
+        )
+        deleted = await client.aio.files.delete(name=upload["name"])
+        return upload, result, deleted
+
+    sdk_fakes.gemini.queue("files.upload", response={"name": "files/audio", "uri": "https://files.invalid/audio"})
+    response = types.GenerateContentResponse(candidates=[types.Candidate(
+        content=types.Content(parts=[types.Part(text="Здравствуйте / hello")]),
+    )])
+    sdk_fakes.gemini.queue("generate_content", response=response)
+    sdk_fakes.gemini.queue("files.delete", response={"name": "files/audio"})
+    upload, generated, deleted = __import__("asyncio").run(run())
+
+    assert upload["name"] == deleted["name"] == "files/audio"
+    assert generated.candidates[0].content.parts[0].text == "Здравствуйте / hello"
+    assert [event["operation"] for event in sdk_fakes.trace if event["boundary"] == "gemini"] == [
+        "client", "files.upload", "generate_content", "files.delete",
+    ]
+
+
 def test_google_genai_232_sdk_capabilities_are_available():
     from google.genai import types
 

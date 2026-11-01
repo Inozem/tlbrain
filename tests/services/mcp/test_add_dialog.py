@@ -656,6 +656,7 @@ def _seed_index_backlog(client, count: int):
         create_outbox_record(
             client, f"backlog-index-{index}", target_kind="index_dispatch", generation=1,
             schedule_at=schedule_at, now=schedule_at, operation_id=f"backlog-operation-{index}",
+            document_id=f"backlog-document-{index}",
         )
 
 

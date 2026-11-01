@@ -6,7 +6,7 @@ from google import genai
 from google.genai import types
 
 from .client import make_client
-from core.utils.retry import with_retry
+from core.utils.retry import RetryPolicy, with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +64,14 @@ _CLIENT_DETECTION_SCHEMA = {
 }
 
 
-def call_gemini_json(prompt: str) -> dict:
-    client = make_client()
-    return _generate_structured(client, prompt, schema=_CLIENT_DETECTION_SCHEMA)
+def call_gemini_json(prompt: str, *, retry_policy: RetryPolicy | None = None) -> dict:
+    if retry_policy is None:
+        client = make_client()
+        return _generate_structured(client, prompt, schema=_CLIENT_DETECTION_SCHEMA)
+    client = make_client(single_attempt=retry_policy.attempts == 1)
+    return _generate_structured(
+        client, prompt, schema=_CLIENT_DETECTION_SCHEMA, retry_policy=retry_policy,
+    )
 
 
 def generate_summary_and_facts(utterances: list[dict[str, Any]]) -> tuple[str, list[str]]:

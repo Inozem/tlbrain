@@ -487,6 +487,32 @@ def test_temporary_download_and_gemini_file_are_cleaned_after_success_or_error(f
             assert not Path(source).exists()
 
 
+def test_parent_loss_stops_transcription_but_deletes_owned_gemini_upload():
+    files = _Files()
+    models = _Models({AUDIO_BYTES: "must not be generated"})
+    telegram = _Telegram({"file-1": _download()})
+    factory = _GeminiFactory(models, files)
+    checks = 0
+
+    def assert_current():
+        nonlocal checks
+        checks += 1
+        if checks == 5:
+            raise PermissionError("synthetic stale parent lease")
+
+    service = _service(
+        telegram, _Repository(), factory, inline_request_limit_bytes=1,
+        assert_current=assert_current,
+    )
+    with pytest.raises(PermissionError, match="stale parent"):
+        _run(service._transcribe_message(_message(1)))
+
+    assert len(files.uploaded) == 1
+    assert files.deleted == [files.uploaded[0][2].name]
+    assert models.calls == []
+    assert len(telegram.cleaned) == 1
+
+
 def test_audio_boundary_logs_exclude_tokens_urls_audio_and_transcript(caplog):
     transcript_secret = "synthetic private transcript"
     models = _Models({AUDIO_BYTES: transcript_secret})

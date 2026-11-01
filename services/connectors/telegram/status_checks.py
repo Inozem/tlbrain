@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -17,6 +18,7 @@ from core.integrations.firestore.outbox import (
 
 
 STATUS_CHECK_OFFSETS = (60, 120, 300)
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 
 
 def _aware(value: datetime, name: str) -> datetime:
@@ -67,11 +69,13 @@ class TelegramStatusChecks:
         notification_publisher: Any,
         clock: Callable[[], datetime] | None = None,
         terminal_notification_updater: Callable[[Any], str | None] | None = None,
+        managed_runtime: bool = False,
     ) -> None:
         self.client = client
         self.status_reader = status_reader or (lambda operation_id: _read_operation(client, operation_id))
         self.notification_publisher = notification_publisher
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.managed_runtime = managed_runtime is True
         if terminal_notification_updater is None:
             from services.connectors.telegram.app.terminal_notifications import update_terminal_notification
             terminal_notification_updater = update_terminal_notification
@@ -114,6 +118,23 @@ class TelegramStatusChecks:
         status = await self._read_current_status(operation_id, queue_operation)
         state = self._status_state(persisted, status)
         if state in {"completed", "failed"}:
+            if self.managed_runtime:
+                linked_id = await asyncio.to_thread(
+                    self._linked_terminal_notification_id, record, persisted, status, queue_operation, state,
+                )
+                if linked_id:
+                    delivery_state = await self.notification_publisher.publish(linked_id)
+                    if delivery_state not in {"delivered", "failed", "delivery_unknown"}:
+                        raise RuntimeError("Telegram status notification delivery is pending")
+                    return str(state)
+                if await asyncio.to_thread(self._managed_save_is_processing, record, queue_operation):
+                    progress_id = await asyncio.to_thread(
+                        self._ensure_progress_notification, record, {"state": "running"},
+                    )
+                    delivery_state = await self.notification_publisher.publish(progress_id)
+                    if delivery_state not in {"delivered", "failed", "delivery_unknown"}:
+                        raise RuntimeError("Telegram status notification delivery is pending")
+                    return str(state)
             return await self._handle_terminal_status(
                 record, shared_operation, persisted, status, state,
             )
@@ -245,6 +266,70 @@ class TelegramStatusChecks:
             ):
                 return True
         return False
+
+    def _linked_terminal_notification_id(
+        self, record: Any, persisted: dict[str, Any], status: dict[str, Any],
+        queue_operation: dict[str, Any] | None, state: str,
+    ) -> str | None:
+        """Find only a canonical terminal row bound to this operation and context."""
+        from services.connectors.telegram.repository import TelegramRepository
+
+        if not record.context_id or not record.operation_id:
+            return None
+        expected_kind = "final" if state == "completed" else "error"
+        digest = hashlib.sha256(record.operation_id.encode()).hexdigest()
+        candidates = [
+            (queue_operation or {}).get("notification_id"),
+            persisted.get("notification_id"), status.get("notification_id"),
+            f"tg{expected_kind}-{digest}",
+        ]
+        repository = TelegramRepository(self.client)
+        seen: set[str] = set()
+        for notification_id in candidates:
+            if not isinstance(notification_id, str) or notification_id in seen:
+                continue
+            seen.add(notification_id)
+            row = repository.get_notification(notification_id)
+            if (row and row.get("notification_id") == notification_id
+                    and row.get("context_id") == record.context_id
+                    and row.get("operation_id") == record.operation_id
+                    and row.get("kind") == expected_kind):
+                return notification_id
+        return None
+
+    def _managed_save_is_processing(
+        self, record: Any, queue_operation: dict[str, Any] | None,
+    ) -> bool:
+        """Defer fallback only for a queue-bound, sealed save/retry still cleaning up."""
+        if (not isinstance(record.context_id, str) or not _SAFE_ID.fullmatch(record.context_id)
+                or not isinstance(record.operation_id, str) or not _SAFE_ID.fullmatch(record.operation_id)
+                or not isinstance(queue_operation, dict)):
+            return False
+        route = queue_operation.get("route_control")
+        if (
+            queue_operation.get("operation_id") != record.operation_id
+            or queue_operation.get("state") != "running"
+            or queue_operation.get("save_operation_id") != record.operation_id
+            or not isinstance(route, dict)
+            or route.get("status") not in {"ok", "success"}
+            or route.get("kind") not in {"save", "retry"}
+        ):
+            return False
+        draft_id = queue_operation.get("target_draft_id") or route.get("target_draft_id")
+        if not isinstance(draft_id, str) or not _SAFE_ID.fullmatch(draft_id):
+            return False
+        snapshot = (self.client.collection("telegram_sessions").document(record.context_id)
+                    .collection("drafts").document(draft_id).get())
+        draft = snapshot.to_dict() or {} if snapshot.exists else {}
+        intent_id = draft.get("immutable_save_intent_id")
+        return (
+            draft.get("draft_id") == draft_id
+            and draft.get("sealed_at") is not None
+            and isinstance(draft.get("manifest_ref"), str) and bool(draft.get("manifest_ref"))
+            and isinstance(draft.get("manifest_digest"), str) and bool(draft.get("manifest_digest"))
+            and draft.get("active_save_operation_id") == record.operation_id
+            and isinstance(intent_id, str) and bool(_SAFE_ID.fullmatch(intent_id))
+        )
 
     @staticmethod
     def _fallback_terminal_notification_id(operation_id: str) -> str:

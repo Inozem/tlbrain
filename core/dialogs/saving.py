@@ -89,6 +89,7 @@ def accept_save(
     origin_operation_ref: str | None = None,
     dialog_time: str = "",
     save_intent_id: str | None = None,
+    write_document: Callable[[Any, dict[str, Any]], Any] | None = None,
 ) -> AcceptedSave:
     """Validate and durably accept a dialog without classification or provider I/O."""
     now = _aware(now)
@@ -110,7 +111,7 @@ def accept_save(
     intent_id = save_intent_id or _intent_id(operation_id)
     if not intent_id or "/" in intent_id:
         raise ValueError("save_intent_id must be a non-empty Firestore document ID")
-    write_input_parts(client, input_ref, serialized)
+    write_input_parts(client, input_ref, serialized, write_document=write_document)
     # Verify before publishing the operation that points to the accepted input.
     if read_input_parts(client, input_ref) != serialized:
         raise ValueError("accepted immutable input failed verification")
@@ -447,7 +448,8 @@ def _dispatch_save_index(
 
     _upsert(context.client.transaction())
     outbox_id = "index-dispatch-" + hashlib.sha256(
-        f"{context.intent_id}\0{document_id}\0{context.accepted['desired_content']}".encode("utf-8")
+        f"{context.operation_id}\0{context.intent_id}\0{document_id}\0"
+        f"{context.accepted['desired_content']}".encode("utf-8")
     ).hexdigest()
     existing_outbox = get_outbox_record(context.client, outbox_id)
     if existing_outbox is not None:

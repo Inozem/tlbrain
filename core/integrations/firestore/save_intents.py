@@ -711,6 +711,7 @@ def _write_completed_save(
                    "updated_at": commit_now})
     operation.update({
         "state": "completed", "doc_id": result.document_id, "result": _result_data(result),
+        "index_completion_ref": certificate["receipt_ref"],
         "document_finalized": True, "cleanup_authorization": cleanup_authorization,
         "input_cleanup_state": "pending",
         "finished_at": commit_now, "status_updated_at": commit_now, "updated_at": commit_now,

@@ -9,7 +9,7 @@ import inspect
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from google.cloud import firestore
@@ -82,6 +82,26 @@ def _fixed_target(operation: Mapping[str, Any]) -> tuple[str | None, bool]:
 def _wake_outbox_id(context_id: str, operation_id: str, generation: int) -> str:
     digest = hashlib.sha256(f"{context_id}:{operation_id}:{generation}".encode()).hexdigest()
     return f"tgqueue-{digest}"
+
+
+def resolve_current_head_wakeup(client: Any, context_id: str) -> Any | None:
+    """Read the stored wakeup for the current reserved head, if it is still pending."""
+    context_ref = client.collection(SESSIONS).document(context_id)
+    context_snapshot = context_ref.get()
+    context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
+    operation_id = context.get("reserved_operation_id")
+    generation = context.get("telegram_dispatch_wake_generation")
+    if (not isinstance(operation_id, str) or not operation_id
+            or type(generation) is not int or generation < 1):
+        return None
+    record = get_outbox_record(client, _wake_outbox_id(context_id, operation_id, generation))
+    if (record is None or record.target_kind is not OutboxTargetKind.TELEGRAM_DISPATCH
+            or record.context_id != context_id or record.operation_id != operation_id
+            or record.generation != generation or record.state not in {
+                OutboxState.PENDING, OutboxState.RETRY,
+            }):
+        return None
+    return record
 
 
 def _ensure_wakeup_outbox_record(
@@ -203,6 +223,7 @@ class TelegramQueueWorker:
         owner_factory: Callable[[], str] | None = None,
         heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
         max_slice_seconds: float = MAX_EXECUTION_SLICE_SECONDS,
+        same_head_delay_seconds: float = 0.0,
     ) -> None:
         if not callable(processor) or not callable(clock):
             raise TypeError("processor and clock must be callable")
@@ -210,12 +231,15 @@ class TelegramQueueWorker:
             raise ValueError("heartbeat_interval_seconds must be positive")
         if max_slice_seconds <= 0 or max_slice_seconds > MAX_EXECUTION_SLICE_SECONDS:
             raise ValueError("max_slice_seconds must be positive and at most 480 seconds")
+        if same_head_delay_seconds < 0:
+            raise ValueError("same_head_delay_seconds must not be negative")
         self.client = client
         self.processor = processor
         self.clock = clock
         self.owner_factory = owner_factory or (lambda: uuid.uuid4().hex)
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.max_slice_seconds = max_slice_seconds
+        self.same_head_delay_seconds = same_head_delay_seconds
 
     def _retry_governor(self, context_ref: Any) -> RetryGovernor:
         from core.integrations.firestore.operation_queue import QueueOperationRetryStore
@@ -768,12 +792,13 @@ class TelegramQueueWorker:
             return False
         if result is QueueOperationState.RUNNING:
             yielded_at = self.clock()
+            wake_at = yielded_at + timedelta(seconds=self.same_head_delay_seconds)
 
             def wake_same_head(transaction: Any, updated_context: dict[str, Any]) -> None:
                 _ensure_wakeup_in_transaction(
                     self.client, transaction, updated_context,
                     context_id=context_id, operation_id=lease.operation_id,
-                    schedule_at=yielded_at, now=yielded_at,
+                    schedule_at=wake_at, now=yielded_at,
                 )
 
             await _offload_sync(

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import socket
 
@@ -173,3 +175,44 @@ def test_malformed_authorized_body_logs_only_fixed_receipt_and_stage(caplog):
     assert BODY_MARKER not in caplog.text + response.text
     assert "header-marker" not in caplog.text + response.text
     assert SECRET not in caplog.text + response.text
+
+
+def test_cloud_run_formatter_keeps_safe_settlement_fields_and_drops_sensitive_aliases():
+    from core.utils.logging import _CloudRunFormatter
+
+    record = logging.LogRecord(
+        "telegram", logging.ERROR, __file__, 1, "Save settlement", (), None,
+    )
+    record.event = "telegram_save_settlement"
+    record.operation_id = "tgop-safe_id"
+    record.context_id = "tg_safe-context"
+    record.service = "gemini"
+    record.stage = "metadata"
+    record.error_code = "provider_unavailable"
+    record.operation_state = "failed"
+    record.outcome = "failed"
+    record.failures = 3
+    record.code = "oauth-sensitive-code"
+    record.state = "oauth-sensitive-state"
+
+    payload = json.loads(_CloudRunFormatter().format(record))
+
+    assert payload["event"] == "telegram_save_settlement"
+    assert payload["operation_id"] == "tgop-safe_id"
+    assert payload["context_id"] == "tg_safe-context"
+    assert payload["service"] == "gemini"
+    assert payload["stage"] == "metadata"
+    assert payload["error_code"] == "provider_unavailable"
+    assert payload["operation_state"] == "failed"
+    assert payload["outcome"] == "failed"
+    assert payload["failures"] == 3
+    assert "code" not in payload and "state" not in payload
+
+
+def test_operation_log_ids_require_generated_technical_identifier_shape():
+    from types import SimpleNamespace
+    from services.connectors.telegram.app.main import _safe_operation_log_ids
+
+    record = SimpleNamespace(operation_id="safe_operation-123", context_id="unsafe/id")
+
+    assert _safe_operation_log_ids(record) == {"operation_id": "safe_operation-123"}

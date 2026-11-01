@@ -605,7 +605,7 @@ Enabled Telegram deployments also reuse the existing Gemini, Drive, Qdrant and r
 
 `GET /` reports process liveness and whether Telegram credentials are configured. Verify message delivery separately: a real message must reach `POST /telegram/webhook`, enter the task queue and produce a reply. Cloud Run request logs show HTTP delivery; application logs include safe webhook event/stage and exception-type diagnostics without message contents, credentials or provider exception text.
 
-Production runtime corrections are in progress. The command adapters under `services/connectors/telegram/runtime/` are tested separately; default application/queue/save composition and shared-read retry integration still require their integration checks before Telegram processing can be considered ready.
+The default application lazily composes the command queue and shared save pipeline. Offline integration tests cover ordinary replies, forwarded text/audio saves, prolonged indexing waits, numbered retries, cleanup recovery, direct saves and predecessor-bound commands through a verified final reply. T135 is complete; shared SDK/read retry integration remains in T136. These local checks do not establish deployment readiness.
 
 The public `POST /telegram/webhook` route checks the generated Firestore webhook secret and accepts only private chats from the configured user allowlist. Each context processes one agent operation at a time through a durable FIFO queue. Accepted operations schedule status checks relative to acceptance at 60, 120, and 300 seconds. Failed drafts and already-created Docs are retained; recovery requires an explicit numbered retry. Source cleanup is restartable and requires proof from the completed save certificate.
 

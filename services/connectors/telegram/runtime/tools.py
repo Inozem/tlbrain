@@ -21,6 +21,19 @@ from core.operations.write import WriteContext
 from services.connectors.telegram.tools import invoke_tool
 
 
+def direct_add_dialog_operation_id(parent_operation_id: str, ordinal: int,
+                                  arguments: Mapping[str, Any]) -> str:
+    """Derive one replay-stable direct-save child from its validated call identity."""
+    validated = registry.validate_arguments("add_dialog", arguments)
+    serialized = json.dumps(validated, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=False)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    identity = hashlib.sha256(
+        f"{parent_operation_id}\0{int(ordinal)}\0{digest}".encode("utf-8")
+    ).hexdigest()
+    return f"telegram-tool-{identity}"
+
+
 class TelegramRegistryExecutor:
     """Validate against the shared 13-operation registry before dispatch."""
 
@@ -61,9 +74,12 @@ class TelegramRegistryExecutor:
             return None
         parent_id = self.execution_context["operation_id"]
         context_id = self.execution_context["context_id"]
-        operation_id = "telegram-tool-" + hashlib.sha256(
-            f"{parent_id}\0{int(call_ordinal)}".encode("utf-8")
-        ).hexdigest()
+        operation_id = (
+            direct_add_dialog_operation_id(parent_id, call_ordinal, validated)
+            if name == "add_dialog" else "telegram-tool-" + hashlib.sha256(
+                f"{parent_id}\0{int(call_ordinal)}".encode("utf-8")
+            ).hexdigest()
+        )
         checkpoint_ref = (self.client.collection("telegram_sessions").document(context_id)
                           .collection("operations").document(parent_id)
                           .collection("agent_checkpoints").document(f"tool-{int(call_ordinal)}"))

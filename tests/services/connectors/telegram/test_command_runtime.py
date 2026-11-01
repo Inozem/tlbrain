@@ -1153,6 +1153,10 @@ def test_runtime_offers_only_confirmed_saves_in_the_immutable_predecessor_chain(
     assert candidates == ({
         "operation_id": "op-save", "doc_id": "doc-saved", "dialog_number": 5,
         "conversation_id": "conversation:doc-saved", "title": "Saved topic",
+        "state": "completed", "save_operation_id": "op-save",
+        "target_doc_id": "doc-saved", "target_dialog_number": 5,
+        "target_conversation_id": "conversation:doc-saved",
+        "route_result": {"kind": "save"},
     },)
 
 

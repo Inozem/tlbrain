@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from google.cloud import firestore
@@ -20,6 +20,15 @@ from services.connectors.telegram.repository._common import (
     _integer,
     _aware,
 )
+
+
+def _retry_deadline(now: datetime, delay_seconds: int) -> datetime:
+    """Return a retry deadline without overflowing Python's datetime range."""
+    try:
+        return now + timedelta(seconds=delay_seconds)
+    except OverflowError:
+        return datetime.max.replace(tzinfo=timezone.utc)
+
 
 @dataclass(slots=True)
 class _AckFailureState:
@@ -76,11 +85,17 @@ class _TelegramNotificationMixin:
             if data.get("kind") == "draft_ack" and data.get("message_id") is not None:
                 raise ValueError("delivered draft acknowledgement cannot be revised")
             new_revision = _integer(data.get("revision", 1), "revision", minimum=1) + 1
+            retry_not_before = (
+                data.get("retry_not_before")
+                if data.get("last_outcome") == "rate_limited"
+                and isinstance(data.get("retry_not_before"), datetime)
+                else None
+            )
             updates = {"body": body, "revision": new_revision,
                        "desired_status_revision": new_revision,
                        "state": (data.get("state") if data.get("in_flight_attempt_id")
                                  else "pending"),
-                       "retry_not_before": None, "delivered_at": None,
+                       "retry_not_before": retry_not_before, "delivered_at": None,
                        "last_error": None, "updated_at": now}
             transaction.update(ref, updates)
             return {**data, **updates}
@@ -284,14 +299,16 @@ class _TelegramNotificationMixin:
 
     def settle_notification_attempt(
         self, notification_id: str, *, attempt_id: str, revision: int, outcome: str,
-        now: datetime, message_id: int | None = None,
+        now: datetime, message_id: int | None = None, retry_after: int | None = None,
     ) -> dict[str, Any] | None:
         """Settle the reserved attempt, retaining success from a superseded revision."""
         notification_id = _identifier(notification_id, "notification_id")
         attempt_id = _identifier(attempt_id, "attempt_id")
         revision = _integer(revision, "revision", minimum=1)
-        if outcome not in {"sent", "edited", "unknown", "rejected"}:
+        if outcome not in {"sent", "edited", "unknown", "rejected", "rate_limited"}:
             raise ValueError("outcome is invalid")
+        if retry_after is not None and (type(retry_after) is not int or retry_after < 0):
+            retry_after = None
         if outcome == "sent":
             message_id = _integer(message_id, "message_id", minimum=1)
         elif message_id is not None:
@@ -339,8 +356,13 @@ class _TelegramNotificationMixin:
                                     "last_error": outcome, "failed_at": now})
                 else:
                     delay = min(2 ** max(0, sends - 1), 60)
+                    if outcome == "rate_limited" and retry_after is not None:
+                        delay = max(delay, retry_after)
                     updates.update({"state": "pending" if stale_revision else "retry",
-                                    "retry_not_before": None if stale_revision else now + timedelta(seconds=delay),
+                                    "retry_not_before": (
+                                        None if stale_revision and outcome != "rate_limited"
+                                        else _retry_deadline(now, delay)
+                                    ),
                                     "last_error": outcome})
                     if outcome == "unknown" and data.get("message_id") is None:
                         updates["unknown_send_outcome"] = True

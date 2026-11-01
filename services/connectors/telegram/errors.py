@@ -16,6 +16,25 @@ _SAFE_STAGE_FAILURE = re.compile(r"^Stage execution failed \([A-Za-z][A-Za-z0-9_
 _CONFIRMED_PROVIDER_CATEGORIES = {"billing", "quota"}
 
 
+class TelegramSaveInputRejected(ValueError):
+    """A direct save failed pure domain validation before child acceptance."""
+
+    def __init__(self) -> None:
+        super().__init__("Direct save input was rejected")
+
+
+class TelegramDirectSaveInterrupted(RuntimeError):
+    """An unexpected direct-save interruption requiring canonical recovery."""
+
+    def __init__(self) -> None:
+        super().__init__("Direct save outcome requires recovery")
+
+
+TELEGRAM_SAVE_INPUT_REFUSAL = (
+    "I could not save that dialog because its input is invalid. Please correct it and try again."
+)
+
+
 def _identifier(value: Any, fallback: str) -> str:
     return value if isinstance(value, str) and _SAFE_IDENTIFIER.fullmatch(value) else fallback
 
@@ -86,7 +105,8 @@ def format_terminal_error(
     if isinstance(occurred_at, datetime) and occurred_at.tzinfo is not None and occurred_at.utcoffset() is not None:
         timestamp = occurred_at.astimezone(timezone.utc).isoformat(timespec="seconds")
     details = (
-        f"Error in {safe_service}/{safe_stage} (code={safe_code}, category={safe_category}); "
+        f"Error in {safe_service}/{safe_stage} (code={safe_code}, category={safe_category}, "
+        f"failures={failures if type(failures) is int and failures >= 1 else 'unknown'}); "
         f"reason: {_reason(safe_category, sanitized_message)} "
         f"Occurred: {timestamp}; operation_id={safe_operation_id}."
     )

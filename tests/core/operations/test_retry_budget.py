@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -214,6 +216,172 @@ def test_expired_reconciliation_stays_in_flight_for_fresh_owner(
 def test_max_failures_cannot_exceed_three():
     with pytest.raises(ValueError, match="between 1 and 3"):
         RetryGovernor(max_failures=4)
+
+
+def test_async_stage_offloads_store_read_and_keeps_callback_on_origin_loop(firestore_fake, fake_clock):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    lease = claim_operation(client, OPERATION_ID, owner="async-worker", now=NOW, lease_seconds=60)
+    assert lease is not None
+    governor = _governor(client, fake_clock)
+    entered, release = threading.Event(), threading.Event()
+    original_call = governor._store_call
+    loop_thread = threading.get_ident()
+    callback_threads = []
+
+    def blocked_call(name, fallback, *args, **kwargs):
+        if name == "get_stage" and not entered.is_set():
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("stage read release timed out")
+        return original_call(name, fallback, *args, **kwargs)
+
+    governor._store_call = blocked_call
+
+    async def invoke():
+        task = asyncio.create_task(governor.run_stage_async(
+            OPERATION_ID, "async-offload",
+            lambda: callback_threads.append(threading.get_ident()) or "saved",
+            owner="async-worker", fence=lease.fence, now=NOW,
+        ))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+        return await task
+
+    try:
+        assert asyncio.run(invoke()) == "saved"
+    finally:
+        release.set()
+    assert callback_threads == [loop_thread]
+
+
+def test_async_stage_storage_wait_is_cancellable_without_waiting_for_blocked_thread(
+    firestore_fake, fake_clock,
+):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    lease = claim_operation(client, OPERATION_ID, owner="cancel-worker", now=NOW, lease_seconds=60)
+    assert lease is not None
+    governor = _governor(client, fake_clock)
+    entered, release = threading.Event(), threading.Event()
+    original_call = governor._store_call
+
+    def blocked_call(name, fallback, *args, **kwargs):
+        if name == "validate_lease":
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("lease validation release timed out")
+        return original_call(name, fallback, *args, **kwargs)
+
+    governor._store_call = blocked_call
+
+    async def invoke():
+        task = asyncio.create_task(governor.run_stage_async(
+            OPERATION_ID, "cancel-storage", lambda: pytest.fail("callback must not run"),
+            owner="cancel-worker", fence=lease.fence, now=NOW,
+        ))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+        finally:
+            release.set()
+
+    asyncio.run(invoke())
+
+
+@pytest.mark.parametrize("async_stage", [False, True])
+@pytest.mark.parametrize("mode,expected_failures", [("permanent", 1), ("transient", 3)])
+def test_terminal_stage_replay_settles_operation_without_new_attempt(
+    firestore_fake, fake_clock, monkeypatch, async_stage, mode, expected_failures,
+):
+    from tests.fixtures.firestore_fake import FakeTransaction
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    lease = claim_operation(client, OPERATION_ID, owner="first-owner", now=NOW, lease_seconds=60)
+    assert lease is not None
+    governor = _governor(client, fake_clock)
+    original_commit = FakeTransaction._commit
+    interrupted = {"done": False}
+    operation_path = f"dialog_operations/{OPERATION_ID}"
+
+    def fail_terminal_settlement_commit(transaction):
+        if (not interrupted["done"] and any(
+            ref.path == operation_path and isinstance(data, dict)
+            and data.get("state") == "failed"
+            for _operation, ref, data, _merge in transaction._writes
+        )):
+            interrupted["done"] = True
+            raise OSError("synthetic fault before terminal operation settlement commit")
+        return original_commit(transaction)
+
+    monkeypatch.setattr(FakeTransaction, "_commit", fail_terminal_settlement_commit)
+    calls = []
+
+    def provider_failure():
+        calls.append("provider")
+        raise ValueError("permanent provider rejection")
+
+    for attempt in range(expected_failures):
+        terminal_attempt = attempt == expected_failures - 1
+        if async_stage:
+            async def initial():
+                expected_error = OSError if terminal_attempt else ValueError
+                with pytest.raises(expected_error):
+                    await governor.run_stage_async(
+                        OPERATION_ID, "terminal-replay", provider_failure,
+                        owner="first-owner", fence=lease.fence, now=fake_clock.now(),
+                        retryable=lambda _error: mode == "transient",
+                    )
+            asyncio.run(initial())
+        else:
+            expected_error = OSError if terminal_attempt else ValueError
+            with pytest.raises(expected_error):
+                governor.run_stage(
+                    OPERATION_ID, "terminal-replay", provider_failure,
+                    owner="first-owner", fence=lease.fence, now=fake_clock.now(),
+                    retryable=lambda _error: mode == "transient",
+                )
+
+    stage = get_stage(client, OPERATION_ID, "terminal-replay")
+    assert stage.failures == stage.attempts_started == expected_failures
+    assert get_operation(client, OPERATION_ID).state is OperationState.RUNNING
+    fake_clock.advance(seconds=61)
+
+    def forbidden_retry():
+        calls.append("retry")
+
+    replay_lease = claim_operation(
+        client, OPERATION_ID, owner="replay-owner", now=fake_clock.now(), lease_seconds=60,
+    )
+    assert replay_lease is not None
+    if async_stage:
+        async def replay():
+            with pytest.raises(RetryBudgetExceeded):
+                await governor.run_stage_async(
+                    OPERATION_ID, "terminal-replay", forbidden_retry,
+                    owner="replay-owner", fence=replay_lease.fence, now=fake_clock.now(),
+                )
+        asyncio.run(replay())
+    else:
+        with pytest.raises(RetryBudgetExceeded):
+            governor.run_stage(
+                OPERATION_ID, "terminal-replay", forbidden_retry, owner="replay-owner",
+                fence=replay_lease.fence, now=fake_clock.now(),
+            )
+
+    assert calls == ["provider"] * expected_failures
+    stage = get_stage(client, OPERATION_ID, "terminal-replay")
+    assert stage.failures == stage.attempts_started == expected_failures
+    assert get_operation(client, OPERATION_ID).state is OperationState.FAILED
 
 
 def test_with_retry_preserves_legacy_default_attempts_and_backoffs(monkeypatch):

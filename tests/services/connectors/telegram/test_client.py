@@ -110,6 +110,41 @@ def test_download_uses_only_validated_get_file_path_and_returns_memory_payload()
     assert "url" not in result and "temporary_url" not in result
 
 
+@pytest.mark.parametrize("use_async_guard", [False, True])
+@pytest.mark.parametrize("stop_at", ["before_get_file", "before_download"])
+def test_download_audio_checks_call_local_guard_around_get_file(use_async_guard, stop_at):
+    requests = []
+    checks = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"ok": True, "result": {"file_path": "voice/clip.ogg"}})
+        return httpx.Response(200, content=b"audio", headers={"content-type": "audio/ogg"})
+
+    async def run():
+        client, http = _client(handler)
+        async def async_guard_cb():
+            checks.append(len(requests))
+            if len(checks) == (1 if stop_at == "before_get_file" else 2):
+                raise PermissionError("stale parent")
+        def sync_guard():
+            checks.append(len(requests))
+            if len(checks) == (1 if stop_at == "before_get_file" else 2):
+                raise PermissionError("stale parent")
+        try:
+            with pytest.raises(PermissionError, match="stale parent"):
+                await client.download_audio(
+                    "provider-id", assert_current=async_guard_cb if use_async_guard else sync_guard,
+                )
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+    assert len(requests) == (0 if stop_at == "before_get_file" else 1)
+    assert checks == ([0] if stop_at == "before_get_file" else [0, 1])
+
+
 @pytest.mark.parametrize("path", ["../secret", "/foreign/path", "https://evil.test/file", "a%2f..%2fsecret", "a\\b"])
 def test_invalid_get_file_paths_never_trigger_download(path):
     requests = []

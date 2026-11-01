@@ -45,7 +45,7 @@ def _document(client, path):
     return reference
 
 
-def _seed_failed_draft(firestore_fake, *, update_id=12):
+def _seed_failed_draft(firestore_fake, *, update_id=12, core_accepted=True):
     """Persist a sealed save, then model its terminal failure without providers."""
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
@@ -91,6 +91,10 @@ def _seed_failed_draft(firestore_fake, *, update_id=12):
     assert repository.confirm_save_command(
         context_id, old_operation_id, owner=lease.owner, fence=lease.fence, now=NOW,
     ) is True
+    assert repository.persist_route(
+        old_operation_id, {"status": "ok", "kind": "save"},
+        context_id=context_id, owner=lease.owner, fence=lease.fence, now=NOW,
+    ) is True
     draft_ref = (
         client.collection(SESSIONS).document(context_id)
         .collection("drafts").document(draft_id)
@@ -99,11 +103,12 @@ def _seed_failed_draft(firestore_fake, *, update_id=12):
     intent_id = draft["immutable_save_intent_id"]
     # Keep a pre-existing document identity to prove retry does not allocate a
     # second document or replace the immutable save intent.
-    draft_ref.update({"state": "failed", "doc_id": f"doc-{update_id}"})
+    draft_ref.update({"state": "failed", "doc_id": f"doc-{update_id}" if core_accepted else None})
     client.collection(SESSIONS).document(context_id).collection("operations").document(
         old_operation_id
     ).update({"state": "failed", "finished_at": NOW})
-    client.collection(OPERATIONS_COLLECTION).document(old_operation_id).set({
+    if core_accepted:
+        client.collection(OPERATIONS_COLLECTION).document(old_operation_id).set({
         "operation_id": old_operation_id,
         "origin": OperationOrigin.TELEGRAM.value,
         "origin_operation_ref": f"{SESSIONS}/{context_id}/operations/{old_operation_id}",
@@ -116,8 +121,8 @@ def _seed_failed_draft(firestore_fake, *, update_id=12):
         "created_at": NOW,
         "updated_at": NOW,
         "status_updated_at": NOW,
-    })
-    client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).set({
+        })
+        client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).set({
         "save_intent_id": intent_id,
         "immutable_input_digest": f"digest-{old_operation_id}",
         "desired_content_hash": f"content-{old_operation_id}",
@@ -141,7 +146,7 @@ def _seed_failed_draft(firestore_fake, *, update_id=12):
         "index_checkpoint_ref": None,
         "created_at": NOW,
         "updated_at": NOW,
-    })
+        })
     context_ref = client.collection(SESSIONS).document(context_id)
     context = context_ref.get().to_dict()
     context.update({
@@ -258,6 +263,70 @@ def test_manual_retry_replay_for_same_update_adds_no_records(firestore_fake):
     assert replay == first
     assert set(firestore_fake.documents) == paths_after_first
     assert firestore_fake.documents == documents_after_first
+
+
+def test_pre_core_retry_proves_absent_create_gate_and_defers_shared_acceptance(firestore_fake):
+    repository, client, context_id, draft_id, previous_id, intent_id = (
+        _seed_failed_draft(firestore_fake, update_id=81, core_accepted=False)
+    )
+    draft_before = repository.get_draft(context_id, draft_id)
+    old_manifest = _document(client, draft_before["manifest_ref"]).get().to_dict()
+    assert client.collection(OPERATIONS_COLLECTION).document(previous_id).get().exists is False
+    assert client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).get().exists is False
+    previous_row = (client.collection(SESSIONS).document(context_id).collection("operations")
+                    .document(previous_id).get().to_dict())
+    assert (previous_row.get("state"), previous_row.get("save_operation_id"),
+            previous_row.get("target_draft_id"), previous_row.get("route_control")) == (
+        "failed", previous_id, draft_id, {"status": "ok", "kind": "save"},
+    )
+
+    retried = _retry(repository, context_id, draft_before["dialog_number"], update_id=181)
+
+    assert retried.accepted is True
+    assert retried.draft_id == draft_id
+    retry_row = (client.collection(SESSIONS).document(context_id).collection("operations")
+                 .document(retried.operation_id).get().to_dict())
+    assert retry_row["save_intent_id"] == intent_id
+    assert retry_row["draft_id"] == draft_id
+    assert retry_row["save_operation_id"] == retried.operation_id
+    assert retry_row["route_control"]["kind"] == "retry"
+    assert client.collection(OPERATIONS_COLLECTION).document(retried.operation_id).get().exists is False
+    assert client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).get().exists is False
+    new_manifest = _document(client, repository.get_draft(context_id, draft_id)["manifest_ref"])
+    assert new_manifest.get().to_dict()["ordered_message_ids"] == old_manifest["ordered_message_ids"]
+
+
+def test_repeated_pre_core_retry_accepts_new_budget_with_retry_lineage(firestore_fake):
+    """A second terminal pre-core attempt may retry only the same sealed intent."""
+    repository, client, context_id, draft_id, _previous_id, _intent_id = (
+        _seed_failed_draft(firestore_fake, update_id=82, core_accepted=False)
+    )
+    first = _retry(repository, context_id, 1, update_id=182)
+    assert first.accepted is True
+
+    draft_ref = client.collection(SESSIONS).document(context_id).collection(
+        "drafts"
+    ).document(draft_id)
+    draft = draft_ref.get().to_dict()
+    draft["state"] = "failed"
+    draft["save_error_code"] = "provider_failed"
+    draft_ref.set(draft)
+    retry_ref = client.collection(SESSIONS).document(context_id).collection(
+        "operations"
+    ).document(first.operation_id)
+    retry_row = retry_ref.get().to_dict()
+    retry_row["state"] = "failed"
+    retry_ref.set(retry_row)
+
+    second = _retry(repository, context_id, 1, update_id=183)
+
+    assert second.accepted is True
+    assert second.operation_id != first.operation_id
+    assert second.draft_id == draft_id
+    assert client.collection(OPERATIONS_COLLECTION).document(first.operation_id).get().exists is False
+    assert client.collection(SAVE_INTENTS_COLLECTION).document(
+        repository.get_draft(context_id, draft_id)["immutable_save_intent_id"]
+    ).get().exists is False
 
 
 def test_retry_from_accepted_command_uses_command_identity_and_preserves_input(firestore_fake):

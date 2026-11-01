@@ -22,6 +22,7 @@ def _load_terminal_notification_draft(
 ) -> tuple[dict[str, Any], int] | None:
     """Resolve the persisted command draft and its public dialog number."""
     from services.connectors.telegram.repository import SESSIONS
+    from services.connectors.telegram.repository._common import _document_ref
 
     context_ref = client.collection(SESSIONS).document(context_id)
     queue_operation = context_ref.collection("operations").document(operation_id).get()
@@ -30,7 +31,7 @@ def _load_terminal_notification_draft(
     input_ref = (queue_operation.to_dict() or {}).get("input_ref")
     if not isinstance(input_ref, str):
         return None
-    command = client.document(input_ref).get()
+    command = _document_ref(client, input_ref).get()
     if not command.exists:
         return None
     draft_id = (command.to_dict() or {}).get("draft_id")
@@ -64,9 +65,33 @@ def _load_completion_certificate(
     intent = intent_snapshot.to_dict() or {}
     certificate = intent.get("completion_certificate") or {}
     confirmed = intent.get("confirmed_result") or {}
+    core_operation = (client.collection("dialog_operations").document(operation_id)
+                      .get().to_dict() or {})
     if not _completion_certificate_matches_operation(
         certificate, local_certificate, confirmed, operation, operation_id, intent_id,
     ):
+        return None
+    origin = certificate.get("origin_binding")
+    expected_origin = {
+        "context_id": local_certificate.get("context_id"),
+        "draft_id": local_certificate.get("draft_id"),
+        "manifest_digest": local_certificate.get("manifest_digest"),
+    }
+    cleanup_authorization = {
+        "certificate_id": certificate.get("certificate_id"),
+        "save_intent_id": intent_id,
+        "operation_id": operation_id,
+        "origin_binding": origin,
+    }
+    if (not isinstance(certificate.get("certificate_id"), str)
+            or not certificate.get("certificate_id")
+            or origin != expected_origin
+            or (core_operation.get("origin_binding") is not None
+                and core_operation.get("origin_binding") != expected_origin)
+            or intent.get("cleanup_authorization") != cleanup_authorization
+            or core_operation.get("cleanup_authorization") != cleanup_authorization
+            or local_certificate.get("receipt_ref") != certificate.get("receipt_ref")
+            or local_certificate.get("receipt_version") != certificate.get("receipt_version")):
         return None
     return certificate
 
@@ -96,27 +121,19 @@ def _completion_certificate_matches_operation(
 
 
 def _completion_receipt_matches_index(client: Any, certificate: dict[str, Any]) -> bool:
-    """Verify the completion receipt against the currently indexed transcript generation."""
+    """Verify the pinned completed receipt without revoking an immutable save later."""
     from core.integrations.firestore.index_completions import get_completion
 
     doc_id = certificate.get("doc_id")
     content_hash = certificate.get("content_hash")
     receipt = get_completion(client, doc_id, content_hash)
-    transcript_snapshot = client.collection("transcript_index").document(doc_id).get()
-    if receipt is None or not transcript_snapshot.exists:
+    if receipt is None:
         return False
-    transcript = transcript_snapshot.to_dict() or {}
-    generation_fields = (
-        "doc_id", "root_folder_id", "content_hash", "version", "parent_id",
-        "parent_id_hash", "provider", "fence", "index_fence", "resource_epoch",
-    )
     return (
         receipt.get("status") == "completed"
         and receipt.get("version") == certificate.get("receipt_version")
-        and receipt.get("index_fence") == certificate.get("index_fence")
-        and receipt.get("resource_epoch") == certificate.get("resource_epoch")
-        and transcript.get("status") == "synced"
-        and all(transcript.get(field) == receipt.get(field) for field in generation_fields)
+        and certificate.get("receipt_ref")
+        == f"index_completions/{doc_id}/generations/{content_hash}"
     )
 
 
@@ -130,11 +147,7 @@ def _verified_completion_details(
     if certificate is None or not _completion_receipt_matches_index(client, certificate):
         return False, None, None
     path_parts = operation.selected_folder_path
-    folder_path = (
-        "/".join(path_parts)
-        if path_parts and all(isinstance(part, str) for part in path_parts)
-        else None
-    )
+    folder_path = _verified_folder_path(path_parts)
     local_certificate = draft.get("completion_certificate") or {}
     classification_outcome = local_certificate.get("classification_outcome")
     if classification_outcome not in {"ambiguous", "unassigned"}:
@@ -142,6 +155,21 @@ def _verified_completion_details(
     elif classification_outcome == "unassigned" and path_parts != ("_unassigned",):
         classification_outcome = None
     return True, folder_path, classification_outcome
+
+
+def _verified_folder_path(path_parts: Any) -> str | None:
+    """Preserve root as `/`, while keeping unknown or malformed paths distinct."""
+    if path_parts is None:
+        return None
+    if not isinstance(path_parts, (tuple, list)):
+        return None
+    if len(path_parts) == 0:
+        return "/"
+    if not all(
+        isinstance(part, str) and part for part in path_parts
+    ):
+        return None
+    return "/".join(path_parts)
 
 
 def _safe_lifecycle_code(value: Any, fallback: str) -> str:
@@ -259,6 +287,7 @@ def _persist_terminal_notification(
         occurred_at=error_details.get("occurred_at"),
         failures=error_details.get("failures"),
         sanitized_message=error_details.get("sanitized_message"),
+        title=operation.title if completion_confirmed else None,
     )
     body = build_lifecycle_body(lifecycle=lifecycle)
     notification_id = "tg" + kind + "-" + hashlib.sha256(record.operation_id.encode("utf-8")).hexdigest()
@@ -272,6 +301,32 @@ def _persist_terminal_notification(
     return notification_id
 
 
+def _linked_final_notification_id(client: Any, record: Any) -> str | None:
+    """Return this operation's linked final ledger ID only when its identity is valid."""
+    from services.connectors.telegram.repository import SESSIONS, TelegramRepository
+
+    if not record.context_id or not record.operation_id:
+        return None
+    operation = (client.collection(SESSIONS).document(record.context_id)
+                 .collection("operations").document(record.operation_id).get())
+    notification_id = (operation.to_dict() or {}).get("notification_id") if operation.exists else None
+    if not isinstance(notification_id, str) or not notification_id:
+        return None
+    notification = TelegramRepository(client).get_notification(notification_id)
+    if not notification or (
+        notification.get("notification_id") != notification_id
+        or notification.get("context_id") != record.context_id
+        or notification.get("operation_id") != record.operation_id
+        or notification.get("kind") not in {"final", "error"}
+        or notification.get("state") not in {
+            "pending", "retry", "sending", "editing", "delivered", "failed",
+            "delivery_unknown",
+        }
+    ):
+        return None
+    return notification_id
+
+
 def update_terminal_notification(record: Any) -> str | None:
     """Create a stable lifecycle ledger entry only from persisted terminal operation evidence."""
     if not record.operation_id or not record.context_id:
@@ -280,6 +335,9 @@ def update_terminal_notification(record: Any) -> str | None:
     from core.integrations.firestore.operations import get_operation
 
     client = get_client()
+    linked_notification_id = _linked_final_notification_id(client, record)
+    if linked_notification_id:
+        return linked_notification_id
     operation = get_operation(client, record.operation_id)
     if operation is None or not operation.state.is_terminal:
         return None

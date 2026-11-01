@@ -23,6 +23,7 @@ from services.connectors.telegram.client import TelegramClient
 from services.connectors.telegram.models import TelegramContext
 from services.connectors.telegram.notifications import TelegramNotificationPublisher
 from services.connectors.telegram.repository import TelegramRepository
+from services.connectors.telegram.save import TelegramSavePending
 from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
 from services.connectors.telegram.runtime.routing import GeminiCommandRouter
 from services.connectors.telegram.runtime.store import TelegramRuntimeStore
@@ -40,6 +41,27 @@ async def _offload(function: Any, *args: Any, **kwargs: Any) -> Any:
 
 def _value(item: Any, key: str, default: Any = None) -> Any:
     return item.get(key, default) if isinstance(item, Mapping) else getattr(item, key, default)
+
+
+def _direct_completion_paragraph(result: Mapping[str, Any]) -> str | None:
+    """Render one verified direct completion with its exact folder binding."""
+    number = result.get("dialog_number")
+    if type(number) is not int or number < 1:
+        return None
+    path = result.get("folder_path")
+    folder = (
+        "/" if isinstance(path, list) and not path else
+        " / ".join(item for item in path if isinstance(item, str))
+        if isinstance(path, list) else ""
+    )
+    sentence = f"Saved as dialog #{number} in {folder}." if folder else f"Saved as dialog #{number}."
+    from services.connectors.telegram.notifications import _safe_verified_title
+
+    title = _safe_verified_title(result.get("title"))
+    if title:
+        sentence += f" Title: {title}."
+    notice = result.get("notice")
+    return sentence + (" " + notice.strip() if isinstance(notice, str) and notice.strip() else "")
 
 
 class _GovernedModel:
@@ -139,6 +161,11 @@ class _GovernedExecutor:
     def execute(self, *, name: str, arguments: Any, call_ordinal: int) -> Any:
         if not self.lease_check():
             raise PermissionError("Telegram operation lease is stale")
+        if name == "add_dialog":
+            # The shared save pipeline owns physical stage budgets. A queue-level
+            # logical tool attempt would incorrectly charge each indexing slice.
+            return self.executor.execute(name=name, arguments=arguments,
+                                         call_ordinal=call_ordinal)
         if self.governor is None:
             return self.executor.execute(name=name, arguments=arguments,
                                          call_ordinal=call_ordinal)
@@ -514,7 +541,18 @@ class TelegramCommandRuntime:
         for row in chain:
             fixed = _fixed_save_target(row)
             if fixed is not None:
-                candidates.append(fixed)
+                actual_route = row.get("route_result")
+                candidates.append({
+                    **fixed,
+                    "state": row.get("state"),
+                    "save_operation_id": row.get("save_operation_id"),
+                    "target_doc_id": fixed["doc_id"],
+                    "target_dialog_number": fixed["dialog_number"],
+                    "target_conversation_id": fixed["conversation_id"],
+                    "route_result": {
+                        "kind": actual_route.get("kind"),
+                    } if isinstance(actual_route, Mapping) else None,
+                })
         return tuple(candidates)
 
     def _predecessor_search_results(self, context_id: str, operation: Any,
@@ -623,21 +661,46 @@ class _CommandExecution:
         if self.command is None:
             self.pinned = await _offload(runtime.repository.get_route_control,
                                          self.context_id, self.operation_id)
+            queue_row = await _offload(self._queue_operation_row)
             retry_work = (
                 isinstance(self.pinned, Mapping)
                 and self.pinned.get("status") in {"ok", "success"}
                 and self.pinned.get("kind") == "retry"
                 and type(self.pinned.get("dialog_number")) is int
-                and isinstance(_value(self.operation, "retry_request_operation_id"), str)
+                and isinstance(queue_row, Mapping)
+                and queue_row.get("route_control") == self.pinned
+                and isinstance(queue_row.get("draft_id"), str)
+                and queue_row.get("target_draft_id") == queue_row.get("draft_id")
+                and queue_row.get("save_operation_id") == self.operation_id
+                and isinstance(queue_row.get("save_intent_id"), str)
+                and (queue_row.get("retry_request_operation_id") is None
+                     or isinstance(queue_row.get("retry_request_operation_id"), str))
             )
             if retry_work or (isinstance(self.pinned, Mapping)
                               and self.pinned.get("kind") == "save"):
-                self.replay_save_result = await runtime.save_handler.save_draft(
+                self._compose_ports()
+                self._compose_replies()
+                state = await runtime.save_handler.save_draft(
                     self.context_id, self.operation, self.lease,
                     retry_governor=self.retry_governor,
                 )
+                if state is QueueOperationState.FAILED:
+                    self.replay_save_result = await self._settle_save_failure()
+                    return True
+                self.replay_save_result = (
+                    await self._complete_save_reply()
+                    if state is QueueOperationState.COMPLETED else state
+                )
                 return True
         return False
+
+    def _queue_operation_row(self) -> dict[str, Any] | None:
+        """Load this operation's canonical queue record for replay classification."""
+        ref = (self.runtime.repository.client.collection("telegram_sessions")
+               .document(self.context_id).collection("operations").document(self.operation_id))
+        snapshot = ref.get()
+        row = snapshot.to_dict() or {} if snapshot.exists else {}
+        return row if row.get("operation_id") == self.operation_id else None
 
     def _compose_ports(self) -> None:
         """Build durable store, ledger, governed model, executor, publisher, and search ports."""
@@ -695,7 +758,9 @@ class _CommandExecution:
 
     async def _select_route(self) -> None:
         """Load safe candidates and replay or persist the model-only routing decision."""
-        from services.connectors.telegram.sessions import _candidate_cards, _valid_response
+        from services.connectors.telegram.sessions import (
+            _candidate_cards, _safe_save_candidates, _valid_response,
+        )
         runtime = self.runtime
         self.cards = await _offload(_candidate_cards, self.store)
         self.save_candidates = await _offload(
@@ -718,7 +783,10 @@ class _CommandExecution:
                 self.raw_decision = await _offload(
                     self.route_model.route,
                     text=self.command.text if self.command is not None else "",
-                    candidates=self.cards, operation_candidates=self.save_candidates,
+                    candidates=self.cards,
+                    operation_candidates=tuple(
+                        _safe_save_candidates(self.save_candidates).values()
+                    ),
                     recent_search_results=self.recent_search_results,
                     context_metadata={
                         "active_conversation_id": self.context.active_conversation_id,
@@ -825,7 +893,7 @@ class _CommandExecution:
             and decision.get("tool_choice", {}).get("arguments", {}).get("doc_id") is None
             and decision.get("tool_choice", {}).get("name") in {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
-                "sync_status", "sync_changes",
+                "sync_status", "sync_changes", "add_dialog",
             }
         )
         pinned_global = bool(
@@ -907,7 +975,7 @@ class _CommandExecution:
                 record["result_refs"] = list(self.search_refs or [])
                 record["search_session_id"] = self.search_session_id
             prompt = self.command.text if self.command is not None else self.replay_request
-            if decision.get("kind") in {"substantive", "search"} and isinstance(prompt, str):
+            if decision.get("kind") in {"substantive", "search", "save"} and isinstance(prompt, str):
                 await _offload(self.ledger.save_request, self.global_conversation_id,
                                self.operation_id, prompt)
         try:
@@ -939,9 +1007,40 @@ class _CommandExecution:
             self.context_id, self.operation, self.lease,
             retry_governor=self.retry_governor,
         )
+        if state is QueueOperationState.FAILED:
+            return await self._settle_save_failure()
         if state != QueueOperationState.COMPLETED:
             return state
-        return await self.finish_reply("The save completed.")
+        return await self._complete_save_reply()
+
+    async def _complete_save_reply(self) -> QueueOperationState:
+        """Publish the verified save reply and pin its predecessor binding under this lease."""
+        formatter = getattr(self.runtime.save_handler, "save_reply", None)
+        if callable(formatter):
+            try:
+                message = await _offload(formatter, self.context_id, self.operation)
+            except Exception:
+                message = "The save completed, but its verified result is unavailable."
+        else:
+            message = "The save completed, but its verified result is unavailable."
+        state = await self.finish_reply(message)
+        if state is not QueueOperationState.COMPLETED:
+            return state
+        commit_result = getattr(self.runtime.save_handler, "commit_completed_save", None)
+        if callable(commit_result) and not await _offload(
+                commit_result, self.context_id, self.operation, self.lease):
+            return QueueOperationState.RUNNING
+        return QueueOperationState.COMPLETED
+
+    async def _settle_save_failure(self) -> QueueOperationState:
+        """Publish one safe terminal reply after the save runtime persisted failure."""
+        formatter = getattr(self.runtime.save_handler, "failure_reply", None)
+        if not callable(formatter):
+            return QueueOperationState.FAILED
+        message = await _offload(
+            formatter, self.context_id, self.operation, self.retry_governor,
+        )
+        return await self.finish_reply(message, kind="error", failure_final=True)
 
     async def _handle_global_retry(self) -> QueueOperationState:
         """Queue the retry for the route's validated dialog number."""
@@ -1009,6 +1108,7 @@ class _CommandExecution:
         if not isinstance(prompt, str) or not prompt:
             return QueueOperationState.FAILED
         executor = self.executor_factory(None, self.operation_id, self.executor_context)
+        self.direct_save_conversation_id = self.global_conversation_id
         choice = self.decision.get("tool_choice")
         if choice is not None:
             return await self._handle_global_tool(executor, choice)
@@ -1020,8 +1120,26 @@ class _CommandExecution:
                 executor_factory=lambda _doc, _delivery, _ctx: executor,
                 execution_context=self.executor_context,
             )
-        except Exception:
-            record = {"status": "error"}
+        except TelegramSavePending:
+            return QueueOperationState.RUNNING
+        except Exception as error:
+            from services.connectors.telegram.errors import TelegramDirectSaveInterrupted
+            if not isinstance(error, TelegramDirectSaveInterrupted):
+                record = {"status": "error"}
+                direct_failure = await self._direct_add_dialog_failure()
+                if direct_failure is not False:
+                    return direct_failure
+                if self.governed_model.failure is not None or any(
+                        item.failure is not None for item in self.governed_executors):
+                    return QueueOperationState.RUNNING
+                answer = "I could not complete that request. Please clarify."
+                return await self.finish_reply(answer, kind="error")
+            direct_failure = await self._direct_add_dialog_failure(
+                self.global_conversation_id,
+            )
+            if direct_failure is False:
+                raise
+            return direct_failure
         if self.governed_model.failure is not None or any(
                 item.failure is not None for item in self.governed_executors):
             return QueueOperationState.RUNNING
@@ -1029,6 +1147,12 @@ class _CommandExecution:
         answer = answer if isinstance(answer, str) and answer.strip() else (
             "I could not complete that request. Please clarify."
         )
+        if record.get("status") == "ok":
+            answer = await self._include_verified_direct_metadata(
+                answer, self.global_conversation_id,
+            )
+            if isinstance(answer, QueueOperationState):
+                return answer
         return await self.finish_reply(answer, kind="final" if record.get("status") == "ok" else "error")
 
     async def _handle_global_tool(self, executor: Any, choice: Mapping[str, Any]) -> QueueOperationState:
@@ -1050,7 +1174,20 @@ class _CommandExecution:
                 result = await _offload(
                     executor.execute, name=name, arguments=arguments, call_ordinal=0,
                 )
-            except Exception:
+            except TelegramSavePending:
+                return QueueOperationState.RUNNING
+            except Exception as error:
+                from services.connectors.telegram.errors import (
+                    TELEGRAM_SAVE_INPUT_REFUSAL, TelegramSaveInputRejected,
+                )
+                if isinstance(error, TelegramSaveInputRejected):
+                    return await self.finish_reply(
+                        TELEGRAM_SAVE_INPUT_REFUSAL, kind="error", failure_final=True,
+                    )
+                if name == "add_dialog":
+                    direct_failure = await self._direct_add_dialog_failure()
+                    if direct_failure is not False:
+                        return direct_failure
                 settled = await self._settle_governed_failure()
                 if settled is not None:
                     return settled
@@ -1058,6 +1195,59 @@ class _CommandExecution:
             await _offload(self.ledger.save_tool_result, self.global_conversation_id,
                            self.operation_id, 0, result)
         return await self.finish_reply(json.dumps(result, ensure_ascii=False, default=str))
+
+    async def _direct_add_dialog_failure(self, conversation_id: str | None = None
+                                         ) -> QueueOperationState | None | bool:
+        """Settle only a direct save failure proven by its persisted tool call."""
+        formatter = getattr(self.runtime.save_handler, "direct_failure_reply", None)
+        if not callable(formatter):
+            return False
+        message = await _offload(
+            formatter, self.context_id, self.operation_id, self.retry_governor,
+            conversation_id or getattr(self, "direct_save_conversation_id", None),
+        )
+        if message is None:
+            # Child stage evidence can be retryable or unavailable. Keep the queue
+            # item live; never turn an arbitrary provider exception into a final.
+            return QueueOperationState.RUNNING
+        if message is False:
+            return False
+        return await self.finish_reply(message, kind="error", failure_final=True)
+
+    async def _include_verified_direct_metadata(self, answer: str,
+                                               conversation_id: str | None
+                                               ) -> str | QueueOperationState:
+        """Add only omitted metadata from verified direct-save certificates."""
+        formatter = getattr(self.runtime.save_handler, "verified_direct_results", None)
+        if not callable(formatter):
+            return answer
+        if not isinstance(conversation_id, str):
+            return QueueOperationState.RUNNING
+        try:
+            results = await _offload(
+                formatter, self.context_id, self.operation_id, conversation_id,
+                self.lease, self.retry_governor,
+            )
+        except Exception:
+            return QueueOperationState.RUNNING
+        if results is None:
+            return QueueOperationState.RUNNING
+        body = answer
+        for result in results:
+            if not isinstance(result, Mapping):
+                return QueueOperationState.RUNNING
+            canonical = _direct_completion_paragraph(result)
+            if canonical is None:
+                return QueueOperationState.RUNNING
+            if canonical not in body.splitlines():
+                body = body.rstrip() + "\n" + canonical
+        return body
+
+    async def _document_target_conversation_id(self) -> str | None:
+        route = await _offload(self.runtime.repository.get_route_control,
+                               self.context_id, self.operation_id)
+        conversation_id = route.get("conversation_id") if isinstance(route, Mapping) else None
+        return conversation_id if isinstance(conversation_id, str) and conversation_id else None
 
     async def _run_document(self) -> QueueOperationState:
         """Run the established Telegram document processor and settle its answer once."""
@@ -1069,10 +1259,29 @@ class _CommandExecution:
             selection_publisher=self._selection_callback, clock=self.runtime.clock,
         )
         self.capturing_agent = processor.agent
-        result = await processor(
-            self.context_id, self.operation, self.lease, command=self.command,
-            retry_governor=self.retry_governor,
-        )
+        try:
+            result = await processor(
+                self.context_id, self.operation, self.lease, command=self.command,
+                retry_governor=self.retry_governor,
+            )
+        except TelegramSavePending:
+            return QueueOperationState.RUNNING
+        except Exception as error:
+            from services.connectors.telegram.errors import TelegramDirectSaveInterrupted
+            if not isinstance(error, TelegramDirectSaveInterrupted):
+                raise
+            conversation_id = await self._document_target_conversation_id()
+            direct_failure = await self._direct_add_dialog_failure(conversation_id)
+            if direct_failure is False:
+                raise
+            return direct_failure
+        if result == QueueOperationState.FAILED:
+            route = await _offload(self.runtime.repository.get_route_control,
+                                   self.context_id, self.operation_id)
+            conversation_id = route.get("conversation_id") if isinstance(route, Mapping) else None
+            direct_failure = await self._direct_add_dialog_failure(conversation_id)
+            if direct_failure is not False:
+                return direct_failure
         failure_result = await self._settle_governed_failure()
         if failure_result is not None:
             return failure_result
@@ -1101,12 +1310,22 @@ class _CommandExecution:
     async def _settle_document_reply(self, result: QueueOperationState) -> QueueOperationState:
         """Publish captured model text or recover the checkpointed final answer."""
         if self.capturing_agent.answer is not None and result == QueueOperationState.COMPLETED:
-            delivery = await self.finish_reply(self.capturing_agent.answer)
+            conversation_id = await self._document_target_conversation_id()
+            answer = await self._include_verified_direct_metadata(
+                self.capturing_agent.answer, conversation_id,
+            )
+            if isinstance(answer, QueueOperationState):
+                return answer
+            delivery = await self.finish_reply(answer)
             if delivery != QueueOperationState.COMPLETED:
                 return delivery
         elif result == QueueOperationState.COMPLETED:
             answer = await self._load_document_answer()
             if isinstance(answer, str) and answer.strip():
+                conversation_id = await self._document_target_conversation_id()
+                answer = await self._include_verified_direct_metadata(answer, conversation_id)
+                if isinstance(answer, QueueOperationState):
+                    return answer
                 return await self.finish_reply(answer)
         elif result == QueueOperationState.FAILED and self.decision is not None:
             message = (

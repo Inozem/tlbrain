@@ -73,6 +73,19 @@ def _response_parts(response: Any) -> list[Any]:
     return list(_field(content, "parts", ()) or ())
 
 
+def _wire_model_part(part: Any) -> Any:
+    """Normalize legacy routed-call fields only when replaying to Gemini."""
+    if not isinstance(part, Mapping) or "function_call" in part:
+        return part
+    if not {"name", "args"}.issubset(part):
+        return part
+    call = {key: part[key] for key in ("id", "name", "args") if key in part}
+    return {
+        **{key: value for key, value in part.items() if key not in {"id", "name", "args"}},
+        "function_call": call,
+    }
+
+
 def _call_part(part: Any) -> Any | None:
     return _field(part, "function_call", part if _field(part, "name") else None)
 
@@ -221,9 +234,9 @@ class TelegramAgent:
             raise ValueError("operation conversation is invalid")
 
         state = self._load_state(conversation_id, delivery_id)
-        response: Any = {"parts": [{
+        response: Any = {"parts": [{"function_call": {
             "id": f"route-{delivery_id}", "name": name, "args": validated,
-        }]}
+        }}]}
         if state.calls:
             saved = state.calls[0]
             if (saved.get("name") != name or saved.get("arguments") != validated
@@ -367,7 +380,10 @@ class TelegramAgent:
 
     @staticmethod
     def _append_model_response(contents: list[Any], response: Any) -> None:
-        contents.append({"role": "model", "parts": _response_parts(response)})
+        contents.append({
+            "role": "model",
+            "parts": [_wire_model_part(part) for part in _response_parts(response)],
+        })
 
     def _run_calls(
         self, contents: list[Any], response: Any, calls: list[dict[str, Any]],
@@ -392,13 +408,40 @@ class TelegramAgent:
 
     @staticmethod
     def _source_call(response: Any, saved_call: Mapping[str, Any]) -> Any:
+        saved_id = saved_call.get("id")
+        saved_name = saved_call["name"]
+        saved_arguments = saved_call.get("arguments")
         for part in _response_parts(response):
             call = _call_part(part)
-            if call is not None and _field(call, "id") == saved_call.get("id"):
-                if isinstance(call, Mapping):
-                    return SimpleNamespace(**call)
+            if call is None:
+                continue
+            call_id = _field(call, "id")
+            if saved_id is not None:
+                matches = call_id == saved_id
+            else:
+                # FunctionCall.id is optional. Correlate an id-less call by
+                # its persisted name and validated arguments, never by None
+                # alone (which could associate a different call in the same
+                # model round).
+                call_arguments = _field(call, "args", _field(call, "arguments"))
+                matches = (call_id is None and _field(call, "name") == saved_name
+                           and call_arguments == saved_arguments)
+            if not matches:
+                continue
+            if isinstance(call, Mapping):
+                source = dict(call)
+                source["id"] = call_id if call_id is not None else saved_id
+                source["name"] = saved_name
+                return SimpleNamespace(**source)
+            if call_id is not None and _field(call, "name") == saved_name:
                 return call
-        return SimpleNamespace(id=saved_call.get("id"), name=saved_call["name"])
+            # SDK objects may omit the optional attribute entirely. Keep
+            # available opaque fields (such as thought_signature) intact.
+            source = dict(vars(call)) if hasattr(call, "__dict__") else {}
+            source["id"] = call_id if call_id is not None else saved_id
+            source["name"] = saved_name
+            return SimpleNamespace(**source)
+        return SimpleNamespace(id=saved_id, name=saved_name, args=saved_arguments)
 
     @staticmethod
     def _failure(message: str, usage: dict[str, int]) -> dict[str, Any]:

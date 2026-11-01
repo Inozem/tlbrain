@@ -89,6 +89,19 @@ class FirestoreAgentLedger:
                     now=self.clock(), expiry=context_data.get("lock_expires_at"))):
             raise PermissionError("Telegram operation lease is stale")
 
+    def _write_input_document(
+        self, reference: Any, data: dict[str, Any], *, write_assertion: Any = None,
+    ) -> None:
+        """Commit one input part or manifest while the queue fence is current."""
+        @firestore.transactional
+        def _txn(transaction: Any) -> None:
+            self._assert_current(transaction)
+            if write_assertion is not None:
+                write_assertion(transaction)
+            transaction.set(reference, data)
+
+        _txn(self.client.transaction(max_attempts=5))
+
     @staticmethod
     def _json_bytes(value: Any) -> bytes:
         def encode(item: Any) -> Any:
@@ -110,7 +123,9 @@ class FirestoreAgentLedger:
             return item
         return decode(json.loads(payload.decode("utf-8")))
 
-    def _store_payload(self, kind: str, value: Any) -> dict[str, Any]:
+    def _store_payload(
+        self, kind: str, value: Any, *, write_assertion: Any = None,
+    ) -> dict[str, Any]:
         payload = self._json_bytes(value)
         digest = hashlib.sha256(payload).hexdigest()
         if len(payload) <= _INLINE_CHECKPOINT_VALUE_BYTES:
@@ -120,7 +135,12 @@ class FirestoreAgentLedger:
             f"{self.context_id}\0{self.operation_id}\0{kind}\0{digest}".encode()
         ).hexdigest()
         input_ref = f"dialog_operations/{data_operation}/input_parts/manifest"
-        write_input_parts(self.client, input_ref, payload)
+        write_input_parts(
+            self.client, input_ref, payload,
+            write_document=lambda reference, data: self._write_input_document(
+                reference, data, write_assertion=write_assertion,
+            ),
+        )
         return {"_input_ref": input_ref, "sha256": digest,
                 "byte_length": len(payload), "max_part_bytes": MAX_PART_BYTES}
 

@@ -89,6 +89,21 @@ async def _await_if_needed(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
+def _accepts_keyword(function: Any, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (parameter.name == keyword and parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        })
+        for parameter in parameters
+    )
+
+
 class TelegramAudioTranscriber:
     """Transcribe audio messages, checkpoint each source, then analyze once."""
 
@@ -99,6 +114,7 @@ class TelegramAudioTranscriber:
         repository: Any,
         gemini_client_factory: Callable[..., Any] = make_client,
         context_id: str | None = None,
+        assert_current: Callable[[], Any] | None = None,
         max_audio_bytes: int = _DEFAULT_MAX_AUDIO_BYTES,
         inline_request_limit_bytes: int = _DEFAULT_INLINE_REQUEST_LIMIT_BYTES,
     ) -> None:
@@ -108,6 +124,7 @@ class TelegramAudioTranscriber:
         self.repository = repository
         self.gemini_client_factory = gemini_client_factory
         self.context_id = context_id
+        self.assert_current = assert_current
         self.max_audio_bytes = max_audio_bytes
         self.inline_request_limit_bytes = inline_request_limit_bytes
 
@@ -130,6 +147,8 @@ class TelegramAudioTranscriber:
                 state = _get(message, "transcription_state")
                 state = getattr(state, "value", state)
                 saved_text = _get(message, "transcription_text")
+                if state == "not_required":
+                    return message_id, message
                 if state == "completed" and isinstance(saved_text, str):
                     saved_text = await self._reconcile_completed_transcript(
                         message_id,
@@ -178,7 +197,9 @@ class TelegramAudioTranscriber:
         """Reuse a completed checkpoint and reconcile a matching in-flight stage."""
         if retry_governor is not None and operation_id and operation_lease is not None:
             stage_key = f"telegram.audio.{message_id}"
-            stage_record = retry_governor.get_stage(operation_id, stage_key)
+            stage_record = await asyncio.to_thread(
+                retry_governor.get_stage, operation_id, stage_key,
+            )
             if stage_record.in_flight_attempt_id is not None:
                 return await retry_governor.run_stage_async(
                     operation_id, stage_key, lambda: saved_text,
@@ -256,7 +277,8 @@ class TelegramAudioTranscriber:
                 )),
             )
         except Exception as error:
-            self._mark_governed_error_retryability(
+            await asyncio.to_thread(
+                self._mark_governed_error_retryability,
                 error,
                 retry_governor=retry_governor,
                 operation_id=operation_id,
@@ -323,7 +345,8 @@ class TelegramAudioTranscriber:
         remote_name = None
         temporary_file = None
         try:
-            download = await self.telegram_client.download_audio(file_id)
+            download = await self._download_audio(file_id)
+            await self._assert_current()
             data = _get(download, "data")
             mime_type = _get(download, "mime_type")
             declared_size = _get(download, "size")
@@ -345,6 +368,7 @@ class TelegramAudioTranscriber:
             if not isinstance(mime_type, str) or mime_type.lower() not in _SUPPORTED_AUDIO_MIME_TYPES:
                 raise TelegramAudioInputError("Telegram audio MIME type is unsupported")
 
+            await self._assert_current()
             client = self.gemini_client_factory(single_attempt=True)
             config = _transcription_config()
             inline_part = types.Part(inline_data=types.Blob(data=data, mime_type=mime_type.lower()))
@@ -354,6 +378,7 @@ class TelegramAudioTranscriber:
                 temporary_file = tempfile.TemporaryFile(mode="w+b")
                 temporary_file.write(data)
                 temporary_file.seek(0)
+                await self._assert_current()
                 uploaded = await client.aio.files.upload(
                     file=temporary_file,
                     config=types.UploadFileConfig(mime_type=mime_type.lower()),
@@ -366,6 +391,7 @@ class TelegramAudioTranscriber:
                     raise RuntimeError("Gemini Files upload returned an invalid resource")
                 part = types.Part(file_data=types.FileData(file_uri=uri, mime_type=mime_type.lower()))
 
+            await self._assert_current()
             return await transcribe_part(client, part)
         finally:
             if temporary_file is not None:
@@ -380,6 +406,20 @@ class TelegramAudioTranscriber:
                     await self.telegram_client.cleanup_download(download)
                 except Exception:
                     logger.warning("Telegram temporary audio cleanup failed")
+
+    async def _download_audio(self, file_id: str) -> Any:
+        """Fence and download through compatible Telegram client signatures."""
+        await self._assert_current()
+        download_audio = self.telegram_client.download_audio
+        if self.assert_current is not None and _accepts_keyword(download_audio, "assert_current"):
+            return await download_audio(file_id, assert_current=self._assert_current)
+        return await download_audio(file_id)
+
+    async def _assert_current(self) -> None:
+        if self.assert_current is None:
+            return
+        from services.connectors.telegram.runtime.runtime import _offload
+        await _offload(self.assert_current)
 
 
 def _transcription_config() -> types.GenerateContentConfig:

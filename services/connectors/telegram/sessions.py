@@ -17,6 +17,8 @@ from typing import Any, Callable
 from core.operations.registry import OPERATIONS, validate_arguments
 from services.connectors.telegram.context import build_document_context
 from services.connectors.telegram.conversations import TurnRole
+from services.connectors.telegram.save import TelegramSavePending
+from services.connectors.telegram.errors import TelegramDirectSaveInterrupted
 
 
 _ROUTE_KINDS = frozenset({"pure_switch", "search", "substantive", "save", "retry"})
@@ -968,6 +970,8 @@ async def _process_substantive_turn(
         return {"status": "error", "kind": kind}
     try:
         answer = await agent(prompt=prompt, target_doc_id=target_doc_id)
+    except (TelegramSavePending, TelegramDirectSaveInterrupted):
+        raise
     except Exception:
         return {"status": "error", "kind": kind}
     repository.append_turn(

@@ -335,6 +335,28 @@ def test_audio_barrier_precedes_ordered_preprocessing_analysis_and_classificatio
     assert repository.draft["source_manifest"] == original_manifest
 
 
+def test_indexing_pending_propagates_as_running_without_failed_workflow_state():
+    from services.connectors.telegram.save import TelegramSavePending
+
+    repository = _Repository()
+    events = []
+    pipeline = _Pipeline(events)
+
+    async def pending_save(*_args, **_kwargs):
+        raise TelegramSavePending()
+
+    pipeline.save = pending_save
+    workflow = _workflow(repository, events, pipeline)
+    with pytest.raises(TelegramSavePending):
+        _run(workflow.save(
+            draft_id="draft-original", intent_id="operation-1", operation_id="operation-1",
+        ))
+
+    assert workflow.status == {"stage": "indexing", "state": "running", "error_code": None}
+    assert repository.certificate is None
+    assert repository.deleted == []
+
+
 def test_topic_hint_and_explicit_folder_reach_classifier_without_changing_save_payload():
     from core.dialogs.classification import FolderSelectionResult
     from services.connectors.telegram.save import TelegramClassifiedDialog
@@ -1238,4 +1260,40 @@ def test_governed_stage_state_read_error_remains_retryable():
             "telegram.analysis", lambda: None,
         ))
 
+    assert error.telegram_stage_retryable is True
+
+
+def test_governed_stage_failure_state_read_does_not_block_async_workflow_loop():
+    import threading
+    from services.connectors.telegram.save import _run_telegram_stage
+
+    error = OSError("synthetic stage write fault")
+    entered, release = threading.Event(), threading.Event()
+
+    class Governor:
+        max_failures = 3
+
+        async def run_stage_async(self, *_args, **_kwargs):
+            raise error
+
+        def get_stage(self, *_args):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("stage state read release timed out")
+            return type("Stage", (), {"last_error": None, "failures": 0})()
+
+    async def exercise():
+        task = asyncio.create_task(_run_telegram_stage(
+            Governor(), "operation", type("Lease", (), {"owner": "worker", "fence": 1})(),
+            "telegram.analysis", lambda: None,
+        ))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+        with pytest.raises(OSError, match="stage write fault"):
+            await task
+
+    _run(exercise())
     assert error.telegram_stage_retryable is True

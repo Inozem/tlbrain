@@ -45,9 +45,10 @@ class TelegramDraftCleanup:
         self.repository = repository
         self.page_size = min(page_size, 400)
 
-    async def cleanup(self, *, context_id: str) -> bool:
+    async def cleanup(self, *, context_id: str, certificate: Any = None) -> bool:
         """Remove source and prepared pages only after durable authorization."""
-        certificate = await _await(self.repository.load_completion_certificate(context_id))
+        if certificate is None:
+            certificate = await _await(self.repository.load_completion_certificate(context_id))
         if certificate is None or _value(certificate, "context_id") != context_id:
             return False
         draft_id = _value(certificate, "draft_id")
@@ -59,6 +60,9 @@ class TelegramDraftCleanup:
             return False
         await self._delete_source_pages(context_id, draft_id)
         await self._delete_prepared_pages(context_id, draft_id)
+        purge = getattr(self.repository, "cleanup_temporary_save_payloads", None)
+        if callable(purge) and await _await(purge(context_id, certificate)) is not True:
+            return False
         finalized = await _await(self.repository.finalize_cleanup(context_id, certificate))
         return finalized is True
 

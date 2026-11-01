@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -198,6 +199,63 @@ def test_prepared_records_and_metadata_are_persisted_as_ordered_firestore_lists(
     assert draft["preparation_digest"] == "sha256:stable"
 
 
+def test_prepared_checkpoint_pages_bound_transaction_writes_and_preserve_full_input(
+    firestore_fake, monkeypatch,
+):
+    from tests.fixtures.firestore_fake import FakeTransaction
+
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    result = _accept(repo)
+    largest_transaction = {"writes": 0}
+    original_set = FakeTransaction.set
+
+    def counted_set(transaction, reference, data, merge=False):
+        original_set(transaction, reference, data, merge)
+        largest_transaction["writes"] = max(
+            largest_transaction["writes"], len(transaction._writes),
+        )
+
+    monkeypatch.setattr(FakeTransaction, "set", counted_set)
+    rows = [PreparedUtterance(i, "Speaker", None, f"row {i} " + ("x" * 2500),
+                              3, (101,)) for i in range(501)]
+    repo.save_prepared_utterances(
+        result.context_id, result.draft_id, rows, required_audio_count=0,
+        completed_audio_ids=(), context_capacity=521,
+        preparation_digest="sha256:large", now=NOW,
+    )
+
+    stored = [path for path in firestore_fake.documents
+              if path.startswith(f"telegram_sessions/{result.context_id}/drafts/{result.draft_id}/prepared/")]
+    assert len(stored) == 501
+    assert sum(len(firestore_fake.documents[path]["text"]) for path in stored) > 1_000_000
+    assert repo.get_draft(result.context_id, result.draft_id)["prepared_count"] == 501
+    assert largest_transaction["writes"] <= 400
+
+
+def test_transcription_checkpoint_rejects_stale_queue_fence(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, operation_id = "42_5", "draft-1", "save-op"
+    context = client.collection("telegram_sessions").document(context_id)
+    context.set({"reserved_operation_id": operation_id, "active_operation_id": operation_id,
+                 "lock_owner": "worker", "fence": 4, "lock_expires_at": NOW.replace(year=2027)})
+    operation = context.collection("operations").document(operation_id)
+    operation.set({"operation_id": operation_id, "state": "running",
+                   "target_draft_id": draft_id, "save_operation_id": operation_id})
+    draft = context.collection("drafts").document(draft_id)
+    draft.set({"draft_id": draft_id, "active_save_operation_id": operation_id,
+               "immutable_save_intent_id": operation_id})
+    draft.collection("messages").document("101").set({"message_id": 101})
+
+    with pytest.raises(PermissionError):
+        repo.checkpoint_transcription(
+            context_id, draft_id, 101, "must not persist",
+            queue_operation_id=operation_id, queue_owner="worker", queue_fence=3, now=NOW,
+        )
+    assert draft.collection("messages").document("101").get().to_dict() == {"message_id": 101}
+
+
 def test_document_binding_reuses_number_and_allocator_never_decrements(firestore_fake):
     client = firestore_fake.client_class()
     repo = TelegramRepository(client)
@@ -343,6 +401,7 @@ def _seed_completion_records(client, *, mismatch=None):
     draft_ref.set({
         "draft_id": draft_id,
         "dialog_number": 2,
+        "conversation_id": f"{context_id}-2",
         "state": "processing",
         "active_save_operation_id": operation_id,
         "immutable_save_intent_id": intent_id,
@@ -350,6 +409,28 @@ def _seed_completion_records(client, *, mismatch=None):
         "manifest_digest": digest,
         "ordered_message_ids": [101, 102],
         "doc_id": doc_id,
+    })
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.collection("dialogs").document("2").set({
+        "dialog_number": 2, "conversation_id": f"{context_id}-2",
+        "draft_id": draft_id, "doc_id": None,
+        "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+    })
+    context_ref.collection("conversations").document(f"{context_id}-2").set({
+        "conversation_id": f"{context_id}-2", "kind": "draft",
+        "draft_id": draft_id, "doc_id": None, "dialog_number": 2,
+        "search_filters": None,
+        "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "last_substantive_at": None, "last_turn_sequence": 1,
+    })
+    context_ref.collection("conversations").document(f"{context_id}-2").collection(
+        "turns",
+    ).document("turn-1").set({
+        "turn_id": "turn-1", "conversation_id": f"{context_id}-2",
+        "operation_id": "operation-prior", "role": "user",
+        "parts": [{"text": "prior substantive turn"}],
+        "turn_sequence": 1, "created_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
     })
     draft_ref.collection("save_manifests").document(operation_id).set({
         "draft_id": draft_id,
@@ -374,6 +455,39 @@ def _seed_completion_records(client, *, mismatch=None):
     return context_id, draft_id, operation_id, telegram_certificate
 
 
+def _install_completion_queue_lease(client, context_id, draft_id, *, owner="worker-save",
+                                    fence=7, expires_at=None):
+    expires_at = expires_at or NOW + timedelta(minutes=5)
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.update({
+        "reserved_operation_id": "operation-save",
+        "active_operation_id": "operation-save",
+        "lock_owner": "worker-save", "fence": 7,
+        "lock_expires_at": expires_at,
+    })
+    context_ref.collection("operations").document("operation-save").set({
+        "operation_id": "operation-save", "state": "running",
+        "target_draft_id": draft_id, "save_intent_id": "intent-save",
+    })
+    return {"queue_operation_id": "operation-save", "queue_owner": owner,
+            "queue_fence": fence, "queue_now": NOW}
+
+
+def _completion_binding_state(client, context_id, draft_id):
+    context = client.collection("telegram_sessions").document(context_id)
+    return {
+        "context": context.get().to_dict(),
+        "draft": context.collection("drafts").document(draft_id).get().to_dict(),
+        "dialog": context.collection("dialogs").document("2").get().to_dict(),
+        "conversation": context.collection("conversations").document(
+            f"{context_id}-2",
+        ).get().to_dict(),
+        "binding": context.collection("document_bindings").document(
+            hashlib.sha256(b"doc-save").hexdigest(),
+        ).get().to_dict(),
+    }
+
+
 def test_completion_cleanup_authorization_requires_exact_shared_bindings(firestore_fake):
     client = firestore_fake.client_class()
     repo = TelegramRepository(client)
@@ -383,6 +497,25 @@ def test_completion_cleanup_authorization_requires_exact_shared_bindings(firesto
     pending = repo.get_draft(context_id, draft_id)
     assert pending["cleanup_state"] == "pending"
     assert isinstance(pending["updated_at"], datetime)
+    dialog = _read(client, f"telegram_sessions/{context_id}/dialogs/2")
+    conversation = _read(client, f"telegram_sessions/{context_id}/conversations/{context_id}-2")
+    assert dialog["doc_id"] == "doc-save"
+    assert dialog["conversation_id"] == f"{context_id}-2"
+    assert "draft_id" not in dialog
+    assert conversation["kind"] == "document"
+    assert conversation["draft_id"] is None
+    assert conversation["doc_id"] == "doc-save"
+    assert conversation["created_at"] == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert conversation["last_turn_sequence"] == 1
+    preserved_turn = _read(
+        client, f"telegram_sessions/{context_id}/conversations/{context_id}-2/turns/turn-1",
+    )
+    assert preserved_turn == {
+        "turn_id": "turn-1", "conversation_id": f"{context_id}-2",
+        "operation_id": "operation-prior", "role": "user",
+        "parts": [{"text": "prior substantive turn"}],
+        "turn_sequence": 1, "created_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+    }
     assert repo.authorize_cleanup(context_id, certificate) is True
     draft = repo.get_draft(context_id, draft_id)
     assert draft["cleanup_state"] == "authorized"
@@ -428,6 +561,70 @@ def test_commit_completion_replay_accepts_firestore_list_origin_binding(firestor
     draft_ref.set(draft)
 
     assert repo.commit_completion(certificate) is True
+
+
+def test_commit_completion_accepts_current_queue_fence(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, _operation_id, certificate = _seed_completion_records(client)
+    fence = _install_completion_queue_lease(client, context_id, draft_id)
+
+    assert repo.commit_completion(certificate, **fence) is True
+    assert _read(client, f"telegram_sessions/{context_id}/dialogs/2")["doc_id"] == "doc-save"
+    assert _read(client, f"telegram_sessions/{context_id}/document_bindings/"
+                 f"{hashlib.sha256(b'doc-save').hexdigest()}")["dialog_number"] == 2
+
+
+@pytest.mark.parametrize("failure", ["stale_fence", "wrong_owner", "expired_lease"])
+def test_commit_completion_rejects_invalid_queue_fence_without_mutation(firestore_fake, failure):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, _operation_id, certificate = _seed_completion_records(client)
+    expires_at = NOW - timedelta(seconds=1) if failure == "expired_lease" else None
+    fence = _install_completion_queue_lease(
+        client, context_id, draft_id, expires_at=expires_at,
+    )
+    if failure == "stale_fence":
+        fence["queue_fence"] -= 1
+    elif failure == "wrong_owner":
+        fence["queue_owner"] = "other-worker"
+    before = _completion_binding_state(client, context_id, draft_id)
+
+    with pytest.raises(PermissionError):
+        repo.commit_completion(certificate, **fence)
+
+    assert _completion_binding_state(client, context_id, draft_id) == before
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    ["dialog_document", "binding_number", "binding_conversation", "conversation_target"],
+)
+def test_commit_completion_rejects_binding_conflicts_without_overwrite(firestore_fake, conflict):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id, draft_id, _operation_id, certificate = _seed_completion_records(client)
+    context = client.collection("telegram_sessions").document(context_id)
+    binding_ref = context.collection("document_bindings").document(
+        hashlib.sha256(b"doc-save").hexdigest(),
+    )
+    if conflict == "dialog_document":
+        context.collection("dialogs").document("2").update({"doc_id": "doc-other"})
+    elif conflict == "binding_number":
+        binding_ref.set({"doc_id": "doc-save", "dialog_number": 9,
+                         "conversation_id": f"{context_id}-2"})
+    elif conflict == "binding_conversation":
+        binding_ref.set({"doc_id": "doc-save", "dialog_number": 2,
+                         "conversation_id": "conversation-other"})
+    else:
+        context.collection("conversations").document(f"{context_id}-2").update({
+            "doc_id": "doc-other",
+        })
+    before = _completion_binding_state(client, context_id, draft_id)
+
+    assert repo.commit_completion(certificate) is False
+
+    assert _completion_binding_state(client, context_id, draft_id) == before
 
 
 @pytest.mark.parametrize("tamper", ["authorization", "manifest"])

@@ -146,6 +146,63 @@ def test_notification_dispatch_publishes_identifier_only_without_changing_send_b
     assert notification_ref.get().to_dict() == ledger_before
 
 
+def test_index_dispatch_builds_vector_endpoint_and_keeps_managed_reference(firestore_fake, monkeypatch):
+    client = firestore_fake.client_class()
+    record = create_outbox_record(
+        client, "index-wakeup", target_kind=OutboxTargetKind.INDEX_DISPATCH,
+        generation=1, schedule_at=NOW, now=NOW, operation_id="save-operation",
+        document_id="doc-17", save_intent_id="save-intent",
+    )
+    calls = []
+    monkeypatch.setattr(publisher, "enqueue_task", lambda **kwargs: calls.append(kwargs) or True)
+    target = TaskTargetConfig(
+        "dialog-operations", "https://vector.example.invalid", "telegram-worker@example.invalid",
+        "https://vector.example.invalid", timedelta(seconds=45),
+    )
+
+    result = publish_due_outbox_records(
+        client, {OutboxTargetKind.INDEX_DISPATCH: target}, now=NOW, limit=1,
+    )
+
+    assert result.published == 1
+    assert calls == [{
+        "queue_name": "dialog-operations",
+        "url": "https://vector.example.invalid/sync/doc/doc-17",
+        "task_id": record.task_name,
+        "body": {
+            "schema_version": 1,
+            "outbox_id": "index-wakeup",
+            "target_kind": "index_dispatch",
+            "generation": 1,
+            "operation_id": "save-operation",
+            "document_id": "doc-17",
+            "save_intent_id": "save-intent",
+        },
+        "schedule_time": NOW,
+        "service_account_email": "telegram-worker@example.invalid",
+        "audience": "https://vector.example.invalid",
+        "dispatch_deadline": timedelta(seconds=45),
+    }]
+    assert get_outbox_record(client, "index-wakeup").state is OutboxState.DELIVERED
+
+
+def test_index_dispatch_without_document_id_fails_closed(firestore_fake, monkeypatch):
+    client = firestore_fake.client_class()
+    record = _create(client, "index-without-document", kind=OutboxTargetKind.INDEX_DISPATCH)
+    calls = []
+    monkeypatch.setattr(publisher, "enqueue_task", lambda **kwargs: calls.append(kwargs) or True)
+
+    result = publish_due_outbox_records(
+        client, {OutboxTargetKind.INDEX_DISPATCH: TARGET}, now=NOW, limit=1,
+    )
+
+    assert result.failed == 1
+    assert calls == []
+    failed = get_outbox_record(client, record.outbox_id)
+    assert failed.state is OutboxState.RETRY
+    assert failed.last_error == "cloud_tasks_enqueue_failed"
+
+
 def test_duplicate_result_recovers_crash_after_cloud_tasks_acceptance(firestore_fake, monkeypatch):
     client = firestore_fake.client_class()
     record = _create(client, "outbox-crash")

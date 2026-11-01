@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ from .terminal_notifications import (
 
 configure_logging()
 logger = logging.getLogger(__name__)
+_SAFE_TECHNICAL_ID = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
+_DEFAULT_RUNTIME = object()
 
 
 def _exception_types(exc: BaseException, *, limit: int = 4) -> list[str]:
@@ -69,66 +72,157 @@ def _default_intake() -> Any:
     from services.connectors.telegram.intake import TelegramIntake
     from services.connectors.telegram.repository import TelegramRepository
 
-    class DurableOutboxPublisher:
-        def __init__(self, client: Any) -> None:
-            self.client = client
-
-        def publish(self, outbox_id: str) -> None:
-            from core.integrations.cloud_tasks.client import enqueue_task
-            from core.integrations.firestore.outbox import (
-                OutboxState,
-                OutboxTargetKind,
-                get_outbox_record,
-                record_outbox_delivery_result,
-                task_payload,
-            )
-            record = get_outbox_record(self.client, outbox_id)
-            if record is None or record.target_kind is not OutboxTargetKind.TELEGRAM_DISPATCH:
-                raise RuntimeError("accepted Telegram outbox row is unavailable")
-            if record.state is OutboxState.DELIVERED:
-                return
-            queue_name = os.environ.get("TELEGRAM_CONTROL_QUEUE")
-            target_url = (
-                os.environ.get("TELEGRAM_DELIVERY_URL") if record.notification_id
-                else os.environ.get("TELEGRAM_CONTROL_URL")
-            ) or os.environ.get("TELEGRAM_CONTROL_URL")
-            expected_path = (
-                "/internal/deliver" if record.notification_id and
-                os.environ.get("TELEGRAM_DELIVERY_URL") else "/internal/dispatch"
-            )
-            target = _telegram_task_target(target_url, expected_path=expected_path)
-            if not queue_name or target is None:
-                raise RuntimeError("Telegram task target is not configured")
-            now = datetime.now(timezone.utc)
-            try:
-                enqueue_task(
-                    queue_name=target.queue_name,
-                    url=target.url,
-                    task_id=record.task_name,
-                    body=task_payload(record),
-                    schedule_time=record.schedule_at,
-                    service_account_email=target.service_account_email,
-                    audience=target.audience,
-                    dispatch_deadline=target.dispatch_deadline,
-                )
-            except Exception:
-                record_outbox_delivery_result(
-                    self.client, outbox_id, delivered=False, now=now,
-                    safe_error="cloud_tasks_enqueue_failed",
-                )
-                raise RuntimeError("Telegram task enqueue failed") from None
-            result = record_outbox_delivery_result(
-                self.client, outbox_id, delivered=True, now=now,
-            )
-            if result is None:
-                raise RuntimeError("Telegram outbox row disappeared during enqueue")
-
     client = get_client()
     return TelegramIntake(
         repository=TelegramRepository(client=client),
-        publisher=DurableOutboxPublisher(client),
+        publisher=_DurableOutboxPublisher(client),
         allowed_user_ids=_allowed_user_ids(),
     )
+
+
+class _DurableOutboxPublisher:
+    """Publish one stored Telegram dispatch row through its configured OIDC target."""
+
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    def publish(self, outbox_id: str) -> None:
+        from core.integrations.cloud_tasks.client import enqueue_task
+        from core.integrations.firestore.outbox import (
+            OutboxState, OutboxTargetKind, get_outbox_record,
+            record_outbox_delivery_result, task_payload,
+        )
+        record = get_outbox_record(self.client, outbox_id)
+        if record is None or record.target_kind is not OutboxTargetKind.TELEGRAM_DISPATCH:
+            raise RuntimeError("accepted Telegram outbox row is unavailable")
+        if record.state is OutboxState.DELIVERED:
+            return
+        queue_name = os.environ.get("TELEGRAM_CONTROL_QUEUE")
+        target_url = (os.environ.get("TELEGRAM_DELIVERY_URL") if record.notification_id
+                      else os.environ.get("TELEGRAM_CONTROL_URL")) or os.environ.get(
+                          "TELEGRAM_CONTROL_URL")
+        expected_path = (
+            "/internal/deliver" if record.notification_id and
+            os.environ.get("TELEGRAM_DELIVERY_URL") else "/internal/dispatch"
+        )
+        target = _telegram_task_target(target_url, expected_path=expected_path)
+        if not queue_name or target is None:
+            raise RuntimeError("Telegram task target is not configured")
+        now = datetime.now(timezone.utc)
+        try:
+            enqueue_task(
+                queue_name=target.queue_name, url=target.url, task_id=record.task_name,
+                body=task_payload(record), schedule_time=record.schedule_at,
+                service_account_email=target.service_account_email,
+                audience=target.audience, dispatch_deadline=target.dispatch_deadline,
+            )
+        except Exception:
+            record_outbox_delivery_result(
+                self.client, outbox_id, delivered=False, now=now,
+                safe_error="cloud_tasks_enqueue_failed",
+            )
+            raise RuntimeError("Telegram task enqueue failed") from None
+        result = record_outbox_delivery_result(self.client, outbox_id, delivered=True, now=now)
+        if result is None:
+            raise RuntimeError("Telegram outbox row disappeared during enqueue")
+
+
+def _publish_head_wakeup(client: Any, outbox_id: str) -> None:
+    _DurableOutboxPublisher(client).publish(outbox_id)
+
+
+async def _dispatch_worker_for(app: FastAPI, record: Any) -> Any | JSONResponse:
+    """Resolve the queue worker only after authenticated task and first-ack checks."""
+    worker = app.state.telegram_queue_worker
+    if worker is not None:
+        return worker
+    if not app.state.telegram_managed_runtime:
+        return JSONResponse({"error": "Dispatch unavailable"}, status_code=503)
+    try:
+        worker = await _offload_sync(_default_queue_worker)
+        app.state.telegram_queue_worker = worker
+        return worker
+    except Exception as exc:
+        logger.error(
+            "Telegram runtime initialization failed",
+            extra={"event": "telegram_runtime_failure", "stage": "initialization",
+                   "error_type": type(exc).__name__[:80],
+                   **_safe_operation_log_ids(record)},
+        )
+        return JSONResponse({"error": "Dispatch unavailable"}, status_code=503)
+
+
+async def _schedule_dispatch_status_checks(app: FastAPI, record: Any, publisher: Any) -> None:
+    """Schedule lifecycle checks for an accepted operation before queue execution."""
+    if not record.operation_id or not (
+        app.state.telegram_managed_runtime or record.outbox_id.startswith("tgcommand-")
+    ):
+        return
+    status_worker = app.state.telegram_status_check_worker
+    if status_worker is None:
+        status_worker = await _offload_sync(
+            _status_check_runtime, publisher, app.state.telegram_managed_runtime,
+        )
+        app.state.telegram_status_check_worker = status_worker
+    schedule = getattr(status_worker, "schedule_checks", None)
+    if schedule is None:
+        return
+    accepted_at = (
+        await _offload_sync(_accepted_operation_at, record.context_id, record.operation_id)
+        if app.state.telegram_managed_runtime else None
+    ) or record.created_at or record.schedule_at
+    records = await _offload_sync(
+        schedule, record.context_id, record.operation_id, accepted_at,
+    )
+    await _offload_sync(_enqueue_status_check_records, records)
+
+
+async def _publish_ready_head_wakeup(app: FastAPI, record: Any) -> Any:
+    """Publish a canonical queue continuation after managed worker execution."""
+    if not app.state.telegram_managed_runtime:
+        return None
+    from core.integrations.firestore.client import get_client
+    from services.connectors.telegram.queue import resolve_current_head_wakeup
+
+    client = get_client()
+    wakeup = await _offload_sync(resolve_current_head_wakeup, client, record.context_id)
+    if wakeup is not None:
+        await _offload_sync(_publish_head_wakeup, client, wakeup.outbox_id)
+    return client
+
+
+async def _publish_terminal_status(
+    app: FastAPI, record: Any, publisher: Any, client: Any,
+) -> JSONResponse | None:
+    """Update and deliver terminal status only after managed pending work settles."""
+    if not record.operation_id:
+        return None
+    managed_pending = (
+        await _offload_sync(_managed_operation_pending, client, record)
+        if app.state.telegram_managed_runtime else False
+    )
+    lifecycle_id = (
+        None if managed_pending else await _offload_sync(_update_terminal_notification, record)
+    )
+    if not lifecycle_id:
+        return None
+    if publisher is None:
+        publisher = await _offload_sync(_notification_runtime)
+        app.state.telegram_notification_publisher = publisher
+    delivery = await publisher.publish(lifecycle_id)
+    if delivery not in {"delivered", "failed", "delivery_unknown", "not_found"}:
+        return JSONResponse({"error": "Lifecycle delivery pending"}, status_code=503)
+    return None
+
+
+def _safe_operation_log_ids(record: Any) -> dict[str, str]:
+    """Return only validated canonical identifiers for failure log context."""
+    result: dict[str, str] = {}
+    for field in ("operation_id", "context_id"):
+        value = getattr(record, field, None)
+        if isinstance(value, str) and _SAFE_TECHNICAL_ID.fullmatch(value):
+            result[field] = value
+    return result
 
 
 _TASK_FIELDS = frozenset({
@@ -166,6 +260,16 @@ def _load_task_record(payload: dict[str, Any], target: str) -> Any:
     return record if payload == canonical else None
 
 
+def _managed_operation_pending(client: Any, record: Any) -> bool:
+    """Defer lifecycle fallback while managed queue work still owns its final reply."""
+    from services.connectors.telegram.repository import SESSIONS
+
+    snapshot = (client.collection(SESSIONS).document(record.context_id)
+                .collection("operations").document(record.operation_id).get())
+    row = snapshot.to_dict() or {} if snapshot.exists else {}
+    return row.get("state") not in {"completed", "failed"}
+
+
 def _first_ack_state(record: Any) -> str | None:
     """Return the durable first-ack state for save commands; None means no draft barrier."""
     if not record.operation_id or not record.context_id:
@@ -173,13 +277,14 @@ def _first_ack_state(record: Any) -> str | None:
     from core.integrations.firestore.client import get_client
     from core.integrations.firestore.operation_queue import get_operation
     from services.connectors.telegram.repository import NOTIFICATIONS, SESSIONS
+    from services.connectors.telegram.repository._common import _document_ref
 
     client = get_client()
     context_ref = client.collection(SESSIONS).document(record.context_id)
     operation = get_operation(context_ref, record.operation_id)
     if operation is None or not operation.input_ref:
         return "unavailable"
-    command = client.document(operation.input_ref).get()
+    command = _document_ref(client, operation.input_ref).get()
     if not command.exists:
         return "unavailable"
     draft_id = (command.to_dict() or {}).get("draft_id")
@@ -190,6 +295,21 @@ def _first_ack_state(record: Any) -> str | None:
     if not rows:
         return "unavailable"
     return (rows[0].to_dict() or {}).get("state", "unavailable")
+
+
+def _accepted_operation_at(context_id: str, operation_id: str) -> Any:
+    """Read the immutable queue acceptance time for managed head wakeups too."""
+    from core.integrations.firestore.client import get_client
+    from services.connectors.telegram.repository import SESSIONS
+
+    operation_ref = (get_client().collection(SESSIONS).document(context_id)
+                     .collection("operations").document(operation_id))
+    snapshot = operation_ref.get()
+    row = snapshot.to_dict() or {} if snapshot.exists else {}
+    if (row.get("operation_id") != operation_id
+            or row.get("context_id", context_id) != context_id):
+        return None
+    return row.get("created_at")
 
 
 def _notification_runtime() -> Any:
@@ -204,12 +324,22 @@ def _notification_runtime() -> Any:
     return TelegramNotificationPublisher(TelegramRepository(get_client()), TelegramClient(token))
 
 
-def _status_check_runtime(notification_publisher: Any = None) -> Any:
+def _default_queue_worker() -> Any:
+    """Build the production queue processor only after an authenticated task arrives."""
+    from core.integrations.firestore.client import get_client
+    from services.connectors.telegram.runtime.factory import build_default_queue_worker
+
+    return build_default_queue_worker(get_client())
+
+
+def _status_check_runtime(notification_publisher: Any = None, managed_runtime: bool = False) -> Any:
     from core.integrations.firestore.client import get_client
     from services.connectors.telegram.status_checks import TelegramStatusChecks
 
     publisher = notification_publisher or _notification_runtime()
-    return TelegramStatusChecks(get_client(), notification_publisher=publisher)
+    return TelegramStatusChecks(
+        get_client(), notification_publisher=publisher, managed_runtime=managed_runtime,
+    )
 
 
 def _telegram_task_target(callback_url: str | None, *, expected_path: str) -> Any:
@@ -318,7 +448,7 @@ def _enqueue_status_check_records(records: Any) -> None:
 
 def create_app(
     *, intake: Any = None, webhook_secret: str | None = None,
-    queue_worker: Any = None, notification_publisher: Any = None,
+    queue_worker: Any = _DEFAULT_RUNTIME, notification_publisher: Any = None,
     status_check_worker: Any = None,
     oidc_verifier: Any = None,
     telegram_client: Any = None,
@@ -327,7 +457,8 @@ def create_app(
     app = FastAPI()
     app.state.telegram_intake = intake
     app.state.telegram_webhook_secret = webhook_secret
-    app.state.telegram_queue_worker = queue_worker
+    app.state.telegram_managed_runtime = queue_worker is _DEFAULT_RUNTIME
+    app.state.telegram_queue_worker = None if queue_worker is _DEFAULT_RUNTIME else queue_worker
     app.state.telegram_notification_publisher = notification_publisher
     app.state.telegram_status_check_worker = status_check_worker
     app.state.telegram_oidc_verifier = oidc_verifier
@@ -508,6 +639,7 @@ def create_app(
             return error
         if payload.get("target_kind") != "telegram_dispatch":
             return JSONResponse({"error": "Invalid task"}, status_code=400)
+        record = None
         try:
             record = await _offload_sync(_load_task_record, payload, "telegram_dispatch")
             if record is None:
@@ -530,37 +662,30 @@ def create_app(
                     if ack_state in {"failed", "delivery_unknown"}:
                         return {"status": ack_state}
                     return JSONResponse({"error": "First acknowledgement pending"}, status_code=503)
-            worker = app.state.telegram_queue_worker
-            if worker is None:
-                return JSONResponse({"error": "Dispatch unavailable"}, status_code=503)
-            if record.operation_id and record.outbox_id.startswith("tgcommand-"):
-                status_worker = app.state.telegram_status_check_worker
-                if status_worker is None:
-                    status_worker = await _offload_sync(
-                        _status_check_runtime, publisher,
-                    )
-                    app.state.telegram_status_check_worker = status_worker
-                schedule = getattr(status_worker, "schedule_checks", None)
-                if schedule is not None:
-                    accepted_at = record.created_at or record.schedule_at
-                    status_records = await _offload_sync(
-                        schedule, record.context_id, record.operation_id, accepted_at,
-                    )
-                    await _offload_sync(_enqueue_status_check_records, status_records)
-            # Queue worker isolates each synchronous Firestore operation from its heartbeat loop.
+            worker = await _dispatch_worker_for(app, record)
+            if isinstance(worker, JSONResponse):
+                return worker
+            await _schedule_dispatch_status_checks(app, record, publisher)
             settled = await worker.handle_task(payload)
-            if record.operation_id:
-                lifecycle_id = await _offload_sync(_update_terminal_notification, record)
-                if lifecycle_id:
-                    if publisher is None:
-                        publisher = await _offload_sync(_notification_runtime)
-                        app.state.telegram_notification_publisher = publisher
-                    delivery = await publisher.publish(lifecycle_id)
-                    if delivery not in {"delivered", "failed", "delivery_unknown", "not_found"}:
-                        return JSONResponse({"error": "Lifecycle delivery pending"}, status_code=503)
-        except (ValueError, KeyError):
-            return JSONResponse({"error": "Invalid task"}, status_code=400)
-        except Exception:
+            client = await _publish_ready_head_wakeup(app, record)
+            lifecycle_pending = await _publish_terminal_status(app, record, publisher, client)
+            if lifecycle_pending is not None:
+                return lifecycle_pending
+        except (ValueError, KeyError) as exc:
+            logger.error(
+                "Telegram runtime execution failed",
+                extra={"event": "telegram_runtime_failure", "stage": "execution",
+                       "error_type": type(exc).__name__[:80],
+                       **_safe_operation_log_ids(record)},
+            )
+            return JSONResponse({"error": "Dispatch unavailable"}, status_code=503)
+        except Exception as exc:
+            logger.error(
+                "Telegram runtime execution failed",
+                extra={"event": "telegram_runtime_failure", "stage": "execution",
+                       "error_type": type(exc).__name__[:80],
+                       **_safe_operation_log_ids(record)},
+            )
             return JSONResponse({"error": "Dispatch unavailable"}, status_code=503)
         return {"status": "processed" if settled else "noop"}
 
@@ -582,6 +707,7 @@ def create_app(
             if worker is None:
                 worker = await _offload_sync(
                     _status_check_runtime, app.state.telegram_notification_publisher,
+                    app.state.telegram_managed_runtime,
                 )
                 app.state.telegram_status_check_worker = worker
             handler = worker.handle_task

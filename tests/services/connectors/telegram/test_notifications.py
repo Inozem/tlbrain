@@ -39,9 +39,10 @@ class _Clock:
 
 
 class _Telegram:
-    def __init__(self, *, failures=0, failure_category=None):
+    def __init__(self, *, failures=0, failure_category=None, retry_after=None):
         self.failures = failures
         self.failure_category = failure_category
+        self.retry_after = retry_after
         self.sent = []
         self.edited = []
 
@@ -50,7 +51,7 @@ class _Telegram:
         if self.failures:
             self.failures -= 1
             if self.failure_category is not None:
-                raise TelegramAPIError(self.failure_category)
+                raise TelegramAPIError(self.failure_category, retry_after=self.retry_after)
             raise TimeoutError("synthetic unknown outcome")
         return {"message_id": 901}
 
@@ -290,6 +291,50 @@ def test_create_notification_validates_kind_and_derives_persisted_target(firesto
                                  kind="queued", now=NOW)
 
 
+def test_terminal_notification_reuses_only_matching_linked_final_ledger(firestore_fake, monkeypatch):
+    from types import SimpleNamespace
+    from services.connectors.telegram.app.terminal_notifications import (
+        _linked_final_notification_id,
+    )
+
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo, update=902)
+    terminal = importlib.import_module(
+        "services.connectors.telegram.app.terminal_notifications"
+    )
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: client)
+    operation_id = "save-linked"
+    operation_ref = (client.collection("telegram_sessions").document(accepted.context_id)
+                     .collection("operations").document(operation_id))
+    record = SimpleNamespace(context_id=accepted.context_id, operation_id=operation_id)
+
+    repo.create_notification(
+        "canonical-final", context_id=accepted.context_id, kind="final", body="Saved.",
+        operation_id=operation_id, now=NOW,
+    )
+    operation_ref.set({"notification_id": "canonical-final"})
+    final_ref = client.collection("notification_outbox").document("canonical-final")
+    for transient_state in ("pending", "retry", "sending", "editing"):
+        final_ref.update({"state": transient_state})
+        assert terminal.update_terminal_notification(record) == "canonical-final"
+        assert _linked_final_notification_id(client, record) == "canonical-final"
+
+    repo.create_notification(
+        "progress-pointer", context_id=accepted.context_id, kind="progress", body="Working.",
+        operation_id=operation_id, now=NOW,
+    )
+    operation_ref.set({"notification_id": "progress-pointer"})
+    assert _linked_final_notification_id(client, record) is None
+
+    repo.create_notification(
+        "foreign-final", context_id=accepted.context_id, kind="final", body="Other save.",
+        operation_id="other-save", now=NOW,
+    )
+    operation_ref.set({"notification_id": "foreign-final"})
+    assert _linked_final_notification_id(client, record) is None
+
+
 def test_unknown_send_attempt_budget_survives_replay_and_becomes_delivery_unknown(firestore_fake):
     repo = TelegramRepository(firestore_fake.client_class())
     accepted = _accepted(repo)
@@ -337,6 +382,123 @@ def test_definitive_send_rejection_fails_without_retrying(firestore_fake):
 
     assert _run(publisher.publish(accepted.notification_id)) == "failed"
     assert len(telegram.sent) == 1
+
+
+def test_rate_limited_send_honors_retry_after_and_never_exceeds_three_attempts(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    clock = _Clock()
+    telegram = _Telegram(failures=3, failure_category="rate_limited", retry_after=7)
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+
+    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+    row = repo.get_notification(accepted.notification_id)
+    assert row["last_outcome"] == "rate_limited"
+    assert row["retry_not_before"] == NOW + timedelta(seconds=7)
+    repo.revise_notification(accepted.notification_id, body="Dialog #1: Updated status", now=clock())
+    assert _run(publisher.publish(accepted.notification_id)) == "busy"
+    assert len(telegram.sent) == 1
+
+    clock.advance(7)
+    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+    clock.advance(7)
+    assert _run(publisher.publish(accepted.notification_id)) == "failed"
+    assert _run(publisher.publish(accepted.notification_id)) == "failed"
+    row = repo.get_notification(accepted.notification_id)
+    assert row["send_attempts_started"] == 3
+    assert row["state"] == "failed"
+    assert len(telegram.sent) == 3
+
+
+def test_unknown_send_followed_by_rate_limits_keeps_delivery_unknown_semantics(firestore_fake):
+    class MixedFailures(_Telegram):
+        def __init__(self):
+            super().__init__()
+            self.outcomes = ["timeout", "rate_limited", "rate_limited"]
+
+        async def send_message(self, chat_id, text, *, message_thread_id=None):
+            self.sent.append((chat_id, text, message_thread_id))
+            category = self.outcomes.pop(0)
+            raise TelegramAPIError(category, retry_after=7 if category == "rate_limited" else None)
+
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    clock, telegram = _Clock(), MixedFailures()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+
+    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+    clock.advance(1)
+    assert _run(publisher.publish(accepted.notification_id)) == "retry"
+    assert _run(publisher.publish(accepted.notification_id)) == "busy"
+    clock.advance(7)
+    assert _run(publisher.publish(accepted.notification_id)) == "delivery_unknown"
+    row = repo.get_notification(accepted.notification_id)
+    assert row["send_attempts_started"] == 3
+    assert row["unknown_send_outcome"] is True
+    assert row["last_outcome"] == "rate_limited"
+    assert len(telegram.sent) == 3
+
+
+def test_stale_edit_rate_limit_waits_and_reuses_the_same_message(firestore_fake):
+    class StaleEditTelegram(_Telegram):
+        def __init__(self, repo, notification_id):
+            super().__init__()
+            self.repo = repo
+            self.notification_id = notification_id
+            self.once = True
+
+        async def edit_message_text(self, chat_id, message_id, text):
+            self.edited.append((chat_id, message_id, text))
+            if self.once:
+                self.once = False
+                self.repo.revise_notification(self.notification_id, body="new body", now=clock())
+                raise TelegramAPIError("rate_limited", retry_after=9)
+            return {"message_id": message_id}
+
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    notification_id = "stale-edit-rate-limit"
+    repo.create_notification(notification_id, context_id=accepted.context_id, kind="progress",
+                             body="initial", operation_id="edit-op", now=NOW)
+    clock = _Clock()
+    telegram = StaleEditTelegram(repo, notification_id)
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    repo.revise_notification(notification_id, body="old revision", now=clock())
+
+    assert _run(publisher.publish(notification_id)) == "pending"
+    row = repo.get_notification(notification_id)
+    assert row["last_outcome"] == "rate_limited"
+    assert row["retry_not_before"] == clock() + timedelta(seconds=9)
+    assert row["edit_attempts_started"] == 1
+    assert _run(publisher.publish(notification_id)) == "busy"
+    assert len(telegram.edited) == 1
+    clock.advance(9)
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    row = repo.get_notification(notification_id)
+    assert row["edit_attempts_started"] == 2
+    assert row["message_id"] == 901
+    assert [edit[1] for edit in telegram.edited] == [901, 901]
+
+
+@pytest.mark.parametrize("retry_after, expected", [
+    (90_000, NOW + timedelta(seconds=90_000)),
+    (10**100, datetime.max.replace(tzinfo=timezone.utc)),
+])
+def test_rate_limited_retry_deadline_does_not_truncate_or_overflow(firestore_fake, retry_after, expected):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    reservation = repo.reserve_notification_attempt(
+        accepted.notification_id, attempt_id="long-retry", now=NOW,
+    )
+
+    settled = repo.settle_notification_attempt(
+        accepted.notification_id, attempt_id="long-retry",
+        revision=reservation["attempt_revision"], outcome="rate_limited",
+        retry_after=retry_after, now=NOW,
+    )
+
+    assert settled["retry_not_before"] == expected
 
 
 def test_default_thread_zero_is_persisted_as_no_thread_for_ack_and_new_notice(firestore_fake):

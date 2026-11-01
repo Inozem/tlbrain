@@ -50,6 +50,7 @@ class _RetryState:
     old_shared: dict[str, Any]
     completed_stages: dict[str, dict[str, Any]]
     old_manifest: dict[str, Any]
+    unprepared: bool = False
 
 
 @dataclass(slots=True)
@@ -73,6 +74,8 @@ class _RetrySourceRecords:
     old_shared: dict[str, Any]
     intent: dict[str, Any]
     old_manifest: dict[str, Any]
+    shared_exists: bool = True
+    intent_exists: bool = True
 
 
 def _retry_intent_binding_is_valid(
@@ -223,14 +226,16 @@ def _load_retry_source_records(
         intent_ref.get(transaction=transaction),
         manifest_ref.get(transaction=transaction),
     )
-    if not all(snapshot.exists for snapshot in snapshots):
-        return None
     old_operation_snapshot, old_shared_snapshot, intent_snapshot, manifest_snapshot = snapshots
+    if not old_operation_snapshot.exists or not manifest_snapshot.exists:
+        return None
     return _RetrySourceRecords(
         old_operation=old_operation_snapshot.to_dict() or {},
-        old_shared=old_shared_snapshot.to_dict() or {},
-        intent=intent_snapshot.to_dict() or {},
+        old_shared=old_shared_snapshot.to_dict() or {} if old_shared_snapshot.exists else {},
+        intent=intent_snapshot.to_dict() or {} if intent_snapshot.exists else {},
         old_manifest=manifest_snapshot.to_dict() or {},
+        shared_exists=old_shared_snapshot.exists,
+        intent_exists=intent_snapshot.exists,
     )
 
 
@@ -345,6 +350,7 @@ def _build_retry_state(
     completed_stages: dict[str, dict[str, Any]],
     core_input_digest: str,
     core_input_ref: str,
+    unprepared: bool = False,
 ) -> _RetryState:
     """Assemble the validated retry envelope and its confirmed checkpoint."""
     intent = source.intent
@@ -366,6 +372,7 @@ def _build_retry_state(
         old_shared=source.old_shared,
         completed_stages=completed_stages,
         old_manifest=source.old_manifest,
+        unprepared=unprepared,
     )
 
 
@@ -392,6 +399,54 @@ def _load_retry_state(
         intent_id=draft.intent_id, manifest_ref=draft.manifest_ref,
     )
     if source is None:
+        return None
+
+    # A pre-core failure has no accepted shared record or create gate. Only
+    # append this special retry when the same transaction proves both absent
+    # and the failed queue operation still names the intact sealed manifest.
+    if not source.shared_exists and not source.intent_exists:
+        operation = source.old_operation
+        route = operation.get("route_control")
+        manifest_digest = hashlib.sha256(json.dumps(
+            {"draft_id": draft.draft_id, "message_ids": draft.ordered_ids},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        route_kind = route.get("kind") if isinstance(route, Mapping) else None
+        valid_route = bool(
+            isinstance(route, Mapping)
+            and route.get("status") in {"ok", "success"}
+            and (route_kind == "save" or (
+                route_kind == "retry"
+                and type(route.get("dialog_number")) is int
+                and route.get("dialog_number") == draft.dialog_number
+                and (operation.get("retry_request_operation_id") is None
+                     or isinstance(operation.get("retry_request_operation_id"), str))
+                and operation.get("draft_id") == draft.draft_id
+            ))
+        )
+        if (operation.get("state") != "failed"
+                or operation.get("save_operation_id") != draft.previous_operation_id
+                or operation.get("target_draft_id") != draft.draft_id
+                or (operation.get("save_intent_id") or operation.get("save_operation_id"))
+                   != draft.intent_id
+                or not valid_route
+                or draft.digest != manifest_digest
+                or source.old_manifest.get("draft_id") != draft.draft_id
+                or source.old_manifest.get("save_operation_id") != draft.previous_operation_id
+                or source.old_manifest.get("manifest_digest") != draft.digest
+                or source.old_manifest.get("ordered_message_ids") != draft.ordered_ids):
+            return None
+        completed_stages = _load_completed_retry_stages(
+            transaction, context_ref=context_ref,
+            previous_operation_id=draft.previous_operation_id,
+        )
+        return _build_retry_state(
+            context_ref, draft, source,
+            create_gate_operation_id=draft.previous_operation_id,
+            completed_stages=completed_stages,
+            core_input_digest="", core_input_ref="", unprepared=True,
+        )
+    if not source.shared_exists or not source.intent_exists:
         return None
 
     dispatch_operation_ids, create_gate_operation_id = _retry_create_gate_identity(
@@ -485,23 +540,27 @@ def _persist_retry(
         operation_fields={
             "draft_id": state.draft_id, "dialog_number": state.dialog_number,
             "save_intent_id": state.intent_id, "doc_id": state.doc_id,
-            **({"route_control": {"status": "ok", "kind": "retry",
-                                   "dialog_number": state.dialog_number,
-                                   "retry_request_operation_id": request_operation_id},
+            "target_draft_id": state.draft_id, "save_operation_id": operation_id,
+            "route_control": {"status": "ok", "kind": "retry",
+                               "dialog_number": state.dialog_number,
+                               **({"retry_request_operation_id": request_operation_id}
+                                  if request_operation_id is not None else {})},
+            **({
                 "retry_request_operation_id": request_operation_id}
                if request_operation_id is not None else {}),
         },
     )
     if request_operation_id is None:
         transaction.set(command_ref, command_data)
-    shared_ref = client.collection(OPERATIONS_COLLECTION).document(operation_id)
-    transaction.set(shared_ref, _retry_operation_data(
-        operation_id=operation_id, context_id=context_id, draft_id=state.draft_id,
-        intent_id=state.intent_id, doc_id=state.doc_id, digest=state.digest,
-        core_input_digest=state.core_input_digest, core_input_ref=state.core_input_ref,
-        create_gate_operation_id=state.create_gate_operation_id,
-        manifest_path=retry_manifest_path, now=now, previous=state.old_shared,
-    ))
+    if not state.unprepared:
+        shared_ref = client.collection(OPERATIONS_COLLECTION).document(operation_id)
+        transaction.set(shared_ref, _retry_operation_data(
+            operation_id=operation_id, context_id=context_id, draft_id=state.draft_id,
+            intent_id=state.intent_id, doc_id=state.doc_id, digest=state.digest,
+            core_input_digest=state.core_input_digest, core_input_ref=state.core_input_ref,
+            create_gate_operation_id=state.create_gate_operation_id,
+            manifest_path=retry_manifest_path, now=now, previous=state.old_shared,
+        ))
     for stage_key, source_stage in state.completed_stages.items():
         queue_operation_ref = state.context_ref.collection("operations").document(operation_id)
         transaction.set(queue_operation_ref.collection("stages").document(stage_key), {

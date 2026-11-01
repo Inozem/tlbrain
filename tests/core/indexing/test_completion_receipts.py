@@ -706,6 +706,59 @@ def test_provider_mismatch_cannot_finalize(firestore_fake, sdk_fakes, monkeypatc
     assert intent.get("cleanup_authorization") is None
 
 
+def test_public_finalize_wrapper_accepts_explicit_retry_binding_without_rewriting_create_gate(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.operations import OPERATIONS_COLLECTION
+    from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION
+    from core.integrations.firestore.operations import get_operation
+
+    client = firestore_fake.client_class()
+    lease, intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    retry_id = "completion-numbered-retry"
+    origin_binding = {
+        "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+        "manifest_digest": "sha256:synthetic-manifest",
+    }
+    original = client.collection(OPERATIONS_COLLECTION).document(OPERATION_ID).get().to_dict()
+    retry_authorization = {
+        "operation_id": retry_id, "previous_operation_id": OPERATION_ID,
+        "create_gate_operation_id": OPERATION_ID,
+        **origin_binding, "caller_binding": original["caller_binding"],
+        "immutable_input_digest": original["immutable_input_digest"],
+    }
+    retry = {
+        **original, "operation_id": retry_id, "state": "running",
+        "lease_owner": "retry-worker", "lease_expires_at": NOW + timedelta(minutes=2),
+        "fence": 1, "origin_binding": origin_binding,
+        "retry_authorization": retry_authorization,
+        "retry_of_operation_id": OPERATION_ID,
+        "retry_draft_id": origin_binding["draft_id"],
+        "updated_at": NOW,
+    }
+    client.collection(OPERATIONS_COLLECTION).document(retry_id).set(retry)
+    intent_before = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).get().to_dict()
+    assert intent_before["dispatch_operation_id"] == OPERATION_ID
+    _synthetic_google_oauth(monkeypatch)
+
+    result = _completion_module().finalize_save(
+        client, operation_id=retry_id, save_intent_id=intent_id,
+        owner="retry-worker", fence=1, origin_binding=origin_binding,
+        now=NOW, clock=lambda: NOW,
+    )
+
+    assert result is not None and result.document_id == DOC_ID
+    assert get_operation(client, retry_id).state.value == "completed"
+    certificate = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).get().to_dict()[
+        "completion_certificate"
+    ]
+    assert certificate["operation_id"] == retry_id
+    assert certificate["origin_binding"] == origin_binding
+    assert client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).get().to_dict()[
+        "dispatch_operation_id"
+    ] == OPERATION_ID
+
+
 @pytest.mark.parametrize("certificate_field", ["operation_id", "save_intent_id", "doc_id"])
 def test_misbound_completion_certificate_does_not_replay(
     firestore_fake, sdk_fakes, monkeypatch, certificate_field,

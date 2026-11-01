@@ -46,10 +46,13 @@ def _replay(db: Any, operation_id: str, save_intent_id: str, origin_binding: dic
     certificate = intent.get("completion_certificate") or {}
     result = _result_from(operation.get("result"))
     doc_id = operation.get("doc_id")
+    binding_matches = save_intents._completion_operation_binding_matches(
+        operation, intent, operation_id=operation_id, origin_binding=origin_binding,
+    )
     if (operation.get("state") == "completed"
             and operation.get("save_intent_id") == save_intent_id
             and intent.get("save_intent_id") == save_intent_id
-            and intent.get("dispatch_operation_id") == operation_id
+            and binding_matches
             and intent.get("doc_id") == doc_id
             and certificate.get("operation_id") == operation_id
             and certificate.get("save_intent_id") == save_intent_id
@@ -88,7 +91,9 @@ def finalize_save(
     intent = intent_snapshot.to_dict() or {}
     doc_id = intent.get("doc_id")
     if (not doc_id or operation.get("save_intent_id") != save_intent_id
-            or intent.get("dispatch_operation_id") != operation_id
+            or not save_intents._completion_operation_binding_matches(
+                operation, intent, operation_id=operation_id, origin_binding=origin_binding,
+            )
             or intent.get("state") != save_intents.SaveIntentState.CONFIRMED.value):
         return None
 
