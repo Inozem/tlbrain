@@ -177,6 +177,28 @@ def test_preserves_source_text_whitespace_and_does_not_mutate_input_records():
     assert message == original
 
 
+def test_skips_blank_standalone_rows_but_preserves_fragments_of_meaningful_text():
+    whitespace = _message(1, "  \n\t ")
+    meaningful = _message(2, "  exact text  ")
+    meaningful["caption"] = "\n  "
+
+    prepared = _preprocess([whitespace, meaningful])
+
+    assert len(prepared) == 1
+    assert _source_ids(prepared[0]) == [2]
+    assert _field(prepared[0], "text") == "  exact text  \n\n\n  "
+
+
+def test_blank_different_author_breaks_an_existing_merge_block():
+    prepared = _preprocess([
+        _message(1, "first", reliable_author_key="user:7"),
+        _message(2, " \t ", reliable_author_key="user:8"),
+        _message(3, "last", reliable_author_key="user:7"),
+    ])
+
+    assert [_source_ids(item) for item in prepared] == [[1], [3]]
+
+
 def test_merged_text_preserves_multiline_and_indented_source_fragments_in_order():
     first_text = "  first fragment\n\n\tfirst indentation"
     second_text = "second fragment\n  second indentation\n\n"

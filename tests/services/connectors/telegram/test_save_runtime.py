@@ -19,6 +19,42 @@ import httpx
 pytestmark = pytest.mark.offline
 
 
+def test_contentless_refusal_remains_bound_to_its_operation_after_new_retry(firestore_fake):
+    from services.connectors.telegram.runtime.saving import TelegramSaveRuntime
+
+    client = firestore_fake.client_class()
+    draft = {
+        "draft_id": "legacy-draft", "dialog_number": 4,
+        "active_save_operation_id": "operation-new", "save_error_code": "other_error",
+        "manifest_ref": None,
+    }
+    repository = SimpleNamespace(client=client, get_draft=lambda *_args: draft)
+    runtime = TelegramSaveRuntime(repository=repository)
+    runtime._queue_row = lambda *_args: {
+        "operation_id": "operation-old", "dialog_number": 4,
+        "safe_save_refusal": {
+            "code": "no_supported_content",
+            "message": "No supported text or completed audio was available. The source is retained.",
+        },
+    }
+    runtime._captured_binding = lambda *_args: ("legacy-draft", "intent-old")
+
+    class Governor:
+        max_failures = 3
+
+        @staticmethod
+        def get_stage(*_args):
+            return None
+
+    reply = runtime.failure_reply(
+        "77_default", {"operation_id": "operation-old"}, Governor(),
+    )
+
+    assert "No supported text or completed audio" in reply
+    assert "source is retained" in reply
+    assert "failures=" not in reply
+
+
 @pytest.mark.parametrize("raw", [
     None,
     "",
@@ -716,8 +752,10 @@ def test_default_worker_terminalizes_three_metadata_failures_once(
                 if method == "sendMessage" and "Error in gemini/metadata" in payload.get("text", "")]) == 1
 
 
+@pytest.mark.parametrize("reuse_legacy_cached_stages", [False, True])
 def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_draft(
     firestore_fake, sdk_fakes, monkeypatch,
+    reuse_legacy_cached_stages,
 ):
     """Retry the failed numbered dialog through the real queue and managed index gates."""
     from google.genai import types
@@ -842,6 +880,7 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
         return await post("/internal/deliver", task)
 
     source_a = "The exact forwarded source line for dialog A."
+    source_a_second = "The second exact source row for dialog A."
     forward_a = {"update_id": 15501, "message": {
         "message_id": 61, "date": 1793320000,
         "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
@@ -853,6 +892,26 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
                  if item["body"].get("target_kind") == "telegram_dispatch"
                  and item["body"].get("notification_id"))
     assert asyncio.run(deliver(ack_a), loop_factory=_selector_loop).status_code == 200
+
+    if reuse_legacy_cached_stages:
+        from services.connectors.telegram.repository import TelegramRepository
+        from services.connectors.telegram.intake import normalize_forward
+        legacy_empty_source = normalize_forward({
+            "message_id": 66, "date": 1793320005,
+            "forward_origin": {"type": "user", "sender_user": {
+                "id": 46, "first_name": "Empty sender"}},
+        })
+        legacy_insert = TelegramRepository(client=db).accept_forward(
+            15507, chat_id=77, message=legacy_empty_source, now=clock(),
+        )
+        assert legacy_insert.accepted is True and legacy_insert.draft_id
+        forward_a_second = {"update_id": 15508, "message": {
+            "message_id": 67, "date": 1793320006,
+            "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+            "forward_origin": {"type": "user", "sender_user": {"id": 47, "first_name": "Bea"},
+                               "date": 1793310006}, "text": source_a_second,
+        }}
+        assert asyncio.run(webhook(forward_a_second), loop_factory=_selector_loop).status_code == 200
 
     save_update = {"update_id": 15502, "message": {
         "message_id": 62, "date": 1793320010,
@@ -884,7 +943,9 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
     draft_a_before = session.collection("drafts").document(draft_a_id).get().to_dict()
     assert original["state"] == "failed"
     assert draft_a_before["state"] == "failed" and draft_a_before["dialog_number"] == 1
-    assert draft_a_before["ordered_message_ids"] == [61]
+    assert draft_a_before["ordered_message_ids"] == (
+        [61, 66, 67] if reuse_legacy_cached_stages else [61]
+    )
     original_intent_id = draft_a_before["immutable_save_intent_id"]
     from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION
     assert not db.collection("dialog_operations").document(save_task["operation_id"]).get().exists
@@ -944,14 +1005,75 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
 
     # The retry metadata comes only after the retry route; complete it with the
     # same native document, index receipt, and finalizer path as an initial save.
-    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
-        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
-            text=json.dumps({"title": "Dialog A saved", "folder_path": ["Client"]}),
-        )]))],
-    ))
-    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
-        candidates=[types.Candidate(content=types.Content(parts=[]))],
-    ))
+    if not reuse_legacy_cached_stages:
+        sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+            candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+                text=json.dumps({"title": "Dialog A saved", "folder_path": ["Client"]}),
+            )]))],
+        ))
+        sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+            candidates=[types.Candidate(content=types.Content(parts=[]))],
+        ))
+    else:
+        from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+        from services.connectors.telegram.save import _checkpoint_classified
+        from core.dialogs.classification import FolderSelectionResult
+        from services.connectors.telegram.save import TelegramClassifiedDialog
+        from services.connectors.telegram.save_checkpoints import STAGE_PAYLOAD_REF_FIELD
+
+        retry_operation_id = retry_work_task["operation_id"]
+        ledger = FirestoreAgentLedger(
+            db, context_id=context_id, operation_id=retry_operation_id,
+            owner="synthetic-seeded-stage", fence=1, clock=clock,
+        )
+        prepared = [{
+            "order_index": 0, "speaker": "Ada", "reliable_author_key": "telegram-user:44",
+            "text": source_a, "word_count": len(source_a.split()), "source_message_ids": [61],
+        }, {
+            "order_index": 1, "speaker": "Empty sender", "reliable_author_key": "telegram-user:46",
+            "text": "", "word_count": 0, "source_message_ids": [66],
+        }, {
+            "order_index": 2, "speaker": "Bea", "reliable_author_key": "telegram-user:47",
+            "text": source_a_second, "word_count": len(source_a_second.split()),
+            "source_message_ids": [67],
+        }]
+        analysis = {
+            "title": "Dialog A saved", "folder_id": "folder-client", "provider": "telegram",
+            "utterances": [
+                {"speaker": "Ada", "text": source_a},
+                {"speaker": "Ada", "text": ""},
+                {"speaker": "Bea", "text": source_a_second},
+            ],
+        }
+        classification = _checkpoint_classified(TelegramClassifiedDialog(
+            payload=analysis,
+            selection=FolderSelectionResult(folder_id="folder-client"),
+        ))
+        stage_values = {
+            "telegram.preparation": ("preparation", prepared, 0),
+            "telegram.analysis": ("analysis", analysis, 0),
+            "telegram.classification": ("classification", classification, 1),
+        }
+        for stage_key, (kind, value, attempts) in stage_values.items():
+            payload_bytes = ledger._json_bytes(value)
+            descriptor = {
+                "_inline": value,
+                "sha256": hashlib.sha256(payload_bytes).hexdigest(),
+                "byte_length": len(payload_bytes),
+            }
+            (session.collection("operations").document(retry_operation_id)
+             .collection("stages").document(stage_key).set({
+                 "stage_key": stage_key, "state": "completed", "failures": 0,
+                 "attempts_started": attempts, "in_flight_attempt_id": None,
+                 "retry_not_before": None, "last_error": None, "checkpoint_refs": [],
+                 "updated_at": clock(),
+                 "result": {STAGE_PAYLOAD_REF_FIELD: descriptor},
+             }))
+        seeded_stage_rows = {
+            key: (session.collection("operations").document(retry_operation_id)
+                  .collection("stages").document(key).get().to_dict())
+            for key in stage_values
+        }
     sdk_fakes.drive.queue("files.create", response={"id": "doc-numbered-retry"})
     empty_document = {"revisionId": "rev-empty", "body": {"content": [
         {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
@@ -975,6 +1097,18 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
     assert retry_row["save_intent_id"] == original_intent_id
     core_operation = db.collection("dialog_operations").document(retry_work_task["operation_id"]).get().to_dict()
     assert core_operation["doc_id"] == "doc-numbered-retry"
+    if reuse_legacy_cached_stages:
+        from core.dialogs.saving import _load_accepted
+        accepted_input = _load_accepted(db, retry_work_task["operation_id"])
+        assert accepted_input["utterances"] == [
+            {"speaker": "Ada", "text": source_a},
+            {"speaker": "Bea", "text": source_a_second},
+        ]
+        assert retry_row["skipped_utterance_count"] == 1
+        for stage_key, seeded in seeded_stage_rows.items():
+            actual = (session.collection("operations").document(retry_work_task["operation_id"])
+                      .collection("stages").document(stage_key).get().to_dict())
+            assert actual == seeded
     index_task = next(item for item in task_requests
                       if item["url"].endswith("/sync/doc/doc-numbered-retry"))
     fill_events = [event for event in sdk_fakes.trace
@@ -982,6 +1116,9 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
     assert len(fill_events) == 1
     reader_text = fill_events[0]["arguments"]["body"]["requests"][0]["insertText"]["text"]
     assert source_a in reader_text and source_b not in reader_text
+    from core.parsing.parser import parse_document
+    expected_rows = [source_a, source_a_second] if reuse_legacy_cached_stages else [source_a]
+    assert [row["text"] for row in parse_document(reader_text)[1]] == expected_rows
     monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
                         lambda _doc_id: ("folder-client", False, "Dialog A saved"))
     monkeypatch.setattr("services.vector_sync.app.main.read_google_doc", lambda _doc_id: reader_text)
@@ -994,6 +1131,10 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
         async with httpx.AsyncClient(transport=transport, base_url="http://vector.test") as client:
             return await client.post("/sync/doc/doc-numbered-retry", json=index_task["body"])
 
+    if reuse_legacy_cached_stages:
+        sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+            candidates=[types.Candidate(content=types.Content(parts=[]))],
+        ))
     indexed = asyncio.run(sync_document(), loop_factory=_selector_loop)
     assert indexed.status_code == 200, indexed.text
     assert indexed.json()["status"] == "ok"
@@ -1020,6 +1161,8 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
     assert retry_row["state"] == "completed"
     assert retry_row["doc_id"] == "doc-numbered-retry"
     assert draft_a_after["state"] == "cleaned" and draft_a_after["dialog_number"] == 1
+    if reuse_legacy_cached_stages:
+        assert draft_a_after["manifest_digest"] == draft_a_before["manifest_digest"]
     assert original_after["state"] == "failed"
     assert draft_b_after["state"] == "collecting"
     assert draft_b_after["ordered_message_ids"] == [63]
@@ -1035,6 +1178,8 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
                   if method == "sendMessage"
                   and "Dialog #1: Saved and indexed. Folder: Client." in payload.get("text", "")]
     assert len(final_msgs) == 1
+    if reuse_legacy_cached_stages:
+        assert "Skipped 1 forwarded item without supported text or audio." in final_msgs[0]["text"]
     completed_log = next(row for row in settlement_logs if row.get("outcome") == "completed")
     assert completed_log["operation_id"] == retry_work_task["operation_id"]
     assert completed_log["context_id"] == context_id
@@ -1044,11 +1189,15 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
                       if event["boundary"] == "gemini"
                       and event["operation"] == "generate_content"
                       and "Infer a concise dialog title" in str(event["arguments"])]
-    assert len(metadata_calls) == 4
+    assert len(metadata_calls) == (3 if reuse_legacy_cached_stages else 4)
     for metadata_call in metadata_calls:
         metadata_prompt = json.loads(metadata_call["arguments"]["contents"])
         assert metadata_prompt["user_request"] == "save this dialog"
-        assert metadata_prompt["prepared_dialogue"] == [{"speaker": "Ada", "text": source_a}]
+        assert metadata_prompt["prepared_dialogue"] == (
+            [{"speaker": "Ada", "text": source_a},
+             {"speaker": "Bea", "text": source_a_second}]
+            if reuse_legacy_cached_stages else [{"speaker": "Ada", "text": source_a}]
+        )
         prompt_text = json.dumps(metadata_prompt, ensure_ascii=False)
         assert source_b not in prompt_text and retry_text not in prompt_text
     requests_before_duplicate = dict(firestore_fake.documents)
@@ -1938,6 +2087,30 @@ def _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch, *,
         dispatch=dispatch,
         deliver=lambda task: post("/internal/deliver", task), route_response=route_response,
     )
+
+
+def test_default_app_delivers_unsupported_forward_notice_once(firestore_fake, sdk_fakes, monkeypatch):
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    update = {"update_id": 18701, "message": {
+        "message_id": 81, "date": 1793320000,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44}},
+        "photo": [{"file_id": "synthetic-photo"}],
+    }}
+
+    assert asyncio.run(runtime.webhook(update), loop_factory=_selector_loop).status_code == 200
+    assert asyncio.run(runtime.webhook(update), loop_factory=_selector_loop).status_code == 200
+    task = next(item["body"] for item in runtime.task_requests if item["body"].get("notification_id"))
+    first = asyncio.run(runtime.deliver(task), loop_factory=_selector_loop)
+    duplicate = asyncio.run(runtime.deliver(task), loop_factory=_selector_loop)
+
+    assert first.status_code == duplicate.status_code == 200
+    assert len(runtime.sent) == 1
+    assert "no supported text or audio" in runtime.sent[0][1]["text"]
+    context = runtime.db.collection("telegram_sessions").document(task["context_id"])
+    assert list(context.collection("drafts").stream()) == []
+    assert list(context.collection("operations").stream()) == []
+    assert not [event for event in sdk_fakes.trace if event["boundary"] == "gemini"]
 
 
 def test_default_worker_audio_transcription_failure_uses_exact_stage_evidence(

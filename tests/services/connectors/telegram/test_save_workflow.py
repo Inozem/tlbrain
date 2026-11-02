@@ -335,6 +335,167 @@ def test_audio_barrier_precedes_ordered_preprocessing_analysis_and_classificatio
     assert repository.draft["source_manifest"] == original_manifest
 
 
+@pytest.mark.parametrize("empty_text", ["", " \n\t"])
+def test_cached_classification_projection_skips_empty_rows_for_core_save(empty_text):
+    from core.dialogs.classification import FolderSelectionResult
+    from services.connectors.telegram.save import TelegramClassifiedDialog
+
+    repository = _Repository(messages=[
+        _message(1, "first source"), _message(2, empty_text), _message(3, "last source"),
+    ])
+    original_manifest = copy.deepcopy(repository.draft["source_manifest"])
+    events = []
+    pipeline = _Pipeline(events, receipt=_receipt(repository))
+    original = [
+        {"speaker": "Ada", "text": "first exact"},
+        {"speaker": "Ada", "text": empty_text},
+        {"speaker": "Bo", "text": "last exact"},
+    ]
+
+    async def analyze(_messages, *, context):
+        return {"title": "Synthetic title", "utterances": copy.deepcopy(original)}
+
+    async def classify(result, *, draft_id):
+        return TelegramClassifiedDialog(
+            payload={"title": result["title"], "utterances": result["utterances"],
+                     "provider": "telegram"},
+            selection=FolderSelectionResult(folder_id=None),
+        )
+
+    pipeline.analyze = analyze
+    pipeline.classify = classify
+
+    async def prepare(_messages):
+        return [
+            {"order_index": 0, "speaker": "Ada", "reliable_author_key": "user:1",
+             "text": "first source", "word_count": 2, "source_message_ids": [1]},
+            {"order_index": 1, "speaker": "Ada", "reliable_author_key": "user:2",
+             "text": empty_text, "word_count": 0, "source_message_ids": [2]},
+            {"order_index": 2, "speaker": "Bo", "reliable_author_key": "user:3",
+             "text": "last source", "word_count": 2, "source_message_ids": [3]},
+        ]
+
+    workflow = _save_type()(
+        repository=repository, audio_transcriber=_Audio(repository, events),
+        context_id="telegram-context-1", preprocess=prepare,
+        analyze=pipeline.analyze, classify=pipeline.classify, save=pipeline.save,
+    )
+
+    _run(workflow.save(draft_id="draft-original", intent_id="intent-1", operation_id="operation-1"))
+
+    saved = pipeline.saved_inputs[0]
+    assert saved["utterances"] == [original[0], original[2]]
+    assert repository.draft["source_manifest"] == original_manifest
+    assert _value(repository.certificate, "skipped_utterance_count") == 1
+
+
+def test_fresh_preparation_reports_source_skips_in_verified_completion():
+    repository = _Repository(messages=[
+        _message(1, "first exact"), _message(2, " \n "), _message(3, "last exact"),
+    ])
+    events = []
+    pipeline = _Pipeline(events, receipt=_receipt(repository))
+
+    async def analyze(prepared, *, context):
+        return {"title": "Synthetic title", "utterances": [
+            {"speaker": row["speaker"], "text": row["text"]} for row in prepared
+        ]}
+
+    async def classify(result, *, draft_id):
+        return {"title": result["title"], "utterances": result["utterances"],
+                "provider": "telegram"}
+
+    from services.connectors.telegram.preprocessing import preprocess_messages
+    workflow = _save_type()(
+        repository=repository, audio_transcriber=_Audio(repository, events),
+        context_id="telegram-context-1", preprocess=preprocess_messages,
+        analyze=analyze, classify=classify, save=pipeline.save,
+    )
+
+    _run(workflow.save(draft_id="draft-original", intent_id="intent-1", operation_id="operation-1"))
+
+    assert pipeline.saved_inputs[0]["utterances"] == [
+        {"speaker": "Unknown", "text": "first exact"},
+        {"speaker": "Unknown", "text": "last exact"},
+    ]
+    assert _value(repository.certificate, "skipped_utterance_count") == 1
+
+
+@pytest.mark.parametrize("bad_row", [None, {"speaker": "Ada"},
+                                      {"speaker": "Ada", "text": None},
+                                      {"speaker": "Ada", "text": "ok", "extra": 1}])
+def test_cached_classification_projection_rejects_malformed_rows(bad_row):
+    from services.connectors.telegram.save import _project_contentless_utterances
+
+    with pytest.raises(ValueError, match="classified utterance"):
+        _project_contentless_utterances({
+            "title": "Synthetic", "provider": "telegram", "utterances": [bad_row],
+        }, allowed_skip_count=1)
+
+
+def test_all_empty_cached_classification_fails_before_core_save():
+    from core.dialogs.classification import FolderSelectionResult
+    from services.connectors.telegram.save import TelegramClassifiedDialog, TelegramSaveError
+
+    repository = _Repository(messages=[_message(1, "")])
+    events = []
+    pipeline = _Pipeline(events, receipt=_receipt(repository))
+
+    async def analyze(_messages, *, context):
+        return {"title": "Synthetic title", "utterances": [{"speaker": "Ada", "text": ""}]}
+
+    async def classify(result, *, draft_id):
+        return TelegramClassifiedDialog(
+            {"title": result["title"], "utterances": result["utterances"], "provider": "telegram"},
+            FolderSelectionResult(folder_id=None),
+        )
+
+    async def prepare(_messages):
+        return [{"order_index": 0, "speaker": "Ada", "reliable_author_key": None,
+                 "text": "", "word_count": 0, "source_message_ids": [1]}]
+
+    workflow = _save_type()(
+        repository=repository, audio_transcriber=_Audio(repository, events),
+        context_id="telegram-context-1", preprocess=prepare,
+        analyze=analyze, classify=classify, save=pipeline.save,
+    )
+    with pytest.raises(TelegramSaveError, match="no_supported_content"):
+        _run(workflow.save(draft_id="draft-original", intent_id="intent-1", operation_id="operation-1"))
+    assert pipeline.saved_inputs == []
+    assert repository.draft["messages"] == repository.draft["source_manifest"]
+
+
+def test_all_empty_preparation_fails_before_analysis_or_classification():
+    from services.connectors.telegram.save import TelegramSaveError
+
+    repository = _Repository(messages=[_message(1, " ")])
+    events = []
+
+    async def preprocess(_messages):
+        return []
+
+    async def analyze(*_args, **_kwargs):
+        events.append("analyze")
+        raise AssertionError("empty preparation must not call analysis")
+
+    async def classify(*_args, **_kwargs):
+        events.append("classify")
+        raise AssertionError("empty preparation must not call classification")
+
+    async def save(*_args, **_kwargs):
+        events.append("save")
+        raise AssertionError("empty preparation must not reach core save")
+
+    workflow = _save_type()(
+        repository=repository, audio_transcriber=_Audio(repository, events),
+        context_id="telegram-context-1", preprocess=preprocess,
+        analyze=analyze, classify=classify, save=save,
+    )
+    with pytest.raises(TelegramSaveError, match="no_supported_content"):
+        _run(workflow.save(draft_id="draft-original", intent_id="intent-1", operation_id="operation-1"))
+    assert events == ["audio:start", "audio:checkpointed"]
+
+
 def test_indexing_pending_propagates_as_running_without_failed_workflow_state():
     from services.connectors.telegram.save import TelegramSavePending
 

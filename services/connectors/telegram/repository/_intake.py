@@ -467,6 +467,84 @@ class _TelegramIntakeMixin:
         return _txn(self.client.transaction(max_attempts=5))
 
 
+    def record_unsupported_forward(
+        self,
+        update_id: int,
+        *,
+        chat_id: int,
+        thread_id: int | None = None,
+        topic_name: str | None = None,
+        message_id: int,
+        now: datetime,
+    ) -> TelegramIntakeResult:
+        """Durably acknowledge a contentless/unsupported forward without a draft."""
+        update_id = _integer(update_id, "update_id")
+        chat_id = _integer(chat_id, "chat_id")
+        message_id = _integer(message_id, "message_id", minimum=1)
+        if thread_id is not None:
+            thread_id = _integer(thread_id, "thread_id", minimum=1)
+        if topic_name is not None and not isinstance(topic_name, str):
+            raise ValueError("topic_name must be a string or None")
+        now = _aware(now, "now")
+        context_id = build_context_id(chat_id, thread_id)
+        receipt_ref = _document_ref(self.client, f"{SESSIONS}/{context_id}/updates/{update_id}")
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        notification_id = "tgunsupported-" + hashlib.sha256(
+            f"{context_id}:{update_id}".encode()
+        ).hexdigest()
+        outbox_id = "tgunsupported-dispatch-" + hashlib.sha256(
+            f"{context_id}:{update_id}".encode()
+        ).hexdigest()
+        notification_ref = self.client.collection(NOTIFICATIONS).document(notification_id)
+
+        @firestore.transactional
+        def _txn(transaction: firestore.Transaction) -> TelegramIntakeResult:
+            receipt_snap = receipt_ref.get(transaction=transaction)
+            if receipt_snap.exists:
+                return _receipt_result(receipt_snap.to_dict() or {}, context_id)
+            context_snap = context_ref.get(transaction=transaction)
+            context = context_snap.to_dict() or {}
+            for key, value in _context_defaults(chat_id, thread_id, topic_name, now).items():
+                context.setdefault(key, value)
+            context.update({"chat_id": chat_id, "thread_id": thread_id, "updated_at": now})
+            if topic_name is not None:
+                context["topic_name"] = topic_name
+            notification = {
+                "notification_id": notification_id, "context_id": context_id,
+                "kind": "unsupported_forward",
+                "body": "This forwarded item has no supported text or audio, so it was skipped. Send text, a caption, or audio to add content.",
+                "chat_id": chat_id, "thread_id": thread_id,
+                "message_id": None, "dialog_number": None, "operation_id": None,
+                "state": "pending", "revision": 1, "desired_status_revision": 1,
+                "send_attempts_started": 0, "edit_attempts_started": 0,
+                "unknown_send_outcome": False, "in_flight_attempt_id": None,
+                "attempt_expires_at": None, "last_outcome": None, "retry_not_before": None,
+                "terminal_failure": None, "last_error": None, "delivered_at": None,
+                "failed_at": None, "created_at": now, "updated_at": now,
+            }
+            task = create_outbox_record_in_transaction(
+                self.client, transaction, outbox_id,
+                target_kind=OutboxTargetKind.TELEGRAM_DISPATCH, generation=1,
+                schedule_at=now, now=now, context_id=context_id,
+                notification_id=notification_id,
+            )
+            transaction.set(notification_ref, notification)
+            transaction.set(context_ref, context)
+            transaction.set(receipt_ref, {
+                "update_id": update_id, "context_id": context_id,
+                "accepted": True, "outcome": "unsupported_forward_skipped",
+                "draft_id": None, "dialog_number": None, "message_id": message_id,
+                "intake_sequence": None, "notification_id": notification_id,
+                "outbox_id": task.outbox_id, "created_at": now,
+            })
+            return TelegramIntakeResult(
+                True, context_id, message_id=message_id,
+                notification_id=notification_id, outbox_id=task.outbox_id,
+            )
+
+        return _txn(self.client.transaction(max_attempts=5))
+
+
     def get_update_receipt(self, context_id: str, update_id: int) -> dict[str, Any] | None:
         context_id = _identifier(context_id, "context_id")
         update_id = _integer(update_id, "update_id")

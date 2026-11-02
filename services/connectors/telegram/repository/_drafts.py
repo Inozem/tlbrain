@@ -704,6 +704,7 @@ class _TelegramDraftMixin:
         _validate_save_fence_args(operation_id, owner, fence, now)
         context_ref = self.client.collection(SESSIONS).document(context_id)
         draft_ref = context_ref.collection("drafts").document(draft_id)
+        operation_ref = context_ref.collection("operations").document(operation_id)
 
         @firestore.transactional
         def _txn(transaction: Any) -> bool:
@@ -711,6 +712,8 @@ class _TelegramDraftMixin:
             if not snapshot.exists:
                 return False
             draft = snapshot.to_dict() or {}
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            operation = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
             _assert_save_fence(
                 self.client, transaction, context_id=context_id, draft_id=draft_id,
                 operation_id=operation_id, owner=owner, fence=fence, now=now,
@@ -720,9 +723,23 @@ class _TelegramDraftMixin:
                     or draft.get("state") not in {TelegramDraftState.PROCESSING.value,
                                                     TelegramDraftState.FAILED.value}):
                 return False
+            if (error_code == "no_supported_content"
+                    and (not operation_snapshot.exists
+                         or operation.get("operation_id") != operation_id)):
+                return False
             draft.update({"state": TelegramDraftState.FAILED.value,
                           "save_error_code": error_code, "updated_at": now})
             transaction.set(draft_ref, draft)
+            if error_code == "no_supported_content":
+                operation["safe_save_refusal"] = {
+                    "code": "no_supported_content",
+                    "message": (
+                        "No supported text or completed audio was available. "
+                        "The source is retained."
+                    ),
+                }
+                operation["updated_at"] = now
+                transaction.set(operation_ref, operation)
             return True
         return _txn(self.client.transaction(max_attempts=5))
 

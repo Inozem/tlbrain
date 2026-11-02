@@ -264,6 +264,33 @@ def test_duplicate_update_reuses_all_records_and_repairs_same_outbox_after_gap(
     )) == 1
 
 
+def test_unsupported_contentless_forward_gets_one_durable_notice_without_draft(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    publisher = _Publisher()
+    intake = _intake(repository, publisher, _Classifier(), _Classifier())
+    update = _forward(801)
+    update["message"].pop("text")
+    update["message"]["photo"] = [{"file_id": "synthetic-photo"}]
+
+    first = intake.handle_update(update)
+    replay = intake.handle_update(update)
+
+    assert _value(first, "accepted") is True
+    assert _value(first, "draft_id") is None
+    assert _value(first, "notification_id") == _value(replay, "notification_id")
+    assert _value(first, "outbox_id") == _value(replay, "outbox_id")
+    context_id = _value(first, "context_id")
+    receipt = _read_doc(client, f"telegram_sessions/{context_id}/updates/801")
+    notice = _read_doc(client, f"notification_outbox/{_value(first, 'notification_id')}")
+    outbox = _read_doc(client, f"task_outbox/{_value(first, 'outbox_id')}")
+    assert receipt["outcome"] == "unsupported_forward_skipped"
+    assert notice["kind"] == "unsupported_forward"
+    assert "no supported text or audio" in notice["body"]
+    assert outbox["notification_id"] == notice["notification_id"]
+    assert not _direct_child_paths(firestore_fake, f"telegram_sessions/{context_id}/drafts")
+    assert publisher.outbox_ids == [_value(first, "outbox_id"), _value(first, "outbox_id")]
+
+
 @pytest.mark.parametrize(("chat_type", "user_id"), [("group", 7), ("private", 999)])
 def test_disallowed_chat_or_sender_is_acknowledged_without_persisting_content(
     firestore_fake, chat_type, user_id

@@ -113,6 +113,7 @@ class TelegramCompletionCertificate:
     provider: str = "telegram"
     dialog_date: str = ""
     classification_outcome: str | None = None
+    skipped_utterance_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +122,7 @@ class TelegramClassifiedDialog:
 
     payload: Any
     selection: FolderSelectionResult
+    skipped_utterance_count: int = 0
 
 
 def _checkpoint_classified(value: Any) -> Any:
@@ -134,6 +136,7 @@ def _checkpoint_classified(value: Any) -> Any:
             "speaker_candidate_ids": list(value.selection.speaker_candidate_ids),
             "requires_unassigned": value.selection.requires_unassigned,
         },
+        "skipped_utterance_count": value.skipped_utterance_count,
     }
 
 
@@ -151,6 +154,7 @@ def _restore_classified(value: Any) -> Any:
             speaker_candidate_ids=tuple(selection.get("speaker_candidate_ids", ())),
             requires_unassigned=bool(selection.get("requires_unassigned", False)),
         ),
+        skipped_utterance_count=max(0, int(value.get("skipped_utterance_count", 0))),
     )
 
 
@@ -191,6 +195,13 @@ class TelegramSaveError(RuntimeError):
         super().__init__(f"Telegram save failed during {stage} ({error_code})")
 
 
+class _NoSupportedContentError(TelegramSaveError):
+    """Trusted connector refusal for a sealed input with no saveable content."""
+
+    def __init__(self) -> None:
+        super().__init__("preparation", "no_supported_content", retryable_stage=False)
+
+
 class TelegramSavePending(RuntimeError):
     """Control signal for a durably accepted save that is awaiting indexing."""
 
@@ -223,6 +234,7 @@ class TelegramSaveWorkflow:
         self.status: dict[str, str | None] = {
             "stage": "idle", "state": "idle", "error_code": None,
         }
+        self._skipped_content_count = 0
 
     def _stage(self, stage: str) -> None:
         self.status = {"stage": stage, "state": "running", "error_code": None}
@@ -331,7 +343,17 @@ class TelegramSaveWorkflow:
         prepared = await self._unpack_large_stage_result(prepared)
         if not isinstance(prepared, Sequence) or isinstance(prepared, (str, bytes)):
             raise ValueError("prepared utterances are malformed")
-        prepared_rows = [_prepared_row(row) for row in prepared]
+        prepared_rows, contentless_source_count = _project_prepared_utterances(prepared, messages)
+        self._skipped_content_count = max(
+            self._skipped_content_count, contentless_source_count,
+        )
+        if self._skipped_content_count:
+            await _record_skipped_content_count(
+                self, self._skipped_content_count,
+            )
+        if not prepared_rows:
+            self._stage("preparation")
+            raise _NoSupportedContentError()
         context = build_save_analysis_context(
             prepared_rows, context_id=context_id, draft_id=draft_id,
             dialog_date=dialog_date,
@@ -439,6 +461,7 @@ class TelegramSaveWorkflow:
             classified = await self._unpack_large_stage_result(classified)
             classified = _restore_classified(classified)
         outcome = None
+        selection = None
         if isinstance(classified, TelegramClassifiedDialog):
             selection = classified.selection
             outcome = (
@@ -447,6 +470,22 @@ class TelegramSaveWorkflow:
                 else None
             )
             classified = classified.payload
+        classified, skipped_count = _project_contentless_utterances(
+            classified, allowed_skip_count=self._skipped_content_count,
+        )
+        self._skipped_content_count = max(self._skipped_content_count, skipped_count)
+        if self._skipped_content_count:
+            await _record_skipped_content_count(
+                self, self._skipped_content_count,
+            )
+        if skipped_count and not _utterances(classified):
+            self._stage("preparation")
+            raise _NoSupportedContentError()
+        if self._skipped_content_count:
+            classified = TelegramClassifiedDialog(
+                payload=classified, selection=selection or FolderSelectionResult(folder_id=None),
+                skipped_utterance_count=self._skipped_content_count,
+            )
         return classified, guard_before, outcome
 
     async def _save_and_complete(
@@ -472,6 +511,11 @@ class TelegramSaveWorkflow:
         if _call_supports(self.save_pipeline, "dialog_date"):
             provider_args["dialog_date"] = sealed.dialog_date
         save_input = _with_save_metadata(classified, sealed.dialog_date)
+        skipped_count = max(
+            self._skipped_content_count,
+            classified.skipped_utterance_count
+            if isinstance(classified, TelegramClassifiedDialog) else 0,
+        )
         try:
             receipt = await _await(self.save_pipeline(
                 save_input, **save_args, **provider_args,
@@ -518,6 +562,7 @@ class TelegramSaveWorkflow:
             origin_binding=(sealed.context_id, sealed.draft_id, sealed.manifest_digest),
             dialog_date=sealed.dialog_date,
             classification_outcome=classification_outcome,
+            skipped_utterance_count=skipped_count,
         )
         committed = await _await(self.repository.commit_completion(certificate))
         if committed is False:
@@ -534,6 +579,7 @@ class TelegramSaveWorkflow:
         operation_lease: Any = None,
     ) -> Any:
         self._stage("load")
+        self._skipped_content_count = 0
         try:
             sealed = await self._load_sealed_input(draft_id)
             classified, guard_before, classification_outcome = await self._transcribe_analyze_and_classify(
@@ -558,8 +604,11 @@ class TelegramSaveWorkflow:
             }
             raise
         except TelegramSaveError as error:
-            stage = self.status["stage"] or "load"
-            code = _error_code(error)
+            if isinstance(error, _NoSupportedContentError):
+                stage, code = "preparation", "no_supported_content"
+            else:
+                stage = self.status["stage"] or "load"
+                code = _error_code(error)
             self.status = {
                 "stage": stage,
                 "state": "failed",
@@ -580,6 +629,86 @@ async def _await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _project_prepared_utterances(prepared: Sequence[Any], messages: Sequence[Any]) -> tuple[list[Any], int]:
+    """Filter cached blank rows and count sealed sources confirmed contentless."""
+    contentless_ids = set()
+    for message in messages:
+        message_id = _get(message, "message_id")
+        if (type(message_id) is int and not _get(message, "audio_file_id")
+                and not any(
+                    isinstance(_get(message, field), str) and _get(message, field).strip()
+                    for field in ("text", "caption", "transcription", "transcription_text")
+                )):
+            contentless_ids.add(message_id)
+    retained = []
+    for item in prepared:
+        row = _prepared_row(item)
+        if not isinstance(_get(row, "text"), str):
+            raise ValueError("prepared utterance text is malformed")
+        if _get(row, "text").strip():
+            retained.append(row)
+            continue
+        source_ids = _get(row, "source_message_ids")
+        if (not isinstance(source_ids, Sequence) or isinstance(source_ids, (str, bytes))
+                or not source_ids or any(type(source_id) is not int for source_id in source_ids)
+                or any(source_id not in contentless_ids for source_id in source_ids)):
+            raise ValueError("blank prepared utterance has no matching contentless source")
+    return retained, len(contentless_ids)
+
+
+async def _record_skipped_content_count(workflow: Any, count: int) -> None:
+    """Persist a deterministic skip count through the invocation-bound repository port."""
+    record = getattr(workflow.repository, "record_skipped_utterance_count", None)
+    if callable(record):
+        await _await(record(count))
+
+
+def _utterances(value: Any) -> list[Any]:
+    rows = _get(value, "utterances")
+    return list(rows) if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)) else []
+
+
+def _project_contentless_utterances(
+    classified: Any, *, allowed_skip_count: int = 0,
+) -> tuple[Any, int]:
+    """Filter only blank normalized rows while preserving validated source data."""
+    wrapper = classified if isinstance(classified, TelegramClassifiedDialog) else None
+    payload = wrapper.payload if wrapper is not None else classified
+    if not isinstance(payload, Mapping) or payload.get("provider") != "telegram":
+        return classified, 0
+    if "utterances" not in payload:
+        return classified, 0
+    rows = _utterances(payload)
+    if not isinstance(payload.get("utterances"), Sequence
+    ) or isinstance(payload.get("utterances"), (str, bytes)):
+        raise ValueError("classified utterances are malformed")
+    retained = []
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != {"speaker", "text"}:
+            raise ValueError("classified utterance is malformed")
+        if not isinstance(row.get("speaker"), str) or not row["speaker"].strip():
+            raise ValueError("classified speaker is malformed")
+        if not isinstance(row.get("text"), str):
+            raise ValueError("classified utterance text is malformed")
+        if row["text"].strip():
+            retained.append(dict(row))
+    skipped = len(rows) - len(retained)
+    if skipped > allowed_skip_count:
+        raise ValueError("blank classification rows do not match contentless source messages")
+    if skipped == 0:
+        return classified, 0
+    projected = dict(payload) if isinstance(payload, Mapping) else payload
+    if isinstance(projected, dict):
+        projected["utterances"] = retained
+    else:
+        raise ValueError("classified utterances are malformed")
+    if wrapper is not None:
+        return TelegramClassifiedDialog(
+            projected, wrapper.selection, wrapper.skipped_utterance_count + skipped,
+        ), skipped
+    return projected, skipped
 
 
 async def _run_telegram_stage(

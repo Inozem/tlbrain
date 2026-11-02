@@ -199,6 +199,39 @@ class FirestoreTelegramSaveRepository:
             queue_fence=self.fence,
         )
 
+    async def record_skipped_utterance_count(self, count: int) -> None:
+        """Checkpoint the deterministic projection count under the current queue fence."""
+        if type(count) is not int or count < 1:
+            raise ValueError("skipped utterance count must be positive")
+        await _offload(self._record_skipped_utterance_count, count)
+
+    def _record_skipped_utterance_count(self, count: int) -> None:
+        context_ref, operation_ref = self._refs()
+        now = self.clock()
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> None:
+            context_snapshot = context_ref.get(transaction=transaction)
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
+            operation = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
+            if (not context_snapshot.exists or not operation_snapshot.exists
+                    or operation.get("operation_id") != self.operation_id
+                    or operation.get("state") != "running"
+                    or not validate_context_queue_lease(
+                        context, self.operation_id, owner=self.owner, fence=self.fence,
+                        now=now, expiry=context.get("lock_expires_at"),
+                    )):
+                raise PermissionError("Telegram save queue lease is stale")
+            prior = operation.get("skipped_utterance_count")
+            if prior is not None and prior != count:
+                raise ValueError("skipped utterance count changed during save replay")
+            operation["skipped_utterance_count"] = count
+            operation["updated_at"] = now
+            transaction.set(operation_ref, operation)
+
+        _txn(self.client.transaction(max_attempts=5))
+
     async def mark_sealed_save_failed(self, draft_id: str, error_code: str) -> bool:
         await _offload(self._assert_current)
         return await _offload(self.repository.mark_sealed_save_failed,

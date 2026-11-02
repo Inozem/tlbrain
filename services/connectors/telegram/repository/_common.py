@@ -18,7 +18,7 @@ from services.connectors.telegram.models import (
 
 SESSIONS = "telegram_sessions"
 NOTIFICATIONS = "notification_outbox"
-NOTIFICATION_KINDS = frozenset({"draft_ack", "queued", "switch_notice", "progress", "final", "error"})
+NOTIFICATION_KINDS = frozenset({"draft_ack", "unsupported_forward", "queued", "switch_notice", "progress", "final", "error"})
 NOTIFICATION_MAX_SENDS = 3
 NOTIFICATION_ATTEMPT_LEASE = timedelta(seconds=60)
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,480}$")

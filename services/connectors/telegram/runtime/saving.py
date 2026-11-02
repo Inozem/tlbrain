@@ -71,6 +71,17 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
     return value.get(key, default) if isinstance(value, Mapping) else getattr(value, key, default)
 
 
+def _skipped_content_note(draft: Any, operation: Any = None) -> str:
+    certificate = _get(draft, "completion_certificate") or {}
+    count = _get(operation, "skipped_utterance_count", 0)
+    if type(count) is not int or count <= 0:
+        count = _get(certificate, "skipped_utterance_count", 0)
+    if type(count) is not int or count <= 0:
+        return ""
+    return (f" Skipped {count} forwarded item{'s' if count != 1 else ''} "
+            "without supported text or audio.")
+
+
 from services.connectors.telegram.runtime.save_direct import (
     _completed_dialog_result, _normalize_completed_direct_arguments,
     direct_failure_reply as _direct_failure_reply,
@@ -623,7 +634,7 @@ class TelegramSaveRuntime(_TelegramSharedSaveRuntime, _TelegramCommittedSaveRunt
             stage="save", reason="completed", folder_path=folder_path,
             completion_confirmed=True, classification_outcome=outcome,
             title=shared.title,
-        ))
+        )) + _skipped_content_note(draft, self._queue_row(context_id, operation))
 
     def commit_completed_save(self, context_id: str, operation: Any, lease: Any) -> bool:
         """Pin a verified completed save as a fixed predecessor target under its queue fence."""

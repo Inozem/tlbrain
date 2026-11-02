@@ -218,6 +218,17 @@ class TelegramIntake:
         normalized = normalize_forward(message)
         if normalized["message_id"] is None:
             return None
+        if not _has_forward_content(normalized):
+            accepted = self.repository.record_unsupported_forward(
+                update_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                topic_name=message_topic_name(message),
+                message_id=normalized["message_id"],
+                now=self.clock(),
+            )
+            self._publish_if_accepted(accepted)
+            return accepted
         accepted = self.repository.accept_forward(
             update_id,
             chat_id=chat_id,
@@ -237,3 +248,9 @@ class TelegramIntake:
 
 
 __all__ = ["TelegramIntake", "normalize_forward"]
+
+
+def _has_forward_content(message: Mapping[str, Any]) -> bool:
+    """Accept text-bearing forwards or audio; unsupported media gets a notice."""
+    return any(isinstance(message.get(field), str) and message[field].strip()
+               for field in ("text", "caption")) or bool(message.get("audio_file_id"))

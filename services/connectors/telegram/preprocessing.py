@@ -114,6 +114,9 @@ def preprocess_messages(messages: Sequence[Any]) -> list[PreparedUtterance]:
 
     for message in ordered:
         text = _message_text(message)
+        if not text.strip():
+            flush()
+            continue
         count = len(text.split())
         author = _get(message, "reliable_author_key")
         if not isinstance(author, str) or not author.strip():

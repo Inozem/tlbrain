@@ -386,6 +386,14 @@ class _TelegramCommittedSaveRuntime:
                 )
 
         core_operation = get_operation(self.repository.client, operation_id)
+        refusal = _get(row, "safe_save_refusal") or {}
+        if (_get(refusal, "code") == "no_supported_content"
+                and _get(row, "operation_id") == operation_id):
+            return (
+                f"Dialog #{number}: No supported text or completed audio was available, "
+                f"so nothing was saved. The source is retained. Send a text, caption, or "
+                f"audio forward to create a saveable dialog. operation_id={operation_id}."
+            )
         error = _get(core_operation, "error")
         if error is not None:
             failures = _get(error, "failures")
