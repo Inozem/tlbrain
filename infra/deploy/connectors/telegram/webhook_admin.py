@@ -4,11 +4,94 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import re
+import shutil
+import subprocess
 from typing import Any
 
 from core.integrations.firestore.telegram_secret import (
     get_or_create_telegram_webhook_secret,
 )
+
+
+_GCLOUD_TIMEOUT_SECONDS = 20
+_GCLOUD_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~+/-]+=*\Z")
+_DEPLOY_AUTH_EXCLUDED_ENV = frozenset({
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_ALLOWED_USER_IDS",
+    "TLDV_API_KEY",
+    "TL_DV_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "QDRANT_API_KEY",
+    "GOOGLE_REFRESH_TOKEN",
+    "GOOGLE_CLIENT_SECRET",
+})
+
+
+def _find_gcloud() -> str | None:
+    """Find the active Google Cloud CLI, including native Windows batch shims."""
+    names = ("gcloud.cmd", "gcloud", "gcloud.exe") if os.name == "nt" else ("gcloud",)
+    for name in names:
+        executable = shutil.which(name)
+        if executable:
+            return executable
+    return None
+
+
+def _gcloud_environment() -> dict[str, str]:
+    """Copy the process environment without Telegram or owner API secrets."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name not in _DEPLOY_AUTH_EXCLUDED_ENV
+    }
+
+
+def _active_gcloud_access_token() -> str:
+    """Read a short-lived token from the active CLI without exposing failures."""
+    executable = _find_gcloud()
+    if not executable:
+        raise RuntimeError("gcloud authentication is unavailable")
+
+    arguments = [executable, "auth", "print-access-token", "--quiet"]
+    try:
+        result = subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=_GCLOUD_TIMEOUT_SECONDS,
+            env=_gcloud_environment(),
+            shell=os.name == "nt" and executable.lower().endswith(".cmd"),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("gcloud authentication is unavailable") from None
+
+    token = result.stdout.strip()
+    if result.returncode != 0 or not _GCLOUD_TOKEN_PATTERN.fullmatch(token):
+        raise RuntimeError("gcloud authentication is unavailable")
+    return token
+
+
+def create_deployment_firestore_client(*, project: str) -> Any:
+    """Create a deploy-only Firestore client using the active gcloud identity.
+
+    This deliberately avoids ADC discovery: webhook registration runs as the
+    identity already selected by the deployment's gcloud configuration.
+    """
+    if not isinstance(project, str) or not project.strip():
+        raise ValueError("an explicit Firestore project is required")
+
+    token = _active_gcloud_access_token()
+    from google.cloud import firestore
+    from google.oauth2.credentials import Credentials
+
+    credentials = Credentials(token=token)
+    return firestore.Client(project=project, credentials=credentials)
 
 
 def register_telegram_webhook(
@@ -64,4 +147,4 @@ def register_telegram_webhook(
         return False
 
 
-__all__ = ["register_telegram_webhook"]
+__all__ = ["create_deployment_firestore_client", "register_telegram_webhook"]

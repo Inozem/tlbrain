@@ -74,6 +74,7 @@ if [[ "$1" == --verify-mode ]]; then printf 'sha256:%064d\\n' 7; fi
     _write(root / "infra" / "build" / "bootstrap_runner.py", """import json, os, sys
 log = open(os.environ["EVENT_LOG"], "a")
 log.write(json.dumps(["managed-launch", bool(os.environ.get("TELEGRAM_BOT_TOKEN")), bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")), *sys.argv[1:]]) + "\\n")
+log.write(json.dumps(["managed-env", os.environ.get("GOOGLE_CLOUD_PROJECT")]) + "\\n")
 print("Telegram webhook registration succeeded")
 """, True)
     _write(bindir / "gcloud", """#!/usr/bin/env bash
@@ -134,9 +135,13 @@ set -euo pipefail
     return root, log, env
 
 
-def _run(tmp_path: Path, script: str, overrides: dict[str, str] | None = None):
+def _run(tmp_path: Path, script: str, overrides: dict[str, str | None] | None = None):
     root, log, env = _fixture(tmp_path)
-    env.update(overrides or {})
+    for key, value in (overrides or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     outside = tmp_path / "outside-checkout"
     outside.mkdir()
     command = [_bash(), str(root / "infra" / "deploy" / "connectors" / script)]
@@ -151,8 +156,11 @@ def _run(tmp_path: Path, script: str, overrides: dict[str, str] | None = None):
 
 
 @pytest.mark.parametrize("script,local", [("deploy_telegram.sh", False), ("local_deploy_telegram.sh", True)])
-def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_path: Path, script: str, local: bool):
-    result, events, root = _run(tmp_path, script)
+@pytest.mark.parametrize("inherited_project", ["stale-project-must-not-win", None])
+def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(
+    tmp_path: Path, script: str, local: bool, inherited_project: str | None,
+):
+    result, events, root = _run(tmp_path, script, {"GOOGLE_CLOUD_PROJECT": inherited_project})
     assert result.returncode == 0, f"stdout:\\n{result.stdout}\\nstderr:\\n{result.stderr}"
     deploy = next(event for event in events if event[0] == "gcloud" and event[1:3] == ["run", "deploy"])
     assert deploy[3] == "synthetic-telegram"
@@ -203,7 +211,12 @@ def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_
         root / "core" / "integrations" / "firestore" / "requirements.txt"
     )
     assert managed[managed.index("--source-root") + 1] == str(root)
-    assert "register_telegram_webhook" in " ".join(managed[3:])
+    helper_code = " ".join(managed[3:])
+    assert "register_telegram_webhook" in helper_code
+    assert "create_deployment_firestore_client" in helper_code
+    assert 'project=os.environ["GOOGLE_CLOUD_PROJECT"]' in helper_code
+    assert "get_client" not in helper_code
+    assert next(event for event in events if event[0] == "managed-env") == ["managed-env", "synthetic-project"]
     assert any(event[0] == "gcloud" and event[1:2] == ["info"] for event in events)
     discovery = next(event for event in events if event[0] == "python-discovery-result")
     assert "resolved python path" in discovery[1]

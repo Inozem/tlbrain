@@ -299,12 +299,13 @@ gcloud run services update "${SERVICE_NAME}" --project "${PROJECT_ID}" --region 
 
 if [[ -n "${BOT_TOKEN_CHECK}" ]]; then
   # The helper returns only a boolean and deliberately suppresses provider details.
-  TELEGRAM_BOT_TOKEN="${BOT_TOKEN}" TELEGRAM_WEBHOOK_URL="${SERVICE_URL}/telegram/webhook" \
+  GOOGLE_CLOUD_PROJECT="${PROJECT_ID}" TELEGRAM_BOT_TOKEN="${BOT_TOKEN}" \
+    TELEGRAM_WEBHOOK_URL="${SERVICE_URL}/telegram/webhook" \
     "${PYTHON_EXECUTABLE}" "${REPO_ROOT}/infra/build/bootstrap_runner.py" --run-helper \
     --source-root "${REPO_ROOT}" \
     --requirements "${REPO_ROOT}/core/integrations/firestore/requirements.txt" \
-    --helper-code 'import os; from core.integrations.firestore.client import get_client; from infra.deploy.connectors.telegram.webhook_admin import register_telegram_webhook; ok = False
-try: ok = register_telegram_webhook(client=get_client(), bot_token=os.environ["TELEGRAM_BOT_TOKEN"], webhook_url=os.environ["TELEGRAM_WEBHOOK_URL"])
+    --helper-code 'import os; from infra.deploy.connectors.telegram.webhook_admin import create_deployment_firestore_client, register_telegram_webhook; ok = False
+try: ok = register_telegram_webhook(client=create_deployment_firestore_client(project=os.environ["GOOGLE_CLOUD_PROJECT"]), bot_token=os.environ["TELEGRAM_BOT_TOKEN"], webhook_url=os.environ["TELEGRAM_WEBHOOK_URL"])
 except Exception: pass
 print("Telegram webhook registration succeeded" if ok else "Telegram webhook registration failed"); raise SystemExit(0 if ok else 1)'
 fi
