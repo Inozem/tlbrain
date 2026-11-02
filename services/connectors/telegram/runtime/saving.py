@@ -24,6 +24,44 @@ from services.connectors.telegram.save import (
 
 logger = logging.getLogger(__name__)
 
+_SAVE_METADATA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "folder_path": {
+            "type": ["array", "null"],
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["title", "folder_path"],
+    "additionalProperties": False,
+}
+
+
+class TelegramMetadataOutputError(Exception):
+    """Safe, retryable category for malformed Gemini save metadata output."""
+
+
+def _parse_save_metadata_response(raw: Any) -> tuple[str, list[str] | None]:
+    """Validate provider metadata without repairing or exposing its raw response."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise TelegramMetadataOutputError("Gemini metadata output is empty")
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        raise TelegramMetadataOutputError("Gemini metadata output is malformed") from None
+    if not isinstance(value, dict) or set(value) != {"title", "folder_path"}:
+        raise TelegramMetadataOutputError("Gemini metadata output has an invalid shape")
+    title, folder_path = value["title"], value["folder_path"]
+    if not isinstance(title, str) or not title.strip():
+        raise TelegramMetadataOutputError("Gemini metadata title is invalid")
+    if folder_path is not None and (
+        not isinstance(folder_path, list)
+        or any(not isinstance(part, str) or not part.strip() for part in folder_path)
+    ):
+        raise TelegramMetadataOutputError("Gemini metadata folder path is invalid")
+    return title.strip(), folder_path
+
 
 def _utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -144,23 +182,12 @@ class TelegramSaveRuntime(_TelegramSharedSaveRuntime, _TelegramCommittedSaveRunt
                 }),
             },
             "prepared_dialogue": rows,
-            "response_schema": {"type": "object", "properties": {
-                "title": {"type": "string"},
-                "folder_path": {"type": ["array", "null"], "items": {"type": "string"}},
-            }, "required": ["title", "folder_path"], "additionalProperties": False},
         }
-        response = model.generate(contents=json.dumps(prompt, ensure_ascii=False), mode="tool_loop")
-        raw = _get(response, "text")
-        if not isinstance(raw, str):
-            raise ValueError("save metadata response is unavailable")
-        value = json.loads(raw)
-        title = value.get("title")
-        folder_path = value.get("folder_path")
-        if not isinstance(title, str) or not title.strip():
-            raise ValueError("save title is unavailable")
-        if folder_path is not None and (not isinstance(folder_path, list)
-                                        or any(not isinstance(part, str) for part in folder_path)):
-            raise ValueError("save folder path is invalid")
+        response = model.generate(
+            contents=json.dumps(prompt, ensure_ascii=False), mode="tool_loop",
+            response_json_schema=_SAVE_METADATA_SCHEMA,
+        )
+        title, folder_path = _parse_save_metadata_response(_get(response, "text"))
         return {"title": title.strip(), "folder_path": folder_path,
                 "utterances": rows, "provider": "telegram"}
 

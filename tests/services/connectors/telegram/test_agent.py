@@ -581,6 +581,60 @@ def test_json_schema_wire_preserves_ready_source_schema_without_mutating_inputs(
         http_client.close()
 
 
+def test_save_metadata_call_uses_native_json_schema_on_real_sdk_wire(monkeypatch):
+    import httpx
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.runtime.saving import TelegramSaveRuntime
+
+    source = "Keep this exact source line.\nAnd this second line."
+    prepared = [{"speaker": "Ada", "text": source}]
+    wire_requests = []
+
+    def respond(request):
+        wire_requests.append(request)
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"text": json.dumps({
+                "title": "Source notes", "folder_path": None,
+            })}],
+        }}]})
+
+    client, http_client = _real_sdk_client(monkeypatch, respond)
+    try:
+        runtime = TelegramSaveRuntime(
+            repository=SimpleNamespace(get_context=lambda _context_id: {}),
+            model=GeminiAgent(client=client),
+        )
+        result = runtime._analyze(
+            prepared, {"context_id": "synthetic-context", "draft_id": "draft-1",
+                       "dialog_date": "2026-11-02", "word_capacity": 30},
+            "save this dialog",
+        )
+
+        assert len(wire_requests) == 1
+        request = json.loads(wire_requests[0].content)
+        generation = request["generationConfig"]
+        schema = generation["responseJsonSchema"]
+        assert generation["responseMimeType"] == "application/json"
+        assert schema == {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "folder_path": {"type": ["array", "null"],
+                                "items": {"type": "string"}},
+            },
+            "required": ["title", "folder_path"],
+            "additionalProperties": False,
+        }
+        assert "tools" not in request and "toolConfig" not in request
+        prompt = json.loads(request["contents"][0]["parts"][0]["text"])
+        assert "response_schema" not in prompt
+        assert prompt["prepared_dialogue"] == [{"speaker": "Ada", "text": source}]
+        assert result["utterances"] == prompt["prepared_dialogue"]
+        assert result["provider"] == "telegram"
+    finally:
+        http_client.close()
+
+
 def test_gemini_agent_rejects_unsupported_mode_clearly():
     client = FakeGeminiClient()
     agent = _gemini_agent()(client=client)

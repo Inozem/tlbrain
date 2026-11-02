@@ -19,6 +19,72 @@ import httpx
 pytestmark = pytest.mark.offline
 
 
+@pytest.mark.parametrize("raw", [
+    None,
+    "",
+    "```json\n{\"title\":\"A\",\"folder_path\":null}\n```",
+    "Here is the JSON: {\"title\":\"A\",\"folder_path\":null}",
+    "{broken",
+    "null",
+    "true",
+    "\"a string\"",
+    "[]",
+    "{\"title\":\"A\"}",
+    "{\"title\":7,\"folder_path\":null}",
+    "{\"title\":\" \",\"folder_path\":null}",
+    "{\"title\":\"A\",\"folder_path\":\"Client\"}",
+    "{\"title\":\"A\",\"folder_path\":[\"Client\",2]}",
+    "{\"title\":\"A\",\"folder_path\":[\"\"]}",
+    r'{"title":"A","folder_path":[" "]}',
+    "{\"title\":\"A\",\"folder_path\":null,\"extra\":true}",
+])
+def test_save_metadata_rejects_unstructured_or_wrong_schema_output(raw):
+    from services.connectors.telegram.runtime.saving import (
+        TelegramMetadataOutputError, TelegramSaveRuntime,
+    )
+
+    class Model:
+        def generate(self, **_kwargs):
+            return SimpleNamespace(text=raw)
+
+    runtime = TelegramSaveRuntime(
+        repository=SimpleNamespace(get_context=lambda _context_id: {}), model=Model(),
+    )
+    with pytest.raises(TelegramMetadataOutputError):
+        runtime._analyze(
+            [{"speaker": "Ada", "text": "Original source."}],
+            {"context_id": "context", "draft_id": "draft", "dialog_date": "2026-11-02"},
+            "save this",
+        )
+
+
+@pytest.mark.parametrize("folder_path", [None, [], ["Client", "Invoices"]])
+def test_save_metadata_accepts_only_native_schema_values(folder_path):
+    from services.connectors.telegram.runtime.saving import TelegramSaveRuntime
+
+    class Model:
+        def generate(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(text=json.dumps({"title": "Saved title", "folder_path": folder_path}))
+
+    model = Model()
+    runtime = TelegramSaveRuntime(
+        repository=SimpleNamespace(get_context=lambda _context_id: {}), model=model,
+    )
+    source = [{"speaker": "Ada", "text": "Exact original source."}]
+    result = runtime._analyze(
+        source, {"context_id": "context", "draft_id": "draft", "dialog_date": "2026-11-02"},
+        "save this",
+    )
+
+    assert result == {
+        "title": "Saved title", "folder_path": folder_path,
+        "utterances": source, "provider": "telegram",
+    }
+    assert "response_json_schema" in model.kwargs
+
+
+
 @pytest.mark.parametrize("async_stage", [False, True])
 def test_parent_bound_governor_uses_fresh_runtime_time(async_stage):
     from core.operations.models import OperationStageRecord, StageState
@@ -423,10 +489,12 @@ def _selector_loop():
         socket.socketpair = original_socketpair
 
 
-def test_default_worker_terminalizes_three_real_metadata_failures_once(
+@pytest.mark.parametrize("failure_kind", ["provider", "malformed"])
+def test_default_worker_terminalizes_three_metadata_failures_once(
     firestore_fake, sdk_fakes, monkeypatch, caplog,
+    failure_kind,
 ):
-    """Run the real default save path through three metadata provider failures."""
+    """Provider and malformed-output failures use the budget and retain source."""
     from google.genai import types
     from services.connectors.telegram.app.main import create_app
     from services.connectors.telegram.client import TelegramClient
@@ -510,9 +578,18 @@ def test_default_worker_terminalizes_three_real_metadata_failures_once(
     ))
     secret_marker = "synthetic-provider-secret-marker"
     for _ in range(3):
-        sdk_fakes.gemini.queue(
-            "generate_content", error=RuntimeError(secret_marker),
-        )
+        if failure_kind == "provider":
+            sdk_fakes.gemini.queue(
+                "generate_content", error=RuntimeError(secret_marker),
+            )
+        else:
+            sdk_fakes.gemini.queue(
+                "generate_content", response=types.GenerateContentResponse(
+                    candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+                        text=f"not valid json {secret_marker}",
+                    )]))],
+                ),
+            )
 
     app = create_app(
         webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
@@ -620,17 +697,17 @@ def test_default_worker_terminalizes_three_real_metadata_failures_once(
     error_text = error_messages[0]["text"]
     assert "Dialog #1" in error_text and operation_id in error_text
     assert "administrator" in error_text and "logs" in error_text
-    assert secret_marker not in error_text
     settlement = next(row for row in settlement_logs if row.get("outcome") == "failed")
     assert settlement["operation_id"] == operation_id
     assert settlement["context_id"] == context_id
     assert settlement["service"] == "gemini" and settlement["stage"] == "metadata"
     assert settlement["failures"] == 3 and settlement["error_code"]
-    assert secret_marker not in str(settlement)
     error_rows = [row for path, row in firestore_fake.documents.items()
                   if path.startswith("notification_outbox/")
                   and row.get("operation_id") == operation_id and row.get("kind") == "error"]
     assert len(error_rows) == 1
+    assert secret_marker not in error_text
+    assert secret_marker not in str(settlement)
     assert secret_marker not in caplog.text
 
     duplicate = asyncio.run(dispatch(save_task), loop_factory=_selector_loop)
@@ -2025,8 +2102,10 @@ def test_default_worker_parent_takeover_at_audio_http_boundary_fences_next_rpc(
             .collection("messages").document("81").get().exists)
 
 
+@pytest.mark.parametrize("malformed_first_metadata", [False, True])
 def test_default_worker_saves_two_real_audio_transcripts_in_intake_order(
     firestore_fake, sdk_fakes, monkeypatch,
+    malformed_first_metadata,
 ):
     """Real Telegram downloads and Gemini transcription reach verified cleanup."""
     from google.genai import types
@@ -2041,6 +2120,12 @@ def test_default_worker_saves_two_real_audio_transcripts_in_intake_order(
     for transcript in (first_text, second_text):
         sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
             candidates=[types.Candidate(content=types.Content(parts=[types.Part(text=transcript)]))],
+        ))
+    if malformed_first_metadata:
+        sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+            candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+                text="metadata output is not JSON",
+            )]))],
         ))
     sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
         candidates=[types.Candidate(content=types.Content(parts=[types.Part(
@@ -2271,7 +2356,7 @@ def test_default_worker_saves_two_real_audio_transcripts_in_intake_order(
     receipt = runtime.db.collection("index_completions").document(doc_id).collection(
         "generations").document(core["desired_content_hash"]).get().to_dict()
     assert receipt["status"] == "completed"
-    wake_request = next(item["body"] for item in runtime.task_requests
+    wake_request = next(item["body"] for item in reversed(runtime.task_requests)
                         if item["body"].get("target_kind") == "telegram_dispatch"
                         and item["body"].get("operation_id") == task["operation_id"]
                         and item["body"].get("outbox_id") != task.get("outbox_id"))
@@ -2282,17 +2367,22 @@ def test_default_worker_saves_two_real_audio_transcripts_in_intake_order(
     retry_store = QueueOperationRetryStore(
         runtime.db, runtime.db.collection("telegram_sessions").document(task["context_id"]),
     )
-    for stage_key in (
-        "telegram.audio.91", "telegram.audio.92",
-        "telegram.preparation", "telegram.analysis", "telegram.classification",
-    ):
+    for stage_key in ("telegram.audio.91", "telegram.audio.92", "telegram.preparation",
+                      "telegram.classification"):
         stage = retry_store.get_stage(operation_id=task["operation_id"], stage_key=stage_key)
         assert stage is not None and stage.failures == 0
+        assert stage.attempts_started == 1
+    analysis_stage = retry_store.get_stage(
+        operation_id=task["operation_id"], stage_key="telegram.analysis",
+    )
+    assert analysis_stage is not None
+    assert analysis_stage.failures == int(malformed_first_metadata)
+    assert analysis_stage.attempts_started == 1 + int(malformed_first_metadata)
     metadata_calls = [event for event in sdk_fakes.trace
                       if event["boundary"] == "gemini"
                       and event["operation"] == "generate_content"
                       and "Infer a concise dialog title" in str(event["arguments"])]
-    assert len(metadata_calls) == 1
+    assert len(metadata_calls) == 1 + int(malformed_first_metadata)
     assert len([event for event in sdk_fakes.trace
                 if event["boundary"] == "drive" and event["operation"] == "files.create"]) == 1
     session = runtime.db.collection("telegram_sessions").document(task["context_id"])

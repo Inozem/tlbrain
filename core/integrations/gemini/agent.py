@@ -22,7 +22,7 @@ class GeminiAgent:
     def __init__(self, *, client=None):
         self._client = client if client is not None else gemini_client.make_client(single_attempt=True)
 
-    def generate(self, *, contents, mode: str, tools=None):
+    def generate(self, *, contents, mode: str, tools=None, response_json_schema=None):
         """Make one generation request and return the SDK response unchanged."""
         try:
             thinking_level = _THINKING_LEVELS[mode]
@@ -43,6 +43,8 @@ class GeminiAgent:
             tool_config=(types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(mode="ANY")
             ) if mode == "routing" and sdk_tools else None),
+            response_mime_type=("application/json" if response_json_schema is not None else None),
+            response_json_schema=response_json_schema,
         )
         return self._client.models.generate_content(
             model=AGENT_MODEL,
