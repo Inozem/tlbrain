@@ -848,6 +848,79 @@ def run_preflight(service: str, source_root: os.PathLike[str] | str, output: os.
     return 0
 
 
+def run_managed_helper(
+    source_root: os.PathLike[str] | str,
+    requirements: os.PathLike[str] | str,
+    code: str,
+) -> int:
+    """Run a project helper with its dependencies in a temporary managed venv."""
+    root = Path(source_root).resolve()
+    requirements_path = Path(requirements).resolve()
+    if not root.is_dir() or not requirements_path.is_file():
+        raise ValueError("managed helper source root or requirements file is unavailable")
+    if not code.strip():
+        raise ValueError("managed helper code is empty")
+
+    build_tools = Path(__file__).resolve().parent
+    saved_credentials = {
+        name: os.environ.pop(name)
+        for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USER_IDS")
+        if name in os.environ
+    }
+    consumer_environment = os.environ.copy()
+    consumer_environment.update(saved_credentials)
+    try:
+        runtime = ensure_runtime(
+            build_tools / "runner-toolchain.json", root / ".build" / "toolchain",
+            native_interpreter=Path(sys.executable) if sys.version_info[:2] == (3, 12) else None,
+        )
+        with tempfile.TemporaryDirectory(prefix="tlbrain-helper-") as temporary:
+            work = Path(temporary).resolve()
+            venv_python, preparation_status = _prepare_managed_helper_environment(
+                runtime, requirements_path, work,
+            )
+            if preparation_status or venv_python is None:
+                return preparation_status or 1
+            consumer_environment["PYTHONPATH"] = os.pathsep.join(
+                value for value in (str(root), consumer_environment.get("PYTHONPATH", "")) if value
+            )
+            return subprocess.run(
+                [str(venv_python), "-c", code], cwd=str(root), env=consumer_environment, check=False,
+            ).returncode
+    finally:
+        os.environ.update(saved_credentials)
+
+
+def _prepare_managed_helper_environment(
+    runtime: os.PathLike[str] | str,
+    requirements: Path,
+    work: Path,
+) -> tuple[Path | None, int]:
+    """Create, populate, and validate a temporary helper virtual environment."""
+    environment = work / "venv"
+    created = subprocess.run(
+        [str(runtime), "-I", "-m", "venv", str(environment)], cwd=str(work), check=False,
+    )
+    if created.returncode:
+        return None, created.returncode
+    venv_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not venv_python.is_file():
+        raise RuntimeError("managed helper runtime did not create its virtual environment")
+    installed = subprocess.run(
+        [str(venv_python), "-I", "-m", "pip", "install", "--disable-pip-version-check",
+         "--no-input", "-r", str(requirements)],
+        cwd=str(work), check=False,
+    )
+    if installed.returncode:
+        return None, installed.returncode
+    checked = subprocess.run(
+        [str(venv_python), "-I", "-m", "pip", "check"], cwd=str(work), check=False,
+    )
+    if checked.returncode:
+        return None, checked.returncode
+    return venv_python, 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare and validate one service artifact without publishing it.")
     parser.add_argument("--verify-source", action="store_true", help="verify a Function source artifact against its validation fingerprint")
@@ -856,6 +929,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--service")
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--run-helper", action="store_true", help="run a helper in a temporary managed venv")
+    parser.add_argument("--requirements", type=Path)
+    parser.add_argument("--helper-code")
     args = parser.parse_args(argv)
     try:
         if args.verify_source:
@@ -864,6 +940,10 @@ def main(argv: list[str] | None = None) -> int:
             verified = verify_source_artifact(args.artifact, args.fingerprint)
             print(f"Source artifact fingerprint verified: {verified}")
             return 0
+        if args.run_helper:
+            if args.source_root is None or args.requirements is None or args.helper_code is None:
+                parser.error("--run-helper requires --source-root, --requirements, and --helper-code")
+            return run_managed_helper(args.source_root, args.requirements, args.helper_code)
         if args.service is None or args.source_root is None or args.output is None:
             parser.error("preflight requires --service, --source-root, and --output")
         return run_preflight(args.service, args.source_root, args.output)

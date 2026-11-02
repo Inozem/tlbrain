@@ -233,7 +233,15 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         "if [[ \"${1:-}\" == '--verify-source' ]]; then\n"
         "  exec \"$ROUTE_PYTHON\" \"${BASH_SOURCE[0]%/*}/bootstrap_runner.py\" \"$@\"\n"
         "fi\n"
-        "if [[ \"${1:-}\" == '--python-mode' ]]; then shift; exec \"$ROUTE_PYTHON\" \"$@\"; fi\n"
+        "if [[ \"${1:-}\" == '--python-mode' ]]; then\n"
+        "  shift\n"
+        "  if [[ \"${1:-}\" == '-c' && \"${2:-}\" == 'import sys; print(sys.executable)' ]]; then\n"
+        "    \"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"child-env\",\"python-discovery\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\"))])+\"\\n\")'\n"
+        "    printf '%s\\n' \"$ROUTE_HELPER_PYTHON\"\n"
+        "    exit 0\n"
+        "  fi\n"
+        "  exec \"$ROUTE_PYTHON\" \"$@\"\n"
+        "fi\n"
         "\"$ROUTE_PYTHON\" \"${BASH_SOURCE[0]%/*}/route_gate.py\" \"$@\"\n",
         encoding="utf-8",
     )
@@ -259,7 +267,7 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         "*'run services describe'*'status.url'*) "
         "service=\"$4\"; url=\"https://$service-uc.a.run.app\"; printf '%s\\n' \"$url\"; "
         "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-result\", \"run-service-url\", sys.argv[1], sys.argv[2]]) + \"\\n\")' \"$service\" \"$url\" ;; "
-        "*'functions describe'*) printf 'https://synthetic.example/%s\\n' \"$3\" ;; "
+        "*'functions describe'*) printf 'https://%s-uc.a.run.app\\n' \"$3\" ;; "
         "esac\n",
         encoding="utf-8",
     )
@@ -288,6 +296,17 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     python3.chmod(0o755)
+    helper_python = tmp_path / "python helper with spaces" / "python"
+    helper_python.parent.mkdir(parents=True)
+    helper_python.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os,sys; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"python-helper-launch\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\")),sys.argv[1:]])+\"\\n\")' \"$@\"\n"
+        "if [[ -n \"${TELEGRAM_DISABLE_URL:-}\" ]]; then \"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"telegram-disable\",os.environ.get(\"TELEGRAM_DISABLE_URL\")])+\"\\n\")'; exit 0; fi\n"
+        "case \"$*\" in *'bootstrap_runner.py --run-helper'*) printf 'Telegram webhook registration succeeded\\n'; exit 0 ;; esac\n"
+        "exec \"$ROUTE_PYTHON\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    helper_python.chmod(0o755)
     return bin_dir, helper
 
 
@@ -356,6 +375,7 @@ def _run_route(
         "TEMP": str(tmp_path),
         "TMP": str(tmp_path),
         "ROUTE_PYTHON": sys.executable,
+        "ROUTE_HELPER_PYTHON": str(tmp_path / "python helper with spaces" / "python"),
         "ROUTE_EVENT_LOG": str(log),
         "ROUTE_GCLOUD_EXECUTABLE": str(bin_dir / "gcloud"),
         "ROUTE_GCLOUD_BASH_PATH": _bash_path(bin_dir),
@@ -573,6 +593,20 @@ def test_top_level_route_hands_only_validated_sources_and_images_forward(
     mcp_deploy = next(i for i, command in enumerate(cloud_text)
                       if command.startswith("run deploy synthetic-mcp "))
     assert vector_deploy < import_deploy < checker_deploy < mcp_deploy
+
+
+@pytest.mark.parametrize("route", ["deploy.sh", "local_deploy.sh"])
+def test_top_level_enabled_telegram_uses_managed_helper_handoff_offline(tmp_path: Path, route: str) -> None:
+    result, events, _root = _run_route(tmp_path, route, env_overrides={
+        "TELEGRAM_BOT_TOKEN": "synthetic-telegram-token",
+        "TELEGRAM_ALLOWED_USER_IDS": "101,202",
+    })
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    helper = next(event for event in events if event[0] == "python-helper-launch"
+                  and any("bootstrap_runner.py" in str(arg) for arg in event[3]))
+    assert helper[1:3] == [True, False]
+    assert not any(event[0] == "telegram-disable" for event in events)
+    assert not any("synthetic-telegram-token" in str(value) for event in events for value in event)
 
 
 @pytest.mark.parametrize(

@@ -76,6 +76,162 @@ def test_pinned_toolchain_schema_covers_only_supported_baselines() -> None:
     assert set(lock["entries"]) == set(PINNED_TOOLCHAINS)
 
 
+def test_managed_helper_uses_isolated_firestore_environment_and_scopes_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    root = tmp_path / "source checkout"
+    root.mkdir()
+    requirements = root / "core" / "integrations" / "firestore" / "requirements.txt"
+    requirements.parent.mkdir(parents=True)
+    requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    private_runtime = tmp_path / "managed runtime" / "python.exe"
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+    consumers: list[tuple[list[str], dict[str, str]]] = []
+
+    def ensure_runtime(*_args: Any, **_kwargs: Any) -> Path:
+        assert "TELEGRAM_BOT_TOKEN" not in os.environ
+        assert "TELEGRAM_ALLOWED_USER_IDS" not in os.environ
+        return private_runtime
+
+    def run(argv: list[str], **kwargs: Any) -> Any:
+        calls.append((argv, kwargs.get("env")))
+        assert "TELEGRAM_BOT_TOKEN" not in os.environ
+        assert "TELEGRAM_ALLOWED_USER_IDS" not in os.environ
+        if "venv" in argv:
+            environment = Path(argv[-1])
+            venv_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("synthetic venv interpreter", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+        if "pip" in argv:
+            assert str(private_runtime) not in argv or argv[0] == str(venv_python)
+            return SimpleNamespace(returncode=0)
+        consumers.append((argv, kwargs["env"]))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runner, "ensure_runtime", ensure_runtime)
+    monkeypatch.setattr(runner.subprocess, "run", run)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+    code = "import os; assert os.environ['TELEGRAM_BOT_TOKEN'] == 'synthetic-token'"
+
+    assert runner.run_managed_helper(root, requirements, code) == 0
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    assert len(consumers) == 1
+    consumer_argv, consumer_env = consumers[0]
+    consumer_python = Path(consumer_argv[0])
+    assert consumer_python.name == ("python.exe" if os.name == "nt" else "python")
+    assert consumer_python.parent.name == ("Scripts" if os.name == "nt" else "bin")
+    assert consumer_argv[1:] == ["-c", code]
+    assert consumer_env["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert consumer_env["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    install = next(argv for argv, _env in calls if "install" in argv)
+    assert install[0] == consumer_argv[0]
+    assert install[install.index("-r") + 1] == str(requirements)
+    assert str(private_runtime) not in install
+    assert any("check" in argv for argv, _env in calls)
+    temporary_root = Path(consumer_argv[0]).parents[2]
+    assert not temporary_root.exists()
+
+
+@pytest.mark.parametrize("failed_stage", ["venv", "install", "check"])
+def test_managed_helper_stops_before_consumer_and_cleans_up_on_prepare_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    failed_stage: str,
+) -> None:
+    runner = _runner()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    requirements = root / "requirements.txt"
+    requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(runner, "ensure_runtime", lambda *_args, **_kwargs: tmp_path / "managed-python")
+
+    def run(argv: list[str], **_kwargs: Any) -> Any:
+        calls.append(argv)
+        if "venv" in argv:
+            if failed_stage == "venv":
+                return SimpleNamespace(returncode=17)
+            venv_python = Path(argv[-1]) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("synthetic venv interpreter", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+        if "install" in argv:
+            return SimpleNamespace(returncode=19 if failed_stage == "install" else 0)
+        return SimpleNamespace(returncode=23 if failed_stage == "check" else 0)
+
+    monkeypatch.setattr(runner.subprocess, "run", run)
+    expected_status = {"venv": 17, "install": 19, "check": 23}[failed_stage]
+    assert runner.run_managed_helper(root, requirements, "raise AssertionError()") == expected_status
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    assert not any("-c" in argv for argv in calls)
+    temporary_root = Path(calls[0][-1]).parents[0]
+    assert not temporary_root.exists()
+
+
+def test_managed_helper_restores_credentials_when_runtime_setup_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    requirements = root / "requirements.txt"
+    requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+
+    def fail_runtime(*_args: Any, **_kwargs: Any) -> Path:
+        assert "TELEGRAM_BOT_TOKEN" not in os.environ
+        assert "TELEGRAM_ALLOWED_USER_IDS" not in os.environ
+        raise RuntimeError("synthetic runtime setup failure")
+
+    monkeypatch.setattr(runner, "ensure_runtime", fail_runtime)
+    with pytest.raises(RuntimeError, match="synthetic runtime setup failure"):
+        runner.run_managed_helper(root, requirements, "pass")
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+
+
+def test_managed_helper_cleans_up_and_restores_credentials_after_consumer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    requirements = root / "requirements.txt"
+    requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(runner, "ensure_runtime", lambda *_args, **_kwargs: tmp_path / "managed-python")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **_kwargs: Any) -> Any:
+        calls.append(argv)
+        if "venv" in argv:
+            venv_python = Path(argv[-1]) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("synthetic venv interpreter", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=31 if "-c" in argv else 0)
+
+    monkeypatch.setattr(runner.subprocess, "run", run)
+    assert runner.run_managed_helper(root, requirements, "pass") == 31
+    assert calls[-1][1:] == ["-c", "pass"]
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    temporary_root = Path(calls[-1][0]).parents[2]
+    assert not temporary_root.exists()
+
+
 @pytest.mark.parametrize("key", sorted(PINNED_TOOLCHAINS))
 def test_pinned_toolchain_identity_and_reviewed_asset(key: str) -> None:
     entry = _pinned_toolchain_lock()["entries"][key]

@@ -38,18 +38,50 @@ def _fixture(tmp_path: Path):
     (root / "infra" / "build").mkdir(parents=True)
     bindir = tmp_path / "bin"
     bindir.mkdir()
+    windows_apps = tmp_path / "WindowsApps"
+    windows_apps.mkdir()
     log = tmp_path / "events.jsonl"
     py = sys.executable
+    resolved_python = tmp_path / "resolved python path" / "python"
+    _write(resolved_python, """#!/usr/bin/env bash
+set -euo pipefail
+"$REAL_PYTHON" -c 'import json,os,sys; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["python-argv",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")),*sys.argv[1:]])+"\\n")' "$@"
+if [[ "${1:-}" == "-c" && "${2:-}" == "import sys; print(sys.executable)" ]]; then
+  "$REAL_PYTHON" -c 'import json,os; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["python-discovery-child",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS"))])+"\\n")'
+  printf '%s\\n' "$0"
+  exit 0
+fi
+if [[ -n "${TELEGRAM_DISABLE_URL:-}" ]]; then
+  "$REAL_PYTHON" -c 'import json,os; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["disable",os.environ.get("TELEGRAM_DISABLE_URL"),bool(os.environ.get("TELEGRAM_DISABLE_ID_TOKEN"))])+"\\n")'
+  [[ "${DISABLE_FAIL:-0}" == 1 ]] && exit 1
+  exit 0
+fi
+exec "$REAL_PYTHON" "$@"
+""", True)
+    _write(windows_apps / "python3", """#!/usr/bin/env bash
+set -euo pipefail
+"$REAL_PYTHON" -c 'import json,os,sys; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["alias-executed",*sys.argv[1:]])+"\\n")' "$@"
+""", True)
+    _write(root / "infra" / "build" / "preflight-real.sh", (APP_ROOT / "infra" / "build" / "preflight.sh").read_text(encoding="utf-8"), True)
     _write(root / "infra" / "build" / "preflight.sh", """#!/usr/bin/env bash
 set -euo pipefail
-"$REAL_PYTHON" -c 'import json,os,sys; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["preflight",*sys.argv[1:]])+"\\n")' "$@"
-"$REAL_PYTHON" -c 'import json,os; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["child-env","preflight",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS"))])+"\\n")'
+if [[ "${1:-}" == --python-mode ]]; then
+  exec bash "${BASH_SOURCE[0]%/*}/preflight-real.sh" "$@"
+fi
+"$REAL_PYTHON" -c 'import json,os,sys; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["preflight",*sys.argv[1:]])+"\\n"); open(os.environ["EVENT_LOG"],"a").write(json.dumps(["child-env","preflight",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS"))])+"\\n")' "$@"
 if [[ "$1" == --verify-mode ]]; then printf 'sha256:%064d\\n' 7; fi
+""", True)
+    _write(root / "infra" / "build" / "bootstrap_runner.py", """import json, os, sys
+log = open(os.environ["EVENT_LOG"], "a")
+log.write(json.dumps(["managed-launch", bool(os.environ.get("TELEGRAM_BOT_TOKEN")), bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")), *sys.argv[1:]]) + "\\n")
+print("Telegram webhook registration succeeded")
 """, True)
     _write(bindir / "gcloud", """#!/usr/bin/env bash
 set -euo pipefail
 "$REAL_PYTHON" -c 'import json,os,sys; a=sys.argv[1:]; f=open(os.environ["EVENT_LOG"],"a"); f.write(json.dumps(["gcloud",*a])+"\\n"); f.write(json.dumps(["child-env","gcloud",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS"))])+"\\n");
 if a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and os.environ.get("SERVICE_MISSING"): print("NOT_FOUND",file=sys.stderr); raise SystemExit(1)
+elif a[:1]==["info"] and os.environ.get("PYTHON_DISCOVERY_FAIL"): raise SystemExit(1)
+elif a[:1]==["info"]: print(os.environ["RESOLVED_PYTHON"]); open(os.environ["EVENT_LOG"],"a").write(json.dumps(["python-discovery-result",os.environ["RESOLVED_PYTHON"]])+"\\n")
 elif a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and "status.url" in " ".join(a): print("https://telegram.synthetic.invalid")
 elif a[:4]==["run","services","describe",os.environ["TELEGRAM_SERVICE_NAME"]] and "serviceAccountName" in " ".join(a): print("telegram-runtime@synthetic-project.iam.gserviceaccount.com")
 elif a[:4]==["run","services","describe",os.environ["VECTOR_SYNC_SERVICE_NAME"]]: print("https://vector-sync.synthetic.invalid")
@@ -66,25 +98,11 @@ set -euo pipefail
 "$REAL_PYTHON" -c 'import json,os,sys; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["docker",*sys.argv[1:]])+"\\n")' "$@"
 "$REAL_PYTHON" -c 'import json,os; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["child-env","docker",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS"))])+"\\n")'
 """, True)
-    _write(bindir / "python3", """#!/usr/bin/env bash
-set -euo pipefail
-"$REAL_PYTHON" -c 'import json,os,sys; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["python-argv",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")),*sys.argv[1:]])+"\\n")' "$@"
-if [[ -n "${TELEGRAM_DISABLE_URL:-}" ]]; then
-  "$REAL_PYTHON" -c 'import json,os; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["disable",os.environ.get("TELEGRAM_DISABLE_URL"),bool(os.environ.get("TELEGRAM_DISABLE_ID_TOKEN"))])+"\\n")'
-  [[ "${DISABLE_FAIL:-0}" == 1 ]] && exit 1
-  exit 0
-fi
-case "$*" in
-  *register_telegram_webhook*)
-    "$REAL_PYTHON" -c 'import json,os; open(os.environ["EVENT_LOG"],"a").write(json.dumps(["webhook",bool(os.environ.get("TELEGRAM_BOT_TOKEN")),os.environ.get("TELEGRAM_WEBHOOK_URL"),os.environ.get("PYTHONPATH")])+"\\n"); print("Telegram webhook registration succeeded")'
-    ;;
-  *) exec "$REAL_PYTHON" "$@" ;;
-esac
-""", True)
     env = {
         **{k: os.environ[k] for k in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT") if k in os.environ},
-        "PATH": os.pathsep.join((str(bindir), str(Path(py).parent), os.environ.get("PATH", ""))),
+        "PATH": os.pathsep.join((str(windows_apps), str(bindir), str(Path(py).parent), os.environ.get("PATH", ""))),
         "REAL_PYTHON": py,
+        "RESOLVED_PYTHON": str(resolved_python),
         "EVENT_LOG": str(log),
         "PROJECT_ID": "synthetic-project",
         "GOOGLE_CLOUD_PROJECT": "stale-project-must-not-win",
@@ -109,7 +127,9 @@ esac
         "TZ": "Asia/Jerusalem",
         "SKIP_CONFIRM": "1",
     }
-    assert Path(env["PATH"].split(os.pathsep)[0]).resolve() == bindir.resolve()
+    path_entries = env["PATH"].split(os.pathsep)
+    assert Path(path_entries[0]).resolve() == windows_apps.resolve()
+    assert Path(path_entries[1]).resolve() == bindir.resolve()
     assert (bindir / "gcloud").is_file()
     return root, log, env
 
@@ -176,10 +196,20 @@ def test_standalone_deploy_has_telegram_gate_iam_callbacks_and_webhook_last(tmp_
         and "status.url" in " ".join(event)
     )
     assert events.index(deploy) < service_url_lookup < events.index(update)
-    webhook = next(event for event in events if event[0] == "webhook")
-    assert events.index(update) < events.index(webhook)
-    assert webhook[1:3] == [True, "https://telegram.synthetic.invalid/telegram/webhook"]
-    assert Path(webhook[3].split(os.pathsep)[0]).resolve() == root.resolve()
+    managed = next(event for event in events if event[0] == "managed-launch")
+    assert events.index(update) < events.index(managed)
+    assert managed[1:3] == [True, False]
+    assert managed[managed.index("--requirements") + 1] == str(
+        root / "core" / "integrations" / "firestore" / "requirements.txt"
+    )
+    assert managed[managed.index("--source-root") + 1] == str(root)
+    assert "register_telegram_webhook" in " ".join(managed[3:])
+    assert any(event[0] == "gcloud" and event[1:2] == ["info"] for event in events)
+    discovery = next(event for event in events if event[0] == "python-discovery-result")
+    assert "resolved python path" in discovery[1]
+    discovery_child = next(event for event in events if event[0] == "python-discovery-child")
+    assert discovery_child[1:] == [False, False]
+    assert not any(event[0] == "alias-executed" for event in events)
     for queue, limit in (("tlbrain-dialog-operations", "2"), ("tlbrain-telegram-control", "4")):
         assert any(e[0] == "gcloud" and e[1:4] == ["tasks", "queues", "update"] and e[4] == queue
                    and f"--max-concurrent-dispatches={limit}" in e for e in events)
@@ -229,6 +259,18 @@ def test_enabled_deploy_rejects_missing_shared_runtime_config_before_mutation(tm
     assert "synthetic-qdrant-key" not in result.stderr + result.stdout
     assert not any(event[0] in {"docker", "preflight", "webhook"} for event in events)
     assert not any(event[0] == "gcloud" for event in events)
+
+
+@pytest.mark.parametrize("script", ["deploy_telegram.sh", "local_deploy_telegram.sh"])
+def test_python_discovery_failure_stops_deploy_and_cleans_private_env_file(tmp_path: Path, script: str):
+    result, events, root = _run(tmp_path, script, {"PYTHON_DISCOVERY_FAIL": "1"})
+    assert result.returncode != 0
+    assert "no approved bootstrap interpreter" in result.stderr
+    assert not any(event[0] == "docker" for event in events)
+    assert not any(event[0] == "gcloud" and event[1:3] == ["run", "deploy"] for event in events)
+    assert not any(event[0] in {"managed-launch", "env-file"} for event in events)
+    assert not list(root.parent.glob("tlbrain-telegram-env.*"))
+    assert TOKEN not in result.stdout + result.stderr + json.dumps(events)
 
 
 @pytest.mark.parametrize("script", ["deploy_telegram.sh", "local_deploy_telegram.sh"])

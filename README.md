@@ -73,6 +73,8 @@ You can ask your assistant for a full list of folders and their sync status at a
  
 **Prerequisites:** Bash, `gcloud` authenticated and configured for a Google Cloud project with the required access, a TL;DV account, Qdrant Cloud, a Gemini API key, and the existing `.env` values described below. Ordinary deployment uses published service images and source packages. It does not require Docker or a system Python installation; build preflight supplies a private Python 3.12 runner. Docker is needed only for local image builds and image checks.
 
+Normal and local deployment helpers share Python discovery, including the Google Cloud CLI fallback on Windows, so no manual Python `PATH` adjustment is required. Telegram webhook registration uses a temporary private Python 3.12 environment with the existing Firestore SDK requirements.
+
 Despite the one-command deployment, all third-party services (Google Cloud, Firebase, Qdrant, Google AI Studio) must be registered and configured manually — the steps below walk you through each one.
 
 > Stuck at any step? Share this section of the README and a screenshot of where you are with Claude or ChatGPT for help.

@@ -13,6 +13,26 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 
+resolve_python() {
+  local selected
+  if ! selected=$(bash "${REPO_ROOT}/infra/build/preflight.sh" --python-mode -c 'import sys; print(sys.executable)'); then
+    echo "Could not discover an installed Python interpreter" >&2
+    return 1
+  fi
+  selected=${selected%$'\r'}
+  if [[ "${selected:0:1}" == '"' && "${selected: -1}" == '"' ]]; then
+    selected=${selected:1:${#selected}-2}
+  fi
+  if [[ "${selected}" =~ ^[A-Za-z]:[\\/].* ]] && command -v cygpath >/dev/null 2>&1; then
+    selected=$(cygpath -u "${selected}")
+  fi
+  if [[ -z "${selected}" ]]; then
+    echo "Could not discover an installed Python interpreter" >&2
+    return 1
+  fi
+  PYTHON_EXECUTABLE=${selected}
+}
+
 # Load the local configuration before validating it, but never enable shell tracing.
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   set -a
@@ -82,8 +102,9 @@ if [[ "${MODE}" == off ]]; then
     echo "Could not authenticate as the Telegram deployment identity; credentials were retained" >&2
     exit 1
   fi
+  resolve_python
   if ! TELEGRAM_DISABLE_ID_TOKEN="${ID_TOKEN}" TELEGRAM_DISABLE_URL="${SERVICE_URL}/internal/disable-webhook" \
-    python3 -c 'import json, os, urllib.error, urllib.request
+    "${PYTHON_EXECUTABLE}" -c 'import json, os, urllib.error, urllib.request
 request = urllib.request.Request(os.environ["TELEGRAM_DISABLE_URL"], data=b"{}", method="POST", headers={"Authorization": "Bearer " + os.environ["TELEGRAM_DISABLE_ID_TOKEN"], "Content-Type": "application/json"})
 try:
  response = urllib.request.urlopen(request, timeout=20)
@@ -144,6 +165,7 @@ fi
 
 TEMP_ENV_FILE=$(mktemp "${TMPDIR:-/tmp}/tlbrain-telegram-env.XXXXXX")
 chmod 600 "${TEMP_ENV_FILE}"
+  resolve_python
 # All runtime settings travel through a private JSON env file. Bot credentials
 # are passed only to this writer and the later webhook-registration helper.
 REGION="${REGION}" GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT}" \
@@ -156,7 +178,7 @@ REGION="${REGION}" GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT}" \
   SYNC_CHECKER_URL="${SYNC_CHECKER_URL}" DIALOG_OPERATIONS_QUEUE="${CORE_QUEUE}" \
   TELEGRAM_BOT_TOKEN="${BOT_TOKEN}" \
   TELEGRAM_ALLOWED_USER_IDS="${ALLOWED_USER_IDS}" \
-  python3 -c 'import json, os, sys; names = ("REGION", "GOOGLE_CLOUD_PROJECT", "ROOT_FOLDER_URL", "GEMINI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "RETRIEVAL_TOP_K", "RETRIEVAL_SCORE_THRESHOLD", "GOOGLE_REFRESH_TOKEN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "VECTOR_SYNC_URL", "SYNC_CHECKER_URL", "DIALOG_OPERATIONS_QUEUE"); data = {name: os.environ[name] for name in names};
+  "${PYTHON_EXECUTABLE}" -c 'import json, os, sys; names = ("REGION", "GOOGLE_CLOUD_PROJECT", "ROOT_FOLDER_URL", "GEMINI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "RETRIEVAL_TOP_K", "RETRIEVAL_SCORE_THRESHOLD", "GOOGLE_REFRESH_TOKEN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "VECTOR_SYNC_URL", "SYNC_CHECKER_URL", "DIALOG_OPERATIONS_QUEUE"); data = {name: os.environ[name] for name in names};
 if os.environ.get("TELEGRAM_BOT_TOKEN"): data.update(TELEGRAM_BOT_TOKEN=os.environ["TELEGRAM_BOT_TOKEN"], TELEGRAM_ALLOWED_USER_IDS=os.environ["TELEGRAM_ALLOWED_USER_IDS"])
 json.dump(data, open(sys.argv[1], "w", encoding="utf-8"))' "${TEMP_ENV_FILE}"
 fi
@@ -277,9 +299,11 @@ gcloud run services update "${SERVICE_NAME}" --project "${PROJECT_ID}" --region 
 
 if [[ -n "${BOT_TOKEN_CHECK}" ]]; then
   # The helper returns only a boolean and deliberately suppresses provider details.
-  PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
-    TELEGRAM_BOT_TOKEN="${BOT_TOKEN}" TELEGRAM_WEBHOOK_URL="${SERVICE_URL}/telegram/webhook" python3 -c \
-    'import os; from core.integrations.firestore.client import get_client; from infra.deploy.connectors.telegram.webhook_admin import register_telegram_webhook; ok = False
+  TELEGRAM_BOT_TOKEN="${BOT_TOKEN}" TELEGRAM_WEBHOOK_URL="${SERVICE_URL}/telegram/webhook" \
+    "${PYTHON_EXECUTABLE}" "${REPO_ROOT}/infra/build/bootstrap_runner.py" --run-helper \
+    --source-root "${REPO_ROOT}" \
+    --requirements "${REPO_ROOT}/core/integrations/firestore/requirements.txt" \
+    --helper-code 'import os; from core.integrations.firestore.client import get_client; from infra.deploy.connectors.telegram.webhook_admin import register_telegram_webhook; ok = False
 try: ok = register_telegram_webhook(client=get_client(), bot_token=os.environ["TELEGRAM_BOT_TOKEN"], webhook_url=os.environ["TELEGRAM_WEBHOOK_URL"])
 except Exception: pass
 print("Telegram webhook registration succeeded" if ok else "Telegram webhook registration failed"); raise SystemExit(0 if ok else 1)'
