@@ -425,6 +425,13 @@ def test_global_direct_save_waits_for_real_index_and_replays(
                 and item["body"].get("operation_id") == task["operation_id"]
                 and item["body"].get("outbox_id") != task["outbox_id"])
     wake_record = get_outbox_record(runtime.db, wake["body"]["outbox_id"])
+    from services.connectors.telegram.queue import _current_head_wakeup
+
+    def current_wake_task():
+        current = _current_head_wakeup(runtime.db, task["context_id"], pending_only=False)
+        assert current is not None and current.operation_id == task["operation_id"]
+        return task_payload(current)
+
     core_operation_ref = runtime.db.collection("dialog_operations").document(
         index_task["body"]["operation_id"])
     if folder_mode == "finalizer_failure":
@@ -455,18 +462,21 @@ def test_global_direct_save_waits_for_real_index_and_replays(
 
         monkeypatch.setattr(sdk_fake_module, "_script", fail_common_settlement_after_third_docs_error)
         for _ in range(2):
-            result = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+            current_task = current_wake_task()
+            result = asyncio.run(runtime.dispatch(current_task),
                                  loop_factory=_direct_save_selector_loop)
         # The terminal provider stage is durable before common-operation failure
         # settlement. Interrupt that settlement once; replay must repair it
         # without issuing a fourth Docs read or returning a false terminal reply.
-        interrupted = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+        interrupted_task = current_wake_task()
+        interrupted = asyncio.run(runtime.dispatch(interrupted_task),
                                   loop_factory=_direct_save_selector_loop)
         assert interrupted.status_code in {200, 503}
         assert core_operation_ref.get().to_dict()["state"] == "running"
         assert not [payload for method, payload in runtime.sent
                     if method == "sendMessage" and "google_docs/finalization" in payload.get("text", "")]
-        result = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+        terminal_repair_task = current_wake_task()
+        result = asyncio.run(runtime.dispatch(terminal_repair_task),
                              loop_factory=_direct_save_selector_loop)
         queue_row = session.collection("operations").document(task["operation_id"]).get().to_dict()
         core_row = core_operation_ref.get().to_dict()
@@ -490,7 +500,7 @@ def test_global_direct_save_waits_for_real_index_and_replays(
         assert "failures=3" in reported[0] or "attempts=3" in reported[0]
         assert "synthetic-finalizer-provider-secret" not in reported[0]
         assert "A directly saved conversation." not in reported[0]
-        duplicate = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+        duplicate = asyncio.run(runtime.dispatch(terminal_repair_task),
                                 loop_factory=_direct_save_selector_loop)
         assert duplicate.status_code == 200
         assert len([event for event in sdk_fakes.trace
@@ -509,7 +519,8 @@ def test_global_direct_save_waits_for_real_index_and_replays(
     binding_path = f"telegram_sessions/{task['context_id']}/dialogs/1"
     firestore_fake.fail_next("commit", path=binding_path,
                              exception=RuntimeError("synthetic bind transaction outage"))
-    interrupted = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+    interrupted_task = current_wake_task()
+    interrupted = asyncio.run(runtime.dispatch(interrupted_task),
                               loop_factory=_direct_save_selector_loop)
     assert interrupted.status_code == 503, interrupted.text
     assert session.collection("operations").document(task["operation_id"]).get().to_dict()["state"] == "running"
@@ -519,7 +530,8 @@ def test_global_direct_save_waits_for_real_index_and_replays(
     assert core_operation["state"] == "completed"
     accepted_completion_ref = core_operation["index_completion_ref"]
     core_operation_ref.update({"index_completion_ref": "index_completions/direct-doc-b/foreign"})
-    untrusted = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+    untrusted_task = current_wake_task()
+    untrusted = asyncio.run(runtime.dispatch(untrusted_task),
                             loop_factory=_direct_save_selector_loop)
     assert untrusted.status_code == 200, untrusted.text
     assert session.collection("operations").document(task["operation_id"]).get().to_dict()["state"] == "running"
@@ -539,7 +551,8 @@ def test_global_direct_save_waits_for_real_index_and_replays(
     before_timezone_replay = len(sdk_fakes.trace)
     if accepted_timezone_replay:
         monkeypatch.setenv("TZ", "Pacific/Kiritimati")
-    completed = asyncio.run(runtime.dispatch(task_payload(wake_record)),
+    completed_task = current_wake_task()
+    completed = asyncio.run(runtime.dispatch(completed_task),
                             loop_factory=_direct_save_selector_loop)
     assert completed.status_code == 200, completed.text
     queue_row = session.collection("operations").document(task["operation_id"]).get().to_dict()

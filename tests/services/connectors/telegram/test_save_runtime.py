@@ -930,6 +930,7 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
     wake_record = get_outbox_record(db, wake_kwargs["body"]["outbox_id"])
     assert wake_record is not None
     wake_task = task_payload(wake_record)
+    clock.value = max(clock.value, wake_record.schedule_at)
     completed = asyncio.run(dispatch(wake_task), loop_factory=_selector_loop)
     assert completed.status_code == 200, completed.text
     assert completed.json() == {"status": "processed"}
@@ -1838,6 +1839,16 @@ def _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch, *,
             )]))],
         ))
 
+    async def dispatch(task):
+        from core.integrations.firestore.outbox import get_outbox_record
+        outbox_id = task.get("outbox_id") if isinstance(task, dict) else None
+        record = get_outbox_record(db, outbox_id) if isinstance(outbox_id, str) else None
+        if (record is not None and record.created_at is not None
+                and record.schedule_at > record.created_at
+                and record.schedule_at > clock.value):
+            clock.value = record.schedule_at
+        return await post("/internal/dispatch", task)
+
     return SimpleNamespace(
         app=app, clock=clock, db=db, task_requests=task_requests, sent=sent, post=post,
         worker=lambda: workers[-1] if workers else None,
@@ -1847,7 +1858,7 @@ def _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch, *,
         audio_request_hook=audio_request_hook,
         audio_response_hook=audio_response_hook,
         webhook=lambda update: post("/telegram/webhook", update, secret=True),
-        dispatch=lambda task: post("/internal/dispatch", task),
+        dispatch=dispatch,
         deliver=lambda task: post("/internal/deliver", task), route_response=route_response,
     )
 
@@ -2782,7 +2793,8 @@ def test_default_worker_saves_501_unicode_source_rows_over_one_mib(
     for snapshot in operation_ref.collection("stages").stream():
         row = snapshot.to_dict() or {}
         if (isinstance(row.get("result"), dict)
-                and "__telegram_save_stage_payload__" in row["result"]):
+                and ("telegram_save_stage_payload_ref" in row["result"]
+                     or "__telegram_save_stage_payload__" in row["result"])):
             stage_results_before_cleanup[snapshot.id] = row["result"]
     assert stage_results_before_cleanup
     allocated_input_refs = []
@@ -2848,6 +2860,7 @@ def test_default_worker_saves_501_unicode_source_rows_over_one_mib(
         stage_after_cleanup = operation_ref.collection("stages").document(stage_id).get().to_dict()
         result = stage_after_cleanup["result"]
         assert result.get("purged") is True
+        assert "telegram_save_stage_payload_ref" not in result
         assert "__telegram_save_stage_payload__" not in result
     assert batch_observations and max(batch_observations) <= 400
 
@@ -3190,6 +3203,135 @@ def test_default_worker_reconstructs_real_preparation_after_fenced_writer_takeov
     assert new_response.status_code == 200, new_response.text
 
 
+def test_large_preparation_checkpoint_uses_firestore_safe_map_keys(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A strict Firestore boundary accepts the >4KiB stage result checkpoint."""
+    import re
+    from tests.fixtures.firestore_fake import FakeTransaction
+
+    original_commit = FakeTransaction._commit
+
+    def reject_reserved_map_keys(value):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if isinstance(key, str) and re.fullmatch(r"__.*__", key):
+                    raise ValueError("Firestore field name uses a reserved pattern")
+                reject_reserved_map_keys(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                reject_reserved_map_keys(nested)
+
+    with pytest.raises(ValueError, match="reserved pattern"):
+        reject_reserved_map_keys({"__telegram_save_stage_payload__": {"sha256": "synthetic"}})
+    with pytest.raises(ValueError, match="reserved pattern"):
+        reject_reserved_map_keys({"telegram_classification": {
+            "__telegram_classified_dialog__": True,
+        }})
+
+    runtime_holder = {"runtime": None}
+    interrupted = {"value": False}
+    payload_part_commits = []
+
+    def strict_commit(transaction):
+        for _operation, _reference, data, _merge in transaction._writes:
+            reject_reserved_map_keys(data)
+        stage_result = next((data for _operation, reference, data, _merge
+                             in transaction._writes
+                             if reference.path.endswith("/stages/telegram.preparation")
+                             and isinstance(data, dict) and data.get("state") == "completed"), None)
+        if stage_result is not None and not interrupted["value"]:
+            marker = stage_result.get("result")
+            descriptor = (marker.get("telegram_save_stage_payload_ref")
+                          if isinstance(marker, dict) else None)
+            if isinstance(descriptor, dict) and descriptor.get("byte_length", 0) > 4096:
+                input_ref = descriptor["_input_ref"]
+                manifest = runtime_holder["runtime"].db.collection("dialog_operations").document(
+                    input_ref.split("/")[1],
+                ).collection("input_parts").document("manifest").get().to_dict()
+                assert manifest and manifest["ready"] is True
+                interrupted["value"] = True
+                raise RuntimeError("synthetic stage result checkpoint interruption")
+        if any("/input_parts/part-" in reference.path
+               for _operation, reference, _data, _merge in transaction._writes):
+            payload_part_commits.append(1)
+        return original_commit(transaction)
+
+    monkeypatch.setattr(FakeTransaction, "_commit", strict_commit)
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    runtime_holder["runtime"] = runtime
+    source = "synthetic source line " * 300
+    forward = {"update_id": 16901, "message": {
+        "message_id": 111, "date": 1793320000,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Ada"},
+                           "date": 1793310000},
+        "text": source,
+    }}
+    assert asyncio.run(runtime.webhook(forward), loop_factory=_selector_loop).status_code == 200
+    ack_task = next(row["body"] for row in runtime.task_requests
+                    if row["body"].get("notification_id"))
+    assert asyncio.run(runtime.deliver(ack_task), loop_factory=_selector_loop).status_code == 200
+    runtime.route_response("save")
+    sdk_fakes.gemini.queue("generate_content", error=RuntimeError("synthetic analysis stop"))
+    save_update = {"update_id": 16902, "message": {
+        "message_id": 112, "date": 1793320010,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "text": "save this dialog",
+    }}
+    assert asyncio.run(runtime.webhook(save_update), loop_factory=_selector_loop).status_code == 200
+    task = next(row["body"] for row in reversed(runtime.task_requests)
+                if row["body"].get("target_kind") == "telegram_dispatch"
+                and not row["body"].get("notification_id"))
+    response = asyncio.run(runtime.dispatch(task), loop_factory=_selector_loop)
+    assert response.status_code == 200, response.text
+
+    context_ref = runtime.db.collection("telegram_sessions").document(task["context_id"])
+    operation_ref = context_ref.collection("operations").document(task["operation_id"])
+    preparation = operation_ref.collection("stages").document("telegram.preparation").get().to_dict()
+    assert interrupted["value"] is True
+    assert preparation is not None
+    assert preparation["state"] == "running"
+    assert preparation["failures"] == 0 and preparation["attempts_started"] == 1
+    attempt_id = preparation["in_flight_attempt_id"]
+    marker = (operation_ref.collection("save_payloads").stream())
+    allocations = [row.to_dict() for row in marker]
+    assert len(allocations) == 1 and allocations[0]["byte_length"] > 4096
+    manifest_ref = allocations[0]["input_ref"]
+    part_collection = runtime.db.collection("dialog_operations").document(
+        manifest_ref.split("/")[1],
+    ).collection("input_parts")
+    first_manifest = part_collection.document("manifest").get().to_dict()
+    assert first_manifest["ready"] is True and part_collection.document("part-000000").get().exists
+    assert payload_part_commits == [1]
+
+    continuation = next(row["body"] for row in reversed(runtime.task_requests)
+                        if row["body"].get("target_kind") == "telegram_dispatch"
+                        and row["body"].get("operation_id") == task["operation_id"]
+                        and row["body"].get("outbox_id") != task["outbox_id"]
+                        and not row["body"].get("notification_id"))
+    recovered = asyncio.run(runtime.dispatch(continuation), loop_factory=_selector_loop)
+    assert recovered.status_code == 200, recovered.text
+    preparation = operation_ref.collection("stages").document("telegram.preparation").get().to_dict()
+    assert preparation["state"] == "completed"
+    assert preparation["failures"] == 0 and preparation["attempts_started"] == 1
+    assert preparation["in_flight_attempt_id"] is None and preparation["result"]
+    assert attempt_id is not None
+    assert payload_part_commits == [1]
+    marker = preparation["result"]
+    assert set(marker) == {"telegram_save_stage_payload_ref"}
+    descriptor = marker["telegram_save_stage_payload_ref"]
+    assert descriptor["byte_length"] > 4096
+    input_parts = runtime.db.collection("dialog_operations").document(
+        descriptor["_input_ref"].split("/")[1],
+    ).collection("input_parts")
+    manifest = input_parts.document("manifest").get().to_dict()
+    assert manifest["ready"] is True and manifest["byte_length"] == descriptor["byte_length"]
+    assert input_parts.document("part-000000").get().exists
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.create"]
+
+
 def test_default_app_retry_reuses_real_doc_after_fill_403(
     firestore_fake, sdk_fakes, monkeypatch, caplog,
 ):
@@ -3520,8 +3662,14 @@ def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuse
         sdk_fakes.docs.queue(
             "documents.get", error=ConnectionError(provider_secret + " private source"),
         )
-    for _ in range(3):
+    for attempt in range(3):
         settled = asyncio.run(runtime.dispatch(wake), loop_factory=_selector_loop)
+        if attempt < 2:
+            from core.integrations.firestore.outbox import task_payload
+            from services.connectors.telegram.queue import _current_head_wakeup
+            next_wake = _current_head_wakeup(runtime.db, context_id, pending_only=False)
+            assert next_wake is not None
+            wake = task_payload(next_wake)
 
     session = runtime.db.collection("telegram_sessions").document(context_id)
     operation_row = session.collection("operations").document(operation_id).get().to_dict()

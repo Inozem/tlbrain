@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import inspect
+import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -43,6 +44,7 @@ Clock = Callable[[], datetime]
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-firestore")
 MAX_EXECUTION_SLICE_SECONDS = 480.0
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,480}$")
+logger = logging.getLogger(__name__)
 
 
 class _WorkerClock:
@@ -84,8 +86,8 @@ def _wake_outbox_id(context_id: str, operation_id: str, generation: int) -> str:
     return f"tgqueue-{digest}"
 
 
-def resolve_current_head_wakeup(client: Any, context_id: str) -> Any | None:
-    """Read the stored wakeup for the current reserved head, if it is still pending."""
+def _current_head_wakeup(client: Any, context_id: str, *, pending_only: bool) -> Any | None:
+    """Read wake metadata for the reserved head, including a published task if requested."""
     context_ref = client.collection(SESSIONS).document(context_id)
     context_snapshot = context_ref.get()
     context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
@@ -97,11 +99,18 @@ def resolve_current_head_wakeup(client: Any, context_id: str) -> Any | None:
     record = get_outbox_record(client, _wake_outbox_id(context_id, operation_id, generation))
     if (record is None or record.target_kind is not OutboxTargetKind.TELEGRAM_DISPATCH
             or record.context_id != context_id or record.operation_id != operation_id
-            or record.generation != generation or record.state not in {
-                OutboxState.PENDING, OutboxState.RETRY,
-            }):
+            or record.generation != generation
+            or (pending_only and record.state not in {OutboxState.PENDING, OutboxState.RETRY})
+            or (not pending_only and record.state not in {
+                OutboxState.PENDING, OutboxState.RETRY, OutboxState.DELIVERED,
+            })):
         return None
     return record
+
+
+def resolve_current_head_wakeup(client: Any, context_id: str) -> Any | None:
+    """Read the stored wakeup for the current reserved head, if it is still pending."""
+    return _current_head_wakeup(client, context_id, pending_only=True)
 
 
 def _ensure_wakeup_outbox_record(
@@ -113,11 +122,14 @@ def _ensure_wakeup_outbox_record(
     generation: int,
     schedule_at: datetime,
     now: datetime,
+    retry_not_before: datetime | None = None,
+    minimum_delay_seconds: float = 0.0,
     prepared_writes: list[Any] | None = None,
 ) -> int:
-    """Reuse or create a wakeup; a consumed wakeup cannot wake the head again.
+    """Reuse or create a wakeup without losing durable retry eligibility.
 
-    Advancing its generation keeps this repair retryable and idempotent.
+    A due or too-early generation is superseded; an already-future valid deadline
+    remains stable across stale deliveries so retries cannot extend themselves.
     """
     while True:
         outbox_id = _wake_outbox_id(context_id, operation_id, generation)
@@ -135,7 +147,22 @@ def _ensure_wakeup_outbox_record(
                 generation += 1
                 continue
             if data.get("state") in {OutboxState.PENDING.value, OutboxState.RETRY.value}:
-                break
+                prior_schedule = data.get("schedule_at")
+                if minimum_delay_seconds <= 0 and retry_not_before is None:
+                    break
+                created_at = data.get("created_at")
+                minimum_at = (
+                    created_at + timedelta(seconds=minimum_delay_seconds)
+                    if isinstance(created_at, datetime) else schedule_at
+                )
+                if retry_not_before is not None:
+                    minimum_at = max(minimum_at, retry_not_before)
+                if (isinstance(prior_schedule, datetime)
+                        and (prior_schedule >= schedule_at
+                             or (prior_schedule > now and prior_schedule >= minimum_at))):
+                    break
+                generation += 1
+                continue
             generation += 1
             continue
         prepared = prepare_outbox_record_in_transaction(
@@ -164,6 +191,8 @@ def _ensure_wakeup_in_transaction(
     operation_id: str,
     schedule_at: datetime,
     now: datetime,
+    retry_not_before: datetime | None = None,
+    minimum_delay_seconds: float = 0.0,
     prepared_writes: list[Any] | None = None,
 ) -> None:
     """Write/reuse a deterministic wakeup while the caller holds the context txn."""
@@ -179,12 +208,39 @@ def _ensure_wakeup_in_transaction(
         generation=generation,
         schedule_at=schedule_at,
         now=now,
+        retry_not_before=retry_not_before,
+        minimum_delay_seconds=minimum_delay_seconds,
         prepared_writes=prepared_writes,
     )
     context["telegram_dispatch_wake_generation"] = generation
 
 
-def _ensure_head_wakeup(client: Any, context_id: str, *, now: datetime) -> str | None:
+def _head_retry_not_before(context_ref: Any, operation_id: str) -> datetime | None:
+    """Return the latest eligibility bound for an unfinished stage on this operation."""
+    stages = (context_ref.collection("operations").document(operation_id)
+              .collection("stages").select(["state", "retry_not_before"]))
+    retry_not_before = None
+    for snapshot in stages.stream():
+        data = snapshot.to_dict() or {}
+        retry_at = data.get("retry_not_before")
+        if (data.get("state") != "completed" and isinstance(retry_at, datetime)
+                and (retry_not_before is None or retry_at > retry_not_before)):
+            retry_not_before = retry_at
+    return retry_not_before
+
+
+def _head_retry_schedule_at(
+    *, now: datetime, minimum_delay_seconds: float, retry_not_before: datetime | None,
+) -> datetime:
+    """Honor persisted stage eligibility and enforce a minimum same-head delay."""
+    schedule_at = now + timedelta(seconds=minimum_delay_seconds)
+    return max(schedule_at, retry_not_before) if retry_not_before else schedule_at
+
+
+def _ensure_head_wakeup(
+    client: Any, context_id: str, *, now: datetime, minimum_delay_seconds: float = 0.0,
+    retry_not_before: datetime | None = None,
+) -> str | None:
     context_ref = client.collection(SESSIONS).document(context_id)
 
     @firestore.transactional
@@ -198,17 +254,80 @@ def _ensure_head_wakeup(client: Any, context_id: str, *, now: datetime) -> str |
             return None
         expiry = context.get("lock_expires_at")
         active_id = context.get("active_operation_id")
-        schedule_at = expiry if active_id == operation_id and isinstance(expiry, datetime) and expiry > now else now
+        eligibility_at = retry_not_before or _head_retry_not_before(context_ref, operation_id)
+        schedule_at = (
+            max(expiry, eligibility_at) if active_id == operation_id
+            and isinstance(expiry, datetime) and expiry > now and eligibility_at
+            else expiry if active_id == operation_id and isinstance(expiry, datetime) and expiry > now
+            else _head_retry_schedule_at(
+                now=now,
+                minimum_delay_seconds=minimum_delay_seconds,
+                retry_not_before=eligibility_at,
+            )
+        )
         _ensure_wakeup_in_transaction(
             client, transaction, context,
             context_id=context_id, operation_id=operation_id,
             schedule_at=schedule_at, now=now,
+            retry_not_before=eligibility_at,
+            minimum_delay_seconds=minimum_delay_seconds,
         )
         # A write to the context makes repair serialize with a concurrent finish.
         transaction.set(context_ref, context)
         return operation_id
 
     return _txn(client.transaction(max_attempts=5))
+
+
+async def _defer_until_head_eligible(
+    worker: "TelegramQueueWorker", client: Any, context_id: str, context_ref: Any,
+    operation_id: str, delivery_time: datetime,
+) -> bool:
+    """Prevent stale deliveries from bypassing a retry deadline or delayed wakeup."""
+    current_wakeup = await _offload_sync(
+        _current_head_wakeup, client, context_id, pending_only=False,
+    )
+    retry_not_before = await _offload_sync(_head_retry_not_before, context_ref, operation_id)
+    if isinstance(retry_not_before, datetime) and retry_not_before > delivery_time:
+        wake_is_eligible = (
+            current_wakeup is not None and current_wakeup.operation_id == operation_id
+            and current_wakeup.schedule_at >= retry_not_before
+        )
+        if not wake_is_eligible:
+            await _offload_sync(
+                _ensure_head_wakeup, client, context_id, now=delivery_time,
+                minimum_delay_seconds=worker.same_head_delay_seconds,
+                retry_not_before=retry_not_before,
+            )
+        return True
+    return bool(
+        current_wakeup is not None and current_wakeup.operation_id == operation_id
+        and current_wakeup.schedule_at > delivery_time
+    )
+
+
+def _log_processor_error(
+    error: Exception, *, context_id: str, operation_id: str, retryable_stage: bool,
+) -> None:
+    """Emit bounded stage diagnostics without exception or provider text."""
+    stage = getattr(error, "stage", None)
+    if not isinstance(stage, str) or re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", stage) is None:
+        stage = None
+    cause = error.__cause__
+    cause_type = type(cause).__name__ if cause is not None else None
+    if (not isinstance(cause_type, str)
+            or re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,79}", cause_type) is None):
+        cause_type = None
+    logger.warning("Telegram queue processor error settled", extra={
+        "event": "telegram_queue_stage_error",
+        "context_id": context_id,
+        "operation_id": operation_id,
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "cause_type": cause_type,
+        "settlement": "retry" if retryable_stage else "terminal",
+        "retryable_stage": retryable_stage,
+    })
 
 
 class TelegramQueueWorker:
@@ -383,7 +502,10 @@ class TelegramQueueWorker:
         )
         if not valid_delivery:
             if context_id:
-                await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=now)
+                await _offload_sync(
+                    _ensure_head_wakeup, self.client, context_id, now=now,
+                    minimum_delay_seconds=self.same_head_delay_seconds,
+                )
             return None
         return record, now
 
@@ -396,25 +518,42 @@ class TelegramQueueWorker:
         context_snapshot = await _offload_sync(context_ref.get)
         context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
         if context.get("reserved_operation_id") != record.operation_id:
-            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=delivery_time)
+            await _offload_sync(
+                _ensure_head_wakeup, self.client, context_id, now=delivery_time,
+                minimum_delay_seconds=self.same_head_delay_seconds,
+            )
             return None
         operation = await _offload_sync(get_operation, context_ref, record.operation_id)
         if operation is None or operation.state.is_terminal:
-            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=delivery_time)
+            await _offload_sync(
+                _ensure_head_wakeup, self.client, context_id, now=delivery_time,
+                minimum_delay_seconds=self.same_head_delay_seconds,
+            )
+            return None
+
+        if await _defer_until_head_eligible(
+            self, self.client, context_id, context_ref, record.operation_id, delivery_time,
+        ):
             return None
 
         lease = await _offload_sync(
             claim_head, self.client, context_ref, owner=self.owner_factory(), now=delivery_time,
         )
         if lease is None:
-            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=self.clock())
+            await _offload_sync(
+                _ensure_head_wakeup, self.client, context_id, now=self.clock(),
+                minimum_delay_seconds=self.same_head_delay_seconds,
+            )
             return None
         if lease.operation_id != record.operation_id:
             await _offload_sync(release_head,
                 self.client, context_ref, operation_id=lease.operation_id,
                 owner=lease.owner, fence=lease.fence, now=self.clock(),
             )
-            await _offload_sync(_ensure_head_wakeup, self.client, context_id, now=self.clock())
+            await _offload_sync(
+                _ensure_head_wakeup, self.client, context_id, now=self.clock(),
+                minimum_delay_seconds=self.same_head_delay_seconds,
+            )
             return None
         return context_id, context_ref, operation, lease
 
@@ -441,6 +580,10 @@ class TelegramQueueWorker:
             retryable_stage = self._retryable_error_stage(error)
             if retryable_stage is None:
                 raise
+            _log_processor_error(
+                error, context_id=context_id, operation_id=operation.operation_id,
+                retryable_stage=retryable_stage,
+            )
             return await self._settle_processor_error(
                 context_id, context_ref, lease, retryable_stage,
             )
@@ -761,10 +904,17 @@ class TelegramQueueWorker:
         settled_at = self.clock()
         if retryable_stage:
             def wake_retry(transaction: Any, updated_context: dict[str, Any]) -> None:
+                retry_not_before = _head_retry_not_before(context_ref, lease.operation_id)
                 _ensure_wakeup_in_transaction(
                     self.client, transaction, updated_context,
                     context_id=context_id, operation_id=lease.operation_id,
-                    schedule_at=settled_at, now=settled_at,
+                    schedule_at=_head_retry_schedule_at(
+                        now=settled_at,
+                        minimum_delay_seconds=self.same_head_delay_seconds,
+                        retry_not_before=retry_not_before,
+                    ), now=settled_at,
+                    retry_not_before=retry_not_before,
+                    minimum_delay_seconds=self.same_head_delay_seconds,
                 )
             return await _offload_sync(release_head, self.client, context_ref,
                 operation_id=lease.operation_id, owner=lease.owner, fence=lease.fence,
@@ -801,6 +951,7 @@ class TelegramQueueWorker:
                     self.client, transaction, updated_context,
                     context_id=context_id, operation_id=lease.operation_id,
                     schedule_at=wake_at, now=yielded_at,
+                    minimum_delay_seconds=self.same_head_delay_seconds,
                 )
 
             await _offload_sync(

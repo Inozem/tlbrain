@@ -17,6 +17,7 @@ from core.operations.retries import ConfirmedStageFailure, ConfirmedStageSuccess
 from core.dialogs.classification import FolderSelectionResult
 from services.connectors.telegram.context import build_save_analysis_context
 from services.connectors.telegram.preprocessing import preprocess_messages
+from services.connectors.telegram.save_checkpoints import STAGE_PAYLOAD_REF_FIELD, stage_payload_ref
 
 
 def _get(value: Any, name: str, default: Any = None) -> Any:
@@ -126,7 +127,7 @@ def _checkpoint_classified(value: Any) -> Any:
     if not isinstance(value, TelegramClassifiedDialog):
         return _checkpoint_analysis(value)
     return {
-        "__telegram_classified_dialog__": True,
+        "telegram_classified_dialog": True,
         "payload": _checkpoint_analysis(value.payload),
         "selection": {
             "folder_id": value.selection.folder_id,
@@ -137,7 +138,10 @@ def _checkpoint_classified(value: Any) -> Any:
 
 
 def _restore_classified(value: Any) -> Any:
-    if not isinstance(value, Mapping) or value.get("__telegram_classified_dialog__") is not True:
+    if not isinstance(value, Mapping) or not (
+        value.get("telegram_classified_dialog") is True
+        or value.get("__telegram_classified_dialog__") is True
+    ):
         return value
     selection = value.get("selection") or {}
     return TelegramClassifiedDialog(
@@ -350,15 +354,18 @@ class TelegramSaveWorkflow:
         if not callable(store):
             return value
         ref = await _await(store(operation_id, stage, value))
-        return {"__telegram_save_stage_payload__": ref}
+        return {STAGE_PAYLOAD_REF_FIELD: ref}
 
     async def _unpack_large_stage_result(self, value: Any) -> Any:
-        if not isinstance(value, Mapping) or set(value) != {"__telegram_save_stage_payload__"}:
+        if not isinstance(value, Mapping):
+            return value
+        payload_ref = stage_payload_ref(value)
+        if payload_ref is None:
             return value
         load = getattr(self.repository, "load_retry_stage_payload", None)
         if not callable(load):
             raise ValueError("prepared checkpoint payload is unavailable")
-        return await _await(load(value["__telegram_save_stage_payload__"]))
+        return await _await(load(payload_ref))
 
     async def _transcribe_analyze_and_classify(
         self,

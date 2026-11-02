@@ -850,6 +850,12 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
     assert wake is not None and wake.operation_id == save_dispatch["operation_id"]
     assert wake.schedule_at > wake.created_at
     wake_task = task_payload(wake)
+    scheduled_clock = lambda: wake.schedule_at
+    worker = app.state.telegram_queue_worker
+    worker.clock = scheduled_clock
+    worker.processor.clock = scheduled_clock
+    if getattr(worker.processor, "save_handler", None) is not None:
+        worker.processor.save_handler.clock = scheduled_clock
     completed = asyncio.run(post("/internal/dispatch", wake_task),
                             loop_factory=_selector_loop)
     assert completed.status_code == 200, completed.text

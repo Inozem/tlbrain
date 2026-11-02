@@ -1204,7 +1204,8 @@ def test_default_publisher_helper_resolves_same_head_then_next_head_wakeup(fires
     async def processor(_context_id, _operation, _lease):
         return next(outcomes)
 
-    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW,
+    clock = [NOW]
+    worker = TelegramQueueWorker(client, processor, clock=lambda: clock[0],
                                  owner_factory=lambda: "worker", same_head_delay_seconds=5)
     assert _run(worker.handle_task(payloads["op-a"])) is False
     same_head = resolve_current_head_wakeup(client, "ctx")
@@ -1212,11 +1213,87 @@ def test_default_publisher_helper_resolves_same_head_then_next_head_wakeup(fires
     assert same_head.operation_id == "op-a"
     assert same_head.schedule_at == NOW + timedelta(seconds=5)
 
+    clock[0] = same_head.schedule_at
     assert _run(worker.handle_task(payloads["op-a"])) is True
     next_head = resolve_current_head_wakeup(client, "ctx")
     assert next_head is not None
     assert next_head.operation_id == "op-b"
-    assert next_head.schedule_at == NOW
+    assert next_head.schedule_at == clock[0]
+
+
+@pytest.mark.parametrize("eligibility_seconds", [None, 30])
+def test_retryable_stage_failure_delays_wakeup_and_replay_cannot_bypass_it(
+    firestore_fake, eligibility_seconds,
+):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client)
+    future_eligibility = (NOW + timedelta(seconds=eligibility_seconds)
+                          if eligibility_seconds is not None else None)
+    clock = [NOW]
+    calls = []
+
+    async def processor(_context_id, _operation, _lease):
+        calls.append(clock[0])
+        if future_eligibility is not None:
+            context_ref.collection("operations").document("op-a").collection("stages").document(
+                "telegram.analysis",
+            ).set({"stage_key": "telegram.analysis", "state": "failed",
+                   "retry_not_before": future_eligibility})
+        error = ConnectionError("synthetic failure")
+        error.retryable_stage = True
+        raise error
+
+    worker = TelegramQueueWorker(
+        client, processor, clock=lambda: clock[0], owner_factory=lambda: "worker",
+        same_head_delay_seconds=5,
+    )
+    assert _run(worker.handle_task(payloads["op-a"])) is False
+    wake = resolve_current_head_wakeup(client, "ctx")
+    assert wake is not None
+    expected_eligibility = future_eligibility or NOW + timedelta(seconds=5)
+    assert wake.schedule_at == expected_eligibility
+    client.collection(OUTBOX_COLLECTION).document(wake.outbox_id).update({
+        "state": "delivered",
+    })
+
+    assert _run(worker.handle_task(payloads["op-a"])) is False
+    assert calls == [NOW]
+    assert get_outbox_record(client, wake.outbox_id).schedule_at == expected_eligibility
+
+    clock[0] = expected_eligibility
+    assert _run(worker.handle_task(payloads["op-a"])) is False
+    assert calls == [NOW, expected_eligibility]
+
+
+def test_stage_retry_not_before_blocks_initial_or_stale_queue_delivery(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client)
+    from services.connectors.telegram.queue import _ensure_head_wakeup
+    _ensure_head_wakeup(client, "ctx", now=NOW, minimum_delay_seconds=2)
+    eligible_at = NOW + timedelta(seconds=30)
+    context_ref.collection("operations").document("op-a").collection("stages").document(
+        "telegram.analysis",
+    ).set({"stage_key": "telegram.analysis", "state": "failed",
+           "retry_not_before": eligible_at})
+    clock = [NOW]
+    calls = []
+
+    async def processor(_context_id, _operation, _lease):
+        calls.append(clock[0])
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(
+        client, processor, clock=lambda: clock[0], owner_factory=lambda: "worker",
+        same_head_delay_seconds=5,
+    )
+    assert _run(worker.handle_task(payloads["op-a"])) is False
+    assert calls == []
+    wake = resolve_current_head_wakeup(client, "ctx")
+    assert wake is not None and wake.schedule_at == eligible_at
+
+    clock[0] = eligible_at
+    assert _run(worker.handle_task(payloads["op-a"])) is True
+    assert calls == [eligible_at]
 
 
 async def _fail_provider(calls):

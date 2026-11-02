@@ -9,6 +9,7 @@ from typing import Any
 
 from core.integrations.firestore.input_parts import MAX_PART_BYTES
 from services.connectors.telegram.runtime.ledger import _INLINE_CHECKPOINT_VALUE_BYTES
+from services.connectors.telegram.save_checkpoints import stage_payload_ref
 
 _STAGE_KINDS = {
     "telegram.preparation": "preparation",
@@ -152,8 +153,8 @@ class TemporarySavePayloadCleanup:
                         elif isinstance(result.get("purged_input_ref"), str):
                             payload_refs.append(result["purged_input_ref"])
                         continue
-                    if isinstance(result, Mapping) and set(result) == {"__telegram_save_stage_payload__"}:
-                        descriptor = result["__telegram_save_stage_payload__"]
+                    descriptor = stage_payload_ref(result)
+                    if descriptor is not None:
                         verified = self._verify_any_owner(
                             descriptor, context_id, operation_ids, kind,
                         )

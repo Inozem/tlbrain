@@ -1037,7 +1037,8 @@ def test_workflow_governs_and_reuses_firestore_safe_preparation_and_classificati
     assert all(isinstance(row, dict) for row in preparation.result)
     assert isinstance(preparation.result[0]["source_message_ids"], list)
     assert isinstance(classification.result, dict)
-    assert classification.result["__telegram_classified_dialog__"] is True
+    assert classification.result["telegram_classified_dialog"] is True
+    assert "__telegram_classified_dialog__" not in classification.result
     encode_value(preparation.result)
     assert isinstance(analysis.result, dict)
     encode_value(analysis.result)

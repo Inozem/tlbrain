@@ -249,9 +249,11 @@ class _TelegramCommittedSaveRuntime:
         if stage is None or getattr(stage.state, "value", stage.state) != "completed":
             return None
         result = stage.result
-        if isinstance(result, Mapping) and set(result) == {"__telegram_save_stage_payload__"}:
+        from services.connectors.telegram.save_checkpoints import stage_payload_ref
+        payload_ref = stage_payload_ref(result)
+        if payload_ref is not None:
             try:
-                result = ledger._load_payload(result["__telegram_save_stage_payload__"])
+                result = ledger._load_payload(payload_ref)
             except Exception:
                 return None
         from services.connectors.telegram.save import _restore_classified
