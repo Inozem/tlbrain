@@ -16,17 +16,18 @@ _ROUTE_SCHEMA = {
     "type": "object",
     "properties": {
         "kind": {"type": "string", "enum": ["pure_switch", "search", "substantive", "save", "retry"]},
-        "target_ref": {"type": "string", "nullable": True},
-        "target_operation_id": {"type": "string", "nullable": True},
-        "dialog_number": {"type": "integer", "nullable": True},
+        "target_ref": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "target_operation_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "dialog_number": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
         "result_refs": {"type": "array", "items": {"type": "string"}},
-        "substantive_text": {"type": "string", "nullable": True},
-        "tool_choice": {"type": "object", "nullable": True,
+        "substantive_text": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "tool_choice": {"anyOf": [{"type": "object",
             "properties": {
                 "name": {"type": "string", "enum": list(registry.OPERATIONS)},
                 "arguments": {"type": "object"},
                 "link_requested": {"type": "boolean"},
             }, "required": ["name", "arguments"], "additionalProperties": False},
+            {"type": "null"}]},
         "certainty": {"type": "string", "enum": ["certain", "uncertain"]},
     },
     "required": ["kind", "target_ref", "target_operation_id", "dialog_number",
@@ -82,7 +83,7 @@ class GeminiCommandRouter:
             contents=[{"role": "user", "parts": [{"text": json.dumps(prompt, ensure_ascii=False)}]}],
             mode="routing", tools=[{"name": "route_command",
                 "description": "Return the structured route for this Telegram command.",
-                "parameters": _ROUTE_SCHEMA}],
+                "parameters_json_schema": _ROUTE_SCHEMA}],
         )
         for part in _response_parts(response):
             call = _field(part, "function_call")

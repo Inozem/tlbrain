@@ -82,7 +82,7 @@ def test_catalog_has_exactly_the_shared_registry_tools_and_schemas():
     assert "delete_transcript" not in names
 
     expected = _schema_from_registry()
-    actual = {tool["name"]: tool["inputSchema"] for tool in tools}
+    actual = {tool["name"]: tool["parameters_json_schema"] for tool in tools}
     assert {
         name: {key: prop["type"] for key, prop in schema["properties"].items()}
         | ({"required": schema["required"]} if "required" in schema else {})

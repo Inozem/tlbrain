@@ -130,6 +130,33 @@ def _config(request):
             and getattr(config, key) is not None}
 
 
+def _wire_parameters_schema(declaration):
+    keys = [key for key in ("parametersJsonSchema", "parameters_json_schema")
+            if key in declaration]
+    assert len(keys) == 1
+    assert "parameters" not in declaration
+    return declaration[keys[0]]
+
+
+def _real_sdk_client(monkeypatch, handler):
+    """Build the real GenAI client against an in-process HTTP transport."""
+    import httpx
+    from google import genai
+    from google.genai import types
+    from tests.fixtures import sdk_fakes
+
+    monkeypatch.setattr(genai, "Client", sdk_fakes._REAL_GENAI_CLIENT)
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = genai.Client(
+        api_key="synthetic-gemini-key",
+        http_options=types.HttpOptions(
+            base_url="http://127.0.0.1/v1beta",
+            httpx_client=http_client,
+        ),
+    )
+    return client, http_client
+
+
 def test_gemini_agent_uses_single_flash_lite_request_without_sdk_retry_or_sampling_knobs():
     response = _response(SimpleNamespace(text="route: query"))
     client = FakeGeminiClient([response])
@@ -138,7 +165,7 @@ def test_gemini_agent_uses_single_flash_lite_request_without_sdk_retry_or_sampli
     result = agent.generate(
         contents=[{"role": "user", "parts": [{"text": "synthetic request"}]}],
         mode="routing",
-        tools=[{"name": "query", "parameters": {"type": "object"}}],
+        tools=[{"name": "query", "parameters_json_schema": {"type": "object"}}],
     )
 
     assert result is response
@@ -298,6 +325,208 @@ def test_gemini_agent_passes_tools_and_uses_shared_single_attempt_client(monkeyp
     sdk_tools = _field(fake_client.models.requests[0]["config"], "tools")
     declarations = _field(sdk_tools[0], "function_declarations")
     assert _field(declarations[0], "name") == "query"
+
+
+def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeypatch):
+    import httpx
+    from services.connectors.telegram.runtime.routing import GeminiCommandRouter
+    from core.integrations.gemini.agent import GeminiAgent
+
+    wire_requests = []
+    route = {
+        "kind": "substantive", "target_ref": None,
+        "target_operation_id": None, "dialog_number": None,
+        "result_refs": [], "substantive_text": "Summarize the decision.",
+        "tool_choice": {"name": "query", "arguments": {"query": "budget"}},
+        "certainty": "certain",
+    }
+
+    def respond(request):
+        wire_requests.append(request)
+        return httpx.Response(200, json={
+            "candidates": [{"content": {"role": "model", "parts": [{
+                "functionCall": {
+                    "id": "route-call-7", "name": "route_command", "args": route,
+                },
+                "thoughtSignature": "b3BhcXVlLXJvdXRlLXNpZ25hdHVyZQ==",
+            }]}}],
+        })
+
+    client, http_client = _real_sdk_client(monkeypatch, respond)
+    try:
+        sdk_agent = GeminiAgent(client=client)
+
+        class CaptureAgent:
+            def __init__(self):
+                self.response = None
+
+            def generate(self, **kwargs):
+                self.response = sdk_agent.generate(**kwargs)
+                return self.response
+
+        agent = CaptureAgent()
+        selected = GeminiCommandRouter(agent).route(text="Summarize this", candidates=[])
+        assert selected == route
+        function_call = agent.response.candidates[0].content.parts[0].function_call
+        assert function_call.id == "route-call-7"
+        assert function_call.args == route
+        assert agent.response.candidates[0].content.parts[0].thought_signature == (
+            b"opaque-route-signature"
+        )
+
+        request = json.loads(wire_requests[0].content)
+        declaration = request["tools"][0]["functionDeclarations"][0]
+        schema = _wire_parameters_schema(declaration)
+        assert declaration["name"] == "route_command"
+        assert schema["additionalProperties"] is False
+        tool_choice_schema = schema["properties"]["tool_choice"]
+        tool_choice = tool_choice_schema["anyOf"][0]
+        assert tool_choice["properties"]["arguments"] == {
+            "type": "object",
+        }
+        for field_name, field_type in (
+            ("target_ref", "string"), ("target_operation_id", "string"),
+            ("dialog_number", "integer"), ("tool_choice", "object"),
+            ("substantive_text", "string"),
+        ):
+            nullable_schema = schema["properties"][field_name]
+            assert nullable_schema["anyOf"][0]["type"] == field_type
+            assert nullable_schema["anyOf"][1] == {"type": "null"}
+        assert "parameters" not in declaration
+        assert "additional_properties" not in json.dumps(schema)
+        assert wire_requests[0].url.path.endswith(f"models/{MODEL}:generateContent")
+        assert request["generationConfig"]["thinkingConfig"]["thinking_level"] == "MINIMAL"
+    finally:
+        http_client.close()
+
+
+def test_full_telegram_catalog_serializes_raw_json_schemas_without_mutating_inputs(monkeypatch):
+    import httpx
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.tools import get_tool_catalog
+
+    catalog = get_tool_catalog()["tools"]
+    declarations = deepcopy(catalog)
+    before = deepcopy(declarations)
+    wire_requests = []
+
+    def respond(request):
+        wire_requests.append(request)
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"text": "synthetic"}],
+        }}]})
+
+    client, http_client = _real_sdk_client(monkeypatch, respond)
+    try:
+        GeminiAgent(client=client).generate(
+            contents=[{"role": "user", "parts": [{"text": "show folders"}]}],
+            mode="tool_loop", tools=declarations,
+        )
+        assert declarations == before
+        assert catalog == get_tool_catalog()["tools"]
+
+        request = json.loads(wire_requests[0].content)
+        serialized = request["tools"][0]["functionDeclarations"]
+        by_name = {tool["name"]: tool for tool in serialized}
+        original_by_name = {tool["name"]: tool["parameters_json_schema"] for tool in catalog}
+        assert set(by_name) == set(original_by_name)
+        assert _wire_parameters_schema(by_name["add_dialog"]) == original_by_name["add_dialog"]
+        utterance = _wire_parameters_schema(by_name["add_dialog"])["properties"]["utterances"]
+        add_dialog = _wire_parameters_schema(by_name["add_dialog"])
+        assert add_dialog["required"] == ["provider", "utterances"]
+        assert add_dialog["additionalProperties"] is False
+        assert add_dialog["properties"]["provider"]["minLength"] == 1
+        assert add_dialog["properties"]["title"]["minLength"] == 1
+        assert add_dialog["properties"]["dialog_date"]["format"] == "date"
+        assert add_dialog["properties"]["folder_path"]["items"] == {
+            "type": "string", "minLength": 1,
+        }
+        assert utterance["minItems"] == 1
+        assert utterance["items"]["additionalProperties"] is False
+        assert utterance["items"]["required"] == ["speaker", "text"]
+        assert utterance["items"]["properties"]["speaker"] == {
+            "type": "string", "minLength": 1,
+        }
+        assert utterance["items"]["properties"]["text"] == {
+            "type": "string", "minLength": 1,
+        }
+        for name in ("list_folders", "sync_status"):
+            assert _wire_parameters_schema(by_name[name]) == original_by_name[name]
+        for item in serialized:
+            _wire_parameters_schema(item)
+    finally:
+        http_client.close()
+
+
+def test_real_sdk_http_400_is_not_retried_for_json_schema_request(monkeypatch):
+    import httpx
+    from core.integrations.gemini.agent import GeminiAgent
+    from google.genai.errors import ClientError
+    from services.connectors.telegram.runtime.routing import _ROUTE_SCHEMA
+
+    wire_requests = []
+
+    def reject(request):
+        wire_requests.append(request)
+        return httpx.Response(400, json={"error": {"code": 400, "message": "synthetic"}})
+
+    client, http_client = _real_sdk_client(monkeypatch, reject)
+    try:
+        with pytest.raises(ClientError) as error:
+            GeminiAgent(client=client).generate(
+                contents=[{"role": "user", "parts": [{"text": "synthetic"}]}],
+                mode="routing",
+                tools=[{"name": "route_command", "parameters_json_schema": deepcopy(_ROUTE_SCHEMA)}],
+            )
+        assert error.value.code == 400
+        assert len(wire_requests) == 1
+        request = json.loads(wire_requests[0].content)
+        declaration = request["tools"][0]["functionDeclarations"][0]
+        assert _wire_parameters_schema(declaration) == _ROUTE_SCHEMA
+    finally:
+        http_client.close()
+
+
+def test_json_schema_wire_preserves_ready_source_schema_without_mutating_inputs(monkeypatch):
+    import httpx
+    from core.integrations.gemini.agent import GeminiAgent
+
+    wire_requests = []
+    schema = {
+        "type": "object",
+        "properties": {
+            "nullable": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        },
+        "required": ["nullable"],
+        "additionalProperties": False,
+    }
+    original_schema = deepcopy(schema)
+
+    def respond(request):
+        wire_requests.append(request)
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"text": "synthetic"}],
+        }}]})
+
+    client, http_client = _real_sdk_client(monkeypatch, respond)
+    try:
+        GeminiAgent(client=client).generate(
+            contents=[{"role": "user", "parts": [{"text": "synthetic"}]}],
+            mode="routing",
+            tools=[{"name": "schema_probe", "parameters_json_schema": schema}],
+        )
+        declaration = json.loads(wire_requests[0].content)["tools"][0][
+            "functionDeclarations"
+        ][0]
+        serialized = _wire_parameters_schema(declaration)
+        assert schema == original_schema
+        assert list(serialized["properties"]) == ["nullable"]
+        assert serialized["required"] == ["nullable"]
+        assert serialized["properties"]["nullable"] == {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+        }
+    finally:
+        http_client.close()
 
 
 def test_gemini_agent_rejects_unsupported_mode_clearly():

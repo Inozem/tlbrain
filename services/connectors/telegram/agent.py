@@ -107,14 +107,6 @@ def _calls_from(response: Any) -> list[dict[str, Any]]:
     return calls
 
 
-def _tool_declarations() -> list[dict[str, Any]]:
-    return [
-        {"name": item["name"], "description": item["description"],
-         "parameters": item["inputSchema"]}
-        for item in get_tool_catalog()["tools"]
-    ]
-
-
 def _usage(response: Any) -> dict[str, int]:
     metadata = _field(response, "usage_metadata")
     if metadata is None:
@@ -316,7 +308,7 @@ class TelegramAgent:
         target_doc_id: str | None,
     ) -> dict[str, Any] | None:
         response = self.model.generate(
-            contents=contents, mode="tool_loop", tools=_tool_declarations(),
+            contents=contents, mode="tool_loop", tools=get_tool_catalog()["tools"],
         )
         try:
             calls = self._validate_calls(response, state, target_doc_id=target_doc_id)

@@ -62,7 +62,7 @@ def get_tool_catalog() -> dict[str, Any]:
             {
                 "name": name,
                 "description": f"Run the {name} operation.",
-                "inputSchema": _argument_schema(name),
+                "parameters_json_schema": _argument_schema(name),
             }
             for name in registry.OPERATIONS
         ]

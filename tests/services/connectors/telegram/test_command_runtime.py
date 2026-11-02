@@ -85,7 +85,7 @@ def test_router_uses_structured_gemini_call_and_all_route_fields():
     assert model.calls[0]["mode"] == "routing"
     declaration = model.calls[0]["tools"][0]
     assert declaration["name"] == "route_command"
-    assert set(declaration["parameters"]["required"]) == {
+    assert set(declaration["parameters_json_schema"]["required"]) == {
         "kind", "target_ref", "target_operation_id", "dialog_number",
         "result_refs", "substantive_text", "tool_choice", "certainty",
     }
