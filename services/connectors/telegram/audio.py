@@ -259,6 +259,8 @@ class TelegramAudioTranscriber:
         operation_lease: Any,
     ) -> str:
         """Execute the transcription checkpoint as a retry-governed stage."""
+        from services.connectors.telegram.runtime.save_fencing import _provider_error_retryable
+
         stage_key = f"telegram.audio.{message_id}"
         try:
             return await retry_governor.run_stage_async(
@@ -267,7 +269,10 @@ class TelegramAudioTranscriber:
                 lambda: self._transcribe_and_checkpoint(message, draft_id, message_id),
                 owner=operation_lease.owner,
                 fence=operation_lease.fence,
-                retryable=lambda error: not isinstance(error, (ValueError, TypeError, KeyError)),
+                retryable=lambda error: (
+                    not isinstance(error, (ValueError, TypeError, KeyError))
+                    and _provider_error_retryable(error)
+                ),
                 reconcile=lambda: ConfirmedStageFailure(OperationError(
                     code="unknown_outcome",
                     category="execution",

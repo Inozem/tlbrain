@@ -147,11 +147,17 @@ def test_terminal_error_has_safe_fields_exhaustion_advice_and_confirmed_only_bil
     assert "RuntimeError" not in generic
 
     billing = format_terminal_error(**{**common, "failures": 1}, category="billing")
+    gemini_billing = format_terminal_error(
+        **{**common, "service": "gemini", "failures": 1}, category="billing",
+    )
     quota = format_terminal_error(**{**common, "failures": 1}, category="quota")
     assert "confirmed a billing issue" in billing
     assert "confirmed a quota limit" in quota
     assert "Check provider billing" in billing
     assert "Check provider billing" not in quota
+    assert "Prepay credits" not in billing
+    assert "Prepay credits" in gemini_billing
+    assert "https://aistudio.google.com/billing" in gemini_billing
 
 
 def test_terminal_error_drops_untrusted_error_text_and_malformed_identifiers():

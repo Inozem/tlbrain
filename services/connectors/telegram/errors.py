@@ -112,7 +112,13 @@ def format_terminal_error(
     )
     exhausted = type(failures) is int and failures >= 3
     if safe_category == "billing":
-        details += " Check provider billing."
+        if safe_service == "gemini":
+            details += (
+                " Check Gemini API billing and Prepay credits for your API key's project in "
+                "Google AI Studio: https://aistudio.google.com/billing."
+            )
+        else:
+            details += " Check provider billing."
     if exhausted:
         details += " Automatic retries have stopped; contact an administrator to check the logs."
     return (prefix + details)[:4096]

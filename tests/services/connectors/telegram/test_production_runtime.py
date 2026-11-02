@@ -184,6 +184,154 @@ def test_default_app_webhook_dispatch_routes_real_greeting_and_delivers_durable_
     assert notification["state"] == "delivered"
 
 
+def test_default_app_gemini_402_fails_save_once_and_preserves_numbered_draft(
+    firestore_fake, sdk_fakes, monkeypatch, caplog,
+):
+    """Exercise default intake, routing, terminal settlement, replay, and safe delivery."""
+    from google.genai.errors import ClientError
+    from core.integrations.firestore.outbox import get_outbox_record, task_payload
+    from services.connectors.telegram.app.main import create_app
+    from services.connectors.telegram.client import TelegramClient
+
+    db = firestore_fake.client_class()
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
+    monkeypatch.setattr("services.connectors.telegram.app.main._allowed_user_ids", lambda: {7})
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "pytest-telegram-control-queue")
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.pytest.invalid/internal/dispatch")
+    monkeypatch.setenv("TELEGRAM_DELIVERY_URL", "https://telegram.pytest.invalid/internal/deliver")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+
+    task_requests, sent = [], []
+    enqueue_fake = lambda **kwargs: task_requests.append(kwargs)
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
+
+    def bot_response(request):
+        payload = json.loads(request.content)
+        sent.append((request.url.path.rsplit("/", 1)[-1], payload))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 900 + len(sent)}})
+
+    original_init = TelegramClient.__init__
+
+    def telegram_client_init(self, token, *, http_client=None, timeout=30.0):
+        return original_init(self, token, http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(bot_response)), timeout=timeout)
+
+    monkeypatch.setattr(TelegramClient, "__init__", telegram_client_init)
+    private_marker = "synthetic-provider-private-marker"
+    sdk_fakes.gemini.queue("generate_content", error=ClientError(402, {"error": {
+        "code": 402, "status": "RESOURCE_EXHAUSTED", "message": private_marker,
+    }}))
+    app = create_app(
+        webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+        oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})(),
+    )
+
+    async def post(path, payload, *, secret=False):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            headers = {"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"} if secret else {
+                "Authorization": "Bearer fake-task",
+            }
+            return await client.post(path, headers=headers, json=payload)
+
+    source_text = "Synthetic forwarded source that must remain in its draft."
+    forward = {"update_id": 14011, "message": {
+        "message_id": 71, "date": 1793320000,
+        "chat": {"id": 78, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Ada"},
+                           "date": 1793310000},
+        "text": source_text,
+    }}
+    accepted = asyncio.run(post("/telegram/webhook", forward, secret=True), loop_factory=_selector_loop)
+    assert accepted.status_code == 200, accepted.text
+    forward_dispatch = next(item["body"] for item in task_requests
+                            if item["body"].get("target_kind") == "telegram_dispatch")
+    assert get_outbox_record(db, forward_dispatch["outbox_id"]) is not None
+    delivered_ack = asyncio.run(post("/internal/deliver", forward_dispatch), loop_factory=_selector_loop)
+    assert delivered_ack.status_code == 200, delivered_ack.text
+
+    command = {"update_id": 14012, "message": {
+        "message_id": 72, "date": 1793320010,
+        "chat": {"id": 78, "type": "private"}, "from": {"id": 7}, "text": "save this dialog",
+    }}
+    command_result = asyncio.run(post("/telegram/webhook", command, secret=True), loop_factory=_selector_loop)
+    assert command_result.status_code == 200, command_result.text
+    command_tasks = [item["body"] for item in task_requests
+                     if item["body"].get("target_kind") == "telegram_dispatch"]
+    operation_dispatch = next(body for body in reversed(command_tasks) if not body.get("notification_id"))
+    for body in reversed(command_tasks):
+        if body.get("notification_id"):
+            ack = asyncio.run(post("/internal/deliver", body), loop_factory=_selector_loop)
+            assert ack.status_code == 200, ack.text
+            break
+
+    result = asyncio.run(post("/internal/dispatch", operation_dispatch), loop_factory=_selector_loop)
+    assert result.status_code == 200, result.text
+    assert result.json() == {"status": "processed"}
+    status_dispatch = next(item["body"] for item in task_requests
+                           if item["body"].get("target_kind") == "telegram_status_check"
+                           and item["body"].get("operation_id") == operation_dispatch["operation_id"])
+    status_result = asyncio.run(post("/internal/status-check", status_dispatch),
+                                loop_factory=_selector_loop)
+    assert status_result.status_code == 200, status_result.text
+    duplicate = asyncio.run(post("/internal/dispatch", operation_dispatch), loop_factory=_selector_loop)
+    assert duplicate.status_code == 200, duplicate.text
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "gemini" and event["operation"] == "generate_content"]) == 1
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.create"]
+
+    operation_ref = (db.collection("telegram_sessions").document(operation_dispatch["context_id"])
+                     .collection("operations").document(operation_dispatch["operation_id"]))
+    operation = operation_ref.get().to_dict()
+    assert operation["state"] == "failed"
+    context = db.collection("telegram_sessions").document(operation_dispatch["context_id"]).get().to_dict()
+    draft_id = (operation.get("target_draft_id") or operation.get("draft_id")
+                or context.get("active_draft_id"))
+    assert draft_id
+    context_ref = db.collection("telegram_sessions").document(operation_dispatch["context_id"])
+    draft_ref = context_ref.collection("drafts").document(draft_id)
+    draft = draft_ref.get().to_dict()
+    assert draft["dialog_number"] > 0
+    assert draft_ref.collection("messages").document("71").get().to_dict()["text"] == source_text
+    stage_rows = [row for path, row in firestore_fake.documents.items()
+                  if path.startswith(
+                      f"telegram_sessions/{operation_dispatch['context_id']}/operations/"
+                      f"{operation_dispatch['operation_id']}/stages/"
+                  )]
+    assert len(stage_rows) == 1
+    stage = stage_rows[0]
+    assert stage["failures"] == 1
+    assert stage["last_error"]["category"] == "billing"
+    assert stage["last_error"]["service"] == "gemini"
+    assert stage["last_error"]["retryable"] is False
+    assert private_marker not in repr(stage)
+
+    error_messages = [payload["text"] for method, payload in sent if method == "sendMessage"]
+    terminal = next(text for text in error_messages if "Prepay credits" in text)
+    assert f"Dialog #{draft['dialog_number']}" in terminal
+    assert "Error in gemini/routing" in terminal
+    assert "category=billing" in terminal
+    assert operation_dispatch["operation_id"] in terminal
+    assert "failures=1" in terminal
+    assert "https://aistudio.google.com/billing" in terminal
+    assert private_marker not in repr(error_messages)
+    assert "GEMINI_API_KEY" not in terminal
+    assert source_text not in terminal
+    assert private_marker not in caplog.text
+    assert source_text not in caplog.text
+    stored_errors = [row for path, row in firestore_fake.documents.items()
+                     if path.startswith("notification_outbox/")
+                     and row.get("operation_id") == operation_dispatch["operation_id"]]
+    assert private_marker not in repr(stored_errors)
+    assert source_text not in repr(stored_errors)
+
+
 def test_default_save_repository_roundtrips_large_stage_payload_as_bounded_parts(firestore_fake):
     from services.connectors.telegram.commands import parse_command
     from services.connectors.telegram.queue import claim_head

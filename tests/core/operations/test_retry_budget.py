@@ -748,14 +748,16 @@ def test_structured_provider_errors_are_bounded_and_never_store_provider_text(
         (403, {"error": {"code": 403, "status": "PERMISSION_DENIED",
                           "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
                                        "reason": "BILLING_DISABLED"}]}}, "billing"),
+        (402, {"error": {"code": 402, "status": "RESOURCE_EXHAUSTED",
+                          "message": "private-marker"}}, "billing"),
         (429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
-                          "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                                       "reason": "RATE_LIMIT_EXCEEDED"}]}}, "rate_limited"),
+                          "message": "private-marker"}}, "rate_limited"),
     ],
 )
 def test_installed_genai_client_error_uses_machine_fields_only(
     firestore_fake, fake_clock, code, envelope, category,
 ):
+    from types import SimpleNamespace
     from google.genai.errors import ClientError
     from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
 
@@ -764,6 +766,29 @@ def test_installed_genai_client_error_uses_machine_fields_only(
     assert telegram_error_classifier(RuntimeError("unknown"), "telegram-tool-00") == (
         "execution", None,
     )
+    assert telegram_error_classifier(SimpleNamespace(code=402), "telegram-tool-00") == (
+        "execution", None,
+    )
+
+
+def test_unconfigured_governor_keeps_actual_genai_402_generic(firestore_fake, fake_clock):
+    from google.genai.errors import ClientError
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    _new_operation(client)
+    error = ClientError(402, {"error": {
+        "code": 402, "status": "RESOURCE_EXHAUSTED", "message": "private-marker",
+    }})
+    with pytest.raises(ClientError):
+        _governor(client, fake_clock).run_stage(
+            OPERATION_ID, "legacy-genai-402", lambda: (_ for _ in ()).throw(error),
+            now=fake_clock.now(),
+        )
+    stage = get_stage(client, OPERATION_ID, "legacy-genai-402")
+    assert stage.last_error.category == "execution"
+    assert stage.last_error.service is None
+    assert "private-marker" not in repr(stage.last_error)
 
 
 def test_unconfigured_governor_preserves_legacy_generic_error_fields(firestore_fake, fake_clock):

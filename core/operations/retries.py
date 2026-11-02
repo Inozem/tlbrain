@@ -127,7 +127,7 @@ def _error_reason_codes(error: BaseException) -> set[str]:
     return values
 
 
-def _provider_error_category(error: BaseException) -> str:
+def _provider_error_category(error: BaseException, *, service: str | None = None) -> str:
     reasons = _error_reason_codes(error)
     if reasons & _BILLING_REASONS:
         return "billing"
@@ -137,6 +137,8 @@ def _provider_error_category(error: BaseException) -> str:
     status = getattr(error, "code", None) or getattr(error, "status_code", None)
     if status is None:
         status = getattr(getattr(error, "resp", None), "status", None)
+    if status == 402 and service == "gemini":
+        return "billing"
     return "rate_limited" if status == 429 else "execution"
 
 

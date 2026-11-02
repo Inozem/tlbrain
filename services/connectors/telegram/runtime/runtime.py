@@ -28,6 +28,7 @@ from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
 from services.connectors.telegram.runtime.routing import GeminiCommandRouter
 from services.connectors.telegram.runtime.store import TelegramRuntimeStore
 from services.connectors.telegram.runtime.tools import TelegramRegistryExecutor
+from services.connectors.telegram.runtime.save_fencing import _provider_error_retryable
 
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-command-runtime")
 
@@ -90,6 +91,7 @@ class _GovernedModel:
             result = self.governor.run_stage(
                 self.operation_id, stage_key,
                 lambda: self._pack(stage_key, _safe_response(self.model.generate(**kwargs))), now=self.clock(),
+                retryable=_provider_error_retryable,
                 reconcile=lambda: ConfirmedStageFailure(OperationError(
                     code="unknown_outcome", category="execution",
                     message="Stage execution failed", retryable=True,
@@ -175,6 +177,7 @@ class _GovernedExecutor:
                 self.operation_id, stage_key,
                 lambda: self._pack(stage_key, self.executor.execute(
                     name=name, arguments=arguments, call_ordinal=call_ordinal)),
+                retryable=_provider_error_retryable,
                 reconcile=lambda: self._reconcile(stage_key, name, arguments, call_ordinal),
                 now=self.clock(), owner=_value(self.lease, "owner"),
                 fence=_value(self.lease, "fence"),

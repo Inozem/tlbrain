@@ -15,6 +15,8 @@ def _provider_error_retryable(error: BaseException) -> bool:
     status = getattr(response, "status_code", None)
     if status is None:
         status = getattr(getattr(source, "resp", None), "status", None)
+    if status is None:
+        status = getattr(source, "code", None)
     if type(status) is int and 400 <= status < 500:
         return status in {408, 429}
     return True
@@ -42,7 +44,7 @@ def telegram_error_classifier(error: BaseException, stage_key: str) -> tuple[str
                 service = "qdrant"
         except ImportError:
             pass
-    return _provider_error_category(source), service
+    return _provider_error_category(source, service=service), service
 
 
 class _TelegramSaveRetryGovernor(RetryGovernor):
@@ -55,6 +57,10 @@ class _TelegramSaveRetryGovernor(RetryGovernor):
     def run_stage(self, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("retryable", _provider_error_retryable)
         return super().run_stage(*args, **kwargs)
+
+    async def run_stage_async(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("retryable", _provider_error_retryable)
+        return await super().run_stage_async(*args, **kwargs)
 
 
 class _RuntimeClock:

@@ -293,6 +293,18 @@ def test_save_retry_policy_stops_on_definitive_provider_rejection(status, expect
     assert _provider_error_retryable(error) is expected
 
 
+def test_genai_client_error_code_is_used_by_provider_retry_policy():
+    from google.genai.errors import ClientError
+    from services.connectors.telegram.runtime.saving import _provider_error_retryable
+
+    assert _provider_error_retryable(ClientError(402, {"error": {
+        "code": 402, "status": "RESOURCE_EXHAUSTED", "message": "private-marker",
+    }})) is False
+    assert _provider_error_retryable(ClientError(429, {"error": {
+        "code": 429, "status": "RESOURCE_EXHAUSTED",
+    }})) is True
+
+
 def test_permanent_fill_stage_rejection_terminalizes_shared_save_once(firestore_fake):
     """Exercise shared governor handling for a definitive fill-stage rejection."""
     from core.dialogs.saving import accept_save
@@ -329,6 +341,62 @@ def test_permanent_fill_stage_rejection_terminalizes_shared_save_once(firestore_
 
     assert get_stage(client, operation_id, "fill").failures == 1
     assert get_operation(client, operation_id).state is OperationState.FAILED
+
+
+def test_shared_save_gemini_402_is_safe_and_terminal_after_one_provider_attempt(firestore_fake):
+    from google.genai.errors import ClientError
+    from core.dialogs.saving import accept_save
+    from core.integrations.firestore.operations import claim_operation, get_stage
+    from core.operations.models import OperationOrigin
+    from core.operations.retries import RetryBudgetExceeded
+    from services.connectors.telegram.runtime.saving import _TelegramSaveRetryGovernor
+
+    client = firestore_fake.client_class()
+    now = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    accepted = accept_save(
+        client,
+        {"provider": "telegram", "title": "Sealed", "utterances": [
+            {"speaker": "Ada", "text": "Exact source."},
+        ]},
+        operation_id="telegram-gemini-payment-required", caller_binding="telegram:42_11",
+        origin=OperationOrigin.TELEGRAM, now=now,
+        save_intent_id="telegram-gemini-payment-required",
+    )
+    operation_id = accepted.operation.operation_id
+    lease = claim_operation(
+        client, operation_id, owner="telegram-save-test", now=now, lease_seconds=600,
+    )
+    assert lease is not None
+    calls = []
+    error = ClientError(402, {"error": {
+        "code": 402, "status": "RESOURCE_EXHAUSTED", "message": "private-marker",
+    }})
+    governor = _TelegramSaveRetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+    )
+
+    def request():
+        calls.append(1)
+        raise error
+
+    with pytest.raises(ClientError):
+        governor.run_stage(
+            operation_id, "gemini-analysis", request,
+            owner="telegram-save-test", fence=lease.fence, now=now,
+        )
+    with pytest.raises((RetryBudgetExceeded, RuntimeError)):
+        governor.run_stage(
+            operation_id, "gemini-analysis", request,
+            owner="telegram-save-test", fence=lease.fence, now=now,
+        )
+
+    stage = get_stage(client, operation_id, "gemini-analysis")
+    assert calls == [1]
+    assert stage.failures == 1
+    assert stage.last_error.category == "billing"
+    assert stage.last_error.service == "gemini"
+    assert stage.last_error.retryable is False
+    assert "private-marker" not in repr(stage.last_error)
 
 
 def _selector_loop():
@@ -2965,8 +3033,15 @@ def test_default_worker_heartbeats_while_parent_stage_storage_read_is_blocked(
             assert await asyncio.to_thread(entered.wait, 5)
             expiry_before = context.get().to_dict()["lock_expires_at"]
             runtime.clock.value += timedelta(seconds=1)
-            await asyncio.sleep(0.06)
-            assert context.get().to_dict()["lock_expires_at"] > expiry_before
+            deadline = asyncio.get_running_loop().time() + 5
+            expiry_after = expiry_before
+            while expiry_after <= expiry_before and asyncio.get_running_loop().time() < deadline:
+                assert not read_finished.is_set(), "blocked stage read finished before lease renewal"
+                expiry_after = context.get().to_dict()["lock_expires_at"]
+                if expiry_after <= expiry_before:
+                    await asyncio.sleep(0.01)
+            assert expiry_after > expiry_before, "queue worker did not renew its context lease"
+            assert not read_finished.is_set(), "stage read must remain blocked through lease renewal"
             release.set()
             response = await asyncio.wait_for(dispatch, timeout=10)
             assert await asyncio.to_thread(read_finished.wait, 5)

@@ -29,7 +29,9 @@ import pytest
 from core.integrations.firestore.operation_queue import (
     QueueOperationRetryStore, claim_head, register_operation,
 )
-from core.operations.retries import RetryGovernor, UnknownOutcome, ReconciledStageFailure
+from core.operations.retries import (
+    RetryBudgetExceeded, RetryGovernor, UnknownOutcome, ReconciledStageFailure,
+)
 from services.connectors.telegram.repository import SESSIONS
 
 
@@ -760,6 +762,59 @@ def test_unknown_audio_outcome_reconciles_as_retryable_failure_without_user_fail
         ("audio-context", "draft-audio", 1, "recovered transcript"),
     ]
     assert governor.get_stage("audio-operation", "telegram.audio.1").failures == 1
+
+
+def test_audio_gemini_402_is_terminal_and_does_not_repeat_provider_call(firestore_fake):
+    from google.genai.errors import ClientError
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    context_ref = client.collection(SESSIONS).document("audio-context")
+    now = datetime.now(timezone.utc)
+    register_operation(client, context_ref, "audio-operation", identity_digest="d", input_ref="i", now=now)
+    lease = claim_head(client, context_ref, owner="audio-worker", now=now)
+    assert lease is not None
+
+    class Clock:
+        def now(self):
+            return now
+
+    governor = RetryGovernor(
+        client, clock=Clock(),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+        error_classifier=telegram_error_classifier,
+    )
+    service = _service(
+        _Telegram({}), _Repository(), _GeminiFactory(_Models()), context_id="audio-context",
+    )
+    provider_calls = []
+    error = ClientError(402, {"error": {
+        "code": 402, "status": "RESOURCE_EXHAUSTED", "message": "private-marker",
+    }})
+
+    async def fail(_message):
+        provider_calls.append(1)
+        raise error
+
+    service._transcribe_message = fail
+    with pytest.raises(ClientError):
+        _run(service.process_messages(
+            [_message(1)], draft_id="draft-audio", analyze=lambda rows: rows,
+            retry_governor=governor, operation_id="audio-operation", operation_lease=lease,
+        ))
+    with pytest.raises(RetryBudgetExceeded):
+        _run(service.process_messages(
+            [_message(1)], draft_id="draft-audio", analyze=lambda rows: rows,
+            retry_governor=governor, operation_id="audio-operation", operation_lease=lease,
+        ))
+
+    stage = governor.get_stage("audio-operation", "telegram.audio.1")
+    assert provider_calls == [1]
+    assert stage.failures == 1
+    assert stage.last_error.category == "billing"
+    assert stage.last_error.service == "gemini"
+    assert stage.last_error.retryable is False
+    assert "private-marker" not in repr(stage.last_error)
 
 
 def test_audio_persistence_error_preserves_checkpoint_without_failure_checkpoint():

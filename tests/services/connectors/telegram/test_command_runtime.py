@@ -158,6 +158,57 @@ def test_router_reads_real_gemini_candidate_envelope_and_governor_replays_it(fir
     assert len(stages) == 1 and stages[0]["state"] == "completed"
 
 
+def test_governed_model_terminalizes_genai_402_without_replay_call(firestore_fake):
+    from google.genai.errors import ClientError
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryBudgetExceeded, RetryGovernor
+    from services.connectors.telegram.runtime.runtime import _GovernedModel
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    error = ClientError(402, {"error": {
+        "code": 402, "status": "RESOURCE_EXHAUSTED", "message": "private-marker",
+    }})
+
+    class Model:
+        calls = 0
+
+        def generate(self, **_kwargs):
+            self.calls += 1
+            raise error
+
+    source = Model()
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(
+            client, client.collection("telegram_sessions").document(context_id)),
+        error_classifier=telegram_error_classifier,
+    )
+    model = _GovernedModel(source, governor, operation["operation_id"], lease,
+                           lambda: now, lambda: True)
+    with pytest.raises(ClientError):
+        model.generate(contents=[{"role": "user", "parts": [{"text": "save"}]}],
+                       mode="tool_loop")
+
+    stage_key = model.failure_stage
+    stage = governor.get_stage(operation["operation_id"], stage_key)
+    assert source.calls == 1
+    assert stage.failures == 1
+    assert stage.last_error.category == "billing"
+    assert stage.last_error.service == "gemini"
+    assert stage.last_error.retryable is False
+    with pytest.raises(RetryBudgetExceeded):
+        model.generate(contents=[{"role": "user", "parts": [{"text": "save"}]}],
+                       mode="tool_loop")
+    assert source.calls == 1
+    stored = client.collection("telegram_sessions").document(context_id).collection(
+        "operations").document(operation["operation_id"]).collection(
+        "stages").document(stage_key).get().to_dict()
+    assert "private-marker" not in repr(stored)
+
+
 def test_governed_model_round_identity_advances_after_interrupted_round(firestore_fake):
     from core.integrations.firestore.operation_queue import QueueOperationRetryStore
     from core.operations.retries import RetryGovernor
@@ -308,6 +359,92 @@ def test_governor_reconciles_an_interrupted_tool_stage_without_duplicate_effect(
 
     assert result == {"confirmed": True}
     assert inner.calls == 1
+
+
+def test_governed_tool_terminalizes_genai_402_without_second_sdk_call(firestore_fake):
+    from google.genai.errors import ClientError
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryBudgetExceeded, RetryGovernor
+    from services.connectors.telegram.runtime.runtime import _GovernedExecutor
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    error = ClientError(402, {"error": {
+        "code": 402, "status": "RESOURCE_EXHAUSTED", "message": "private-marker",
+    }})
+
+    class Executor:
+        calls = 0
+
+        def execute(self, **_kwargs):
+            self.calls += 1
+            raise error
+
+    inner = Executor()
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(
+            client, client.collection("telegram_sessions").document(context_id)),
+        error_classifier=telegram_error_classifier,
+    )
+    executor = _GovernedExecutor(
+        inner, governor, operation["operation_id"], lease, lambda: now, lambda: True,
+    )
+    with pytest.raises(ClientError):
+        executor.execute(name="get_transcript", arguments={"doc_id": "doc"}, call_ordinal=0)
+
+    stage = governor.get_stage(operation["operation_id"], "telegram-tool-00")
+    assert inner.calls == 1
+    assert stage.failures == 1
+    assert stage.last_error.category == "billing"
+    assert stage.last_error.service == "gemini"
+    assert stage.last_error.retryable is False
+    with pytest.raises(RetryBudgetExceeded):
+        executor.execute(name="get_transcript", arguments={"doc_id": "doc"}, call_ordinal=0)
+    assert inner.calls == 1
+
+
+def test_governed_model_keeps_transient_genai_503_within_three_attempts(firestore_fake):
+    from google.genai.errors import ClientError
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryBudgetExceeded, RetryGovernor
+    from services.connectors.telegram.runtime.runtime import _GovernedModel
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    error = ClientError(503, {"error": {"code": 503, "status": "UNAVAILABLE"}})
+
+    class Model:
+        calls = 0
+
+        def generate(self, **_kwargs):
+            self.calls += 1
+            raise error
+
+    source = Model()
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(
+            client, client.collection("telegram_sessions").document(context_id)),
+        error_classifier=telegram_error_classifier,
+    )
+    model = _GovernedModel(source, governor, operation["operation_id"], lease,
+                           lambda: now, lambda: True)
+    request = {"contents": [{"role": "user", "parts": [{"text": "save"}]}], "mode": "tool_loop"}
+    for _ in range(3):
+        with pytest.raises(ClientError):
+            model.generate(**request)
+    with pytest.raises(RetryBudgetExceeded):
+        model.generate(**request)
+
+    assert source.calls == 3
+    stage = governor.get_stage(operation["operation_id"], model.failure_stage)
+    assert stage.failures == 3
+    assert stage.last_error.retryable is True
 
 
 def test_interrupted_registry_write_reconciliation_never_reinvokes_mutation(
