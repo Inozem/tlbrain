@@ -62,6 +62,18 @@ class FirestoreAgentLedger:
                 .collection("operations").document(self.operation_id)
                 .collection("agent_requests").document("request"))
 
+    def checkpoint_conversation_id(self, delivery_id: str) -> str | None:
+        """Return the existing operation checkpoint binding without loading payloads."""
+        turn = self._ref(delivery_id).get().to_dict() or {}
+        request = self._request_ref(delivery_id).get().to_dict() or {}
+        values = {
+            row.get("conversation_id") for row in (turn, request)
+            if isinstance(row.get("conversation_id"), str)
+        }
+        if len(values) > 1:
+            raise ValueError("agent checkpoint conversation binding changed")
+        return next(iter(values), None)
+
     def _assert_current(self, transaction: Any) -> None:
         context_ref = self.client.collection(SESSIONS).document(self.context_id)
         operation_ref = context_ref.collection("operations").document(self.operation_id)

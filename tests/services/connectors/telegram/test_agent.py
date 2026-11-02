@@ -377,6 +377,7 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         request = json.loads(wire_requests[0].content)
         declaration = request["tools"][0]["functionDeclarations"][0]
         schema = _wire_parameters_schema(declaration)
+        assert request["toolConfig"]["functionCallingConfig"]["mode"] == "ANY"
         assert declaration["name"] == "route_command"
         assert schema["additionalProperties"] is False
         tool_choice_schema = schema["properties"]["tool_choice"]
@@ -396,6 +397,56 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         assert "additional_properties" not in json.dumps(schema)
         assert wire_requests[0].url.path.endswith(f"models/{MODEL}:generateContent")
         assert request["generationConfig"]["thinkingConfig"]["thinking_level"] == "MINIMAL"
+    finally:
+        http_client.close()
+
+
+def test_run_search_history_reaches_real_sdk_as_supported_untrusted_data(
+    monkeypatch, firestore_fake,
+):
+    import httpx
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.search_sessions import run_search
+    from services.connectors.telegram.context import build_conversation_history
+    from core.integrations.gemini.agent import GeminiAgent
+
+    repository = TelegramRepository(client=firestore_fake.client_class())
+    outcome = run_search(
+        context_id="search-context", operation_id="search-operation",
+        query="budget decisions", repository=repository,
+        retrieve=lambda **_filters: ([{
+            "doc_id": "doc-search", "title": "Budget notes",
+            "folder_path": ["Finance"],
+        }], {"count": 1}),
+        title_lookup=lambda _ids: {},
+    )
+    turns = repository.list_turns("search-context", outcome["conversation_id"])
+    history = build_conversation_history(
+        turns, conversation_id=outcome["conversation_id"],
+    )
+    assert [row["role"] for row in history] == ["user", "user"]
+    assert "doc-search" in history[1]["parts"][0]["text"]
+
+    wire_requests = []
+
+    def respond(request):
+        wire_requests.append(request)
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"text": "The result is a budget note."}],
+        }}]})
+
+    client, http_client = _real_sdk_client(monkeypatch, respond)
+    try:
+        GeminiAgent(client=client).generate(
+            contents=[*history, {"role": "user", "parts": [{"text": "What did search find?"}]}],
+            mode="tool_loop",
+        )
+        payload = json.loads(wire_requests[0].content)
+        assert [content["role"] for content in payload["contents"]] == [
+            "user", "user", "user",
+        ]
+        assert "doc-search" in payload["contents"][1]["parts"][0]["text"]
+        assert payload["contents"][-1]["parts"][0]["text"] == "What did search find?"
     finally:
         http_client.close()
 
@@ -427,6 +478,7 @@ def test_full_telegram_catalog_serializes_raw_json_schemas_without_mutating_inpu
 
         request = json.loads(wire_requests[0].content)
         serialized = request["tools"][0]["functionDeclarations"]
+        assert "toolConfig" not in request
         by_name = {tool["name"]: tool for tool in serialized}
         original_by_name = {tool["name"]: tool["parameters_json_schema"] for tool in catalog}
         assert set(by_name) == set(original_by_name)

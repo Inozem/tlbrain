@@ -7,6 +7,7 @@ from services.connectors.telegram.conversations import (
     build_conversation,
     build_turn_payload,
 )
+from services.connectors.telegram.context import build_conversation_history
 from services.connectors.telegram.repository import TelegramRepository
 
 
@@ -23,6 +24,7 @@ def test_conversation_kinds_enforce_their_target_shapes():
     search = build_conversation(
         "search-1", "search", search_filters={"folder": "notes"}, now=NOW,
     )
+    chat = build_conversation("chat-1", "chat", now=NOW)
 
     assert (draft.kind.value, draft.draft_id, draft.doc_id, draft.dialog_number) == (
         "draft", "draft-1", None, 1,
@@ -32,6 +34,9 @@ def test_conversation_kinds_enforce_their_target_shapes():
     )
     assert (search.draft_id, search.doc_id, search.dialog_number) == (None, None, None)
     assert search.search_filters == {"folder": "notes"}
+    assert (chat.kind.value, chat.draft_id, chat.doc_id, chat.dialog_number) == (
+        "chat", None, None, None,
+    )
     with pytest.raises(ValueError):
         build_conversation("bad", "search", dialog_number=1, now=NOW)
     with pytest.raises(ValueError):
@@ -90,6 +95,28 @@ def test_agent_prompt_fails_closed_on_missing_or_malformed_top_level_payload(tur
 def test_agent_prompt_preserves_legacy_string_content_fallback():
     prompt = build_agent_prompt([{"role": "user", "content": "legacy turn"}], "question")
     assert prompt["history"] == [{"role": "user", "parts": [{"text": "legacy turn"}]}]
+
+
+def test_conversation_history_keeps_all_ordered_turns_and_rejects_malformed_rows():
+    history = [
+        {"conversation_id": "chat", "role": role,
+         "parts": [{"text": f"turn-{index}"}], "turn_sequence": index}
+        for index, role in enumerate(("user", "model", "user", "model", "tool", "user"), 1)
+    ]
+    projected = build_conversation_history(history, conversation_id="chat")
+    assert [row["parts"][0]["text"] for row in projected] == [
+        "turn-1", "turn-2", "turn-3", "turn-4", "turn-5", "turn-6",
+    ]
+    with pytest.raises(ValueError, match="unsupported"):
+        build_conversation_history(
+            [*history, {"conversation_id": "chat", "role": "system", "parts": []}],
+            conversation_id="chat",
+        )
+    with pytest.raises(ValueError, match="session boundary"):
+        build_conversation_history(
+            [*history, {"conversation_id": "other", "role": "user", "parts": []}],
+            conversation_id="chat",
+        )
 
 
 def test_draft_session_record_is_separate_and_creation_is_idempotent(firestore_fake):

@@ -184,6 +184,302 @@ def test_default_app_webhook_dispatch_routes_real_greeting_and_delivers_durable_
     assert notification["state"] == "delivered"
 
 
+def test_default_app_forward_question_followup_use_current_draft_full_history(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """Exercise default intake, route/model SDK calls, session persistence and replay."""
+    from google.genai import types
+    from services.connectors.telegram.app.main import create_app
+
+    db = firestore_fake.client_class()
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
+    monkeypatch.setattr("services.connectors.telegram.app.main._allowed_user_ids", lambda: {7})
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "pytest-telegram-control-queue")
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.pytest.invalid/internal/dispatch")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+
+    tasks, sent = [], []
+    enqueue_fake = lambda **kwargs: tasks.append(kwargs)
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
+
+    def bot_response(request):
+        payload = json.loads(request.content)
+        sent.append((request.url.path.rsplit("/", 1)[-1], payload))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 700 + len(sent)}})
+
+    from services.connectors.telegram.client import TelegramClient
+    original_init = TelegramClient.__init__
+
+    def telegram_client_init(self, token, *, http_client=None, timeout=30.0):
+        return original_init(self, token, http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(bot_response)), timeout=timeout)
+
+    monkeypatch.setattr(TelegramClient, "__init__", telegram_client_init)
+
+    def queue_route(text):
+        route = {
+            "kind": "substantive", "target_ref": None, "target_operation_id": None,
+            "dialog_number": None, "result_refs": [], "substantive_text": text,
+            "tool_choice": None, "certainty": "certain",
+        }
+        sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+            candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+                function_call=types.FunctionCall(name="route_command", args=route),
+            )]))],
+        ))
+
+    queue_route("When is the kickoff?")
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text="The kickoff is April 17.",
+        )]))],
+    ))
+    queue_route("And what day?")
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text="It is April 17.",
+        )]))],
+    ))
+    long_question = "Which detail should I keep? " + ("full-context tail " * 89) + "full-context tail"
+    queue_route(long_question)
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text="Keep the April 17 kickoff date.",
+        )]))],
+    ))
+    app = create_app(
+        webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+        oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})(),
+    )
+
+    async def post(path, payload, *, secret=False):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            headers = ({"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"}
+                       if secret else {"Authorization": "Bearer fake-task"})
+            return await client.post(path, headers=headers, json=payload)
+
+    async def submit(update):
+        start = len(tasks)
+        response = await post("/telegram/webhook", update, secret=True)
+        assert response.status_code == 200, response.text
+        fresh = [item["body"] for item in tasks[start:]
+                 if item["body"].get("target_kind") == "telegram_dispatch"]
+        for body in fresh:
+            if body.get("notification_id"):
+                delivered = await post("/internal/deliver", body)
+                assert delivered.status_code == 200, delivered.text
+        operation = next((body for body in fresh if not body.get("notification_id")), None)
+        if operation is None:
+            return fresh[0]
+        result = await post("/internal/dispatch", operation)
+        assert result.status_code == 200, result.text
+        return operation
+
+    source_text = "Kickoff is April 17."
+    forward = asyncio.run(submit({"update_id": 14101, "message": {
+        "message_id": 81, "date": 1793320000,
+        "chat": {"id": 79, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Nora"},
+                           "date": 1793310000},
+        "text": source_text,
+    }}), loop_factory=_selector_loop)
+    first = asyncio.run(submit({"update_id": 14102, "message": {
+        "message_id": 82, "date": 1793320010,
+        "chat": {"id": 79, "type": "private"}, "from": {"id": 7},
+        "text": "When is the kickoff?",
+    }}), loop_factory=_selector_loop)
+    second = asyncio.run(submit({"update_id": 14103, "message": {
+        "message_id": 83, "date": 1793320020,
+        "chat": {"id": 79, "type": "private"}, "from": {"id": 7},
+        "text": "And what day?",
+    }}), loop_factory=_selector_loop)
+    third = asyncio.run(submit({"update_id": 14104, "message": {
+        "message_id": 84, "date": 1793320030,
+        "chat": {"id": 79, "type": "private"}, "from": {"id": 7},
+        "text": long_question,
+    }}), loop_factory=_selector_loop)
+
+    assert [payload["text"] for method, payload in sent if method == "sendMessage"][-3:] == [
+        "The kickoff is April 17.", "It is April 17.", "Keep the April 17 kickoff date.",
+    ]
+    gemini_calls = [event["arguments"] for event in sdk_fakes.trace
+                    if event["boundary"] == "gemini" and event["operation"] == "generate_content"]
+    assert len(gemini_calls) == 6
+    is_routing = lambda call: getattr(call["config"], "tool_config", None) is not None
+    route_inputs = [json.loads(call["contents"][0]["parts"][0]["text"])
+                    for call in gemini_calls if is_routing(call)]
+    assert [row["command"] for row in route_inputs] == [
+        "When is the kickoff?", "And what day?", long_question,
+    ]
+    assert len(route_inputs[2]["command"]) == len(long_question)
+    assert [turn["parts"][0]["text"] for turn in route_inputs[1]["conversation_history"]] == [
+        "When is the kickoff?", "The kickoff is April 17.",
+    ]
+    assert [turn["parts"][0]["text"] for turn in route_inputs[2]["conversation_history"]] == [
+        "When is the kickoff?", "The kickoff is April 17.",
+        "And what day?", "It is April 17.",
+    ]
+    main_inputs = [json.dumps(call["contents"], ensure_ascii=False, default=str)
+                   for call in gemini_calls if not is_routing(call)]
+    assert all(source_text in request for request in main_inputs)
+    assert all("untrusted_forwarded_source" in request for request in main_inputs)
+    assert any(str(call["config"].tool_config.function_calling_config.mode).endswith("ANY")
+               for call in gemini_calls if is_routing(call))
+
+    context_id = first["context_id"]
+    context = db.collection("telegram_sessions").document(context_id).get().to_dict()
+    conversation_id = context["active_conversation_id"]
+    turns = (db.collection("telegram_sessions").document(context_id)
+             .collection("conversations").document(conversation_id).collection("turns").stream())
+    rows = sorted((row.to_dict() for row in turns), key=lambda row: row["turn_sequence"])
+    assert [row["role"] for row in rows] == [
+        "user", "model", "user", "model", "user", "model",
+    ]
+    assert rows[4]["parts"][0]["text"] == long_question
+    assert source_text not in repr(rows)
+    draft_id = context["active_draft_id"]
+    assert db.collection("telegram_sessions").document(context_id).collection(
+        "drafts").document(draft_id).collection("messages").document("81").get().exists
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.create"]
+    assert forward["context_id"] == first["context_id"] == second["context_id"] == third["context_id"]
+
+
+def test_default_app_malformed_accepted_draft_cutoff_settles_safely_without_main_model(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A broken accepted source manifest settles once without invoking the main model."""
+    from google.genai import types
+    from services.connectors.telegram.app.main import create_app
+    from services.connectors.telegram.client import TelegramClient
+
+    db = firestore_fake.client_class()
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
+    monkeypatch.setattr("services.connectors.telegram.app.main._allowed_user_ids", lambda: {7})
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "pytest-telegram-control-queue")
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.pytest.invalid/internal/dispatch")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+
+    tasks, sent = [], []
+    enqueue_fake = lambda **kwargs: tasks.append(kwargs)
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
+
+    def bot_response(request):
+        payload = json.loads(request.content)
+        sent.append((request.url.path.rsplit("/", 1)[-1], payload))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 800 + len(sent)}})
+
+    original_init = TelegramClient.__init__
+
+    def telegram_client_init(self, token, *, http_client=None, timeout=30.0):
+        return original_init(self, token, http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(bot_response)), timeout=timeout)
+
+    monkeypatch.setattr(TelegramClient, "__init__", telegram_client_init)
+    route = {
+        "kind": "substantive", "target_ref": None, "target_operation_id": None,
+        "dialog_number": None, "result_refs": [], "substantive_text": "What was forwarded?",
+        "tool_choice": None, "certainty": "certain",
+    }
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            function_call=types.FunctionCall(name="route_command", args=route),
+        )]))],
+    ))
+    app = create_app(
+        webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+        oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})(),
+    )
+
+    async def post(path, payload, *, secret=False):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            headers = ({"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"}
+                       if secret else {"Authorization": "Bearer fake-task"})
+            return await client.post(path, headers=headers, json=payload)
+
+    async def accept(update):
+        start = len(tasks)
+        response = await post("/telegram/webhook", update, secret=True)
+        assert response.status_code == 200, response.text
+        fresh = [item["body"] for item in tasks[start:]
+                 if item["body"].get("target_kind") == "telegram_dispatch"]
+        for body in fresh:
+            if body.get("notification_id"):
+                delivered = await post("/internal/deliver", body)
+                assert delivered.status_code == 200, delivered.text
+        return fresh
+
+    source_text = "Accepted source must remain available after cutoff validation fails."
+    forward = asyncio.run(accept({"update_id": 14201, "message": {
+        "message_id": 91, "date": 1793321000,
+        "chat": {"id": 79, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Nora"},
+                           "date": 1793320000},
+        "text": source_text,
+    }}), loop_factory=_selector_loop)
+    question_tasks = asyncio.run(accept({"update_id": 14202, "message": {
+        "message_id": 92, "date": 1793321010,
+        "chat": {"id": 79, "type": "private"}, "from": {"id": 7},
+        "text": "What was forwarded?",
+    }}), loop_factory=_selector_loop)
+    operation_dispatch = next(body for body in question_tasks if not body.get("notification_id"))
+    operation_ref = (db.collection("telegram_sessions").document(operation_dispatch["context_id"])
+                     .collection("operations").document(operation_dispatch["operation_id"]))
+    operation = operation_ref.get().to_dict()
+    command_path = operation["input_ref"].split("/")
+    command_ref = (db.collection(command_path[0]).document(command_path[1])
+                   .collection(command_path[2]).document(command_path[3]))
+    command_ref.update({"cutoff_message_ids": [99999]})
+
+    result = asyncio.run(post("/internal/dispatch", operation_dispatch),
+                         loop_factory=_selector_loop)
+    assert result.status_code == 200, result.text
+    assert result.json() == {"status": "processed"}
+    settled = operation_ref.get().to_dict()
+    assert settled["state"] == "failed"
+    assert settled.get("notification_id")
+    terminal = db.collection("notification_outbox").document(settled["notification_id"]).get().to_dict()
+    assert terminal["state"] == "delivered"
+    assert "dialog #1" in terminal["body"]
+    assert operation_dispatch["operation_id"] in terminal["body"]
+    assert source_text not in terminal["body"]
+    draft_id = db.collection("telegram_sessions").document(
+        operation_dispatch["context_id"]).get().to_dict()["active_draft_id"]
+    source_ref = (db.collection("telegram_sessions").document(operation_dispatch["context_id"])
+                  .collection("drafts").document(draft_id).collection("messages").document("91"))
+    assert source_ref.get().exists
+
+    sdk_count = len([event for event in sdk_fakes.trace
+                     if event["boundary"] == "gemini" and event["operation"] == "generate_content"])
+    assert sdk_count == 1
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.create"]
+    status_dispatch = next(body for item in tasks for body in [item["body"]]
+                           if body.get("target_kind") == "telegram_status_check"
+                           and body.get("operation_id") == operation_dispatch["operation_id"])
+    status_result = asyncio.run(post("/internal/status-check", status_dispatch),
+                                loop_factory=_selector_loop)
+    assert status_result.status_code == 200, status_result.text
+    duplicate = asyncio.run(post("/internal/dispatch", operation_dispatch),
+                             loop_factory=_selector_loop)
+    assert duplicate.status_code == 200, duplicate.text
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "gemini" and event["operation"] == "generate_content"]) == sdk_count
+    assert len([payload for method, payload in sent if method == "sendMessage"]) == 2
+
+
 def test_default_app_gemini_402_fails_save_once_and_preserves_numbered_draft(
     firestore_fake, sdk_fakes, monkeypatch, caplog,
 ):

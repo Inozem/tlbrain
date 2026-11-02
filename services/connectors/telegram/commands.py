@@ -6,9 +6,6 @@ from dataclasses import dataclass
 import unicodedata
 
 
-MAX_COMMAND_CHARS = 1000
-
-
 @dataclass(frozen=True, slots=True)
 class TelegramCommand:
     kind: str
@@ -16,9 +13,9 @@ class TelegramCommand:
 
 
 def parse_command(value: str) -> TelegramCommand:
-    """Return a bounded command candidate without inspecting draft content."""
+    """Return the complete normalized command candidate without inspecting draft content."""
     text = unicodedata.normalize("NFKC", value).strip()
-    return TelegramCommand("freeform", text[:MAX_COMMAND_CHARS])
+    return TelegramCommand("freeform", text)
 
 
-__all__ = ["MAX_COMMAND_CHARS", "TelegramCommand", "parse_command"]
+__all__ = ["TelegramCommand", "parse_command"]

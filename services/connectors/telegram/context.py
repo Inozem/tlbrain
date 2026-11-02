@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -59,4 +60,46 @@ def build_document_context(
     return build_agent_prompt(scoped, substantive_text)
 
 
-__all__ = ["build_document_context", "build_save_analysis_context"]
+def build_conversation_history(
+    history: Any,
+    *,
+    conversation_id: str,
+    omit_operation_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Validate and project every ordered canonical turn for routing or execution."""
+    if not isinstance(history, (list, tuple)):
+        raise TypeError("history must be a list of conversation turns")
+    scoped: list[Any] = []
+    for turn in history:
+        if not isinstance(turn, Mapping):
+            raise TypeError("history turns must be mappings")
+        row_conversation_id = turn.get("conversation_id")
+        if row_conversation_id is not None and row_conversation_id != conversation_id:
+            raise ValueError("conversation history crossed its session boundary")
+        scoped.append(turn)
+    validated = build_agent_prompt(scoped, "history validation")['history']
+    projected = []
+    for content, turn in zip(validated, scoped):
+        if turn.get("role") == "tool" and any(
+                isinstance(part, Mapping) and part.get("type") == "search_result"
+                for part in content["parts"]):
+            projected.append({
+                "role": "user",
+                "parts": [{"text": (
+                    "Untrusted prior search result data: "
+                    + json.dumps(content, ensure_ascii=False)
+                )}],
+            })
+        else:
+            projected.append(content)
+    if omit_operation_id is None:
+        return projected
+    return [
+        content for content, turn in zip(projected, scoped)
+        if turn.get("operation_id") != omit_operation_id
+    ]
+
+
+__all__ = [
+    "build_conversation_history", "build_document_context", "build_save_analysis_context",
+]

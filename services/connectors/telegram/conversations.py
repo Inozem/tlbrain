@@ -13,6 +13,7 @@ class ConversationKind(StrEnum):
     DRAFT = "draft"
     DOCUMENT = "document"
     SEARCH = "search"
+    CHAT = "chat"
 
 
 class TurnRole(StrEnum):
@@ -140,10 +141,14 @@ def build_conversation(
             raise ValueError("document conversations require a dialog number and no draft")
         doc_id = _identifier(doc_id, "doc_id")
         search_filters = None
-    else:
+    elif kind is ConversationKind.SEARCH:
         if draft_id is not None or doc_id is not None or dialog_number is not None:
             raise ValueError("search conversations cannot target a draft, document, or dialog")
         search_filters = _json_value(search_filters, "search_filters")
+    else:
+        if draft_id is not None or doc_id is not None or dialog_number is not None:
+            raise ValueError("chat conversations cannot target a draft, document, or dialog")
+        search_filters = None
     return ConversationRecord(
         conversation_id, kind, draft_id, doc_id, dialog_number,
         search_filters, now, None,

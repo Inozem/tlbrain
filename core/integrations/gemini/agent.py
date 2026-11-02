@@ -40,6 +40,9 @@ class GeminiAgent:
         config = types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
             tools=sdk_tools,
+            tool_config=(types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+            ) if mode == "routing" and sdk_tools else None),
         )
         return self._client.models.generate_content(
             model=AGENT_MODEL,

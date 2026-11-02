@@ -37,6 +37,13 @@ def test_all_command_text_stays_freeform_for_structured_router(command):
     assert parsed.text == command
 
 
+def test_command_parser_preserves_complete_long_text():
+    text = "Earlier context. " + ("detail " * 160) + "TAIL MUST SURVIVE"
+    parsed = parse_command(text)
+    assert parsed.text == text
+    assert parsed.text.endswith("TAIL MUST SURVIVE")
+
+
 def _repository(firestore_fake):
     repository_type = importlib.import_module(
         "services.connectors.telegram.repository"
