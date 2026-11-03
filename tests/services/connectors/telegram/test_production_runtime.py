@@ -1163,3 +1163,277 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
                 if method == "sendMessage"
                 and payload.get("text") == "The milestone date is June 12."]) == 1
     gemini_http.close()
+
+
+def test_default_asgi_selected_document_routes_query_then_answers_over_real_gemini_http(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """Route a selected-document query through shared retrieval and untrusted result context."""
+    import httpx
+    from google import genai
+    from google.genai import types
+    from types import SimpleNamespace
+    from tests.fixtures import sdk_fakes as sdk_fake_module
+    from services.connectors.telegram.app.main import create_app
+    from services.connectors.telegram.client import TelegramClient
+    from services.connectors.telegram.repository import TelegramRepository
+
+    db = firestore_fake.client_class()
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
+    monkeypatch.setattr("services.connectors.telegram.app.main._allowed_user_ids", lambda: {7})
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "pytest-telegram-control-queue")
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.pytest.invalid/internal/dispatch")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("ROOT_FOLDER_URL", "https://drive.google.com/drive/folders/pytest-synthetic-root")
+
+    task_requests = []
+    enqueue_fake = lambda **kwargs: task_requests.append(kwargs)
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
+
+    sent = []
+
+    def bot_response(request):
+        payload = json.loads(request.content)
+        sent.append((request.url.path.rsplit("/", 1)[-1], payload))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 900 + len(sent)}})
+
+    def telegram_client_init(self, token, *, http_client=None, timeout=30.0):
+        return TelegramClient.__original_init__(
+            self, token, http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(bot_response),
+            ), timeout=timeout,
+        )
+
+    original_telegram_init = TelegramClient.__init__
+    monkeypatch.setattr(TelegramClient, "__original_init__", original_telegram_init, raising=False)
+    monkeypatch.setattr(TelegramClient, "__init__", telegram_client_init)
+
+    repository = TelegramRepository(client=db)
+    context_id = "77_default"
+    now = datetime.now(timezone.utc)
+    db.collection("folders").document("pytest-synthetic-root").set({
+        "folder_id": "pytest-synthetic-root", "name": "Root", "parent_id": None,
+    })
+    db.collection("folders").document("folder-client").set({
+        "folder_id": "folder-client", "name": "Client",
+        "parent_id": "pytest-synthetic-root",
+    })
+    db.collection("transcript_index").document("doc-selected").set({
+        "source_file": "Selected meeting notes", "parent_id": "folder-client",
+        "dialog_date": "2026-10-22", "provider": "telegram", "status": "synced",
+    })
+    number = repository.bind_document(
+        context_id, "doc-selected", "conversation-selected",
+        metadata={"title": "Selected meeting notes", "folder_path": []},
+        now=now, update_last_doc=False,
+    )
+    repository.ensure_conversation(
+        context_id, "conversation-selected", kind="document", doc_id="doc-selected",
+        dialog_number=number, now=now,
+    )
+    db.collection("telegram_sessions").document(context_id).update({
+        "active_conversation_id": "conversation-selected",
+        "selected_dialog_number": number,
+    })
+    repository.append_turn(
+        context_id, "conversation-selected", turn_id="prior-question",
+        operation_id="prior-operation", role="user",
+        parts=[{"text": "What did the team decide about the schedule?"}], now=now,
+    )
+    repository.append_turn(
+        context_id, "conversation-selected", turn_id="prior-answer",
+        operation_id="prior-operation", role="model",
+        parts=[{"text": "They moved the launch to May."}], now=now,
+    )
+
+    monkeypatch.setenv("RETRIEVAL_TOP_K", "15")
+    monkeypatch.setenv("RETRIEVAL_SCORE_THRESHOLD", "0.5")
+    from core.integrations.qdrant import client as qdrant_client
+    monkeypatch.setattr(qdrant_client, "_single_attempt_client", None)
+    monkeypatch.setattr(qdrant_client, "_client", None)
+    summary_hit = SimpleNamespace(
+        id="synthetic-summary", version=1, score=0.95,
+        payload={
+            "doc_id": "doc-selected", "parent_id": "folder-client",
+            "type": "summary", "center_index": 0, "covered_range": [0, 0],
+        },
+    )
+    sdk_fakes.qdrant.queue(
+        "query_points", response=SimpleNamespace(points=[summary_hit]),
+    )
+    sdk_fakes.qdrant.queue(
+        "query_points", response=SimpleNamespace(points=[summary_hit]),
+    )
+    sdk_fakes.qdrant.queue(
+        "query_points", response=SimpleNamespace(points=[]),
+    )
+    sdk_fakes.qdrant.queue("scroll", response=([SimpleNamespace(
+        id="synthetic-utterance",
+        payload={
+            "doc_id": "doc-selected", "type": "utterance", "order_index": 0,
+            "dialog_date": "2026-10-22", "speaker": "Team",
+            "text": "The milestone date is June 12.",
+        },
+    )], None))
+
+    route = {
+        "kind": "substantive", "target_ref": "doc-selected",
+        "target_operation_id": None, "dialog_number": number, "result_refs": [],
+        "substantive_text": "What is the milestone date in the saved notes?",
+        "tool_choice": {
+            "name": "query", "arguments": {"query": "milestone date in saved notes"},
+        },
+        "certainty": "certain",
+    }
+    wire_requests = []
+    generation_requests = 0
+
+    def gemini_response(request):
+        nonlocal generation_requests
+        wire_requests.append(request)
+        if request.url.path.endswith(":batchEmbedContents"):
+            return httpx.Response(200, json={"embeddings": [{"values": [0.25] * 768}]})
+        generation_requests += 1
+        payload = json.loads(request.content)
+        serialized_contents = json.dumps(payload["contents"], ensure_ascii=False)
+        assert "What did the team decide about the schedule?" in serialized_contents
+        assert "They moved the launch to May." in serialized_contents
+        if generation_requests == 1:
+            assert payload["tools"][0]["functionDeclarations"][0]["name"] == "route_command"
+            assert payload["generationConfig"]["thinkingConfig"]["thinking_level"] == "MINIMAL"
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"name": "route_command", "args": route},
+                    "thoughtSignature": "c3ludGhldGljLXJvdXRlLXNpZw==",
+                }],
+            }}]})
+
+        assert generation_requests == 2
+        assert payload["generationConfig"]["thinkingConfig"]["thinking_level"] == "MEDIUM"
+        assert payload["contents"][-1]["parts"][0]["text"] == route["substantive_text"]
+        markers = [part["text"] for content in payload["contents"]
+                   for part in content.get("parts", [])
+                   if isinstance(part, dict) and isinstance(part.get("text"), str)
+                   and "<application-tool-result-data>" in part["text"]]
+        assert len(markers) == 1
+        routed_data = json.loads(markers[0].split(
+            "<application-tool-result-data>\n", 1
+        )[1].split("\n</application-tool-result-data>", 1)[0])
+        assert routed_data["name"] == "query"
+        assert routed_data["arguments"] == route["tool_choice"]["arguments"]
+        result_rows, result_metadata = routed_data["result"]
+        assert result_rows[0]["doc_id"] == "doc-selected"
+        assert result_rows[0]["segments"][0]["dialog"][0]["text"] == (
+            "The milestone date is June 12."
+        )
+        assert result_metadata["total_matches"] == 1
+        parts = [part for content in payload["contents"]
+                 for part in content.get("parts", [])]
+        assert not any("functionCall" in part or "functionResponse" in part for part in parts)
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"text": "The milestone date is June 12."}],
+        }}]})
+
+    monkeypatch.setattr(genai, "Client", sdk_fake_module._REAL_GENAI_CLIENT)
+    gemini_http = httpx.Client(transport=httpx.MockTransport(gemini_response))
+    sdk_client = genai.Client(
+        api_key="synthetic-gemini-key",
+        http_options=types.HttpOptions(
+            base_url="http://127.0.0.1/v1beta", httpx_client=gemini_http,
+        ),
+    )
+    monkeypatch.setattr(
+        "core.integrations.gemini.agent.gemini_client.make_client",
+        lambda **_kwargs: sdk_client,
+    )
+    monkeypatch.setattr(
+        "core.integrations.gemini.embeddings.make_client",
+        lambda **_kwargs: sdk_client,
+    )
+    tool_calls = []
+    from core.operations import registry
+    original_invoke_operation = registry.invoke_operation
+
+    def observe_registry_call(name, arguments, *, context=None, retry_policy=None):
+        tool_calls.append((name, arguments, context, retry_policy))
+        return original_invoke_operation(
+            name, arguments, context=context, retry_policy=retry_policy,
+        )
+
+    monkeypatch.setattr(registry, "invoke_operation", observe_registry_call)
+    monkeypatch.setattr(
+        "core.integrations.firestore.transcripts.get_client", lambda: db,
+    )
+    app = create_app(
+        webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+        oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})(),
+    )
+    update = {"update_id": 24001, "message": {
+        "message_id": 161, "date": 1793320000,
+        "chat": {"id": 77, "type": "private"},
+        "from": {"id": 7, "first_name": "Tester"},
+        "text": route["substantive_text"],
+    }}
+
+    async def post(path, payload, *, secret=False):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            headers = ({"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"}
+                       if secret else {"Authorization": "Bearer fake-task"})
+            return await client.post(path, headers=headers, json=payload)
+
+    intake = asyncio.run(post("/telegram/webhook", update, secret=True),
+                         loop_factory=_selector_loop)
+    assert intake.status_code == 200, intake.text
+    dispatch = next(item["body"] for item in task_requests
+                    if item["body"].get("target_kind") == "telegram_dispatch"
+                    and not item["body"].get("notification_id"))
+    processed = asyncio.run(post("/internal/dispatch", dispatch), loop_factory=_selector_loop)
+    assert processed.status_code == 200, processed.text
+    assert processed.json() in ({"status": "processed"}, {"status": "noop"})
+    operation = (db.collection("telegram_sessions").document(context_id)
+                 .collection("operations").document(dispatch["operation_id"]).get().to_dict())
+    assert operation["state"] == "completed"
+
+    assert len(wire_requests) == 4
+    assert len(tool_calls) == 1
+    assert tool_calls[0][0:2] == (
+        "query", {"query": "milestone date in saved notes"},
+    )
+    assert tool_calls[0][2] is None
+    assert tool_calls[0][3] is not None
+    delivered = [payload["text"] for method, payload in sent if method == "sendMessage"]
+    assert len(delivered) == 1
+    assert delivered == ["The milestone date is June 12."]
+    assert operation["route_control"]["target_doc_id"] == "doc-selected"
+    assert operation["route_control"]["tool_choice"]["name"] == "query"
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "qdrant"
+                and event["operation"] == "query_points"]) == 3
+    assert sum(request.url.path.endswith(":generateContent")
+               for request in wire_requests) == 2
+    assert sum(request.url.path.endswith(":batchEmbedContents")
+               for request in wire_requests) == 2
+    turns = repository.list_turns(context_id, "conversation-selected")
+    assert [turn["role"] for turn in turns] == ["user", "model", "user", "model"]
+    assert turns[0]["parts"][0]["text"] == "What did the team decide about the schedule?"
+    assert turns[1]["parts"][0]["text"] == "They moved the launch to May."
+    assert turns[-2]["operation_id"] == dispatch["operation_id"]
+    assert turns[-2]["parts"][0]["text"] == route["substantive_text"]
+    assert turns[-1]["parts"][0]["text"] == delivered[0]
+    assert all("application-tool-result-data" not in str(turn) for turn in turns)
+
+    duplicate = asyncio.run(post("/internal/dispatch", dispatch), loop_factory=_selector_loop)
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json() in ({"status": "noop"}, {"status": "processed"})
+    assert len(wire_requests) == 4
+    assert len(tool_calls) == 1
+    assert len([payload for method, payload in sent
+                if method == "sendMessage"
+                and payload.get("text") == delivered[0]]) == 1
+    gemini_http.close()

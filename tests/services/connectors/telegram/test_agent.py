@@ -465,8 +465,10 @@ def test_gemini_agent_passes_tools_and_uses_shared_single_attempt_client(monkeyp
 def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeypatch):
     import httpx
     from services.connectors.telegram.runtime.routing import GeminiCommandRouter
+    from services.connectors.telegram.tools import get_tool_catalog
     from core.integrations.gemini.agent import GeminiAgent
 
+    catalog_before = deepcopy(get_tool_catalog()["tools"])
     wire_requests = []
     route = {
         "kind": "substantive", "target_ref": None,
@@ -516,9 +518,37 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         assert declaration["name"] == "route_command"
         assert schema["additionalProperties"] is False
         tool_choice_schema = schema["properties"]["tool_choice"]
-        tool_choice = tool_choice_schema["anyOf"][0]
-        assert tool_choice["properties"]["arguments"] == {
-            "type": "object",
+        assert tool_choice_schema["anyOf"][-1] == {"type": "null"}
+        choices = tool_choice_schema["anyOf"][:-1]
+        catalog = {item["name"]: item["parameters_json_schema"]
+                   for item in get_tool_catalog()["tools"]}
+        assert get_tool_catalog()["tools"] == catalog_before
+        assert len(choices) == len(catalog)
+        by_name = {}
+        for choice in choices:
+            assert choice["additionalProperties"] is False
+            name_schema = choice["properties"]["name"]
+            assert len(name_schema["enum"]) == 1
+            name = name_schema["enum"][0]
+            by_name[name] = choice
+            assert choice["properties"]["arguments"] == catalog[name]
+        assert set(by_name) == set(catalog)
+        assert by_name["query"]["properties"]["arguments"]["required"] == ["query"]
+        assert by_name["query"]["properties"]["arguments"]["properties"]["query"] == {
+            "type": "string",
+        }
+        assert "arguments" in by_name["create_folder"]["required"]
+        add_dialog = by_name["add_dialog"]["properties"]["arguments"]
+        assert add_dialog["required"] == ["provider", "utterances"]
+        utterances = add_dialog["properties"]["utterances"]
+        assert utterances["minItems"] == 1
+        assert utterances["items"]["required"] == ["speaker", "text"]
+        assert utterances["items"]["additionalProperties"] is False
+        assert by_name["list_folders"]["properties"]["arguments"] == catalog["list_folders"]
+        assert by_name["list_folders"]["properties"]["arguments"].get("required", []) == []
+        assert "link_requested" not in by_name["query"]["properties"]
+        assert by_name["get_transcript"]["properties"]["link_requested"] == {
+            "type": "boolean",
         }
         for field_name, field_type in (
             ("target_ref", "string"), ("target_operation_id", "string"),
@@ -527,7 +557,8 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         ):
             nullable_schema = schema["properties"][field_name]
             assert nullable_schema["anyOf"][0]["type"] == field_type
-            assert nullable_schema["anyOf"][1] == {"type": "null"}
+            null_schema = nullable_schema["anyOf"][-1] if field_name == "tool_choice" else nullable_schema["anyOf"][1]
+            assert null_schema == {"type": "null"}
         assert "parameters" not in declaration
         assert "additional_properties" not in json.dumps(schema)
         assert wire_requests[0].url.path.endswith(f"models/{MODEL}:generateContent")
