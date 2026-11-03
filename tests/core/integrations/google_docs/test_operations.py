@@ -49,6 +49,66 @@ def test_reader_uses_strict_oauth_and_extracts_nonempty_paragraphs(monkeypatch, 
     assert sdk_fakes.trace[-1]["operation"] == "documents.get"
 
 
+def test_reader_preserves_encoded_native_paragraphs_exactly(monkeypatch, sdk_fakes):
+    from core.dialogs.models import normalize_dialog_input
+    from core.dialogs.formatting import format_dialog
+    from core.indexing.hashing import sha256_text
+    from datetime import datetime, timezone
+
+    _set_oauth(monkeypatch)
+    normalized = normalize_dialog_input(
+        {
+            "provider": "custom",
+            "dialog_date": "2026-01-09",
+            "utterances": [
+                {"speaker": "Ada", "text": '  first\n\n  line  "quoted" ' + r"\\n" + "\U0001f600"},
+                {"speaker": "Lin", "text": "second\u2028line\u2029next  "},
+            ],
+        },
+        accepted_at=datetime(2026, 1, 9, tzinfo=timezone.utc),
+    )
+    expected, _ranges = format_dialog(normalized)
+    content = []
+    for index, line in enumerate(expected.split("\n")):
+        runs = [{"textRun": {"content": line[: max(1, len(line) // 2)]}}]
+        runs.append({"textRun": {"content": line[max(1, len(line) // 2):] + "\n"}})
+        content.append({"paragraph": {"elements": runs}})
+    sdk_fakes.docs.queue("documents.get", response={"body": {"content": [
+        {"sectionBreak": {"sectionStyle": {}}},
+        *content,
+    ]}})
+
+    actual = reader.read_google_doc("encoded-doc")
+
+    assert actual == expected
+    assert sha256_text(actual) == sha256_text(expected)
+
+
+def test_reader_keeps_legacy_projection_and_requires_supported_encoded_structure():
+    legacy = {"body": {"content": [
+        {"paragraph": {"elements": [{"textRun": {
+            "content": "DATE: 2026-01-09\nPROVIDER: tldv\n---\n"
+            "TEXT_ENCODING: json-string-v1\n"
+        }}]}},
+        {"paragraph": {"elements": [{"textRun": {"content": "  \n"}}]}},
+        {"paragraph": {"elements": [{"textRun": {"content": "A :: literal\n"}}]}},
+    ]}}
+    assert reader._extract_text(legacy) == (
+        "DATE: 2026-01-09\nPROVIDER: tldv\n---\n"
+        "TEXT_ENCODING: json-string-v1\nA :: literal"
+    )
+
+    malformed_encoded = {"body": {"content": [
+        {"paragraph": {"elements": [{"textRun": {"content":
+            "DATE: 2026-01-09\nPROVIDER: custom\n"
+            "TEXT_ENCODING: json-string-v1\n---\nA :: \\\"ok\\\"\n"
+        }}]}},
+        {"table": {}},
+    ]}}
+    with pytest.raises(ValueError, match="Unsupported or malformed"):
+        reader._extract_text(malformed_encoded)
+
+
 def test_reader_consumes_explicit_retry_policy_at_decorated_boundary(monkeypatch, sdk_fakes):
     _set_oauth(monkeypatch)
     sdk_fakes.docs.queue("documents.get", response={"body": {"content": []}})

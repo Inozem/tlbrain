@@ -3842,7 +3842,7 @@ def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuse
     empty_document = {"revisionId": "rev-empty", "body": {"content": [
         {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
     ]}}
-    for _ in range(12):
+    for _ in range(2):
         sdk_fakes.docs.queue("documents.get", response=empty_document)
     sdk_fakes.docs.queue("documents.batchUpdate", response={"revisionId": "rev-filled"})
     for index in range(16):
@@ -3852,7 +3852,8 @@ def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuse
             "trashed": False,
         })
 
-    source = "A sealed source line that must remain private."
+    source = "A sealed first source line that must remain private."
+    second_source = 'A second source with a literal "quote" and Unicode \U0001f600.'
     forward = {"update_id": 18001, "message": {
         "message_id": 101, "date": 1793320000,
         "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
@@ -3863,7 +3864,17 @@ def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuse
     ack = next(row["body"] for row in runtime.task_requests
                if row["body"].get("notification_id"))
     assert asyncio.run(runtime.deliver(ack), loop_factory=_selector_loop).status_code == 200
-    save_update = {"update_id": 18002, "message": {
+    second_forward = {"update_id": 18002, "message": {
+        "message_id": 104, "date": 1793320005,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 45, "first_name": "Bea"},
+                           "date": 1793310005}, "text": second_source,
+    }}
+    assert asyncio.run(runtime.webhook(second_forward), loop_factory=_selector_loop).status_code == 200
+    second_ack = next(row["body"] for row in reversed(runtime.task_requests)
+                      if row["body"].get("notification_id"))
+    assert asyncio.run(runtime.deliver(second_ack), loop_factory=_selector_loop).status_code == 200
+    save_update = {"update_id": 18003, "message": {
         "message_id": 102, "date": 1793320010,
         "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
         "text": "save this dialog",
@@ -3882,14 +3893,30 @@ def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuse
                       if event["boundary"] == "docs"
                       and event["operation"] == "documents.batchUpdate")
     inserted_text = fill_event["arguments"]["body"]["requests"][0]["insertText"]["text"]
+    from core.indexing.hashing import sha256_text
+    from core.parsing.parser import parse_document
+    decoded_rows = parse_document(inserted_text)[1]
+    assert [(row["speaker"], row["text"]) for row in decoded_rows] == [
+        ("Ada", source), ("Bea", second_source),
+    ]
+    original_common = runtime.db.collection("dialog_operations").document(operation_id).get().to_dict()
+    original_intent = runtime.db.collection(SAVE_INTENTS_COLLECTION).document(operation_id).get().to_dict()
+    assert sha256_text(inserted_text) == original_common["desired_content_hash"]
+    original_fill_checkpoint = original_intent["fill_checkpoint_ref"]
     monkeypatch.setattr("services.vector_sync.app.main.get_file_parent_folder_id",
                         lambda _doc_id: ("folder-client", False, "Dialog Finalize"))
-    monkeypatch.setattr("services.vector_sync.app.main.read_google_doc",
-                        lambda _doc_id: inserted_text)
     from core.integrations.google_docs import reader as docs_reader
     original_read_google_doc = docs_reader.read_google_doc
-    monkeypatch.setattr(docs_reader, "read_google_doc", lambda _doc_id, **_kwargs: inserted_text)
-    monkeypatch.setattr("core.indexing.processor.read_google_doc", lambda _doc_id: inserted_text)
+    native_document = {"body": {"content": [
+        {"sectionBreak": {"sectionStyle": {}}},
+        *[{
+            "paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]},
+        } for line in inserted_text.split("\n")],
+    ]}}
+    assert docs_reader._extract_text(native_document) == inserted_text
+    from core.parsing.parser import is_valid_format
+    assert is_valid_format(inserted_text), repr(inserted_text)
+    sdk_fakes.docs.queue("documents.get", response=native_document)
     from services.vector_sync.app.main import app as vector_app
 
     async def sync_document():
@@ -3909,8 +3936,18 @@ def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuse
         sdk_fakes.gemini.queue("embed_content", response=types.EmbedContentResponse(
             embeddings=[types.ContentEmbedding(values=[0.125] * 768)],
         ))
+    index_trace_start = len(sdk_fakes.trace)
     indexed = asyncio.run(sync_document(), loop_factory=_selector_loop)
     assert indexed.status_code == 200, indexed.text
+    assert indexed.json()["status"] == "ok"
+    index_read_delta = [event for event in sdk_fakes.trace[index_trace_start:]
+                        if event["boundary"] == "docs"
+                        and event["operation"] == "documents.get"]
+    assert len(index_read_delta) == 1
+    assert all(event["arguments"] == {"documentId": doc_id} for event in index_read_delta)
+    managed_receipt = runtime.db.collection("index_completions").document(doc_id).collection(
+        "generations").document(original_common["desired_content_hash"]).get().to_dict()
+    assert managed_receipt["status"] == "completed"
 
     wake_request = next(
         row["body"] for row in runtime.task_requests
@@ -3974,9 +4011,27 @@ def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuse
                 if event["boundary"] == "docs"
                 and event["operation"] == "documents.get"]) == 3
 
+    newer_source = "A newer forward that must remain in its collecting draft."
+    newer_forward = {"update_id": 18004, "message": {
+        "message_id": 105, "date": 1793320025,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 46, "first_name": "Jo"},
+                           "date": 1793310025}, "text": newer_source,
+    }}
+    assert asyncio.run(runtime.webhook(newer_forward), loop_factory=_selector_loop).status_code == 200
+    newer_ack = next(row["body"] for row in reversed(runtime.task_requests)
+                     if row["body"].get("notification_id"))
+    assert asyncio.run(runtime.deliver(newer_ack), loop_factory=_selector_loop).status_code == 200
+    context_before_retry = session.get().to_dict()
+    newer_draft_id = context_before_retry["active_draft_id"]
+    newer_draft_before = session.collection("drafts").document(newer_draft_id).get().to_dict()
+    assert newer_draft_id != draft_id
+    assert newer_draft_before["dialog_number"] == 2
+    assert newer_draft_before["state"] == "collecting"
+
     # Canonical dialog-number retry reuses the same intent and already-created document.
     runtime.route_response("retry", dialog_number=1)
-    retry_update = {"update_id": 18003, "message": {
+    retry_update = {"update_id": 18005, "message": {
         "message_id": 103, "date": 1793320020,
         "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
         "text": "retry dialog 1",
@@ -3993,29 +4048,46 @@ def test_default_sealed_finalizer_sdk_failures_exhaust_then_numbered_retry_reuse
                       if row["body"].get("target_kind") == "telegram_dispatch"
                       and row["body"].get("operation_id") == retry_relation["operation_id"]
                       and not row["body"].get("notification_id"))
+    retry_native_document = {"revisionId": "retry-read", "body": {"content": [
+        {"sectionBreak": {"sectionStyle": {}}},
+        *[{
+            "paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]},
+        } for line in inserted_text.split("\n")],
+    ]}}
     for index in range(4):
-        sdk_fakes.docs.queue("documents.get", response={
-            "revisionId": f"retry-read-{index}", "body": {"content": [
-                {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
-                for line in inserted_text.splitlines()
-            ]},
-        })
+        sdk_fakes.docs.queue("documents.get", response=retry_native_document)
         sdk_fakes.drive.queue("files.get", response={
             "id": doc_id, "mimeType": "application/vnd.google-apps.document",
             "parents": ["folder-client"], "modifiedTime": f"retry-{index}",
             "trashed": False,
         })
+    retry_trace_start = len(sdk_fakes.trace)
     retried = asyncio.run(runtime.dispatch(retry_task), loop_factory=_selector_loop)
     assert retried.status_code == 200, retried.text
+    retry_read_delta = [event for event in sdk_fakes.trace[retry_trace_start:]
+                        if event["boundary"] == "docs"
+                        and event["operation"] == "documents.get"]
+    assert len(retry_read_delta) == 1
+    assert all(event["arguments"] == {"documentId": doc_id} for event in retry_read_delta)
     retry_core = runtime.db.collection("dialog_operations").document(
         retry_task["operation_id"]).get().to_dict()
     retry_intent = runtime.db.collection(SAVE_INTENTS_COLLECTION).document(operation_id).get().to_dict()
     retry_draft = session.collection("drafts").document(draft_id).get().to_dict()
+    newer_draft_after = session.collection("drafts").document(newer_draft_id).get().to_dict()
+    context_after_retry = session.get().to_dict()
     assert retry_core["doc_id"] == doc_id
     assert retry_core["save_intent_id"] == operation_id
+    assert retry_core["desired_content_hash"] == original_common["desired_content_hash"]
     assert retry_intent["doc_id"] == doc_id
+    assert retry_intent["fill_checkpoint_ref"] == original_fill_checkpoint
     assert retry_intent["completion_certificate"]["operation_id"] == retry_task["operation_id"]
     assert retry_draft["state"] == "cleaned" and retry_draft["dialog_number"] == 1
+    assert newer_draft_after["state"] == "collecting"
+    assert newer_draft_after["ordered_message_ids"] == newer_draft_before["ordered_message_ids"]
+    assert context_after_retry["active_draft_id"] == newer_draft_id
+    newer_message = (session.collection("drafts").document(newer_draft_id)
+                     .collection("messages").document("105").get().to_dict())
+    assert newer_message["text"] == newer_source
     assert len([event for event in sdk_fakes.trace
                 if event["boundary"] == "drive"
                 and event["operation"] == "files.create"]) == 0

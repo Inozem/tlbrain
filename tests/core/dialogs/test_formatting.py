@@ -205,11 +205,12 @@ def test_formatter_round_trips_through_real_reader_and_parser(monkeypatch, sdk_f
         response={"body": {"content": paragraphs}},
     )
     from core.integrations.google_docs.reader import read_google_doc
+    from core.indexing.hashing import sha256_text
     from core.indexing.payloads import build_utterance_payloads
 
     restored = read_google_doc("round-trip-doc")
-    projected = "\n".join(line for line in text.split("\n") if line.strip())
-    assert restored == projected
+    assert restored == text
+    assert sha256_text(restored) == sha256_text(text)
     parsed = _parse_document(restored)[1]
     assert parsed == [
         {"speaker": "\U0001f9d1\u200d\U0001f4bb Speaker", "text": original, "order_index": 0}
