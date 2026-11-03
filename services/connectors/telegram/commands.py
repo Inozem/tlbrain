@@ -10,6 +10,7 @@ import unicodedata
 class TelegramCommand:
     kind: str
     text: str
+    action_metadata: dict[str, object] | None = None
 
 
 def parse_command(value: str) -> TelegramCommand:

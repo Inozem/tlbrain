@@ -16,6 +16,11 @@ import httpx
 
 _API_ORIGIN = "https://api.telegram.org"
 _FILE_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+_NOT_MODIFIED_DESCRIPTIONS = frozenset({
+    "bad request: message is not modified",
+    ("bad request: message is not modified: specified new message content and reply "
+     "markup are exactly the same as a current content and reply markup of the message"),
+})
 
 
 class TelegramAPIError(Exception):
@@ -64,13 +69,37 @@ class TelegramClient:
         *,
         message_thread_id: int | None = None,
         parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if message_thread_id is not None:
             payload["message_thread_id"] = message_thread_id
         if parse_mode is not None:
             payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         return await self._call("sendMessage", payload)
+
+    async def answer_callback_query(
+        self, callback_query_id: str, *, text: str | None = None, show_alert: bool = False,
+    ) -> bool:
+        """Acknowledge a callback promptly and validate Telegram's boolean result."""
+        if not isinstance(callback_query_id, str) or not callback_query_id:
+            raise ValueError("callback_query_id is required")
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id,
+                                   "show_alert": bool(show_alert)}
+        if text is not None:
+            payload["text"] = text[:200]
+        return await self._call_boolean("answerCallbackQuery", payload)
+
+    async def send_chat_action(
+        self, chat_id: int | str, action: str, *, message_thread_id: int | None = None,
+    ) -> bool:
+        """Send one best-effort native action; callers own bounded retry policy."""
+        payload: dict[str, Any] = {"chat_id": chat_id, "action": action}
+        if message_thread_id is not None:
+            payload["message_thread_id"] = message_thread_id
+        return await self._call_boolean("sendChatAction", payload)
 
     async def delete_webhook(self) -> dict[str, Any]:
         """Delete this bot's webhook while retaining Telegram's pending updates."""
@@ -95,14 +124,40 @@ class TelegramClient:
         text: str,
         *,
         parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
         if parse_mode is not None:
             payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         return await self._call(
             "editMessageText",
             payload,
         )
+
+    async def _call_boolean(self, method: str, payload: dict[str, Any]) -> bool:
+        """Call a Bot API method whose result envelope must contain a bool."""
+        url = f"{_API_ORIGIN}/bot{self._bot_token}/{method}"
+        response = await self._request("POST", url, json=payload)
+        if response.status_code >= 300:
+            raise self._http_error(response)
+        try:
+            envelope = response.json()
+        except (ValueError, UnicodeDecodeError):
+            raise TelegramAPIError("invalid_response") from None
+        if not isinstance(envelope, dict):
+            raise TelegramAPIError("invalid_response")
+        if envelope.get("ok") is not True:
+            code = envelope.get("error_code")
+            retry_after = self._retry_after(envelope)
+            category = ("rate_limited" if code == 429 or retry_after is not None else
+                        "authorization" if code in (401, 403) else
+                        "not_found" if code == 404 else "provider_error")
+            raise TelegramAPIError(category, retry_after=retry_after)
+        if type(envelope.get("result")) is not bool:
+            raise TelegramAPIError("invalid_response")
+        return envelope["result"]
 
     async def get_file(self, file_id: str) -> TelegramFile:
         if not isinstance(file_id, str) or not file_id:
@@ -154,6 +209,8 @@ class TelegramClient:
         url = f"{_API_ORIGIN}/bot{self._bot_token}/{method}"
         response = await self._request("POST", url, json=payload)
         if response.status_code >= 300:
+            if self._is_not_modified_response(method, response):
+                raise TelegramAPIError("not_modified")
             raise self._http_error(response)
         try:
             envelope = response.json()
@@ -162,6 +219,10 @@ class TelegramClient:
         if not isinstance(envelope, dict):
             raise TelegramAPIError("invalid_response")
         if envelope.get("ok") is not True:
+            description = envelope.get("description")
+            if (method == "editMessageText" and envelope.get("error_code") == 400
+                    and self._is_not_modified_description(description)):
+                raise TelegramAPIError("not_modified")
             code = envelope.get("error_code")
             retry_after = self._retry_after(envelope)
             if code == 429 or retry_after is not None:
@@ -177,6 +238,27 @@ class TelegramClient:
         if not isinstance(result, dict):
             raise TelegramAPIError("invalid_response")
         return result
+
+    @staticmethod
+    def _is_not_modified_response(method: str, response: httpx.Response) -> bool:
+        """Recognize only Telegram's exact edit no-op response on HTTP 400."""
+        if method != "editMessageText" or response.status_code != 400:
+            return False
+        try:
+            envelope = response.json()
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return (
+            isinstance(envelope, dict)
+            and envelope.get("error_code") == 400
+            and TelegramClient._is_not_modified_description(envelope.get("description"))
+        )
+
+    @staticmethod
+    def _is_not_modified_description(description: Any) -> bool:
+        """Match exact known Telegram no-op descriptions without loose substrings."""
+        return (isinstance(description, str)
+                and description.casefold().strip() in _NOT_MODIFIED_DESCRIPTIONS)
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Perform one bounded request without retries or redirect following."""

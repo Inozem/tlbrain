@@ -7,13 +7,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from services.connectors.telegram.notifications import (
     _VerifiedTelegramLifecycle, TelegramNotificationPublisher, build_lifecycle_body,
 )
 from services.connectors.telegram.errors import format_terminal_error
-from services.connectors.telegram.client import TelegramAPIError
+from services.connectors.telegram.client import TelegramAPIError, TelegramClient
 from services.connectors.telegram.repository import TelegramRepository
 
 
@@ -46,8 +47,9 @@ class _Telegram:
         self.sent = []
         self.edited = []
 
-    async def send_message(self, chat_id, text, *, message_thread_id=None):
-        self.sent.append((chat_id, text, message_thread_id))
+    async def send_message(self, chat_id, text, *, message_thread_id=None, reply_markup=None):
+        entry = (chat_id, text, message_thread_id)
+        self.sent.append(entry if reply_markup is None else (*entry, reply_markup))
         if self.failures:
             self.failures -= 1
             if self.failure_category is not None:
@@ -55,8 +57,9 @@ class _Telegram:
             raise TimeoutError("synthetic unknown outcome")
         return {"message_id": 901}
 
-    async def edit_message_text(self, chat_id, message_id, text):
-        self.edited.append((chat_id, message_id, text))
+    async def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
+        entry = (chat_id, message_id, text)
+        self.edited.append(entry if reply_markup is None else (*entry, reply_markup))
         return {"message_id": message_id}
 
 
@@ -252,16 +255,19 @@ def test_ack_is_immutable_and_progress_send_then_edit_adds_no_conversation_turn(
     assert row["kind"] == "draft_ack"
     assert row["chat_id"] == -10042 and row["thread_id"] == 5
     assert row["message_id"] is None and row["send_attempts_started"] == 0
-    assert row["body"] == "Dialog #1: Message received"
+    assert row["body"].startswith("Dialog #1: Thinking")
 
     clock, telegram = _Clock(), _Telegram()
     publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
     assert _run(publisher.publish(accepted.notification_id)) == "delivered"
     row = repo.get_notification(accepted.notification_id)
     assert row["message_id"] == 901 and row["send_attempts_started"] == 1
-    assert telegram.sent == [(-10042, row["body"], 5)]
-    with pytest.raises(ValueError, match="delivered draft acknowledgement"):
-        repo.revise_notification(accepted.notification_id, body="updated control text", now=clock())
+    assert telegram.sent == [(-10042, row["body"], 5, {"inline_keyboard": []})]
+    revised_ack = repo.revise_notification(
+        accepted.notification_id, body="updated receipt card", now=clock(),
+        reply_markup={"inline_keyboard": []},
+    )
+    assert revised_ack["revision"] == 2
 
     progress_id = "progress-edit"
     repo.create_notification(progress_id, context_id=accepted.context_id, kind="progress",
@@ -269,9 +275,140 @@ def test_ack_is_immutable_and_progress_send_then_edit_adds_no_conversation_turn(
     assert _run(publisher.publish(progress_id)) == "delivered"
     repo.revise_notification(progress_id, body="updated progress", now=clock())
     assert _run(publisher.publish(progress_id)) == "delivered"
-    assert telegram.sent == [(-10042, row["body"], 5), (-10042, "working", 5)]
+    assert telegram.sent == [
+        (-10042, row["body"], 5, {"inline_keyboard": []}),
+        (-10042, "working", 5),
+    ]
     assert telegram.edited == [(-10042, 901, "updated progress")]
     assert len(repo.list_messages(accepted.context_id, accepted.draft_id)) == 1
+
+
+def test_receipt_notification_closes_quiet_group_and_edits_ready_save_card(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    clock, telegram = _Clock(), _Telegram()
+    first = repo.accept_forward(
+        100, chat_id=-10042, thread_id=5, user_id=7,
+        message={"message_id": 110, "text": "one"}, now=clock(),
+    )
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish(first.notification_id)) == "delivered"
+
+    clock.advance(0.5)
+    second = repo.accept_forward(
+        101, chat_id=-10042, thread_id=5, user_id=7,
+        message={"message_id": 111, "text": "two"}, now=clock(),
+    )
+    assert second.notification_id == first.notification_id
+    clock.advance(1.0)
+    assert _run(publisher.publish(first.notification_id)) == "delivered"
+
+    row = repo.get_notification(first.notification_id)
+    assert "2 messages received" in row["body"]
+    assert row["reply_markup"]["inline_keyboard"][0][0]["text"] == "Save"
+    assert telegram.edited[-1][0:3] == (-10042, 901, row["body"])
+    markup = telegram.edited[-1][3]
+    callback_data = markup["inline_keyboard"][0][0]["callback_data"]
+    assert callback_data == f"s:{row['receipt_control_token']}"
+    assert len(callback_data.encode("utf-8")) <= 64
+
+
+def test_unsupported_first_generic_send_does_not_satisfy_new_draft_first_ack(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    clock = _Clock()
+    skipped = repo.record_unsupported_forward(
+        110, chat_id=42, thread_id=5, user_id=7, message_id=120, now=clock(),
+    )
+    reserved = repo.reserve_notification_attempt(
+        skipped.notification_id, attempt_id="generic-send", now=clock(),
+    )
+    clock.advance(0.25)
+    accepted = repo.accept_forward(
+        111, chat_id=42, thread_id=5, user_id=7,
+        message={"message_id": 121, "text": "accepted source"}, now=clock(),
+    )
+    assert accepted.notification_id == skipped.notification_id
+    repo.record_unsupported_forward(
+        112, chat_id=42, thread_id=5, user_id=7, message_id=122, now=clock(),
+    )
+    repo.settle_notification_attempt(
+        skipped.notification_id, attempt_id="generic-send",
+        revision=reserved["attempt_revision"], outcome="sent", message_id=901, now=clock(),
+    )
+    row = repo.get_notification(skipped.notification_id)
+    assert row["state"] == "pending"
+    assert row.get("first_ack_confirmed") is not True
+
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish(skipped.notification_id)) == "delivered"
+    row = repo.get_notification(skipped.notification_id)
+    assert row["first_ack_confirmed"] is True
+    assert row["first_ack_confirmed_revision"] == row["attempt_receipt_ack_revision"]
+    assert "Dialog #1" in telegram.edited[-1][2]
+
+
+def test_delayed_first_delivery_of_ready_receipt_confirms_numbered_ack(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    clock = _Clock()
+    accepted = repo.accept_forward(
+        113, chat_id=42, thread_id=5, user_id=7,
+        message={"message_id": 123, "text": "numbered source"}, now=clock(),
+    )
+    clock.advance(2)
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+
+    assert _run(publisher.publish(accepted.notification_id)) == "delivered"
+    row = repo.get_notification(accepted.notification_id)
+    draft = repo.get_draft(accepted.context_id, accepted.draft_id)
+    assert row["body"].startswith("Dialog #1: Ready")
+    assert row["first_ack_confirmed"] is True
+    assert draft["first_ack_confirmed_at"] is not None
+    assert draft["first_ack_notification_id"] == accepted.notification_id
+
+
+def test_later_receipt_send_failure_cannot_fail_acknowledged_sealed_draft(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    clock = _Clock()
+    first = repo.accept_forward(
+        114, chat_id=42, thread_id=5, user_id=7,
+        message={"message_id": 124, "text": "first source"}, now=clock(),
+    )
+    first_delivery = repo.reserve_notification_attempt(
+        first.notification_id, attempt_id="first-numbered-send", now=clock(),
+    )
+    repo.settle_notification_attempt(
+        first.notification_id, attempt_id="first-numbered-send",
+        revision=first_delivery["attempt_revision"], outcome="sent", message_id=901, now=clock(),
+    )
+    draft_ref = client.collection("telegram_sessions").document(first.context_id).collection(
+        "drafts",
+    ).document(first.draft_id)
+    draft_ref.update({"state": "processing", "sealed_at": clock(),
+                      "manifest_ref": "manifests/m1", "manifest_digest": "digest-m1",
+                      "active_save_operation_id": "save-one"})
+    clock.advance(2)
+    second = repo.accept_forward(
+        115, chat_id=42, thread_id=5, user_id=7,
+        message={"message_id": 125, "text": "second action"}, now=clock(),
+    )
+    for index in range(3):
+        attempt_id = f"later-send-{index}"
+        reserved = repo.reserve_notification_attempt(
+            second.notification_id, attempt_id=attempt_id, now=clock(),
+        )
+        assert reserved["reserved"] is True
+        repo.settle_notification_attempt(
+            second.notification_id, attempt_id=attempt_id,
+            revision=reserved["attempt_revision"], outcome="unknown", now=clock(),
+        )
+        clock.advance(2)
+    assert repo.get_notification(second.notification_id)["state"] == "delivery_unknown"
+    assert repo.get_draft(first.context_id, first.draft_id)["state"] == "processing"
 
 
 def test_create_notification_validates_kind_and_derives_persisted_target(firestore_fake):
@@ -422,8 +559,8 @@ def test_unknown_send_followed_by_rate_limits_keeps_delivery_unknown_semantics(f
             super().__init__()
             self.outcomes = ["timeout", "rate_limited", "rate_limited"]
 
-        async def send_message(self, chat_id, text, *, message_thread_id=None):
-            self.sent.append((chat_id, text, message_thread_id))
+        async def send_message(self, chat_id, text, *, message_thread_id=None, reply_markup=None):
+            self.sent.append((chat_id, text, message_thread_id, reply_markup))
             category = self.outcomes.pop(0)
             raise TelegramAPIError(category, retry_after=7 if category == "rate_limited" else None)
 
@@ -485,6 +622,181 @@ def test_stale_edit_rate_limit_waits_and_reuses_the_same_message(firestore_fake)
     assert row["edit_attempts_started"] == 2
     assert row["message_id"] == 901
     assert [edit[1] for edit in telegram.edited] == [901, 901]
+
+
+def test_canonical_not_modified_edit_replay_settles_known_message_without_resend(firestore_fake):
+    calls = []
+
+    def telegram_response(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        calls.append((method, request))
+        if method == "sendMessage":
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 933}})
+        return httpx.Response(400, json={
+            "ok": False, "error_code": 400,
+            "description": ("Bad Request: message is not modified: specified new message content "
+                            "and reply markup are exactly the same as a current content and reply "
+                            "markup of the message"),
+        })
+
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    notification_id = "known-message-not-modified"
+    repo.create_notification(notification_id, context_id=accepted.context_id,
+                             kind="progress", body="Initial", operation_id="op-not-modified",
+                             now=NOW)
+    clock = _Clock()
+    transport = httpx.MockTransport(telegram_response)
+    http = httpx.AsyncClient(transport=transport)
+    publisher = TelegramNotificationPublisher(
+        repo, TelegramClient("synthetic-token", http_client=http), clock=clock,
+    )
+    try:
+        assert _run(publisher.publish(notification_id)) == "delivered"
+        repo.revise_notification(notification_id, body="Current", now=clock())
+        assert _run(publisher.publish(notification_id)) == "delivered"
+        assert _run(publisher.publish(notification_id)) == "delivered"
+    finally:
+        _run(http.aclose())
+
+    row = repo.get_notification(notification_id)
+    assert [method for method, _ in calls] == ["sendMessage", "editMessageText"]
+    assert row["message_id"] == 933
+    assert row["body"] == "Current"
+    assert row["state"] == "delivered"
+    assert row["edit_attempts_started"] == 1
+
+
+def test_saved_old_group_closure_refreshes_new_draft_card_after_newer_group_closes(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    first = repo.accept_forward(
+        2001, chat_id=-10042, thread_id=5,
+        message={"message_id": 201, "text": "first source"}, now=NOW,
+    )
+    first_card = repo.get_notification(first.notification_id)
+    context_ref = repo.client.collection("telegram_sessions").document(first.context_id)
+    draft_a_ref = context_ref.collection("drafts").document(first.draft_id)
+    final_a_body = "Dialog #1: Saved and indexed. Folder: Client."
+    draft_a_ref.update({"state": "completed"})
+    context_ref.update({"active_draft_id": None, "draft_status": "completed"})
+    repo.client.collection("notification_outbox").document(first.notification_id).update({
+        "body": final_a_body, "save_operation_id": "fast-save-a",
+        "receipt_terminal": True, "receipt_terminal_kind": "final",
+        "receipt_terminal_body": final_a_body,
+        "reply_markup": {"inline_keyboard": []},
+        "receipt_control_token": None, "state": "delivered",
+        "message_id": 911, "revision": first_card["revision"] + 1,
+    })
+
+    second_now = NOW + timedelta(seconds=2)
+    second = repo.accept_forward(
+        2002, chat_id=-10042, thread_id=5,
+        message={"message_id": 202, "text": "second source"}, now=second_now,
+    )
+    assert second.draft_id != first.draft_id
+    close_b = repo.refresh_receipt_card(second.notification_id,
+                                        now=second_now + timedelta(seconds=2))
+    card_b_after_b_close = repo.get_notification(second.notification_id)
+    assert close_b == (second.notification_id,)
+    assert card_b_after_b_close["body"] == "Dialog #2: Thinking... 1 messages received."
+    assert not any(token in card_b_after_b_close["body"] for token in ("РІ", "вЂ"))
+    assert card_b_after_b_close["reply_markup"] == {"inline_keyboard": []}
+    assert context_ref.get().to_dict()["pending_receipt_groups"] == 1
+
+    close_a = repo.refresh_receipt_card(first.notification_id,
+                                        now=second_now + timedelta(seconds=2))
+    card_b_ready = repo.get_notification(second.notification_id)
+    assert close_a == (first.notification_id, second.notification_id)
+    assert card_b_ready["body"].startswith("Dialog #2: Ready - 1 messages received.")
+    assert not any(token in card_b_ready["body"] for token in ("РІ", "вЂ"))
+    assert "1 messages received" in card_b_ready["body"]
+    assert card_b_ready["reply_markup"]["inline_keyboard"][0][0]["text"] == "Save"
+    assert repo.get_notification(first.notification_id)["body"] == final_a_body
+    assert context_ref.get().to_dict()["pending_receipt_groups"] == 0
+    draft_b = repo.get_draft(first.context_id, second.draft_id)
+    assert draft_b["ordered_message_ids"] == [202]
+    assert draft_b["state"] == "collecting"
+
+    replay = repo.refresh_receipt_card(first.notification_id,
+                                       now=second_now + timedelta(seconds=3))
+    assert replay == (first.notification_id, second.notification_id)
+    assert repo.get_notification(second.notification_id) == card_b_ready
+    assert repo.get_notification(first.notification_id)["body"] == final_a_body
+
+
+def test_last_old_group_closure_refreshes_latest_card_after_terminal_group(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    first_old = repo.accept_forward(
+        2101, chat_id=-10042, thread_id=5,
+        message={"message_id": 211, "text": "old group one"}, now=NOW,
+    )
+    second_old_time = NOW + timedelta(seconds=2)
+    second_old = repo.accept_forward(
+        2102, chat_id=-10042, thread_id=5,
+        message={"message_id": 212, "text": "old group two"}, now=second_old_time,
+    )
+    assert second_old.draft_id == first_old.draft_id
+    assert second_old.notification_id != first_old.notification_id
+
+    context_ref = repo.client.collection("telegram_sessions").document(first_old.context_id)
+    draft_a_ref = context_ref.collection("drafts").document(first_old.draft_id)
+    terminal_body = "Dialog #1: Saved and indexed. Folder: Client."
+    draft_a_ref.update({"state": "completed"})
+    context_ref.update({"active_draft_id": None, "draft_status": "completed"})
+    second_card = repo.get_notification(second_old.notification_id)
+    repo.client.collection("notification_outbox").document(second_old.notification_id).update({
+        "body": terminal_body, "save_operation_id": "fast-save-old-a",
+        "receipt_terminal": True, "receipt_terminal_kind": "final",
+        "receipt_terminal_body": terminal_body,
+        "reply_markup": {"inline_keyboard": []},
+        "receipt_control_token": None, "state": "delivered",
+        "message_id": 912, "revision": second_card["revision"] + 1,
+    })
+
+    b_time = NOW + timedelta(seconds=4)
+    latest = repo.accept_forward(
+        2103, chat_id=-10042, thread_id=5,
+        message={"message_id": 213, "text": "new draft source"}, now=b_time,
+    )
+    assert latest.draft_id != first_old.draft_id
+    close_latest = repo.refresh_receipt_card(
+        latest.notification_id, now=b_time + timedelta(seconds=2),
+    )
+    assert close_latest == (latest.notification_id,)
+    assert repo.get_notification(latest.notification_id)["body"] == (
+        "Dialog #2: Thinking... 1 messages received."
+    )
+
+    close_saved_group = repo.refresh_receipt_card(
+        second_old.notification_id, now=b_time + timedelta(seconds=3),
+    )
+    assert close_saved_group == (second_old.notification_id, latest.notification_id)
+    latest_while_old_group_pending = repo.get_notification(latest.notification_id)
+    assert latest_while_old_group_pending["body"] == "Dialog #2: Thinking... 1 messages received."
+    assert repo.client.collection("telegram_sessions").document(first_old.context_id).get().to_dict()[
+        "pending_receipt_groups"
+    ] == 1
+
+    close_last_old = repo.refresh_receipt_card(
+        first_old.notification_id, now=b_time + timedelta(seconds=4),
+    )
+    latest_ready = repo.get_notification(latest.notification_id)
+    assert close_last_old == (first_old.notification_id, latest.notification_id)
+    assert latest_ready["body"].startswith("Dialog #2: Ready - 1 messages received.")
+    assert latest_ready["reply_markup"]["inline_keyboard"][0][0]["text"] == "Save"
+    assert latest_ready["receipt_accepted_count"] == 1
+    assert repo.get_notification(second_old.notification_id)["body"] == terminal_body
+    assert repo.get_notification(first_old.notification_id)["draft_id"] == first_old.draft_id
+    assert repo.client.collection("telegram_sessions").document(first_old.context_id).get().to_dict()[
+        "pending_receipt_groups"
+    ] == 0
+
+    replay = repo.refresh_receipt_card(
+        first_old.notification_id, now=b_time + timedelta(seconds=5),
+    )
+    assert replay == (first_old.notification_id, latest.notification_id)
+    assert repo.get_notification(latest.notification_id) == latest_ready
+    assert repo.get_notification(second_old.notification_id)["body"] == terminal_body
 
 
 @pytest.mark.parametrize("retry_after, expected", [
@@ -773,7 +1085,7 @@ def test_terminal_ack_failure_keeps_collecting_draft_and_sealed_identity(firesto
     assert child["lease_owner"] is None and child["lease_expires_at"] is None
 
 
-def test_delivered_ack_cannot_be_revised_and_edit_failure_does_not_fail_sealed_draft(firestore_fake):
+def test_receipt_ack_revision_and_edit_failure_do_not_fail_sealed_draft(firestore_fake):
     client = firestore_fake.client_class()
     repo = TelegramRepository(client)
     accepted = _accepted(repo)
@@ -782,8 +1094,8 @@ def test_delivered_ack_cannot_be_revised_and_edit_failure_does_not_fail_sealed_d
     repo.settle_notification_attempt(accepted.notification_id, attempt_id="ack-send",
                                      revision=reserved["attempt_revision"], outcome="sent",
                                      message_id=901, now=NOW)
-    with pytest.raises(ValueError, match="delivered draft acknowledgement"):
-        repo.revise_notification(accepted.notification_id, body="new acknowledgement", now=NOW)
+    revised = repo.revise_notification(accepted.notification_id, body="new acknowledgement", now=NOW)
+    assert revised["revision"] == 2
 
     draft_ref = client.collection("telegram_sessions").document(accepted.context_id).collection("drafts").document(accepted.draft_id)
     draft_ref.update({"state": "processing", "sealed_at": NOW,
@@ -791,11 +1103,36 @@ def test_delivered_ack_cannot_be_revised_and_edit_failure_does_not_fail_sealed_d
     notification_ref = client.collection("notification_outbox").document(accepted.notification_id)
     notification_ref.update({"state": "editing", "revision": 2, "desired_status_revision": 2,
                              "edit_attempts_started": 3, "in_flight_attempt_id": "edit-3",
+                             "edit_attempts_by_revision": {"2": 3},
                              "attempt_revision": 2, "attempt_expires_at": NOW})
     result = repo.settle_notification_attempt(accepted.notification_id, attempt_id="edit-3",
                                               revision=2, outcome="rejected", now=NOW)
     assert result["state"] == "failed"
     assert repo.get_draft(accepted.context_id, accepted.draft_id)["state"] == "processing"
+
+
+def test_legacy_expired_third_edit_keeps_lifetime_edit_cap_without_revision_map(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo, update=1200)
+    row = repo.create_notification(
+        "legacy-three-edits", context_id=accepted.context_id, kind="progress",
+        body="legacy progress", now=NOW,
+    )
+    ref = client.collection("notification_outbox").document(row["notification_id"])
+    ref.update({"message_id": 901, "state": "editing", "edit_attempts_started": 3,
+                "in_flight_attempt_id": "expired-third-edit", "attempt_revision": 1,
+                "attempt_expires_at": NOW - timedelta(seconds=1)})
+
+    reserved = repo.reserve_notification_attempt(
+        row["notification_id"], attempt_id="forbidden-fourth-edit", now=NOW,
+    )
+
+    assert reserved["reserved"] is False
+    assert reserved["state"] == "failed"
+    after = repo.get_notification(row["notification_id"])
+    assert after["edit_attempts_started"] == 3
+    assert "edit_attempts_by_revision" not in after
 
 
 def test_sealed_ack_failure_preserves_newer_collecting_pointer_without_exact_parent_link(firestore_fake):

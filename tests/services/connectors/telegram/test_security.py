@@ -156,7 +156,10 @@ def test_private_default_and_topic_accept_data_in_separate_contexts_and_reject_o
                for value in firestore_fake.documents.values())
     assert all("business secret" not in repr(value) and "channel secret" not in repr(value)
                for value in firestore_fake.documents.values())
-    assert len(publisher.calls) == 2
+    assert len(publisher.calls) == 4
+    assert sum(call.startswith("tgcard-send-") for call in publisher.calls) == 2
+    assert sum(call.startswith("tgcard-close-") for call in publisher.calls) == 2
+    assert len(set(publisher.calls)) == 4
     assert classifier.calls == semantic_router.calls == []
 
 

@@ -27,6 +27,10 @@ class _SaveConfirmationState:
     operation_ref: Any
     draft_ref: Any
     manifest_ref: Any
+    receipt_card_ref: Any | None
+    receipt_card: dict[str, Any] | None
+    receipt_control_ref: Any | None
+    receipt_control: dict[str, Any] | None
     context: dict[str, Any]
     operation: dict[str, Any]
     draft: dict[str, Any]
@@ -136,6 +140,7 @@ def _load_head_state(
 def _load_seal_state(
     transaction: Any,
     *,
+    client: Any,
     context_ref: Any,
     operation_ref: Any,
     context: dict[str, Any],
@@ -167,12 +172,32 @@ def _load_seal_state(
     manifest = manifest_snapshot.to_dict() or {} if manifest_snapshot.exists else None
     if draft.get("draft_id") != draft_id or not _route_targets_match(operation, draft):
         return None
+    receipt_card_ref = receipt_control_ref = None
+    receipt_card = receipt_control = None
+    latest_id = context.get("latest_receipt_notification_id")
+    if isinstance(latest_id, str):
+        receipt_card_ref = client.collection("notification_outbox").document(latest_id)
+        card_snapshot = receipt_card_ref.get(transaction=transaction)
+        candidate = card_snapshot.to_dict() or {} if card_snapshot.exists else {}
+        if (candidate.get("receipt_card") is True and candidate.get("context_id") == context_id
+                and candidate.get("draft_id") == draft_id):
+            receipt_card = candidate
+            token = candidate.get("receipt_control_token")
+            if isinstance(token, str) and token:
+                receipt_control_ref = context_ref.collection("receipt_controls").document(token)
+                control_snapshot = receipt_control_ref.get(transaction=transaction)
+                receipt_control = (control_snapshot.to_dict() or {}
+                                  if control_snapshot.exists else None)
     digest = _manifest_digest(draft_id, captured_ids)
     return _SaveConfirmationState(
         context_ref=context_ref,
         operation_ref=operation_ref,
         draft_ref=draft_ref,
         manifest_ref=manifest_ref,
+        receipt_card_ref=receipt_card_ref,
+        receipt_card=receipt_card,
+        receipt_control_ref=receipt_control_ref,
+        receipt_control=receipt_control,
         context=context,
         operation=operation,
         draft=draft,
@@ -266,6 +291,30 @@ def _persist_confirmation(
     if state.context.get("active_draft_id") == state.draft_id:
         state.context.update({"active_draft_id": None, "draft_status": None})
     state.context["pending_save_operation_id"] = operation_id
+    if state.receipt_card is not None and state.receipt_card_ref is not None:
+        card = state.receipt_card
+        state.operation["receipt_card_notification_id"] = card["notification_id"]
+        if card.get("save_operation_id") != operation_id:
+            revision = _integer(card.get("revision", 1), "revision", minimum=1) + 1
+            card.update({
+                "body": f"Dialog #{state.draft.get('dialog_number')}: Saving…",
+                "reply_markup": {"inline_keyboard": []},
+                "receipt_control_token": None,
+                "receipt_control_owner_user_id": None,
+                "save_operation_id": operation_id,
+                "operation_id": operation_id,
+                "revision": revision,
+                "desired_status_revision": revision,
+                "state": card.get("state") if card.get("in_flight_attempt_id") else "pending",
+                "delivered_at": None,
+                "updated_at": now,
+            })
+            transaction.set(state.receipt_card_ref, card)
+            if state.receipt_control_ref is not None and state.receipt_control is not None:
+                transaction.update(state.receipt_control_ref, {
+                    "state": "consumed", "operation_id": operation_id,
+                    "consumed_at": now,
+                })
     transaction.set(state.manifest_ref, {
         "draft_id": state.draft_id,
         "ordered_message_ids": state.message_ids,
@@ -311,7 +360,8 @@ class _TelegramSaveCommandMixin:
                 return False
             context, operation, command = head
             state = _load_seal_state(
-                transaction, context_ref=context_ref, operation_ref=operation_ref,
+                transaction, client=self.client,
+                context_ref=context_ref, operation_ref=operation_ref,
                 context=context, operation=operation, command=command,
                 operation_id=operation_id, context_id=context_id,
             )

@@ -261,7 +261,10 @@ class TelegramStatusChecks:
             notification = repository.get_notification(notification_id)
             if (
                 notification
-                and notification.get("kind") in {"final", "error"}
+                and (notification.get("kind") in {"final", "error"}
+                     or (notification.get("receipt_card") is True
+                         and notification.get("receipt_terminal") is True
+                         and notification.get("save_operation_id") == record.operation_id))
                 and notification.get("state") == "delivered"
             ):
                 return True
@@ -293,7 +296,11 @@ class TelegramStatusChecks:
             if (row and row.get("notification_id") == notification_id
                     and row.get("context_id") == record.context_id
                     and row.get("operation_id") == record.operation_id
-                    and row.get("kind") == expected_kind):
+                    and (row.get("kind") == expected_kind
+                         or (row.get("receipt_card") is True
+                             and row.get("receipt_terminal") is True
+                             and row.get("save_operation_id") == record.operation_id
+                             and row.get("receipt_terminal_kind") == expected_kind))):
                 return notification_id
         return None
 

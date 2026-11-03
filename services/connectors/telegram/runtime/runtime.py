@@ -343,6 +343,24 @@ class _DeliveryStatus(str):
     """A durable reply disposition for every chunk in a command answer."""
 
 
+def _command_reply_chunks(
+    body: str, *, kind: str, bound_receipt_card: bool,
+) -> list[tuple[int, str, str]]:
+    """Keep deterministic overflow chunks and put the canonical result on its card.
+
+    When a bound card receives an oversized terminal reply, overflow stays in
+    durable progress notifications while the card retains the leading result.
+    """
+    chunks = [body[index:index + 4000] for index in range(0, len(body), 4000)] or [""]
+    chunk_kinds = [kind if index == len(chunks) - 1 else "progress"
+                   for index in range(len(chunks))]
+    if bound_receipt_card and kind in {"final", "error"} and len(chunks) > 1:
+        return ([(index + 1, chunk, "progress")
+                 for index, chunk in enumerate(chunks[1:])]
+                + [(0, chunks[0], kind)])
+    return [(index, chunk, chunk_kinds[index]) for index, chunk in enumerate(chunks)]
+
+
 class _DurableCommandReplies:
     """Persist and publish complete command answers in deterministic chunks."""
 
@@ -358,18 +376,24 @@ class _DurableCommandReplies:
         return "telegram-command-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     async def deliver(self, body: str, *, kind: str = "final") -> _DeliveryStatus:
-        chunks = [body[index:index + 4000] for index in range(0, len(body), 4000)] or [""]
         context_ref = self.repository.client.collection("telegram_sessions").document(self.context_id)
         operation_ref = context_ref.collection("operations").document(self.operation_id)
-        chunk_kinds = [kind if index == len(chunks) - 1 else "progress"
-                       for index in range(len(chunks))]
-        for index, chunk in enumerate(chunks):
-            notification_id = self.notification_id(chunk_kinds[index], index)
+        initial_operation = operation_ref.get().to_dict() or {}
+        initial_action = initial_operation.get("typed_action")
+        has_receipt_card = (
+            isinstance(initial_action, Mapping)
+            and initial_action.get("action") == "receipt_save"
+        ) or isinstance(initial_operation.get("receipt_card_notification_id"), str)
+        chunk_work = _command_reply_chunks(
+            body, kind=kind, bound_receipt_card=has_receipt_card,
+        )
+        for index, chunk, chunk_kind in chunk_work:
+            notification_id = self.notification_id(chunk_kind, index)
             notification_ref = self.repository.client.collection("notification_outbox").document(
                 notification_id)
             transaction = self.repository.client.transaction()
             @firestore.transactional
-            def persist(tx: Any) -> bool:
+            def persist(tx: Any) -> str | bool:
                 context_snapshot = context_ref.get(transaction=tx)
                 operation_snapshot = operation_ref.get(transaction=tx)
                 context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
@@ -381,22 +405,66 @@ class _DurableCommandReplies:
                             context, self.operation_id, owner=self.owner, fence=self.fence,
                             now=now, expiry=context.get("lock_expires_at"))):
                     return _DeliveryStatus("stale")
+                action = operation.get("typed_action")
+                receipt_action = (isinstance(action, Mapping)
+                                  and action.get("action") == "receipt_save")
+                if ((receipt_action or isinstance(operation.get("receipt_card_notification_id"), str))
+                        and chunk_kind in {"final", "error"}):
+                    card_id = (action.get("notification_id") if receipt_action
+                               else operation.get("receipt_card_notification_id"))
+                    draft_id = (action.get("draft_id") if receipt_action
+                                else operation.get("target_draft_id"))
+                    if not isinstance(card_id, str):
+                        return _DeliveryStatus("terminal")
+                    card_ref = self.repository.client.collection("notification_outbox").document(card_id)
+                    card_snapshot = card_ref.get(transaction=tx)
+                    card = card_snapshot.to_dict() or {} if card_snapshot.exists else {}
+                    if (card.get("receipt_card") is not True
+                            or card.get("save_operation_id") != self.operation_id
+                            or card.get("draft_id") != draft_id
+                            or card.get("context_id") != self.context_id):
+                        return _DeliveryStatus("stale")
+                    if card.get("receipt_terminal") is True:
+                        if (card.get("receipt_terminal_body") != chunk
+                                or card.get("receipt_terminal_kind") != chunk_kind):
+                            return _DeliveryStatus("terminal")
+                        return card_id
+                    card_revision = int(card.get("revision", 1)) + 1
+                    card.update({
+                        "body": chunk, "reply_markup": {"inline_keyboard": []},
+                        "receipt_control_token": None,
+                        "receipt_control_owner_user_id": None,
+                        "receipt_terminal": True,
+                        "receipt_terminal_kind": chunk_kind,
+                        "receipt_terminal_body": chunk,
+                        "revision": card_revision,
+                        "desired_status_revision": card_revision,
+                        "state": (card.get("state") if card.get("in_flight_attempt_id")
+                                  else "pending"),
+                        "delivered_at": None, "last_error": None, "updated_at": now,
+                    })
+                    tx.set(card_ref, card)
+                    tx.update(operation_ref, {"notification_id": card_id})
+                    return card_id
                 snapshot = notification_ref.get(transaction=tx)
                 existing = snapshot.to_dict() or {} if snapshot.exists else None
                 row = self.repository.prepare_notification_in_transaction(
                     notification_ref.id, context_id=self.context_id,
-                    kind=chunk_kinds[index], body=chunk, now=now,
+                    kind=chunk_kind, body=chunk, now=now,
                     context_data=context, existing_data=existing,
                     operation_id=self.operation_id,
                 )
                 if not snapshot.exists:
                     tx.set(notification_ref, row)
-                if index == len(chunks) - 1:
+                if index == len(chunk_work) - 1 and not has_receipt_card:
                     tx.update(operation_ref, {"notification_id": notification_ref.id})
-                return True
-            if persist(transaction) is not True:
+                return notification_ref.id
+            target_id = persist(transaction)
+            if isinstance(target_id, _DeliveryStatus):
+                return target_id
+            if not isinstance(target_id, str):
                 return _DeliveryStatus("stale")
-            result = await self.publisher.publish(notification_id)
+            result = await self.publisher.publish(target_id)
             if result != "delivered":
                 disposition = "terminal" if result in {
                     "failed", "delivery_unknown", "superseded", "not_found", "stale",
@@ -694,9 +762,62 @@ class _CommandExecution:
                 and self.pinned.get("status") in {"ok", "success"}
                 and self.pinned.get("kind") == "save"
             )
+            typed_save = await _offload(self._load_typed_save_action)
+            if typed_save is not None:
+                if typed_save != _value(queue_row, "typed_action"):
+                    self.replay_save_result = QueueOperationState.FAILED
+                    return True
+                if not save_work:
+                    self._compose_ports()
+                    self._compose_replies()
+                    from services.connectors.telegram.sessions import confirm_save_route
+                    confirmed = await _offload(
+                        confirm_save_route, runtime.repository, context_id=self.context_id,
+                        operation_id=self.operation_id, owner=self.owner, fence=self.fence,
+                        now=runtime.clock(), route_result={"kind": "save"},
+                    )
+                    if not confirmed:
+                        self.replay_save_result = await self.finish_reply(
+                            "I could not confirm the save request. Please try again.", kind="error",
+                            failure_final=True,
+                        )
+                        return True
+                    if not await _offload(
+                        runtime.repository.persist_route, self.operation_id,
+                        {"status": "ok", "kind": "save",
+                         "target_draft_id": typed_save.get("draft_id")},
+                        context_id=self.context_id, owner=self.owner, fence=self.fence,
+                        now=runtime.clock(),
+                    ):
+                        self.replay_save_result = await self.finish_reply(
+                            "I could not confirm the save request. Please try again.", kind="error",
+                            failure_final=True,
+                        )
+                        return True
+                    self.pinned = await _offload(runtime.repository.get_route_control,
+                                                 self.context_id, self.operation_id)
+                self._compose_ports()
+                self._compose_replies()
+                if not await self._publish_saving_card():
+                    self.replay_save_result = QueueOperationState.RUNNING
+                    return True
+                state = await runtime.save_handler.save_draft(
+                    self.context_id, self.operation, self.lease,
+                    retry_governor=self.retry_governor,
+                )
+                if state is QueueOperationState.FAILED:
+                    self.replay_save_result = await self._settle_save_failure()
+                elif state is QueueOperationState.COMPLETED:
+                    self.replay_save_result = await self._complete_save_reply()
+                else:
+                    self.replay_save_result = state
+                return True
             if retry_work or save_work:
                 self._compose_ports()
                 self._compose_replies()
+                if save_work and not await self._publish_saving_card():
+                    self.replay_save_result = QueueOperationState.RUNNING
+                    return True
                 state = await runtime.save_handler.save_draft(
                     self.context_id, self.operation, self.lease,
                     retry_governor=self.retry_governor,
@@ -711,6 +832,26 @@ class _CommandExecution:
                 return True
         return False
 
+    def _load_typed_save_action(self) -> dict[str, Any] | None:
+        """Load the server-bound Save button action for first-claim sealing."""
+        input_ref = _value(self.operation, "input_ref")
+        parts = input_ref.split("/") if isinstance(input_ref, str) else []
+        if len(parts) != 4 or parts[:3] != ["telegram_sessions", self.context_id, "commands"]:
+            return None
+        snapshot = self.runtime.repository.client.collection("telegram_sessions").document(
+            self.context_id
+        ).collection("commands").document(parts[3]).get()
+        command = snapshot.to_dict() or {} if snapshot.exists else {}
+        metadata = command.get("action_metadata")
+        if (command.get("context_id") != self.context_id
+                or command.get("operation_id") != self.operation_id
+                or command.get("kind") != "save"
+                or command.get("candidate") != ""
+                or not isinstance(metadata, Mapping)
+                or metadata.get("action") != "receipt_save"):
+            return None
+        return dict(metadata)
+
     def _queue_operation_row(self) -> dict[str, Any] | None:
         """Load this operation's canonical queue record for replay classification."""
         ref = (self.runtime.repository.client.collection("telegram_sessions")
@@ -718,6 +859,35 @@ class _CommandExecution:
         snapshot = ref.get()
         row = snapshot.to_dict() or {} if snapshot.exists else {}
         return row if row.get("operation_id") == self.operation_id else None
+
+    async def _publish_saving_card(self) -> bool:
+        """Publish the receipt card before save work; proceed after terminal delivery.
+
+        Transient delivery leases yield to retry without starting provider work,
+        while terminal delivery outcomes do not strand the sealed source.
+        """
+        if not await _offload(self.lease_check):
+            return False
+        row = await _offload(self._queue_operation_row)
+        if not isinstance(row, Mapping) or row.get("state") != "running":
+            return False
+        action = row.get("typed_action")
+        if isinstance(action, Mapping) and action.get("action") == "receipt_save":
+            notification_id = action.get("notification_id")
+            draft_id = action.get("draft_id")
+        else:
+            notification_id = row.get("receipt_card_notification_id")
+            draft_id = row.get("target_draft_id")
+        if not isinstance(notification_id, str) or not notification_id:
+            return True
+        card = await _offload(self.runtime.repository.get_notification, notification_id)
+        if (not isinstance(card, Mapping) or card.get("receipt_card") is not True
+                or card.get("context_id") != self.context_id
+                or card.get("draft_id") != draft_id
+                or card.get("save_operation_id") != self.operation_id):
+            return False
+        delivery = await self.publisher.publish(notification_id)
+        return delivery in {"delivered", "failed", "delivery_unknown", "not_found", "stale"}
 
     def _compose_ports(self) -> None:
         """Build durable store, ledger, governed model, executor, publisher, and search ports."""
@@ -1158,6 +1328,8 @@ class _CommandExecution:
             return await self.finish_reply(
                 "I could not confirm the save request. Please try again.", kind="error",
             )
+        if not await self._publish_saving_card():
+            return QueueOperationState.RUNNING
         state = await self.runtime.save_handler.save_draft(
             self.context_id, self.operation, self.lease,
             retry_governor=self.retry_governor,

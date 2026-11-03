@@ -138,7 +138,7 @@ def test_webhook_registration_subscribes_to_messages_without_dropping_pending(
         if isinstance(value, str)
     }
     assert call["url"] == webhook_url
-    assert call["allowed_updates"] == ["message"]
+    assert call["allowed_updates"] == ["message", "callback_query"]
     assert call.get("drop_pending_updates") is not True
     assert call["secret_token"] in stored_secret_values
     diagnostics = f"{result!r}\n{caplog.text}"
@@ -199,7 +199,7 @@ def test_webhook_registration_default_path_posts_safely_with_bot_token(
         if isinstance(value, str)
     }
     assert payload["url"] == webhook_url
-    assert payload["allowed_updates"] == ["message"]
+    assert payload["allowed_updates"] == ["message", "callback_query"]
     assert payload["secret_token"] in stored_secret_values
     assert "drop_pending_updates" not in payload
     assert type(result) is bool

@@ -122,9 +122,21 @@ class TelegramNotificationPublisher:
         self.client = client
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
-    async def publish(self, notification_id: str) -> str:
+    async def publish(self, notification_id: str, *, _refresh_receipt: bool = True) -> str:
         """Deliver one notification attempt and return its durable disposition."""
         now = self.clock()
+        if _refresh_receipt:
+            refresh_receipt = getattr(self.repository, "refresh_receipt_card", None)
+            current_card_ids = (
+                await _offload_repository_call(refresh_receipt, notification_id, now=now)
+                if callable(refresh_receipt) else None
+            )
+            if current_card_ids:
+                dispositions = [
+                    await self.publish(card_id, _refresh_receipt=False)
+                    for card_id in current_card_ids
+                ]
+                return next((state for state in dispositions if state != "delivered"), "delivered")
         attempt_id = "tgnotify-" + uuid4().hex
         reservation = await _offload_repository_call(
             self.repository.reserve_notification_attempt,
@@ -143,19 +155,27 @@ class TelegramNotificationPublisher:
         retry_after = None
         try:
             if reservation["is_send"]:
-                response = await self.client.send_message(
-                    chat_id, body, message_thread_id=thread_id,
-                )
+                kwargs = {"message_thread_id": thread_id}
+                if reservation.get("reply_markup") is not None:
+                    kwargs["reply_markup"] = reservation["reply_markup"]
+                response = await self.client.send_message(chat_id, body, **kwargs)
                 message_id = response.get("message_id") if isinstance(response, dict) else None
                 if type(message_id) is not int or message_id < 1:
                     outcome, message_id = "unknown", None
                 else:
                     outcome = "sent"
             else:
-                await self.client.edit_message_text(chat_id, reservation["message_id"], body)
+                kwargs = {}
+                if reservation.get("reply_markup") is not None:
+                    kwargs["reply_markup"] = reservation["reply_markup"]
+                await self.client.edit_message_text(chat_id, reservation["message_id"], body, **kwargs)
                 outcome, message_id = "edited", None
         except TelegramAPIError as exc:
-            if exc.category == "rate_limited":
+            if exc.category == "not_modified" and not reservation["is_send"]:
+                outcome = "edited"
+            elif exc.category == "not_modified":
+                outcome = "rejected"
+            elif exc.category == "rate_limited":
                 outcome = "rate_limited"
             elif exc.category in {"timeout", "transport", "unavailable", "invalid_response"}:
                 outcome = "unknown"

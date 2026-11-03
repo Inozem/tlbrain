@@ -91,6 +91,64 @@ def test_confirmation_seals_only_the_captured_candidate_and_replays_idempotently
     assert repository.get_draft(accepted.context_id, draft_id)["sealed_at"] == NOW
 
 
+def test_freeform_save_seal_disables_the_latest_receipt_control_on_the_same_card(firestore_fake):
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    forward = repository.accept_forward(
+        101, chat_id=42, user_id=7, message={"message_id": 201, "text": "captured source"},
+        now=NOW,
+    )
+    repository.refresh_receipt_card(forward.notification_id, now=NOW + timedelta(seconds=2))
+    card = repository.get_notification(forward.notification_id)
+    card["message_id"] = 901
+    client.collection("notification_outbox").document(forward.notification_id).set(card)
+    accepted = repository.accept_command(
+        102, chat_id=42, user_id=7, command=parse_command("save this dialog"),
+        now=NOW + timedelta(seconds=2),
+    )
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="router-worker", now=NOW + timedelta(seconds=2))
+    assert lease is not None
+
+    assert repository.confirm_save_command(
+        accepted.context_id, lease.operation_id, owner=lease.owner, fence=lease.fence,
+        now=NOW + timedelta(seconds=2),
+    ) is True
+
+    updated = repository.get_notification(forward.notification_id)
+    operation = context_ref.collection("operations").document(lease.operation_id).get().to_dict()
+    control = context_ref.collection("receipt_controls").document(
+        card["receipt_control_token"],
+    ).get().to_dict()
+    assert updated["body"] == "Dialog #1: Saving…"
+    assert updated["reply_markup"] == {"inline_keyboard": []}
+    assert updated["receipt_control_token"] is None
+    assert updated["save_operation_id"] == lease.operation_id
+    assert operation["receipt_card_notification_id"] == forward.notification_id
+    assert control["state"] == "consumed"
+
+    class Telegram:
+        def __init__(self):
+            self.edited = []
+
+        async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+            self.edited.append((chat_id, message_id, text, kwargs.get("reply_markup")))
+            return {"message_id": message_id}
+
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+    telegram = Telegram()
+    publisher = TelegramNotificationPublisher(
+        repository, telegram, clock=lambda: NOW + timedelta(seconds=3),
+    )
+    import asyncio
+    from tests.services.connectors.telegram.test_notifications import _run
+    assert _run(publisher.publish(forward.notification_id)) == "delivered"
+    assert len(telegram.edited) == 1
+    assert telegram.edited[0][:2] == (card["chat_id"], card["message_id"])
+    assert telegram.edited[0][2] == updated["body"]
+    assert telegram.edited[0][3] == {"inline_keyboard": []}
+
+
 def test_routed_command_candidate_cleanup_preserves_save_cutoff_and_confirmation(firestore_fake):
     client, repository, accepted, context_ref, lease, draft_id = _setup(firestore_fake)
     command_ref = context_ref.collection("commands").document("2")

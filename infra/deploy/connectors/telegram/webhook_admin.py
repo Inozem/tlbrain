@@ -115,7 +115,7 @@ def register_telegram_webhook(
             response = telegram_client.set_webhook(
                 url=webhook_url,
                 secret_token=secret,
-                allowed_updates=["message"],
+                allowed_updates=["message", "callback_query"],
             )
         else:
             connection = http.client.HTTPSConnection("api.telegram.org", timeout=10)
@@ -123,7 +123,7 @@ def register_telegram_webhook(
                 payload = json.dumps({
                     "url": webhook_url,
                     "secret_token": secret,
-                    "allowed_updates": ["message"],
+                    "allowed_updates": ["message", "callback_query"],
                 })
                 connection.request(
                     "POST",

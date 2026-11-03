@@ -439,6 +439,20 @@ class TelegramQueueWorker:
                     or not self._is_retry_work_operation(operation_data)):
                 raise ValueError("queued command candidate is unavailable")
             return None
+        if command_data.get("kind") == "save":
+            metadata = command_data.get("action_metadata")
+            operation_ref = self.client.collection(SESSIONS).document(context_id).collection(
+                "operations"
+            ).document(operation_id)
+            operation_snapshot = operation_ref.get()
+            operation_data = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
+            if (command_data.get("candidate") != ""
+                    or not isinstance(metadata, Mapping)
+                    or metadata.get("action") != "receipt_save"
+                    or operation_data.get("operation_id") != operation_id
+                    or operation_data.get("typed_action") != metadata):
+                raise ValueError("queued typed action is unavailable")
+            return None
         if command_data.get("kind") != "freeform":
             raise ValueError("queued command candidate is unavailable")
         candidate = command_data.get("candidate")

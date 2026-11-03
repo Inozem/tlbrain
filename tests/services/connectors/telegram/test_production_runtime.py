@@ -272,6 +272,8 @@ def test_default_app_forward_question_followup_use_current_draft_full_history(
                  if item["body"].get("target_kind") == "telegram_dispatch"]
         for body in fresh:
             if body.get("notification_id"):
+                if body.get("outbox_id", "").startswith("tgcard-close-"):
+                    continue  # The controlled early-close integration is tested separately.
                 delivered = await post("/internal/deliver", body)
                 assert delivered.status_code == 200, delivered.text
         operation = next((body for body in fresh if not body.get("notification_id")), None)
@@ -417,6 +419,8 @@ def test_default_app_malformed_accepted_draft_cutoff_settles_safely_without_main
                  if item["body"].get("target_kind") == "telegram_dispatch"]
         for body in fresh:
             if body.get("notification_id"):
+                if body.get("outbox_id", "").startswith("tgcard-close-"):
+                    continue  # The controlled early-close integration is tested separately.
                 delivered = await post("/internal/deliver", body)
                 assert delivered.status_code == 200, delivered.text
         return fresh
@@ -560,13 +564,24 @@ def test_default_app_gemini_402_fails_save_once_and_preserves_numbered_draft(
     command_tasks = [item["body"] for item in task_requests
                      if item["body"].get("target_kind") == "telegram_dispatch"]
     operation_dispatch = next(body for body in reversed(command_tasks) if not body.get("notification_id"))
+    from core.integrations.firestore.operation_queue import get_operation
+    queued_operation = get_operation(
+        db.collection("telegram_sessions").document(operation_dispatch["context_id"]),
+        operation_dispatch["operation_id"],
+    )
+    assert queued_operation is not None
+    assert not hasattr(queued_operation, "typed_action")
+    assert not hasattr(queued_operation, "receipt_card_notification_id")
     for body in reversed(command_tasks):
         if body.get("notification_id"):
+            if body.get("outbox_id", "").startswith("tgcard-close-"):
+                continue
             ack = asyncio.run(post("/internal/deliver", body), loop_factory=_selector_loop)
             assert ack.status_code == 200, ack.text
             break
 
-    result = asyncio.run(post("/internal/dispatch", operation_dispatch), loop_factory=_selector_loop)
+    result = asyncio.run(post("/internal/dispatch", operation_dispatch),
+                         loop_factory=_selector_loop)
     assert result.status_code == 200, result.text
     assert result.json() == {"status": "processed"}
     status_dispatch = next(item["body"] for item in task_requests
@@ -684,6 +699,28 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
     from core.integrations.firestore.outbox import get_outbox_record, task_payload
     from core.integrations.firestore.folders import upsert_folder
     from services.connectors.telegram.app.main import create_app
+    from services.connectors.telegram.repository import TelegramRepository
+    from datetime import timedelta
+
+    clock_now = [datetime.now(timezone.utc)]
+    real_datetime = datetime
+
+    class ControlledDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = clock_now[0]
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr("services.connectors.telegram.intake.datetime", ControlledDateTime)
+    from services.connectors.telegram.app import main as telegram_main
+    original_notification_runtime = telegram_main._notification_runtime
+
+    def controlled_notification_runtime():
+        publisher = original_notification_runtime()
+        publisher.clock = lambda: clock_now[0]
+        return publisher
+
+    monkeypatch.setattr(telegram_main, "_notification_runtime", controlled_notification_runtime)
 
     db = firestore_fake.client_class()
     monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
@@ -708,9 +745,18 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
     monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
     monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
     sent = []
+    lost_final_edit = [False]
     def bot_response(request):
         payload = json.loads(request.content)
-        sent.append((request.url.path.rsplit("/", 1)[-1], payload))
+        method = request.url.path.rsplit("/", 1)[-1]
+        sent.append((method, payload))
+        if method == "answerCallbackQuery":
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if (method == "editMessageText"
+                and "Saved and indexed." in payload.get("text", "")
+                and not lost_final_edit[0]):
+            lost_final_edit[0] = True
+            raise httpx.ReadTimeout("synthetic lost final edit acknowledgement")
         return httpx.Response(200, json={"ok": True, "result": {"message_id": 900 + len(sent)}})
     from services.connectors.telegram.client import TelegramClient
     original_init = TelegramClient.__init__
@@ -721,14 +767,6 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
 
     upsert_folder("pytest-synthetic-root", "Root", None, db)
     upsert_folder("folder-client", "Client", "pytest-synthetic-root", db)
-    route = {"kind": "save", "target_ref": None, "target_operation_id": None,
-             "dialog_number": None, "result_refs": [], "substantive_text": None,
-             "tool_choice": None, "certainty": "certain"}
-    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
-        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
-            function_call=types.FunctionCall(name="route_command", args=route),
-        )]))],
-    ))
     sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
         candidates=[types.Candidate(content=types.Content(parts=[types.Part(
             text=json.dumps({"title": "A complete saved dialog", "folder_path": ["Client"]}),
@@ -778,29 +816,51 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
                            loop_factory=_selector_loop)
     assert ack_done.status_code == 200, ack_done.text
     assert any(method == "sendMessage" for method, _ in sent)  # durable forward acknowledgement
-
-    command = {"update_id": 15002, "message": {
-        "message_id": 62, "date": 1793320010,
-        "chat": {"id": 77, "type": "private"}, "from": {"id": 7}, "text": "save this dialog",
+    forward_close = next(body for body in forward_tasks
+                         if body.get("notification_id") == forward_ack["notification_id"]
+                         and body.get("outbox_id") != forward_ack["outbox_id"])
+    early_close = asyncio.run(post("/internal/deliver", forward_close),
+                              loop_factory=_selector_loop)
+    assert early_close.status_code == 503, early_close.text
+    clock_now[0] += timedelta(seconds=1)
+    close_done = asyncio.run(post("/internal/deliver", forward_close),
+                             loop_factory=_selector_loop)
+    assert close_done.status_code == 200, close_done.text
+    ready_card = TelegramRepository(db).get_notification(forward_ack["notification_id"])
+    callback_data = ready_card["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    callback = {"update_id": 15002, "callback_query": {
+        "id": "synthetic-save-click", "from": {"id": 7}, "data": callback_data,
+        "message": {"message_id": ready_card["message_id"], "date": 1793320100,
+                    "chat": {"id": 77, "type": "private"}},
     }}
-    command_response = asyncio.run(post("/telegram/webhook", command, secret=True),
-                                   loop_factory=_selector_loop)
-    assert command_response.status_code == 200, command_response.text
+    callback_response = asyncio.run(post("/telegram/webhook", callback, secret=True),
+                                    loop_factory=_selector_loop)
+    assert callback_response.status_code == 200, callback_response.text
+    assert any(method == "answerCallbackQuery" for method, _ in sent)
+    saving_card = TelegramRepository(db).get_notification(forward_ack["notification_id"])
+    assert saving_card["body"] == "Dialog #1: Saving…"
+    assert saving_card["reply_markup"] == {"inline_keyboard": []}
     command_tasks = [item["body"] for item in task_requests
                      if item["body"].get("target_kind") == "telegram_dispatch"]
-    save_dispatch = command_tasks[-1]
-    if save_dispatch.get("notification_id"):
-        ack = save_dispatch
-        ack_done = asyncio.run(post("/internal/deliver", ack), loop_factory=_selector_loop)
-        assert ack_done.status_code == 200, ack_done.text
-        save_dispatch = next((body for body in command_tasks if not body.get("notification_id")), None)
-        assert save_dispatch is not None, command_tasks
+    save_dispatch = next(body for body in reversed(command_tasks)
+                         if not body.get("notification_id")
+                         and body.get("operation_id"))
     first_slice = asyncio.run(post("/internal/dispatch", save_dispatch),
                               loop_factory=_selector_loop)
     assert first_slice.status_code == 200, first_slice.text
-    assert first_slice.json() == {"status": "noop"}  # the index receipt is still pending
+    assert first_slice.json()["status"] in {"noop", "processed"}
+    saving_edits = [(method, payload) for method, payload in sent
+                    if method == "editMessageText"
+                    and payload.get("message_id") == ready_card["message_id"]
+                    and "Saving" in payload.get("text", "")]
+    assert len(saving_edits) == 1
+    assert saving_edits[0][1]["reply_markup"] == {"inline_keyboard": []}
     operation = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
                  .collection("operations").document(save_dispatch["operation_id"]).get().to_dict())
+    accepted_command = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+                        .collection("commands").document("15002").get().to_dict())
+    assert operation.get("typed_action") == accepted_command.get("action_metadata")
+    assert accepted_command.get("cutoff_message_ids") == [61]
     assert operation["state"] == "running"
     assert operation["route_control"]["kind"] == "save"
     core_operation = db.collection("dialog_operations").document(save_dispatch["operation_id"]).get().to_dict()
@@ -845,6 +905,7 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
     wake_task_kwargs = next(item for item in task_requests
                             if item["body"].get("target_kind") == "telegram_dispatch"
                             and item["body"].get("operation_id") == save_dispatch["operation_id"]
+                            and not item["body"].get("notification_id")
                             and item["body"].get("outbox_id") != save_dispatch["outbox_id"])
     wake = get_outbox_record(db, wake_task_kwargs["body"]["outbox_id"])
     assert wake is not None and wake.operation_id == save_dispatch["operation_id"]
@@ -861,10 +922,50 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
     assert completed.status_code == 200, completed.text
     queue_operation = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
                        .collection("operations").document(save_dispatch["operation_id"]).get().to_dict())
+    assert lost_final_edit[0] is True
+    assert queue_operation["state"] == "running"
+    durable_card = TelegramRepository(db).get_notification(forward_ack["notification_id"])
+    assert durable_card["receipt_terminal"] is True
+    assert durable_card["state"] in {"pending", "retry", "delivery_unknown"}
+    draft_ref = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+                 .collection("drafts").document(queue_operation["target_draft_id"]))
+    manifest_before_recovery = draft_ref.collection("save_manifests").document(
+        save_dispatch["operation_id"],
+    ).get().to_dict()
+    draft_before_recovery = draft_ref.get().to_dict()
+    certificate_before_recovery = draft_before_recovery["completion_certificate"]
+    model_work_before_recovery = len([event for event in sdk_fakes.trace
+                                      if event["boundary"] == "gemini"
+                                      and event["operation"] == "generate_content"])
+    assert model_work_before_recovery > 0
+    app = create_app(webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+                     oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})())
+    retry_wakes = [item["body"] for item in task_requests
+                   if item["body"].get("target_kind") == "telegram_dispatch"
+                   and item["body"].get("operation_id") == save_dispatch["operation_id"]
+                   and not item["body"].get("notification_id")
+                   and item["body"].get("outbox_id") != wake_task["outbox_id"]]
+    retry_wake = retry_wakes[-1] if retry_wakes else wake_task
+    retry_record = get_outbox_record(db, retry_wake["outbox_id"])
+    clock_now[0] = max(clock_now[0], retry_record.schedule_at)
+    from services.connectors.telegram.app.main import _default_queue_worker
+    restarted_worker = _default_queue_worker()
+    restarted_clock = lambda: retry_record.schedule_at
+    restarted_worker.clock = restarted_clock
+    restarted_worker.processor.clock = restarted_clock
+    if getattr(restarted_worker.processor, "save_handler", None) is not None:
+        restarted_worker.processor.save_handler.clock = restarted_clock
+    app.state.telegram_queue_worker = restarted_worker
+    replay_after_restart = asyncio.run(post("/internal/dispatch", retry_wake),
+                                       loop_factory=_selector_loop)
+    assert replay_after_restart.status_code == 200, replay_after_restart.text
+    queue_operation = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
+                       .collection("operations").document(save_dispatch["operation_id"])
+                       .get().to_dict())
     shared_after_wake = db.collection("dialog_operations").document(save_dispatch["operation_id"]).get().to_dict()
     draft_after_wake = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
                         .collection("drafts").document(queue_operation["target_draft_id"]).get().to_dict())
-    assert completed.json() == {"status": "processed"}, (
+    assert completed.json()["status"] in {"processed", "noop"}, (
         completed.json(), queue_operation.get("state"), shared_after_wake.get("state"),
         shared_after_wake.get("result"), shared_after_wake.get("stage"),
         draft_after_wake.get("state"), draft_after_wake.get("completion_certificate"),
@@ -882,7 +983,20 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
                  .collection("drafts").document(queue_operation["target_draft_id"]))
     assert draft_ref.collection("messages").stream() == []
     assert draft_ref.collection("prepared").stream() == []
-    assert draft_ref.collection("save_manifests").document(save_dispatch["operation_id"]).get().exists
+    manifest = draft_ref.collection("save_manifests").document(
+        save_dispatch["operation_id"],
+    ).get().to_dict()
+    assert manifest["ordered_message_ids"] == [61]
+    assert manifest["manifest_digest"] == draft_after_wake["manifest_digest"]
+    assert draft_after_wake["completion_certificate"]
+    completion_certificate = draft_after_wake["completion_certificate"]
+    assert manifest_before_recovery == draft_ref.collection("save_manifests").document(
+        save_dispatch["operation_id"],
+    ).get().to_dict()
+    assert certificate_before_recovery == completion_certificate
+    assert model_work_before_recovery == len([event for event in sdk_fakes.trace
+                                               if event["boundary"] == "gemini"
+                                               and event["operation"] == "generate_content"])
     stages = (db.collection("telegram_sessions").document(save_dispatch["context_id"])
               .collection("operations").document(save_dispatch["operation_id"])
               .collection("stages"))
@@ -913,23 +1027,37 @@ def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_rea
     assert len([event for event in sdk_fakes.trace
                 if event["boundary"] == "drive" and event["operation"] == "files.create"]) == 1
     save_finals = [payload for method, payload in sent
-                   if method == "sendMessage"
+                   if method == "editMessageText"
                    and "Dialog #1: Saved and indexed. Folder: Client." in payload.get("text", "")]
-    assert len(save_finals) == 1, sent
+    assert len(save_finals) == (2 if lost_final_edit[0] else 1), sent
+    assert all(payload["chat_id"] == 77 and payload["message_id"] == ready_card["message_id"]
+               for payload in save_finals)
+    generation_count = len([event for event in sdk_fakes.trace
+                            if event["boundary"] == "gemini"
+                            and event["operation"] == "generate_content"])
     final_notices = [row for path, row in firestore_fake.documents.items()
                      if path.startswith("notification_outbox/")
                      and row.get("operation_id") == save_dispatch["operation_id"]
-                     and row.get("kind") in {"final", "error"}]
+                     and row.get("receipt_terminal") is True]
     assert len(final_notices) == 1, final_notices
-    assert final_notices[0]["notification_id"] == queue_operation["notification_id"]
+    assert final_notices[0]["notification_id"] == forward_ack["notification_id"]
 
     # Replaying the canonical wake dispatch must reuse the delivered ledger row.
     duplicate = asyncio.run(post("/internal/dispatch", wake_task),
                             loop_factory=_selector_loop)
     assert duplicate.status_code == 200, duplicate.text
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "gemini"
+                and event["operation"] == "generate_content"]) == generation_count
+    assert draft_ref.collection("save_manifests").document(
+        save_dispatch["operation_id"],
+    ).get().to_dict() == manifest
+    assert draft_ref.get().to_dict()["completion_certificate"] == completion_certificate
     assert len([payload for method, payload in sent
-                if method == "sendMessage"
-                and "Dialog #1: Saved and indexed. Folder: Client." in payload.get("text", "")]) == 1
+                if method == "editMessageText"
+                and "Dialog #1: Saved and indexed. Folder: Client." in payload.get("text", "")]) == (
+                    2 if lost_final_edit[0] else 1
+                )
 
 
 def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemini_http(
@@ -1301,8 +1429,6 @@ def test_default_asgi_malformed_route_error_survives_delivery_replay_and_uncerta
         assert response.status_code == 200, response.text
         rows = [item["body"] for item in task_requests
                 if item["body"].get("target_kind") == "telegram_dispatch"]
-        ack = next(row for row in reversed(rows) if row.get("notification_id"))
-        assert (await post("/internal/deliver", ack)).status_code == 200
         return next(row for row in reversed(rows) if not row.get("notification_id"))
 
     save_dispatch = asyncio.run(

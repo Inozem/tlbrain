@@ -290,11 +290,28 @@ def _first_ack_state(record: Any) -> str | None:
     draft_id = (command.to_dict() or {}).get("draft_id")
     if not draft_id:
         return None
+    draft_ref = _document_ref(client, f"{SESSIONS}/{record.context_id}/drafts/{draft_id}")
+    draft_snapshot = draft_ref.get()
+    draft = draft_snapshot.to_dict() or {} if draft_snapshot.exists else {}
+    if draft.get("first_ack_confirmed_at") is not None:
+        return "delivered"
     rows = list(client.collection(NOTIFICATIONS).where("context_id", "==", record.context_id)
-                .where("draft_id", "==", draft_id).where("kind", "==", "draft_ack").limit(1).stream())
+                .where("draft_id", "==", draft_id).where("kind", "==", "draft_ack").stream())
     if not rows:
         return "unavailable"
-    return (rows[0].to_dict() or {}).get("state", "unavailable")
+    values = [snapshot.to_dict() or {} for snapshot in rows]
+    if any(row.get("first_ack_confirmed") is True for row in values):
+        return "delivered"
+    legacy = next((row for row in values if row.get("receipt_card") is not True), None)
+    if legacy is not None:
+        return legacy.get("state", "unavailable")
+    if any(row.get("state") in {"failed", "delivery_unknown"} for row in values):
+        return next(row["state"] for row in values
+                    if row.get("state") in {"failed", "delivery_unknown"})
+    if any(row.get("state") not in {"delivered", "failed", "delivery_unknown"}
+           for row in values):
+        return "pending"
+    return "unavailable"
 
 
 def _accepted_operation_at(context_id: str, operation_id: str) -> Any:
@@ -585,7 +602,32 @@ def create_app(
                 _log_webhook_failure("intake_init", exc, update_id)
                 return JSONResponse({"detail": "webhook unavailable"}, status_code=503)
         try:
-            await _offload_sync(intake_instance.handle_update, update)
+            if "callback_query" in update:
+                result = await _offload_sync(intake_instance.handle_callback, update)
+                callback = update.get("callback_query")
+                query_id = callback.get("id") if isinstance(callback, dict) else None
+                publisher = app.state.telegram_notification_publisher
+                if publisher is None and app.state.telegram_client is None:
+                    try:
+                        publisher = await _offload_sync(_notification_runtime)
+                        app.state.telegram_notification_publisher = publisher
+                    except Exception:
+                        publisher = None
+                telegram_client = app.state.telegram_client or getattr(publisher, "client", None)
+                if isinstance(query_id, str) and telegram_client is not None:
+                    try:
+                        await telegram_client.answer_callback_query(
+                            query_id,
+                            text=None if getattr(result, "accepted", False)
+                            else "This Save button is no longer available.",
+                        )
+                    except Exception:
+                        logger.info("Telegram callback acknowledgement failed",
+                                    extra={"event": "callback_ack_failed"})
+                if result is not None:
+                    await _offload_sync(intake_instance.publish_result, result)
+            else:
+                await _offload_sync(intake_instance.handle_update, update)
         except Exception as exc:
             _log_webhook_failure("handle_update", exc, update_id)
             return JSONResponse({"detail": "intake unavailable"}, status_code=503)
@@ -741,6 +783,14 @@ def create_app(
             if publisher is None:
                 publisher = await _offload_sync(_notification_runtime)
                 app.state.telegram_notification_publisher = publisher
+            if record.outbox_id.startswith("tgcard-close-"):
+                notification = await _offload_sync(
+                    publisher.repository.get_notification, payload["notification_id"],
+                )
+                deadline = notification.get("receipt_deadline") if notification else None
+                now = publisher.clock()
+                if isinstance(deadline, datetime) and deadline > now:
+                    return JSONResponse({"error": "Receipt close not due"}, status_code=503)
             result = await publisher.publish(payload["notification_id"])
         except (ValueError, KeyError):
             return JSONResponse({"error": "Invalid task"}, status_code=400)

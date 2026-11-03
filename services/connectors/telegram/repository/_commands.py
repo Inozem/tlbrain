@@ -11,7 +11,12 @@ from typing import Any, Mapping
 from google.cloud import firestore
 
 from core.operations.registry import OPERATIONS, validate_arguments
-from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record_in_transaction
+from core.integrations.firestore.outbox import (
+    OutboxTargetKind,
+    create_outbox_record_in_transaction,
+    prepare_outbox_record_in_transaction,
+    write_prepared_outbox_record,
+)
 from core.integrations.firestore.operation_queue import (
     register_operation_in_transaction,
     validate_context_queue_lease,
@@ -79,12 +84,47 @@ def _prepare_command_identity(
         input_ref=command_path,
         identity_digest=hashlib.sha256(
             json.dumps(
-                {"kind": command.kind, "text": command.text},
+                {"kind": command.kind, "text": command.text,
+                 "action_metadata": command.action_metadata},
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest(),
+    )
+
+
+def _receipt_save_control_matches(
+    *, context_exists: bool, context: Mapping[str, Any], control: Mapping[str, Any],
+    row: Mapping[str, Any], draft: Mapping[str, Any], context_id: str,
+    control_token: str, notification_id: Any, user_id: int, message_id: int,
+) -> bool:
+    """Check persisted actor, card, revision, draft, and queue bindings."""
+    return bool(
+        context_exists and control.get("state") == "active"
+        and control.get("token") == control_token
+        and control.get("context_id") == context_id
+        and control.get("owner_user_id") == user_id
+        and control.get("notification_id") == notification_id
+        and row.get("receipt_card") is True
+        and row.get("receipt_control_token") == control_token
+        and row.get("receipt_control_owner_user_id") == user_id
+        and row.get("revision") == control.get("issued_revision")
+        and row.get("message_id") == message_id
+        and row.get("chat_id") == context.get("chat_id")
+        and row.get("thread_id") == context.get("thread_id")
+        and row.get("context_id") == context_id
+        and row.get("draft_id") == draft.get("draft_id")
+        and context.get("latest_receipt_notification_id") == notification_id
+        and context.get("active_draft_id") == draft.get("draft_id")
+        and context.get("draft_status") == TelegramDraftState.COLLECTING.value
+        and not context.get("reserved_operation_id")
+        and not context.get("active_operation_id")
+        and not context.get("pending_save_operation_id")
+        and context.get("pending_receipt_groups", 0) == 0
+        and draft.get("state") == TelegramDraftState.COLLECTING.value
+        and draft.get("dialog_number") == row.get("dialog_number")
+        and bool(draft.get("ordered_message_ids"))
     )
 
 
@@ -163,6 +203,8 @@ def _command_data(
         "user_id": user_id,
         "kind": command.kind,
         "candidate": command.text,
+        **({"action_metadata": dict(command.action_metadata)}
+           if isinstance(command.action_metadata, Mapping) else {}),
         "draft_id": snapshot.draft_id,
         "cutoff_message_ids": list(snapshot.message_ids),
         "cutoff_intake_sequence": snapshot.cutoff_sequence,
@@ -219,6 +261,7 @@ def _register_command_operation(
     identity: _CommandIdentity,
     now: datetime,
     snapshot: _CommandSnapshot,
+    action_metadata: Mapping[str, Any] | None = None,
 ) -> Any:
     """Reserve the FIFO operation and create its outbox before queue writes begin."""
     def create_command_outbox() -> None:
@@ -234,6 +277,9 @@ def _register_command_operation(
             context_id=identity.context_id,
         )
 
+    operation_fields = _command_link_metadata(snapshot)
+    if action_metadata is not None:
+        operation_fields["typed_action"] = dict(action_metadata)
     return register_operation_in_transaction(
         client,
         transaction,
@@ -243,7 +289,7 @@ def _register_command_operation(
         input_ref=identity.input_ref,
         now=now,
         before_write=create_command_outbox,
-        operation_fields=_command_link_metadata(snapshot),
+        operation_fields=operation_fields,
     )
 
 
@@ -678,6 +724,8 @@ class _TelegramCommandMixin:
             identity=identity,
             now=now,
             snapshot=state.snapshot,
+            action_metadata=(command.action_metadata
+                             if isinstance(command.action_metadata, Mapping) else None),
         )
         _update_command_context(
             state.context,
@@ -716,7 +764,9 @@ class _TelegramCommandMixin:
         chat_id = _integer(chat_id, "chat_id")
         user_id = _integer(user_id, "user_id", minimum=1)
         now = _aware(now, "now")
-        if thread_id is not None:
+        if thread_id == 0:
+            thread_id = None
+        elif thread_id is not None:
             thread_id = _integer(thread_id, "thread_id", minimum=1)
         if topic_name is not None and not isinstance(topic_name, str):
             raise ValueError("topic_name must be a string or None")
@@ -742,6 +792,137 @@ class _TelegramCommandMixin:
                 topic_name=topic_name,
                 command=command,
                 now=now,
+            )
+
+        return _txn(self.client.transaction(max_attempts=5))
+
+
+    def accept_receipt_save_callback(
+        self,
+        update_id: int,
+        *,
+        chat_id: int,
+        user_id: int,
+        thread_id: int | None,
+        message_id: int,
+        control_token: str,
+        now: datetime,
+    ) -> TelegramIntakeResult:
+        """Consume a current persisted Save control and reserve its exact draft cutoff."""
+        from services.connectors.telegram.commands import TelegramCommand
+
+        update_id = _integer(update_id, "update_id")
+        chat_id = _integer(chat_id, "chat_id")
+        user_id = _integer(user_id, "user_id", minimum=1)
+        message_id = _integer(message_id, "message_id", minimum=1)
+        thread_id = (None if thread_id == 0 else
+                     _integer(thread_id, "thread_id", minimum=1)
+                     if thread_id is not None else None)
+        control_token = _identifier(control_token, "control_token")
+        now = _aware(now, "now")
+        context_id = build_context_id(chat_id, thread_id)
+        receipt_ref = _document_ref(self.client, f"{SESSIONS}/{context_id}/updates/{update_id}")
+        control_ref = _document_ref(
+            self.client, f"{SESSIONS}/{context_id}/receipt_controls/{control_token}",
+        )
+        control_snapshot = control_ref.get()
+        control_data = control_snapshot.to_dict() or {} if control_snapshot.exists else {}
+        notification_id = control_data.get("notification_id")
+        notification_ref = (self.client.collection("notification_outbox").document(notification_id)
+                            if isinstance(notification_id, str) else None)
+        notification_snapshot = notification_ref.get() if notification_ref is not None else None
+        notification = (notification_snapshot.to_dict() or {}
+                        if notification_snapshot is not None and notification_snapshot.exists else {})
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+
+        @firestore.transactional
+        def _txn(transaction: Any) -> TelegramIntakeResult:
+            replay_snapshot = receipt_ref.get(transaction=transaction)
+            if replay_snapshot.exists:
+                return _receipt_result(replay_snapshot.to_dict() or {}, context_id)
+            control_now = control_ref.get(transaction=transaction)
+            control = control_now.to_dict() or {} if control_now.exists else {}
+            context_snapshot = context_ref.get(transaction=transaction)
+            context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
+            live_notification_snapshot = (
+                notification_ref.get(transaction=transaction)
+                if notification_ref is not None else None
+            )
+            row = (live_notification_snapshot.to_dict() or {}
+                   if live_notification_snapshot is not None and live_notification_snapshot.exists else {})
+            draft_id = row.get("draft_id")
+            draft_ref = (_document_ref(self.client, f"{SESSIONS}/{context_id}/drafts/{draft_id}")
+                         if isinstance(draft_id, str) else None)
+            draft_snapshot = draft_ref.get(transaction=transaction) if draft_ref is not None else None
+            draft = (draft_snapshot.to_dict() or {}
+                     if draft_snapshot is not None and draft_snapshot.exists else {})
+
+            eligible = _receipt_save_control_matches(
+                context_exists=context_snapshot.exists, context=context,
+                control=control, row=row, draft=draft, context_id=context_id,
+                control_token=control_token, notification_id=notification_id,
+                user_id=user_id, message_id=message_id,
+            )
+            if not eligible:
+                transaction.set(receipt_ref, {
+                    "update_id": update_id, "context_id": context_id,
+                    "accepted": False, "outcome": "receipt_save_rejected",
+                    "notification_id": notification_id, "message_id": message_id,
+                    "created_at": now,
+                })
+                return TelegramIntakeResult(False, context_id)
+
+            action_metadata = {
+                "action": "receipt_save", "notification_id": notification_id,
+                "control_token": control_token, "draft_id": draft_id,
+                "dialog_number": row.get("dialog_number"), "card_message_id": message_id,
+                "card_revision": row.get("revision"), "user_id": user_id,
+            }
+            command = TelegramCommand("save", "", action_metadata)
+            identity = _prepare_command_identity(
+                self.client, context_id=context_id, update_id=update_id, command=command,
+            )
+            saving_outbox_id = "tgcard-saving-" + hashlib.sha256(
+                f"{notification_id}:{identity.operation_id}".encode()
+            ).hexdigest()
+            saving_outbox = prepare_outbox_record_in_transaction(
+                self.client, transaction, saving_outbox_id,
+                target_kind=OutboxTargetKind.TELEGRAM_DISPATCH, generation=1,
+                schedule_at=now, now=now, context_id=context_id,
+                notification_id=notification_id, operation_id=identity.operation_id,
+            )
+            result = self._accept_command_in_transaction(
+                transaction, identity=identity, update_id=update_id,
+                chat_id=chat_id, user_id=user_id, thread_id=thread_id,
+                topic_name=context.get("topic_name"), command=command, now=now,
+            )
+            write_prepared_outbox_record(transaction, saving_outbox)
+            next_revision = _integer(row.get("revision", 1), "revision", minimum=1) + 1
+            row.update({
+                "body": f"Dialog #{row.get('dialog_number')}: Saving…",
+                "reply_markup": {"inline_keyboard": []},
+                "receipt_control_token": None,
+                "receipt_control_owner_user_id": None,
+                "save_operation_id": result.operation_id,
+                "operation_id": result.operation_id,
+                "revision": next_revision,
+                "desired_status_revision": next_revision,
+                "state": row.get("state") if row.get("in_flight_attempt_id") else "pending",
+                "delivered_at": None, "updated_at": now,
+            })
+            transaction.set(notification_ref, row)
+            transaction.update(control_ref, {"state": "consumed", "operation_id": result.operation_id,
+                                             "consumed_at": now})
+            transaction.update(receipt_ref, {
+                "notification_id": notification_id, "receipt_group_id": row.get("receipt_group_id"),
+                "card_message_id": message_id,
+                "additional_outbox_ids": [saving_outbox_id],
+            })
+            return TelegramIntakeResult(
+                result.accepted, result.context_id, result.draft_id, result.dialog_number,
+                result.message_id, result.intake_sequence, result.notification_id,
+                result.outbox_id, result.operation_id, result.queue_position,
+                result.snapshot_message_ids, (saving_outbox_id,),
             )
 
         return _txn(self.client.transaction(max_attempts=5))

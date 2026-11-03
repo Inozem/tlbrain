@@ -57,6 +57,104 @@ def test_send_edit_and_get_file_use_fixed_origin_and_single_http_attempts():
     assert requests[0].content == b'{"chat_id":10,"text":"hello","message_thread_id":7}'
 
 
+def test_callback_methods_validate_boolean_results_and_markup_is_sent():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith(("sendMessage", "editMessageText")):
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 11}})
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async def run():
+        client, http = _client(handler)
+        try:
+            markup = {"inline_keyboard": [[{"text": "Save", "callback_data": "save:token"}]]}
+            await client.send_message(10, "ready", reply_markup=markup)
+            await client.edit_message_text(10, 11, "saving", reply_markup={"inline_keyboard": []})
+            assert await client.answer_callback_query("query-id") is True
+            assert await client.send_chat_action(10, "typing") is True
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+    assert len(requests) == 4
+    assert b'"reply_markup":{"inline_keyboard":[[{"text":"Save","callback_data":"save:token"}]]}' in requests[0].content
+    assert b'"reply_markup":{"inline_keyboard":[]}' in requests[1].content
+    assert requests[2].url.path.endswith("/answerCallbackQuery")
+    assert requests[3].url.path.endswith("/sendChatAction")
+
+
+def test_boolean_method_rejects_non_boolean_result():
+    def handler(_request):
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    async def run():
+        client, http = _client(handler)
+        try:
+            await client.answer_callback_query("query-id")
+        finally:
+            await http.aclose()
+
+    with pytest.raises(TelegramAPIError) as caught:
+        asyncio.run(run())
+    assert caught.value.category == "invalid_response"
+
+
+@pytest.mark.parametrize("description", [
+    "Bad Request: message is not modified",
+    ("Bad Request: message is not modified: specified new message content and reply "
+     "markup are exactly the same as a current content and reply markup of the message"),
+])
+@pytest.mark.parametrize("status_code", [200, 400])
+def test_message_not_modified_is_only_applied_to_known_edits(description, status_code):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status_code, json={
+            "ok": False, "error_code": 400,
+            "description": description,
+        })
+
+    async def run():
+        client, http = _client(handler)
+        try:
+            with pytest.raises(TelegramAPIError) as edited:
+                await client.edit_message_text(10, 11, "same")
+            with pytest.raises(TelegramAPIError) as sent:
+                await client.send_message(10, "same")
+            with pytest.raises(TelegramAPIError) as answered:
+                await client.answer_callback_query("query-id")
+            return edited.value.category, sent.value.category, answered.value.category
+        finally:
+            await http.aclose()
+
+    assert asyncio.run(run()) == ("not_modified", "provider_error", "provider_error")
+    assert [request.url.path.rsplit("/", 1)[-1] for request in requests] == [
+        "editMessageText", "sendMessage", "answerCallbackQuery",
+    ]
+
+
+def test_not_modified_lookalike_description_is_not_treated_as_applied_edit():
+    def handler(_request):
+        return httpx.Response(400, json={
+            "ok": False, "error_code": 400,
+            "description": "Bad Request: message is not modified because the target changed",
+        })
+
+    async def run():
+        client, http = _client(handler)
+        try:
+            await client.edit_message_text(10, 11, "same")
+        finally:
+            await http.aclose()
+
+    with pytest.raises(TelegramAPIError) as caught:
+        asyncio.run(run())
+    assert caught.value.category == "provider_error"
+
+
 @pytest.mark.parametrize("result", [True, False])
 def test_delete_webhook_confirms_true_result_without_dropping_pending_updates(result):
     requests = []

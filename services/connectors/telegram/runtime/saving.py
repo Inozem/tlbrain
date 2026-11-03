@@ -159,12 +159,18 @@ class TelegramSaveRuntime(_TelegramSharedSaveRuntime, _TelegramCommittedSaveRunt
             f"{context_id}\0{intent_id}".encode("utf-8")
         ).hexdigest()
         request = ledger.load_request(conversation_id, intent_id)
-        if request:
+        if request is not None:
             return request
         if intent_id != _get(operation, "operation_id"):
             raise ValueError("original save request is unavailable")
         input_ref = _get(operation, "input_ref")
         command = _document_ref(self.repository.client, input_ref).get().to_dict() or {}
+        typed_action = command.get("action_metadata")
+        if (command.get("kind") == "save" and command.get("candidate") == ""
+                and isinstance(typed_action, Mapping)
+                and typed_action.get("action") == "receipt_save"):
+            ledger.save_request(conversation_id, intent_id, "")
+            return ""
         value = command.get("candidate") or command.get("text")
         if not isinstance(value, str) or not value:
             raise ValueError("save command input is unavailable")

@@ -313,11 +313,17 @@ def _linked_final_notification_id(client: Any, record: Any) -> str | None:
     if not isinstance(notification_id, str) or not notification_id:
         return None
     notification = TelegramRepository(client).get_notification(notification_id)
+    receipt_terminal = bool(
+        notification and notification.get("receipt_card") is True
+        and notification.get("receipt_terminal") is True
+        and notification.get("save_operation_id") == record.operation_id
+        and notification.get("context_id") == record.context_id
+    )
     if not notification or (
         notification.get("notification_id") != notification_id
         or notification.get("context_id") != record.context_id
         or notification.get("operation_id") != record.operation_id
-        or notification.get("kind") not in {"final", "error"}
+        or (notification.get("kind") not in {"final", "error"} and not receipt_terminal)
         or notification.get("state") not in {
             "pending", "retry", "sending", "editing", "delivered", "failed",
             "delivery_unknown",

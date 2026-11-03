@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -16,6 +17,9 @@ from services.connectors.telegram.repository import TelegramRepository
 
 def _integer(value: Any) -> int | None:
     return value if type(value) is int else None
+
+
+_SAVE_CALLBACK = re.compile(r"^s:([A-Za-z0-9_-]{1,48})$")
 
 
 def _telegram_date(value: Any) -> datetime | None:
@@ -127,8 +131,57 @@ class TelegramIntake:
                 thread_id=thread_id,
             )
         return self._handle_forward(
-            message, update_id=update_id, chat_id=chat_id, thread_id=thread_id
+            message, update_id=update_id, chat_id=chat_id, user_id=user_id,
+            thread_id=thread_id
         )
+
+    def handle_callback(self, update: Mapping[str, Any]) -> Any:
+        """Validate a private-chat Save callback and reserve it as a typed action."""
+        if not isinstance(update, Mapping):
+            return None
+        callback = update.get("callback_query")
+        if not isinstance(callback, Mapping):
+            return None
+        update_id = _integer(update.get("update_id"))
+        actor = callback.get("from")
+        message = callback.get("message")
+        callback_id = callback.get("id")
+        if (update_id is None or not isinstance(callback_id, str) or not callback_id
+                or len(callback_id) > 256
+                or not isinstance(actor, Mapping) or not isinstance(message, Mapping)):
+            return None
+        user_id = _integer(actor.get("id"))
+        chat = message.get("chat")
+        chat_id = _integer(chat.get("id")) if isinstance(chat, Mapping) else None
+        if (user_id is None or chat_id is None or not isinstance(chat, Mapping)
+                or user_id <= 0 or chat_id <= 0
+                or chat.get("type") != "private"
+                or (self.allowed_user_ids is not None and user_id not in self.allowed_user_ids)):
+            return None
+        data = callback.get("data")
+        match = (_SAVE_CALLBACK.fullmatch(data)
+                 if isinstance(data, str) and len(data.encode("utf-8")) <= 64 else None)
+        if match is None:
+            return None
+        message_id = _integer(message.get("message_id"))
+        message_date = _integer(message.get("date"))
+        raw_thread = message.get("message_thread_id")
+        if raw_thread is not None and type(raw_thread) is not int:
+            return None
+        if type(raw_thread) is int and raw_thread < 0:
+            return None
+        thread_id = normalize_thread_id(raw_thread)
+        if (message_id is None or message_id <= 0 or message_date is None or message_date <= 0
+                or (raw_thread not in (None, 0) and thread_id is None)):
+            return None
+        return self.repository.accept_receipt_save_callback(
+            update_id, chat_id=chat_id, user_id=user_id, thread_id=thread_id,
+            message_id=message_id, control_token=match.group(1), now=self.clock(),
+        )
+
+    def publish_result(self, result: Any) -> None:
+        """Publish accepted durable work after the callback spinner was acknowledged."""
+        self._publish_if_accepted(result)
 
     def _validated_update_context(
         self, update: Mapping[str, Any]
@@ -213,6 +266,7 @@ class TelegramIntake:
         *,
         update_id: int,
         chat_id: int,
+        user_id: int,
         thread_id: int | None,
     ) -> Any:
         normalized = normalize_forward(message)
@@ -222,9 +276,12 @@ class TelegramIntake:
             accepted = self.repository.record_unsupported_forward(
                 update_id,
                 chat_id=chat_id,
+                user_id=user_id,
                 thread_id=thread_id,
                 topic_name=message_topic_name(message),
                 message_id=normalized["message_id"],
+                media_group_id=(message.get("media_group_id")
+                                if isinstance(message.get("media_group_id"), str) else None),
                 now=self.clock(),
             )
             self._publish_if_accepted(accepted)
@@ -235,6 +292,9 @@ class TelegramIntake:
             thread_id=thread_id,
             topic_name=message_topic_name(message),
             message=normalized,
+            user_id=user_id,
+            media_group_id=(message.get("media_group_id")
+                            if isinstance(message.get("media_group_id"), str) else None),
             now=self.clock(),
         )
         self._publish_if_accepted(accepted)
@@ -243,8 +303,16 @@ class TelegramIntake:
     def _publish_if_accepted(self, result: Any) -> None:
         outbox_id = result.outbox_id if hasattr(result, "outbox_id") else result.get("outbox_id")
         is_accepted = result.accepted if hasattr(result, "accepted") else result.get("accepted")
-        if is_accepted and outbox_id:
+        publish_rejection = (result.publish_rejection if hasattr(result, "publish_rejection")
+                             else result.get("publish_rejection", False))
+        should_publish = bool(is_accepted or publish_rejection)
+        if should_publish and outbox_id:
             self.publisher.publish(outbox_id)
+        additional = (result.additional_outbox_ids if hasattr(result, "additional_outbox_ids")
+                      else result.get("additional_outbox_ids", ()))
+        if should_publish:
+            for extra_id in additional:
+                self.publisher.publish(extra_id)
 
 
 __all__ = ["TelegramIntake", "normalize_forward"]

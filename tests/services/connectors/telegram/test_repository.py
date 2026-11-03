@@ -43,7 +43,9 @@ def test_forward_transaction_persists_receipt_draft_dialog_message_and_ack(fires
     assert result.dialog_number == 1
     assert result.intake_sequence == 1
     context = repo.get_context(context_id)
-    assert context == {
+    assert {key: value for key, value in context.items()
+            if key not in {"latest_receipt_notification_id", "open_text_receipt_group_id",
+                           "latest_receipt_group_id", "pending_receipt_groups"}} == {
         "chat_id": 42,
         "thread_id": 5,
         "topic_name": None,
@@ -76,7 +78,7 @@ def test_forward_transaction_persists_receipt_draft_dialog_message_and_ack(fires
     notification = _read(client, f"notification_outbox/{result.notification_id}")
     task = _read(client, f"task_outbox/{result.outbox_id}")
     assert notification["kind"] == "draft_ack"
-    assert notification["body"] == "Dialog #1: Message received"
+    assert notification["body"].startswith("Dialog #1: Thinking")
     assert task["notification_id"] == result.notification_id
 
 
@@ -90,14 +92,14 @@ def test_second_forward_appends_without_creating_another_ack_or_outbox(firestore
     assert second.draft_id == first.draft_id
     assert second.dialog_number == first.dialog_number
     assert second.intake_sequence == 2
-    assert second.notification_id is None
-    assert second.outbox_id is None
+    assert second.notification_id == first.notification_id
+    assert second.outbox_id is not None
     assert repo.get_draft(first.context_id, first.draft_id)["ordered_message_ids"] == [101, 102]
     receipt = repo.get_update_receipt(first.context_id, 2)
-    assert receipt["notification_id"] is None
-    assert receipt["outbox_id"] is None
+    assert receipt["notification_id"] == first.notification_id
+    assert receipt["outbox_id"] == second.outbox_id
     assert len([path for path in firestore_fake.documents if path.startswith("notification_outbox/")]) == 1
-    assert len([path for path in firestore_fake.documents if path.startswith("task_outbox/")]) == 1
+    assert len([path for path in firestore_fake.documents if path.startswith("task_outbox/")]) == 3
 
 
 def test_forward_retains_topic_name_when_later_forward_omits_it(firestore_fake):
@@ -177,6 +179,13 @@ def test_busy_context_receipt_does_not_store_message_content(firestore_fake):
     assert not any("/drafts/" in path for path in firestore_fake.documents)
     receipt = repo.get_update_receipt(context_id, 1)
     assert receipt["accepted"] is False
+    assert receipt["outcome"] == "busy_forward_refused"
+    assert receipt["publish_rejection"] is True
+    assert result.outbox_id and result.notification_id
+    refusal = repo.get_notification(result.notification_id)
+    assert "processing another request" in refusal["body"]
+    assert result.notification_id
+    assert repo.get_notification(result.notification_id)["operation_id"] is None
     assert "forwarded text" not in str(firestore_fake.documents)
 
 

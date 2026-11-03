@@ -635,6 +635,86 @@ def _route(*, tool_choice=None):
             "tool_choice": tool_choice, "certainty": "certain"}
 
 
+def test_long_receipt_save_result_keeps_card_and_durable_overflow_chunks(firestore_fake):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.runtime import _DurableCommandReplies
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    operation_ref = (client.collection("telegram_sessions").document(context_id)
+                     .collection("operations").document(operation["operation_id"]))
+    operation_ref.update({"receipt_card_notification_id": "receipt-card",
+                          "target_draft_id": "draft-1"})
+    client.collection("notification_outbox").document("receipt-card").set({
+        "notification_id": "receipt-card", "context_id": context_id,
+        "draft_id": "draft-1", "receipt_card": True,
+        "save_operation_id": operation["operation_id"],
+        "receipt_terminal": False, "revision": 1, "state": "delivered",
+        "body": "Dialog #1: Saving...", "reply_markup": {"inline_keyboard": []},
+        "chat_id": 42, "message_id": 901,
+    })
+
+    class Publisher:
+        def __init__(self):
+            self.calls = []
+
+        async def publish(self, notification_id):
+            self.calls.append(notification_id)
+            return "delivered"
+
+    publisher = Publisher()
+    body = "Dialog #1: Saved and indexed. Folder: " + "Nested/" * 700
+    replies = _DurableCommandReplies(
+        repository=repository, publisher=publisher, context_id=context_id,
+        operation_id=operation["operation_id"], owner=lease.owner,
+        fence=lease.fence, clock=lambda: datetime.now(timezone.utc),
+    )
+    result = asyncio.run(replies.deliver(body), loop_factory=_selector_loop)
+
+    card = repository.get_notification("receipt-card")
+    overflow = [repository.get_notification(item) for item in publisher.calls
+                if item != "receipt-card"]
+    delivered_text = card["body"] + "".join(row["body"] for row in overflow)
+    assert result == "delivered"
+    assert card["receipt_terminal"] is True
+    assert card["body"].startswith("Dialog #1: Saved and indexed. Folder: ")
+    assert delivered_text == body
+    assert len(publisher.calls) == 2
+
+
+def test_stale_reply_fence_never_publishes_a_status_as_notification_id(firestore_fake):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.runtime import _DurableCommandReplies
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    expired_now = datetime.now(timezone.utc) + timedelta(minutes=5)
+    client.collection("telegram_sessions").document(context_id).update({
+        "lock_expires_at": expired_now - timedelta(seconds=1),
+    })
+
+    class Publisher:
+        calls = []
+
+        async def publish(self, notification_id):
+            self.calls.append(notification_id)
+            return "delivered"
+
+    publisher = Publisher()
+    replies = _DurableCommandReplies(
+        repository=repository, publisher=publisher, context_id=context_id,
+        operation_id=operation["operation_id"], owner=lease.owner,
+        fence=lease.fence, clock=lambda: expired_now,
+    )
+    result = asyncio.run(replies.deliver("A safe final answer."),
+                         loop_factory=_selector_loop)
+
+    assert result == "stale"
+    assert publisher.calls == []
+
+
 def test_no_document_command_runs_agent_and_delivers_durable_answer(firestore_fake):
     from services.connectors.telegram.commands import TelegramCommand
     from services.connectors.telegram.repository import TelegramRepository
