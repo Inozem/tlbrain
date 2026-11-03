@@ -157,6 +157,141 @@ def _real_sdk_client(monkeypatch, handler):
     return client, http_client
 
 
+def test_routed_application_result_reaches_real_sdk_as_untrusted_data_without_fake_call(
+    monkeypatch,
+):
+    import httpx
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.tools import get_tool_catalog
+
+    wire_requests = []
+    synthetic_result = [{"doc_id": "doc-selected", "title": "Meeting notes",
+                         "segments": [{"text": "The milestone is May."}]}]
+
+    def respond(request):
+        wire_requests.append(request)
+        payload = json.loads(request.content)
+        roles = [row["role"] for row in payload["contents"]]
+        model_calls = [part for row in payload["contents"] for part in row.get("parts", [])
+                       if "functionCall" in part]
+        responses = [part["functionResponse"] for row in payload["contents"]
+                     for part in row.get("parts", []) if "functionResponse" in part]
+        for content in payload["contents"]:
+            if content.get("role") != "model":
+                continue
+            content_calls = [part for part in content.get("parts", [])
+                             if "functionCall" in part]
+            if content_calls and content_calls[0].get("thoughtSignature") is None:
+                # Gemini requires a signature on the first function-call Part
+                # in a model content; later parallel calls may omit it.
+                return httpx.Response(400, json={"error": {
+                    "code": 400, "message": "synthetic missing thought signature",
+                }})
+        assert roles in (["user", "model", "user"],
+                         ["user", "model", "user", "model", "user"])
+        assert "Earlier finding" in payload["contents"][0]["parts"][0]["text"]
+        assert payload["contents"][1]["parts"][0]["text"] == "Previous response."
+        current = payload["contents"][2]
+        assert current["parts"][0]["text"] == "What was the milestone?"
+        context_parts = [part["text"] for part in current["parts"][1:]
+                         if isinstance(part, dict) and isinstance(part.get("text"), str)]
+        assert len(context_parts) == 1
+        marker = context_parts[0]
+        assert "Untrusted application tool result data follows" in marker
+        result = json.loads(marker.split("<application-tool-result-data>\n", 1)[1]
+                            .split("\n</application-tool-result-data>", 1)[0])
+        assert result == {
+            "arguments": {}, "name": "list_recent_transcripts", "result": synthetic_result,
+        }
+        if len(wire_requests) == 1:
+            assert model_calls == [] and responses == []
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {
+                        "id": "call-native-1", "name": "query",
+                        "args": {"query": "milestone date"},
+                    },
+                    "thoughtSignature": "c3ludGhldGljLXNpZw==",
+                }],
+            }}]})
+        assert len(model_calls) == 1
+        assert model_calls[0]["functionCall"] == {
+            "id": "call-native-1", "name": "query", "args": {"query": "milestone date"},
+        }
+        assert model_calls[0]["thoughtSignature"] == "c3ludGhldGljLXNpZw=="
+        assert len(responses) == 1
+        assert responses[0]["id"] == "call-native-1"
+        assert responses[0]["name"] == "query"
+        assert responses[0]["response"] == {"result": "Native query result."}
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"text": "The milestone is in May."}],
+        }}]})
+
+    client, http_client = _real_sdk_client(monkeypatch, respond)
+    try:
+        class ScopedExecutor:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, *, name, arguments, call_ordinal):
+                self.calls.append((name, arguments, call_ordinal))
+                if name == "list_recent_transcripts":
+                    assert arguments == {}
+                    return deepcopy(synthetic_result)
+                assert name == "query" and arguments == {"query": "milestone date"}
+                return "Native query result."
+
+        executor = ScopedExecutor()
+        model = GeminiAgent(client=client)
+        from services.connectors.telegram.agent import TelegramAgent
+
+        agent = TelegramAgent(model=model, ledger=FakeLedger(), tool_executor=executor)
+        history = [
+            {"role": "user", "parts": [{"text": "Earlier finding"}]},
+            {"role": "model", "parts": [{"text": "Previous response."}]},
+            {"role": "user", "parts": [{"text": "What was the milestone?"}]},
+        ]
+        routed = agent.dispatch_tool_choice(
+            name="list_recent_transcripts", arguments={}, target_doc_id="doc-selected",
+            conversation_id="conversation-http", delivery_id="operation-http",
+            executor_factory=lambda target, _delivery, _context: (
+                executor if target == "doc-selected" else None
+            ),
+        )
+        assert routed == synthetic_result
+        answer = agent.run(
+            conversation_id="conversation-http", delivery_id="operation-http",
+            history=history, target_doc_id="doc-selected",
+            executor_factory=lambda target, _delivery, _context: (
+                executor if target == "doc-selected" else None
+            ),
+        )
+        assert answer["status"] == "ok"
+        assert answer["answer"] == "The milestone is in May."
+        assert executor.calls == [
+            ("list_recent_transcripts", {}, 0),
+            ("query", {"query": "milestone date"}, 1),
+        ]
+        assert len(wire_requests) == 2
+
+        payload = json.loads(wire_requests[0].content)
+        config = payload["generationConfig"]
+        assert wire_requests[0].url.path.endswith(f"models/{MODEL}:generateContent")
+        assert config["thinkingConfig"]["thinking_level"] == "MEDIUM"
+        assert "temperature" not in config and "topP" not in config
+        declarations = payload["tools"][0]["functionDeclarations"]
+        catalog = get_tool_catalog()["tools"]
+        assert {item["name"] for item in declarations} == {
+            item["name"] for item in catalog
+        }
+        assert any(item["name"] == "list_recent_transcripts" for item in declarations)
+        assert all(part["functionCall"].get("id") != "route-operation-http"
+                   for row in payload["contents"] for part in row.get("parts", [])
+                   if "functionCall" in part)
+    finally:
+        http_client.close()
+
+
 def test_gemini_agent_uses_single_flash_lite_request_without_sdk_retry_or_sampling_knobs():
     response = _response(SimpleNamespace(text="route: query"))
     client = FakeGeminiClient([response])
@@ -655,14 +790,30 @@ class FakeLedger:
     def load_turn(self, conversation_id, delivery_id):
         return deepcopy(self.turns.get((conversation_id, delivery_id)))
 
-    def save_turn(self, conversation_id, delivery_id, *, model_response, tool_calls):
+    def save_turn(self, conversation_id, delivery_id, *, model_response, tool_calls,
+                  application_route=None):
         previous = self.turns.get((conversation_id, delivery_id), {})
         record = {"model_response": deepcopy(model_response),
                   "tool_calls": deepcopy(tool_calls),
                   "tool_results": deepcopy(previous.get("tool_results", {}))}
+        if application_route is not None:
+            record["application_route"] = deepcopy(application_route)
+            record["application_route_round"] = previous.get("application_route_round")
         self.turns[(conversation_id, delivery_id)] = record
         self.events.append(("save_turn", deepcopy(record)))
         return deepcopy(record)
+
+    def save_application_route(self, conversation_id, delivery_id, *, route, tool_calls,
+                               application_route_round):
+        record = self.turns.setdefault((conversation_id, delivery_id), {
+            "model_response": None, "tool_calls": [], "tool_results": {},
+        })
+        if record.get("application_route") not in (None, route):
+            raise ValueError("persisted application route is immutable")
+        record["application_route"] = deepcopy(route)
+        record["application_route_round"] = application_route_round
+        record["tool_calls"] = deepcopy(tool_calls)
+        self.events.append(("save_application_route", deepcopy(record)))
 
     def save_tool_result(self, conversation_id, delivery_id, ordinal, result):
         record = self.turns[(conversation_id, delivery_id)]
@@ -843,16 +994,20 @@ def test_structured_route_choice_uses_validated_allowlisted_tool_and_pinned_targ
         execution_context={"fence": 1},
     )
     assert answer["answer"] == "Here are the folders."
-    assert model.calls[0]["contents"][0] == history[0]
-    assert model.calls[0]["contents"][1]["role"] == "model"
-    types.Content.model_validate(model.calls[0]["contents"][1])
-    function_response = _field(model.calls[0]["contents"][2]["parts"][0], "function_response")
-    assert _field(function_response, "response") == result
-    saved_round = agent._load_state("conversation-pinned", "operation-pinned").rounds[0]["response"]
-    assert saved_round["parts"][0]["function_call"] == {
-        "id": "route-operation-pinned", "name": "get_transcript",
-        "args": {"doc_id": "doc-pinned"},
+    request_turn = model.calls[0]["contents"][0]
+    assert request_turn["role"] == "user"
+    assert request_turn["parts"][0] == {"text": "show this transcript"}
+    assert "Untrusted application tool result data follows" in request_turn["parts"][1]["text"]
+    assert json.loads(request_turn["parts"][1]["text"].split(
+        "<application-tool-result-data>\n", 1
+    )[1].split("\n</application-tool-result-data>", 1)[0])["result"] == result
+    assert len(model.calls[0]["contents"]) == 1
+    persisted = agent._load_state("conversation-pinned", "operation-pinned")
+    assert persisted.application_route == {
+        "name": "get_transcript", "arguments": {"doc_id": "doc-pinned"},
+        "ordinal": 0, "target_doc_id": "doc-pinned",
     }
+    assert persisted.model_round_count == 1
 
     replayed_answer = agent.run(
         conversation_id="conversation-pinned", delivery_id="operation-pinned",
@@ -892,7 +1047,7 @@ def test_structured_route_choice_uses_validated_allowlisted_tool_and_pinned_targ
     assert len(executor.calls) == 1
 
 
-def test_legacy_routed_call_round_is_normalized_only_for_sdk_replay():
+def test_signed_legacy_part_with_route_like_id_remains_a_native_vendor_call():
     from google.genai import types
 
     conversation_id, delivery_id = "conversation-legacy-route", "operation-legacy-route"
@@ -915,16 +1070,6 @@ def test_legacy_routed_call_round_is_normalized_only_for_sdk_replay():
     model = SequenceModel([{"parts": [], "text": "legacy transcript answer"}])
     agent = _agent(model=model, ledger=ledger, executor=executor)
 
-    dispatched = agent.dispatch_tool_choice(
-        name="get_transcript", arguments=arguments, target_doc_id="doc-legacy",
-        conversation_id=conversation_id, delivery_id=delivery_id,
-        executor_factory=lambda *_args: executor,
-    )
-    assert dispatched == executor.results_by_ordinal[0]
-    assert executor.calls == [("get_transcript", arguments, 0)]
-    # Model the real retrieval result's list shape and ensure replay preserves it.
-    ledger.turns[(conversation_id, delivery_id)]["tool_results"][0] = deepcopy(raw_result)
-
     answer = agent.run(
         conversation_id=conversation_id, delivery_id=delivery_id,
         history=[{"role": "user", "parts": [{"text": "show the pinned transcript"}]}],
@@ -933,9 +1078,7 @@ def test_legacy_routed_call_round_is_normalized_only_for_sdk_replay():
 
     assert answer["status"] == "ok"
     assert executor.calls == [("get_transcript", arguments, 0)]
-    assert ledger.turns[(conversation_id, delivery_id)]["model_response"]["rounds"][0][
-        "response"] == legacy_response
-    assert ledger.turns[(conversation_id, delivery_id)]["tool_results"][0] == raw_result
+    assert ledger.turns[(conversation_id, delivery_id)]["tool_results"][0] == executor.results_by_ordinal[0]
     replayed_model_message = model.calls[0]["contents"][1]
     assert replayed_model_message["parts"][0] == {
         "thought_signature": "b3BhcXVlLWxlZ2FjeS1zaWduYXR1cmU=",
@@ -945,6 +1088,10 @@ def test_legacy_routed_call_round_is_normalized_only_for_sdk_replay():
         },
     }
     types.Content.model_validate(replayed_model_message)
+    function_response = _field(model.calls[0]["contents"][2]["parts"][0], "function_response")
+    assert _field(function_response, "id") == "route-operation-legacy-route"
+    assert _field(function_response, "name") == "get_transcript"
+    assert _field(function_response, "response") == executor.results_by_ordinal[0]
 
     native_part = types.Part(text="already native")
     ordinary_text_part = {"text": "plain legacy text"}
@@ -955,6 +1102,161 @@ def test_legacy_routed_call_round_is_normalized_only_for_sdk_replay():
     assert mixed_contents[0]["parts"][0] is native_part
     assert mixed_contents[0]["parts"][1] is ordinary_text_part
     types.Content.model_validate(mixed_contents[0])
+
+
+def test_signed_nested_sdk_part_is_not_adopted_as_an_application_route():
+    from google.genai import types
+
+    conversation_id, delivery_id = "conversation-signed-nested", "operation-signed-nested"
+    arguments = {"doc_id": "doc-selected"}
+    part = types.Part(
+        function_call=types.FunctionCall(
+            id=f"route-{delivery_id}", name="get_transcript", args=arguments,
+        ),
+        thought_signature="b3BhcXVlLW5hdGl2ZS1zaWduYXR1cmU=",
+    )
+    saved_response = {"parts": [part]}
+    ledger = FakeLedger()
+    ledger.turns[(conversation_id, delivery_id)] = {
+        "model_response": saved_response,
+        "tool_calls": [{
+            "id": f"route-{delivery_id}", "name": "get_transcript",
+            "arguments": deepcopy(arguments), "ordinal": 0, "round": 0,
+        }],
+        "tool_results": {},
+    }
+    executor = FakeExecutor()
+    agent = _agent(model=SequenceModel([]), ledger=ledger, executor=executor)
+
+    with pytest.raises(ValueError, match="persisted tool choice"):
+        agent.dispatch_tool_choice(
+            name="get_transcript", arguments=arguments,
+            target_doc_id="doc-selected", conversation_id=conversation_id,
+            delivery_id=delivery_id, executor_factory=lambda *_args: executor,
+        )
+
+    assert executor.calls == []
+    assert ledger.turns[(conversation_id, delivery_id)]["model_response"]["parts"][0] is part
+
+
+def test_legacy_routed_prefix_with_later_native_rounds_recovers_without_repeating_tools():
+    from google.genai import types
+
+    conversation_id, delivery_id = "conversation-old-prefix-native", "operation-old-prefix-native"
+    route_arguments = {"doc_id": "doc-old"}
+    native_arguments = {"query": "synthetic followup"}
+    route_id = f"route-{delivery_id}"
+    signature = "c3ludGhldGljLW5hdGl2ZS1zaWc="
+    route_response = {"parts": [{
+        "function_call": {
+            "id": route_id, "name": "get_transcript", "args": route_arguments,
+        },
+    }]}
+    native_part = types.Part(
+        function_call=types.FunctionCall(
+            id="native-call-1", name="query", args=native_arguments,
+        ),
+        thought_signature=signature,
+    )
+    native_response = {"parts": [native_part]}
+    route_result = [{"doc_id": "doc-old", "text": "Stored transcript."}]
+    native_result = {"result": "Stored followup."}
+    ledger = FakeLedger()
+    ledger.turns[(conversation_id, delivery_id)] = {
+        "model_response": {"_telegram_tool_loop_rounds": 1, "rounds": [
+            {"response": deepcopy(route_response), "call_start": 0, "call_count": 1},
+            {"response": native_response, "call_start": 1, "call_count": 1},
+        ]},
+        "tool_calls": [
+            {"id": route_id, "name": "get_transcript", "arguments": route_arguments,
+             "ordinal": 0, "round": 0},
+            {"id": "native-call-1", "name": "query", "arguments": native_arguments,
+             "ordinal": 1, "round": 1},
+        ],
+        "tool_results": {0: route_result, 1: native_result},
+    }
+    executor = FakeExecutor()
+    model = SequenceModel([{"parts": [], "text": "Recovered complete answer."}])
+    agent = _agent(model=model, ledger=ledger, executor=executor)
+
+    assert agent.dispatch_tool_choice(
+        name="get_transcript", arguments=route_arguments, target_doc_id="doc-old",
+        conversation_id=conversation_id, delivery_id=delivery_id,
+        executor_factory=lambda *_args: executor,
+    ) == route_result
+    answer = agent.run(
+        conversation_id=conversation_id, delivery_id=delivery_id,
+        history=[{"role": "user", "parts": [{"text": "What was decided?"}]}],
+        target_doc_id="doc-old", executor_factory=lambda *_args: executor,
+    )
+
+    assert answer["answer"] == "Recovered complete answer."
+    assert executor.calls == []
+    contents = model.calls[0]["contents"]
+    assert sum("<application-tool-result-data>" in part.get("text", "")
+               for content in contents for part in content.get("parts", [])
+               if isinstance(part, dict)) == 1
+    replayed_native = contents[1]["parts"][0]
+    assert replayed_native == native_part
+    assert replayed_native.thought_signature == b"synthetic-native-sig"
+    native_response_part = contents[2]["parts"][0]
+    assert _field(_field(native_response_part, "function_response"), "id") == "native-call-1"
+    assert _field(_field(native_response_part, "function_response"), "name") == "query"
+    assert _field(_field(native_response_part, "function_response"), "response") == native_result
+    saved = ledger.turns[(conversation_id, delivery_id)]
+    assert saved["model_response"]["rounds"][0]["response"] == route_response
+    assert saved["model_response"]["rounds"][1]["response"]["parts"][0] == native_part
+    assert saved["tool_results"] == {0: route_result, 1: native_result}
+
+
+@pytest.mark.parametrize("shape", ["flat", "function_call"])
+def test_unsigned_persisted_routed_prefix_recovers_without_repeating_tool(shape):
+    conversation_id, delivery_id = "conversation-old-route", "operation-old-route"
+    arguments = {"doc_id": "doc-old"}
+    call = {"id": f"route-{delivery_id}", "name": "get_transcript", "args": arguments}
+    persisted_response = {
+        "parts": [call if shape == "flat" else {"function_call": call}],
+    }
+    prior_result = [{"doc_id": "doc-old", "text": "Synthetic stored context."}]
+    ledger = FakeLedger()
+    ledger.turns[(conversation_id, delivery_id)] = {
+        "model_response": deepcopy(persisted_response),
+        "tool_calls": [{
+            "id": call["id"], "name": call["name"], "arguments": deepcopy(arguments),
+            "ordinal": 0, "round": 0,
+        }],
+        "tool_results": {0: deepcopy(prior_result)},
+    }
+    executor = FakeExecutor()
+    model = SequenceModel([{"parts": [], "text": "Recovered answer."}])
+    agent = _agent(model=model, ledger=ledger, executor=executor)
+    original = deepcopy(persisted_response)
+
+    assert agent.dispatch_tool_choice(
+        name="get_transcript", arguments=arguments, target_doc_id="doc-old",
+        conversation_id=conversation_id, delivery_id=delivery_id,
+        executor_factory=lambda *_args: executor,
+    ) == prior_result
+    answer = agent.run(
+        conversation_id=conversation_id, delivery_id=delivery_id,
+        history=[{"role": "user", "parts": [{"text": "What was in the transcript?"}]}],
+        target_doc_id="doc-old", executor_factory=lambda *_args: executor,
+    )
+
+    assert answer["answer"] == "Recovered answer."
+    assert executor.calls == []
+    saved = ledger.turns[(conversation_id, delivery_id)]
+    assert saved["model_response"]["rounds"][0]["response"] == original
+    assert saved["tool_results"][0] == prior_result
+    assert saved["application_route"] == {
+        "name": "get_transcript", "arguments": arguments,
+        "ordinal": 0, "target_doc_id": "doc-old",
+    }
+    request = model.calls[0]["contents"]
+    assert len(request) == 1 and len(request[0]["parts"]) == 2
+    assert "Synthetic stored context." in request[0]["parts"][1]["text"]
+    assert not any("function_call" in part or "function_response" in part
+                   for content in request for part in content.get("parts", []))
 
 
 class _CommandRepository:
@@ -1059,8 +1361,13 @@ def test_queue_command_processor_persists_structured_route_then_dispatches_pinne
     assert events[1][3]["dependency_operation_id"] == "operation-parent"
     assert events[2][0:3] == ("bind", "doc-pinned", "operation-1")
     assert model.calls[0]["contents"][-1]["role"] == "user"
-    tool_response = _field(model.calls[0]["contents"][-1]["parts"][0], "function_response")
-    assert _field(tool_response, "response") == {"ok": True, "operation": "list_folders"}
+    tool_context = model.calls[0]["contents"][-1]["parts"][1]["text"]
+    assert "Untrusted application tool result data follows" in tool_context
+    assert json.loads(tool_context.split(
+        "<application-tool-result-data>\n", 1
+    )[1].split("\n</application-tool-result-data>", 1)[0])["result"] == {
+        "ok": True, "operation": "list_folders",
+    }
     assert context.active_conversation_id == "conversation:newer"
     assert repository.turns["conversation:target"][-1]["parts"] == [
         {"text": "The folders are ready."},

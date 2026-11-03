@@ -2774,10 +2774,11 @@ def test_pending_save_survives_more_than_three_canonical_work_slices(
     sdk_fakes.qdrant.queue("scroll", response=(
         [SimpleNamespace(payload=payload) for payload in indexed_payloads], None,
     ))
+    following_question = "Read the transcript from that saved dialog."
     runtime.route_response(
         "substantive", target_ref="last", target_operation_id=operation_id,
         dialog_number=None,
-        substantive_text="Read the transcript from that saved dialog.",
+        substantive_text=following_question,
         tool_choice={"name": "get_transcript", "arguments": {"doc_id": doc_id},
                      "link_requested": True},
     )
@@ -2855,15 +2856,42 @@ def test_pending_save_survives_more_than_three_canonical_work_slices(
                         if event["boundary"] == "qdrant" and event["operation"] == "scroll"]
     assert transcript_calls
     from google.genai import types as genai_types
+
+    def json_model(value):
+        dump = getattr(value, "model_dump", None)
+        return dump(mode="json") if callable(dump) else value
+
+    def normalized_contents(event):
+        return [json_model(message)
+                for message in event["arguments"].get("contents", [])]
+
     tool_loop_events = [event for event in sdk_fakes.trace[trace_before_following:]
                         if event["boundary"] == "gemini"
                         and event["operation"] == "generate_content"
                         and isinstance(event["arguments"].get("contents"), list)
-                        and any(isinstance(message, dict) and message.get("role") == "model"
-                                for message in event["arguments"]["contents"])]
+                        and "application-tool-result-data" in json.dumps(
+                            normalized_contents(event), ensure_ascii=False,
+                        )]
     assert tool_loop_events
     for event in tool_loop_events:
-        for message in event["arguments"]["contents"]:
+        contents = event["arguments"]["contents"]
+        normalized = normalized_contents(event)
+        serialized = json.dumps(normalized, ensure_ascii=False)
+        assert source in serialized
+        assert following_question in serialized
+        marked_parts = [part["text"] for content in normalized
+                        for part in content.get("parts", [])
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                        and "<application-tool-result-data>" in part["text"]]
+        assert len(marked_parts) == 1
+        result_payload = json.loads(marked_parts[0].split(
+            "<application-tool-result-data>\n", 1
+        )[1].split("\n</application-tool-result-data>", 1)[0])
+        assert result_payload["name"] == "get_transcript"
+        assert result_payload["arguments"] == {"doc_id": doc_id}
+        assert result_payload["result"] == turn["tool_results"]["0"]
+        assert "functionCall" not in serialized and "functionResponse" not in serialized
+        for message in contents:
             if isinstance(message, dict) and message.get("role") in {"model", "user"}:
                 genai_types.Content.model_validate(message)
     assert any(method == "sendMessage" and source in payload.get("text", "")

@@ -209,14 +209,28 @@ def test_structured_transcript_link_request_survives_missing_execution_context()
     from services.connectors.telegram.agent import TelegramAgent
 
     class Ledger:
+        def __init__(self):
+            self.record = None
+
         def load_turn(self, *_args):
-            return None
+            return deepcopy(self.record)
 
         def save_turn(self, *_args, **_kwargs):
             pass
 
-        def save_tool_result(self, *_args):
-            pass
+        def save_application_route(self, _conversation_id, delivery_id, *, route,
+                                   tool_calls, application_route_round):
+            self.record = {
+                "delivery_id": delivery_id,
+                "model_response": None,
+                "application_route": deepcopy(route),
+                "application_route_round": application_route_round,
+                "tool_calls": deepcopy(tool_calls),
+                "tool_results": {},
+            }
+
+        def save_tool_result(self, _conversation_id, _delivery_id, ordinal, result):
+            self.record["tool_results"][str(ordinal)] = deepcopy(result)
 
     received_contexts = []
 

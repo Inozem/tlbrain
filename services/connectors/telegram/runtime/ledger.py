@@ -179,6 +179,10 @@ class FirestoreAgentLedger:
         if value is not None:
             value["model_response"] = self._load_payload(value.get("model_response"))
             value["tool_calls"] = self._load_payload(value.get("tool_calls", []))
+            if value.get("application_route") is not None:
+                value["application_route"] = self._load_payload(
+                    value["application_route"],
+                )
             raw_results = value.get("tool_results", {})
             restored = {str(key): self._load_payload(result)
                         for key, result in raw_results.items()}
@@ -221,10 +225,17 @@ class FirestoreAgentLedger:
         return value if isinstance(value, str) else None
 
     def save_turn(self, conversation_id: str, delivery_id: str, *,
-                  model_response: Any, tool_calls: list[Any]) -> None:
+                  model_response: Any, tool_calls: list[Any],
+                  application_route: Mapping[str, Any] | None = None) -> None:
         ref = self._ref(delivery_id)
         stored_response = self._store_payload("model", model_response)
         stored_calls = self._store_payload("calls", tool_calls)
+        stored_route = (
+            self._store_payload(
+                "application-route", dict(application_route),
+                write_assertion=self._assert_current,
+            ) if application_route is not None else None
+        )
         transaction = self.client.transaction()
         @firestore.transactional
         def commit(tx: Any) -> None:
@@ -239,9 +250,62 @@ class FirestoreAgentLedger:
             prior_response = self._load_payload(prior.get("model_response"))
             if prior_response is not None and not _prefix_compatible(prior_response, model_response):
                 raise ValueError("persisted agent model rounds are immutable")
-            tx.set(ref, {"conversation_id": conversation_id, "delivery_id": delivery_id,
-                         "model_response": stored_response,
-                         "tool_calls": stored_calls}, merge=False)
+            prior_stored_route = prior.get("application_route")
+            prior_route = (self._load_payload(prior_stored_route)
+                           if prior_stored_route is not None else None)
+            if (prior_route is not None and application_route is not None
+                    and prior_route != dict(application_route)):
+                raise ValueError("persisted application route is immutable")
+            row = {"conversation_id": conversation_id, "delivery_id": delivery_id,
+                   "model_response": stored_response, "tool_calls": stored_calls}
+            route_to_preserve = (prior_stored_route if prior_stored_route is not None
+                                 else stored_route)
+            if route_to_preserve is not None:
+                row["application_route"] = route_to_preserve
+                row["application_route_round"] = prior.get("application_route_round")
+            tx.set(ref, row, merge=False)
+        commit(transaction)
+
+    def save_application_route(
+        self, conversation_id: str, delivery_id: str, *, route: Mapping[str, Any],
+        tool_calls: list[Any], application_route_round: int | None,
+    ) -> None:
+        """Persist trusted app-route provenance without inventing model content."""
+        ref = self._ref(delivery_id)
+        stored_calls = self._store_payload("calls", tool_calls)
+        stored_route = self._store_payload(
+            "application-route", dict(route), write_assertion=self._assert_current,
+        )
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def commit(tx: Any) -> None:
+            self._assert_current(tx)
+            snapshot = ref.get(transaction=tx)
+            prior = snapshot.to_dict() or {} if snapshot.exists else {}
+            if prior.get("conversation_id") not in (None, conversation_id):
+                raise ValueError("agent checkpoint conversation binding changed")
+            existing_stored_route = prior.get("application_route")
+            existing_route = (self._load_payload(existing_stored_route)
+                              if existing_stored_route is not None else None)
+            expected_route = deepcopy(dict(route))
+            if existing_route is not None and existing_route != expected_route:
+                raise ValueError("persisted application route is immutable")
+            prior_calls = self._load_payload(prior.get("tool_calls", []))
+            if prior_calls and prior_calls != tool_calls[:len(prior_calls)]:
+                raise ValueError("persisted agent calls are immutable")
+            prior_round = prior.get("application_route_round")
+            if ("application_route_round" in prior
+                    and prior_round != application_route_round):
+                raise ValueError("persisted application route is immutable")
+            tx.set(ref, {
+                "conversation_id": conversation_id,
+                "delivery_id": delivery_id,
+                "application_route": existing_stored_route or stored_route,
+                "application_route_round": application_route_round,
+                "tool_calls": stored_calls,
+            }, merge=True)
+
         commit(transaction)
 
     def save_tool_result(self, conversation_id: str, delivery_id: str,

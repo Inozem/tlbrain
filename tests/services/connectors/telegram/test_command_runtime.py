@@ -1655,6 +1655,166 @@ def test_agent_ledger_replays_saved_tool_result_and_rejects_stale_fence(firestor
                                {"folders": []})
 
 
+def test_agent_ledger_checkpoints_application_route_outside_model_round(firestore_fake):
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    client = firestore_fake.client_class()
+    context_id, operation, lease, _command = _runtime_queue_item(
+        client, operation_id="op-application-route",
+    )
+    now = datetime.now(timezone.utc)
+    ledger = FirestoreAgentLedger(
+        client, context_id=context_id, operation_id=operation["operation_id"],
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    route = {"name": "list_recent_transcripts", "arguments": {}, "ordinal": 0,
+             "target_doc_id": "doc-selected"}
+    application_call = {
+        "id": None, "name": route["name"], "arguments": {},
+        "ordinal": 0, "round": -1,
+    }
+    ledger.save_application_route(
+        "document-conversation", operation["operation_id"], route=route,
+        tool_calls=[application_call], application_route_round=None,
+    )
+    result = [{"doc_id": "doc-selected", "title": "Synthetic dialog"}]
+    ledger.save_tool_result(
+        "document-conversation", operation["operation_id"], 0, result,
+    )
+
+    checkpoint = ledger.load_turn("document-conversation", operation["operation_id"])
+    assert checkpoint["model_response"] is None
+    assert checkpoint["application_route"] == route
+    assert checkpoint["application_route_round"] is None
+    assert checkpoint["tool_calls"] == [application_call]
+    assert checkpoint["tool_results"] == {"0": result}
+
+    # Completing the answer appends a real model round without introducing an
+    # app call/response exchange or mutating the already checkpointed route.
+    ledger.save_turn(
+        "document-conversation", operation["operation_id"],
+        model_response={"_telegram_tool_loop_rounds": 1, "rounds": [
+            {"response": {"text": "The dialog was synthetic."},
+             "call_start": 1, "call_count": 0},
+        ]},
+        tool_calls=[application_call], application_route=route,
+    )
+    completed = ledger.load_turn("document-conversation", operation["operation_id"])
+    assert completed["application_route"] == route
+    assert completed["model_response"]["rounds"][0]["response"]["text"] == (
+        "The dialog was synthetic."
+    )
+
+
+def test_agent_ledger_parts_large_application_route_and_preserves_it(firestore_fake):
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from core.integrations.firestore.input_parts import MAX_PART_BYTES
+
+    client = firestore_fake.client_class()
+    context_id, operation, lease, _command = _runtime_queue_item(
+        client, operation_id="op-large-application-route",
+    )
+    now = datetime.now(timezone.utc)
+    ledger = FirestoreAgentLedger(
+        client, context_id=context_id, operation_id=operation["operation_id"],
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    arguments = {"utterances": [{"speaker": "Speaker", "text": "x" * (1024 * 1024 + 8192)}]}
+    route = {"name": "add_dialog", "arguments": arguments, "ordinal": 0,
+             "target_doc_id": "doc-large"}
+    application_call = {
+        "id": None, "name": "add_dialog", "arguments": arguments,
+        "ordinal": 0, "round": -1,
+    }
+    ledger.save_application_route(
+        "document-conversation", operation["operation_id"], route=route,
+        tool_calls=[application_call], application_route_round=None,
+    )
+    ledger.save_tool_result(
+        "document-conversation", operation["operation_id"], 0, {"accepted": True},
+    )
+
+    checkpoint_ref = ledger._ref(operation["operation_id"])
+    parent = checkpoint_ref.get().to_dict()
+    assert len(ledger._json_bytes(parent)) < 4 * 1024
+    assert parent["application_route"].get("_input_ref")
+    assert parent["tool_calls"].get("_input_ref")
+    assert not any("__" in key for key in parent)
+    part_payloads = [row["payload"] for path, row in firestore_fake.documents.items()
+                     if "/input_parts/part-" in path]
+    assert part_payloads and max(map(len, part_payloads)) <= MAX_PART_BYTES
+
+    # A following native round may omit the route argument; the ledger keeps
+    # the already checkpointed route envelope and restores its exact value.
+    native_call = {
+        "id": "native-call-1", "name": "query", "arguments": {"query": "synthetic"},
+        "ordinal": 1, "round": 1,
+    }
+    ledger.save_turn(
+        "document-conversation", operation["operation_id"],
+        model_response={"_telegram_tool_loop_rounds": 1, "rounds": [
+            {"response": {"text": "Synthetic native round."},
+             "call_start": 1, "call_count": 1},
+        ]},
+        tool_calls=[application_call, native_call],
+    )
+    restored = ledger.load_turn("document-conversation", operation["operation_id"])
+    assert restored["application_route"] == route
+    assert restored["application_route_round"] is None
+    assert restored["tool_calls"] == [application_call, native_call]
+    assert restored["tool_results"] == {"0": {"accepted": True}}
+    stored_after_round = checkpoint_ref.get().to_dict()
+    assert stored_after_round["application_route"] == parent["application_route"]
+    assert len(ledger._json_bytes(stored_after_round)) < 4 * 1024
+
+    with pytest.raises(ValueError, match="application route is immutable"):
+        ledger.save_application_route(
+            "document-conversation", operation["operation_id"],
+            route={**route, "target_doc_id": "other-doc"},
+            tool_calls=[application_call, native_call], application_route_round=None,
+        )
+    with pytest.raises(ValueError, match="application route is immutable"):
+        ledger.save_application_route(
+            "document-conversation", operation["operation_id"], route=route,
+            tool_calls=[application_call, native_call], application_route_round=0,
+        )
+
+    stale = FirestoreAgentLedger(
+        client, context_id=context_id, operation_id=operation["operation_id"],
+        owner="stale-owner", fence=lease.fence, clock=lambda: now,
+    )
+    with pytest.raises(PermissionError, match="lease is stale"):
+        stale.save_application_route(
+            "document-conversation", operation["operation_id"], route=route,
+            tool_calls=[application_call, native_call], application_route_round=None,
+        )
+
+
+def test_agent_ledger_loads_legacy_raw_application_route_map(firestore_fake):
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    client = firestore_fake.client_class()
+    context_id, operation, lease, _command = _runtime_queue_item(
+        client, operation_id="op-legacy-application-route",
+    )
+    now = datetime.now(timezone.utc)
+    ledger = FirestoreAgentLedger(
+        client, context_id=context_id, operation_id=operation["operation_id"],
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    route = {"name": "get_transcript", "arguments": {"doc_id": "doc-legacy"},
+             "ordinal": 0, "target_doc_id": "doc-legacy"}
+    ledger._ref(operation["operation_id"]).set({
+        "conversation_id": "document-conversation",
+        "delivery_id": operation["operation_id"],
+        "model_response": None, "tool_calls": [],
+        "application_route": route, "application_route_round": None,
+    })
+    assert ledger.load_turn(
+        "document-conversation", operation["operation_id"],
+    )["application_route"] == route
+
+
 def test_agent_ledger_parts_large_results_without_truncating(firestore_fake):
     from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
     from core.integrations.firestore.input_parts import MAX_PART_BYTES
