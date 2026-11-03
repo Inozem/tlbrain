@@ -847,6 +847,50 @@ def test_invalid_or_uncertain_route_fails_closed_without_side_effects(response, 
     assert notices.sent == []
 
 
+@pytest.mark.parametrize("certainty", [None, "maybe", 7, [], {}])
+def test_only_explicit_uncertain_certainty_is_uncertainty(certainty):
+    from services.connectors.telegram.sessions import _valid_response
+
+    response = _decision("substantive", substantive_text="synthetic request")
+    if certainty is None:
+        response.pop("certainty")
+    else:
+        response["certainty"] = certainty
+    decision, status = _valid_response(response)
+
+    assert decision is None
+    assert status == "invalid_route"
+
+
+def test_malformed_unhashable_kind_is_invalid_route_not_validation_exception():
+    from services.connectors.telegram.sessions import _valid_response
+
+    decision, status = _valid_response(_decision([], certainty="certain"))
+
+    assert decision is None
+    assert status == "invalid_route"
+
+
+def test_explicit_model_uncertainty_remains_uncertain():
+    from services.connectors.telegram.sessions import _valid_response
+
+    decision, status = _valid_response(_decision("search", certainty="uncertain"))
+
+    assert decision is None
+    assert status == "uncertain"
+
+
+def test_malformed_explicit_uncertain_route_is_invalid():
+    from services.connectors.telegram.sessions import _valid_response
+
+    decision, status = _valid_response(_decision(
+        "save", certainty="uncertain", target_operation_id="synthetic-save",
+    ))
+
+    assert decision is None
+    assert status == "invalid_route"
+
+
 @pytest.mark.parametrize(("response", "schema_kind", "schema_field", "expected_schema"), [
     (_decision("search", tool_choice={"name": "query", "arguments": {"query": "synthetic topic"}}),
      "search", "tool_choice", {"type": "null"}),

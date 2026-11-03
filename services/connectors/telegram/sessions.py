@@ -40,10 +40,11 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
     }:
         return None, "invalid_route"
     kind = response.get("kind")
-    if kind not in _ROUTE_KINDS:
+    if not isinstance(kind, str) or kind not in _ROUTE_KINDS:
         return None, "invalid_route"
-    if response.get("certainty") != "certain":
-        return None, "uncertain"
+    certainty = response.get("certainty")
+    if certainty != "certain" and certainty != "uncertain":
+        return None, "invalid_route"
     target_ref = response.get("target_ref")
     if target_ref is not None and not isinstance(target_ref, str):
         return None, "invalid_route"
@@ -92,6 +93,8 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
             return None, "invalid_route"
     if kind == "retry" and type(dialog_number) is not int:
         return None, "invalid_route"
+    if certainty == "uncertain":
+        return None, "uncertain"
     return {
         "kind": kind,
         "target_ref": target_ref,

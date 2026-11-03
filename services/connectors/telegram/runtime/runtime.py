@@ -32,6 +32,8 @@ from services.connectors.telegram.runtime.tools import TelegramRegistryExecutor
 from services.connectors.telegram.runtime.save_fencing import _provider_error_retryable
 
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-command-runtime")
+_PROCESSING_ERROR_REPLY = "An error occurred while processing your request. Please try again."
+_UNCERTAIN_ROUTE_REPLY = "I could not determine what you want me to do. Please clarify."
 
 
 class _AcceptedDraftContextInvalid(ValueError):
@@ -252,7 +254,7 @@ class _CapturingAgent:
     def run(self, **kwargs: Any) -> dict[str, Any]:
         result = self.agent.run(**kwargs)
         answer = result.get("answer") if result.get("status") == "ok" else None
-        self.answer = answer if isinstance(answer, str) else None
+        self.answer = answer if isinstance(answer, str) and answer.strip() else None
         if self.answer is None:
             raise RuntimeError("Telegram agent returned no answer")
         return result
@@ -687,8 +689,12 @@ class _CommandExecution:
                 and (queue_row.get("retry_request_operation_id") is None
                      or isinstance(queue_row.get("retry_request_operation_id"), str))
             )
-            if retry_work or (isinstance(self.pinned, Mapping)
-                              and self.pinned.get("kind") == "save"):
+            save_work = (
+                isinstance(self.pinned, Mapping)
+                and self.pinned.get("status") in {"ok", "success"}
+                and self.pinned.get("kind") == "save"
+            )
+            if retry_work or save_work:
                 self._compose_ports()
                 self._compose_replies()
                 state = await runtime.save_handler.save_draft(
@@ -782,6 +788,12 @@ class _CommandExecution:
         )
         self.pinned = await _offload(runtime.repository.get_route_control,
                                      self.context_id, self.operation_id)
+        pinned_status = self.pinned.get("status") if isinstance(self.pinned, Mapping) else None
+        if pinned_status in {"uncertain", "invalid_route", "error"}:
+            self.raw_decision = None
+            self.decision = None
+            self.decision_status = pinned_status
+            return
         try:
             self.chat_conversation_id, self.route_history, self.route_conversation = (
                 await self._routing_conversation()
@@ -1015,10 +1027,16 @@ class _CommandExecution:
         )
         pinned_global = bool(
             command is None and isinstance(self.pinned, Mapping)
-            and self.pinned.get("status") in {"ok", "success"}
-            and self.pinned.get("kind") in {
-                "substantive", "search", "retry", "pure_switch", "save",
-            } and not self.pinned.get("target_doc_id")
+            and (
+                self.pinned.get("status") in {"uncertain", "invalid_route", "error"}
+                or (
+                    not self.pinned.get("target_doc_id")
+                    and self.pinned.get("status") in {"ok", "success"}
+                    and self.pinned.get("kind") in {
+                        "substantive", "search", "retry", "pure_switch", "save",
+                    }
+                )
+            )
         )
         pure_switch = bool(
             decision and decision.get("kind") == "pure_switch"
@@ -1070,9 +1088,9 @@ class _CommandExecution:
         if not await self._persist_global_route():
             return QueueOperationState.FAILED
         if self.decision is None or self.decision_status != "ok":
-            return await self.finish_reply(
-                "I could not determine what you want me to do. Please clarify.", kind="error",
-            )
+            if self.decision_status == "uncertain":
+                return await self.finish_reply(_UNCERTAIN_ROUTE_REPLY)
+            return await self._finish_processing_error()
         cleared = await _offload(
             self.runtime.repository.clear_command_candidate, self.context_id,
             self.operation_id, owner=self.owner, fence=self.fence,
@@ -1092,7 +1110,14 @@ class _CommandExecution:
     async def _persist_global_route(self) -> bool:
         """Durably pin the selected route and its replay checkpoint before side effects."""
         decision = self.decision
-        record = {"status": "ok" if decision is not None else "uncertain",
+        if (decision is None and isinstance(self.pinned, Mapping)
+                and self.pinned.get("status") == self.decision_status
+                and self.decision_status in {"uncertain", "invalid_route", "error"}):
+            return True
+        route_status = self.decision_status
+        if route_status not in {"ok", "uncertain", "invalid_route", "error"}:
+            route_status = "invalid_route"
+        record = {"status": route_status,
                   "kind": decision.get("kind") if decision else None}
         if decision is not None:
             for key in ("target_ref", "target_operation_id", "dialog_number", "result_refs", "tool_choice"):
@@ -1299,8 +1324,7 @@ class _CommandExecution:
                 if self.governed_model.failure is not None or any(
                         item.failure is not None for item in self.governed_executors):
                     return QueueOperationState.RUNNING
-                answer = "I could not complete that request. Please clarify."
-                return await self.finish_reply(answer, kind="error")
+                return await self._finish_processing_error()
             direct_failure = await self._direct_add_dialog_failure(
                 self.global_conversation_id,
             )
@@ -1311,9 +1335,8 @@ class _CommandExecution:
                 item.failure is not None for item in self.governed_executors):
             return QueueOperationState.RUNNING
         answer = record.get("answer") if record.get("status") == "ok" else None
-        answer = answer if isinstance(answer, str) and answer.strip() else (
-            "I could not complete that request. Please clarify."
-        )
+        if not isinstance(answer, str) or not answer.strip():
+            return await self._finish_processing_error()
         if record.get("status") == "ok":
             answer = await self._include_verified_direct_metadata(
                 answer, self.global_conversation_id,
@@ -1321,7 +1344,13 @@ class _CommandExecution:
             if isinstance(answer, QueueOperationState):
                 return answer
             await self._persist_chat_turn("model", answer)
-        return await self.finish_reply(answer, kind="final" if record.get("status") == "ok" else "error")
+        return await self.finish_reply(answer)
+
+    async def _finish_processing_error(self) -> QueueOperationState:
+        """Deliver a fixed safe error and release the operation as failed."""
+        return await self.finish_reply(
+            _PROCESSING_ERROR_REPLY, kind="error", failure_final=True,
+        )
 
     async def _ensure_chat_conversation(self) -> str | None:
         """Ensure the selected canonical conversation and select an empty chat under its fence."""
@@ -1566,14 +1595,7 @@ class _CommandExecution:
         except TelegramSavePending:
             return QueueOperationState.RUNNING
         except Exception as error:
-            from services.connectors.telegram.errors import TelegramDirectSaveInterrupted
-            if not isinstance(error, TelegramDirectSaveInterrupted):
-                raise
-            conversation_id = await self._document_target_conversation_id()
-            direct_failure = await self._direct_add_dialog_failure(conversation_id)
-            if direct_failure is False:
-                raise
-            return direct_failure
+            return await self._settle_document_exception(error)
         if result == QueueOperationState.FAILED:
             route = await _offload(self.runtime.repository.get_route_control,
                                    self.context_id, self.operation_id)
@@ -1585,6 +1607,44 @@ class _CommandExecution:
         if failure_result is not None:
             return failure_result
         return await self._settle_document_reply(result)
+
+    async def _settle_document_exception(self, error: Exception) -> QueueOperationState:
+        """Honor direct/governed failures, recover real answers, then report processing errors."""
+        from services.connectors.telegram.errors import TelegramDirectSaveInterrupted
+        if isinstance(error, TelegramDirectSaveInterrupted):
+            conversation_id = await self._document_target_conversation_id()
+            direct_failure = await self._direct_add_dialog_failure(conversation_id)
+            if direct_failure is False:
+                raise error
+            return direct_failure
+        direct_failure = await self._direct_add_dialog_failure(
+            await self._document_target_conversation_id(),
+        )
+        if direct_failure is not False:
+            return direct_failure
+        failure_result = await self._settle_governed_failure()
+        if failure_result is not None:
+            return failure_result
+        return await self._recover_document_answer_or_fail()
+
+    async def _recover_document_answer_or_fail(self) -> QueueOperationState:
+        """Recover a captured or checkpointed answer before sending a safe processing error."""
+        captured = getattr(self.capturing_agent, "answer", None)
+        if isinstance(captured, str) and captured.strip():
+            try:
+                return await self._settle_document_reply(QueueOperationState.COMPLETED)
+            except Exception:
+                return QueueOperationState.RUNNING
+        try:
+            saved = await self._load_document_answer()
+        except Exception:
+            return QueueOperationState.RUNNING
+        if isinstance(saved, str) and saved.strip():
+            try:
+                return await self._settle_document_reply(QueueOperationState.FAILED)
+            except Exception:
+                return QueueOperationState.RUNNING
+        return await self._finish_processing_error()
 
     async def _route_callback(self, **kwargs: Any) -> Any:
         """Pass the pinned model decision through the established session resolver."""
@@ -1631,14 +1691,27 @@ class _CommandExecution:
                     return QueueOperationState.RUNNING
                 return await self.finish_reply(answer)
             if result == QueueOperationState.COMPLETED:
-                return result
+                route = await _offload(self.runtime.repository.get_route_control,
+                                       self.context_id, self.operation_id)
+                if isinstance(route, Mapping) and route.get("status") == "uncertain":
+                    return await self.finish_reply(_UNCERTAIN_ROUTE_REPLY)
+                if (isinstance(route, Mapping) and route.get("status") in {"ok", "success"}
+                        and route.get("kind") == "pure_switch"):
+                    return result
+                return await self._finish_processing_error()
         if result == QueueOperationState.FAILED and self.decision is not None:
             message = (
                 "I could not find that dialog. Please choose an existing dialog number."
                 if self.decision.get("kind") == "pure_switch" else
-                "I could not complete that request. Please clarify."
+                _PROCESSING_ERROR_REPLY
             )
             return await self.finish_reply(message, kind="error", failure_final=True)
+        if result == QueueOperationState.FAILED:
+            route = await _offload(self.runtime.repository.get_route_control,
+                                   self.context_id, self.operation_id)
+            if isinstance(route, Mapping) and route.get("status") == "uncertain":
+                return await self.finish_reply(_UNCERTAIN_ROUTE_REPLY)
+            return await self._finish_processing_error()
         return result
 
     async def _persist_visible_document_answer(

@@ -1165,6 +1165,223 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
     gemini_http.close()
 
 
+def test_default_asgi_malformed_route_error_survives_delivery_replay_and_uncertainty_comparison(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """Exercise malformed save routing, durable error replay, and genuine uncertainty."""
+    import httpx
+    from google import genai
+    from google.genai import types
+    from tests.fixtures import sdk_fakes as sdk_fake_module
+    from services.connectors.telegram.app.main import create_app
+    from services.connectors.telegram.client import TelegramClient
+    from services.connectors.telegram.repository import TelegramRepository
+
+    db = firestore_fake.client_class()
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
+    monkeypatch.setattr("services.connectors.telegram.app.main._allowed_user_ids", lambda: {7})
+    for name, value in {
+        "TELEGRAM_BOT_TOKEN": "123456:synthetic-token",
+        "TELEGRAM_CONTROL_QUEUE": "pytest-telegram-control-queue",
+        "TELEGRAM_CONTROL_URL": "https://telegram.pytest.invalid/internal/dispatch",
+        "CLOUD_TASKS_OIDC_AUDIENCE": "https://task-worker.pytest.invalid",
+        "OIDC_AUDIENCE": "https://task-worker.pytest.invalid",
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL": "pytest-task-worker@synthetic-project.invalid",
+        "OIDC_SERVICE_ACCOUNT_EMAIL": "pytest-task-worker@synthetic-project.invalid",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    task_requests = []
+    enqueue_fake = lambda **kwargs: task_requests.append(kwargs)
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
+
+    processing_error = "An error occurred while processing your request. Please try again."
+    send_attempts = []
+    delivered = []
+    unknown_error_attempted = False
+
+    def telegram_response(request):
+        nonlocal unknown_error_attempted
+        payload = json.loads(request.content)
+        method = request.url.path.rsplit("/", 1)[-1]
+        if method == "sendMessage":
+            send_attempts.append(payload)
+            if payload.get("text") == processing_error and not unknown_error_attempted:
+                # Simulate an accepted send whose acknowledgement was lost.
+                unknown_error_attempted = True
+                return httpx.Response(200, json={"ok": True, "result": {}})
+            delivered.append(payload)
+            return httpx.Response(
+                200, json={"ok": True, "result": {"message_id": 900 + len(delivered)}},
+            )
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    original_telegram_init = TelegramClient.__init__
+    monkeypatch.setattr(TelegramClient, "__original_init__", original_telegram_init, raising=False)
+    monkeypatch.setattr(
+        TelegramClient, "__init__",
+        lambda self, token, *, http_client=None, timeout=30.0: original_telegram_init(
+            self, token, http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(telegram_response),
+            ), timeout=timeout,
+        ),
+    )
+
+    malformed_save = {
+        "kind": "save", "target_ref": None, "target_operation_id": "synthetic-forbidden-target",
+        "dialog_number": None, "result_refs": [], "substantive_text": None,
+        "tool_choice": None, "certainty": "certain",
+    }
+    uncertain_route = {
+        "kind": "substantive", "target_ref": None, "target_operation_id": None,
+        "dialog_number": None, "result_refs": [], "substantive_text": "synthetic question",
+        "tool_choice": None, "certainty": "uncertain",
+    }
+    route_responses = [malformed_save, uncertain_route]
+    wire_requests = []
+
+    def gemini_response(request):
+        wire_requests.append(request)
+        assert route_responses, "unexpected extra Gemini generation"
+        route = route_responses.pop(0)
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"functionCall": {
+                "name": "route_command", "args": route,
+            }}],
+        }}]})
+
+    monkeypatch.setattr(genai, "Client", sdk_fake_module._REAL_GENAI_CLIENT)
+    gemini_http = httpx.Client(transport=httpx.MockTransport(gemini_response))
+    sdk_client = genai.Client(
+        api_key="synthetic-gemini-key",
+        http_options=types.HttpOptions(
+            base_url="http://127.0.0.1/v1beta", httpx_client=gemini_http,
+        ),
+    )
+    monkeypatch.setattr(
+        "core.integrations.gemini.agent.gemini_client.make_client",
+        lambda **_kwargs: sdk_client,
+    )
+    app = create_app(
+        webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+        oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})(),
+    )
+
+    async def post(path, payload, *, secret=False):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://telegram.test",
+        ) as client:
+            headers = ({"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"}
+                       if secret else {"Authorization": "Bearer fake-task"})
+            return await client.post(path, headers=headers, json=payload)
+
+    repository = TelegramRepository(client=db)
+    forward = {"update_id": 17701, "message": {
+        "message_id": 71, "date": 1793320000,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Synthetic"},
+                           "date": 1793310000},
+        "text": "A synthetic forwarded line remains source data.",
+    }}
+    accepted_forward = asyncio.run(post("/telegram/webhook", forward, secret=True),
+                                   loop_factory=_selector_loop)
+    assert accepted_forward.status_code == 200, accepted_forward.text
+    forward_ack = next(item["body"] for item in task_requests
+                       if item["body"].get("target_kind") == "telegram_dispatch"
+                       and item["body"].get("notification_id"))
+    assert asyncio.run(post("/internal/deliver", forward_ack),
+                       loop_factory=_selector_loop).status_code == 200
+
+    async def accept_and_get_command_dispatch(update_id, message_id, text):
+        response = await post("/telegram/webhook", {"update_id": update_id, "message": {
+            "message_id": message_id, "date": 1793320010,
+            "chat": {"id": 77, "type": "private"}, "from": {"id": 7}, "text": text,
+        }}, secret=True)
+        assert response.status_code == 200, response.text
+        rows = [item["body"] for item in task_requests
+                if item["body"].get("target_kind") == "telegram_dispatch"]
+        ack = next(row for row in reversed(rows) if row.get("notification_id"))
+        assert (await post("/internal/deliver", ack)).status_code == 200
+        return next(row for row in reversed(rows) if not row.get("notification_id"))
+
+    save_dispatch = asyncio.run(
+        accept_and_get_command_dispatch(17702, 72, "save this synthetic dialog"),
+        loop_factory=_selector_loop,
+    )
+    first = asyncio.run(post("/internal/dispatch", save_dispatch),
+                        loop_factory=_selector_loop)
+    assert first.status_code == 200, first.text
+    assert first.json() == {"status": "noop"}
+    context_id, operation_id = save_dispatch["context_id"], save_dispatch["operation_id"]
+    operation_ref = (db.collection("telegram_sessions").document(context_id)
+                     .collection("operations").document(operation_id))
+    operation = operation_ref.get().to_dict()
+    assert operation["state"] == "running"
+    assert operation["route_control"]["status"] == "invalid_route"
+    assert len(wire_requests) == 1
+    assert not any(event["boundary"] == "drive" and event["operation"] == "files.create"
+                   for event in sdk_fakes.trace)
+    assert not db.collection("dialog_operations").document(operation_id).get().exists
+    assert not any(item["url"].startswith("https://vector-sync.pytest.invalid")
+                   for item in task_requests)
+    draft_id = db.collection("telegram_sessions").document(context_id).get().to_dict()[
+        "active_draft_id"
+    ]
+    assert repository.list_messages(context_id, draft_id)[0]["text"] == (
+        "A synthetic forwarded line remains source data."
+    )
+
+    wake = next(item["body"] for item in task_requests
+                if item["body"].get("target_kind") == "telegram_dispatch"
+                and item["body"].get("operation_id") == operation_id
+                and item["body"].get("outbox_id") != save_dispatch["outbox_id"])
+    from core.integrations.firestore.outbox import get_outbox_record
+    wake_record = get_outbox_record(db, wake["outbox_id"])
+    assert wake_record is not None
+    worker = app.state.telegram_queue_worker
+    replay_clock = lambda: wake_record.schedule_at
+    worker.clock = replay_clock
+    worker.processor.clock = replay_clock
+    replayed = asyncio.run(post("/internal/dispatch", wake), loop_factory=_selector_loop)
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json() == {"status": "processed"}
+    operation = operation_ref.get().to_dict()
+    context = db.collection("telegram_sessions").document(context_id).get().to_dict()
+    assert operation["state"] == "failed"
+    assert operation["route_control"]["status"] == "invalid_route"
+    assert context.get("active_operation_id") is None
+    assert context.get("lock_owner") is None
+    assert len(wire_requests) == 1
+    assert [item.get("text") for item in delivered].count(processing_error) == 1
+    assert len([item for item in send_attempts if item.get("text") == processing_error]) == 2
+    assert repository.list_messages(context_id, draft_id)
+
+    duplicate = asyncio.run(post("/internal/dispatch", wake), loop_factory=_selector_loop)
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json() == {"status": "noop"}
+    assert len(wire_requests) == 1
+    assert len([item for item in send_attempts if item.get("text") == processing_error]) == 2
+
+    uncertain_dispatch = asyncio.run(
+        accept_and_get_command_dispatch(17703, 73, "is this synthetic request clear?"),
+        loop_factory=_selector_loop,
+    )
+    uncertain_result = asyncio.run(post("/internal/dispatch", uncertain_dispatch),
+                                   loop_factory=_selector_loop)
+    assert uncertain_result.status_code == 200, uncertain_result.text
+    assert uncertain_result.json() == {"status": "processed"}
+    uncertain_operation = (db.collection("telegram_sessions").document(context_id)
+                           .collection("operations").document(
+                               uncertain_dispatch["operation_id"]).get().to_dict())
+    assert uncertain_operation["state"] == "completed"
+    assert uncertain_operation["route_control"]["status"] == "uncertain"
+    assert delivered[-1]["text"] == "I could not determine what you want me to do. Please clarify."
+    assert len(wire_requests) == 2
+    assert repository.list_messages(context_id, draft_id)
+    gemini_http.close()
+
+
 def test_default_asgi_selected_document_routes_query_then_answers_over_real_gemini_http(
     firestore_fake, sdk_fakes, monkeypatch,
 ):

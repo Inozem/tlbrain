@@ -1224,7 +1224,7 @@ def test_stale_queue_fence_stops_before_routing_or_delivery(firestore_fake):
     assert bot.sent == []
 
 
-def test_model_routing_failure_delivers_safe_clarification(firestore_fake, caplog):
+def test_ungoverned_model_routing_failure_delivers_safe_processing_error(firestore_fake, caplog):
     from services.connectors.telegram.repository import TelegramRepository
     from services.connectors.telegram.runtime import TelegramCommandRuntime
 
@@ -1241,8 +1241,9 @@ def test_model_routing_failure_delivers_safe_clarification(firestore_fake, caplo
     result = asyncio.run(runtime(context_id, operation, lease, command=command),
                          loop_factory=_selector_loop)
 
-    assert result.value == "completed"
-    assert bot.sent[0][1] == "I could not determine what you want me to do. Please clarify."
+    assert result.value == "failed"
+    assert bot.sent[0][1] == "An error occurred while processing your request. Please try again."
+    assert repository.get_route_control(context_id, operation["operation_id"])["status"] == "invalid_route"
     assert "provider secret detail" not in caplog.text
 
 
@@ -1323,7 +1324,7 @@ def test_global_tool_loop_provider_failure_uses_persisted_three_attempt_budget(f
     assert "private global provider failure" not in bot.sent[-1][1]
 
 
-def test_malformed_governed_route_clarifies_without_retrying_provider(firestore_fake):
+def test_malformed_governed_route_fails_truthfully_without_retrying_provider(firestore_fake):
     from core.integrations.firestore.operation_queue import QueueOperationRetryStore
     from core.operations.retries import RetryGovernor
     from services.connectors.telegram.repository import TelegramRepository
@@ -1351,9 +1352,165 @@ def test_malformed_governed_route_clarifies_without_retrying_provider(firestore_
     result = asyncio.run(runtime(context_id, operation, lease, command=command,
                                  retry_governor=governor), loop_factory=_selector_loop)
 
-    assert result.value == "completed"
+    assert result.value == "failed"
     assert model.calls == 1
+    assert bot.sent[0][1] == "An error occurred while processing your request. Please try again."
+    assert repository.get_route_control(context_id, operation["operation_id"])["status"] == "invalid_route"
+
+
+def test_explicit_model_uncertainty_is_a_completed_clarification(firestore_fake):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    route = {**_route(), "certainty": "uncertain"}
+    model, bot = _RuntimeModel(route), _Bot()
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model)
+
+    result = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert result.value == "completed"
+    assert len(model.calls) == 1
     assert bot.sent[0][1] == "I could not determine what you want me to do. Please clarify."
+    assert repository.get_route_control(context_id, operation["operation_id"])["status"] == "uncertain"
+
+
+def test_malformed_certain_save_route_is_failed_without_save_effect(firestore_fake):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    class SaveHandler:
+        def __init__(self):
+            self.calls = []
+        def save_draft(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    route = {
+        "kind": "save", "target_ref": None, "target_operation_id": "synthetic-save",
+        "dialog_number": None, "result_refs": [], "substantive_text": None,
+        "tool_choice": None, "certainty": "certain",
+    }
+    handler, bot = SaveHandler(), _Bot()
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=handler,
+                                     client=bot, model=_RuntimeModel(route))
+
+    result = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert result.value == "failed"
+    assert handler.calls == []
+    assert bot.sent[0][1] == "An error occurred while processing your request. Please try again."
+    assert repository.get_route_control(context_id, operation["operation_id"])["status"] == "invalid_route"
+
+
+@pytest.mark.parametrize("answer", ["", " \n "])
+def test_blank_global_model_answer_is_a_failed_processing_error(firestore_fake, answer):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    bot = _Bot()
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=_RuntimeModel(_route(), answer=answer))
+
+    result = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert result.value == "failed"
+    assert bot.sent[0][1] == "An error occurred while processing your request. Please try again."
+    conversation_id = "telegram-chat-" + __import__("hashlib").sha256(
+        context_id.encode("utf-8")).hexdigest()
+    assert [turn["role"] for turn in repository.list_turns(
+        context_id, conversation_id,
+    )] == ["user"]
+
+
+def test_ungoverned_tool_loop_exception_delivers_safe_failure(firestore_fake, caplog):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    class FailingAnswerModel:
+        def __init__(self):
+            self.calls = 0
+        def generate(self, **kwargs):
+            self.calls += 1
+            if kwargs.get("mode") == "routing":
+                return {"parts": [{"function_call": {
+                    "name": "route_command", "args": _route(),
+                }}]}
+            raise RuntimeError("private answer provider text")
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    model, bot = FailingAnswerModel(), _Bot()
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model)
+
+    result = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert result.value == "failed"
+    assert model.calls == 2
+    assert bot.sent[0][1] == "An error occurred while processing your request. Please try again."
+    assert "private answer provider text" not in caplog.text
+
+
+@pytest.mark.parametrize(("status", "expected_state", "expected_reply"), [
+    ("invalid_route", "failed",
+     "An error occurred while processing your request. Please try again."),
+    ("uncertain", "completed",
+     "I could not determine what you want me to do. Please clarify."),
+    ("error", "failed",
+     "An error occurred while processing your request. Please try again."),
+])
+@pytest.mark.parametrize("command_present", [False, True])
+@pytest.mark.parametrize("kind", ["save", "substantive", None])
+def test_pinned_route_failure_replay_does_not_call_model_or_save(
+    firestore_fake, status, expected_state, expected_reply, command_present, kind,
+):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    assert repository.persist_route(
+        operation["operation_id"], {"status": status, "kind": kind},
+        context_id=context_id, owner=lease.owner, fence=lease.fence, now=now,
+    )
+    model, bot = _RuntimeModel(_route()), _Bot()
+    class SaveHandler:
+        def __init__(self):
+            self.calls = []
+        def save_draft(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+    handler = SaveHandler()
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=handler,
+                                     client=bot, model=model, clock=lambda: now)
+
+    pinned_before = repository.get_route_control(context_id, operation["operation_id"])
+    result = asyncio.run(runtime(
+        context_id, operation, lease,
+        command=_command if command_present else None,
+    ),
+                         loop_factory=_selector_loop)
+
+    assert result.value == expected_state
+    assert model.calls == []
+    assert handler.calls == []
+    assert bot.sent[0][1] == expected_reply
+    assert repository.get_route_control(context_id, operation["operation_id"]) == pinned_before
 
 
 def _search_route():
@@ -2172,6 +2329,111 @@ def test_document_route_publishes_notice_then_answer_and_replays_saved_history(
     assert [mode for mode, _contents, _tools in model.calls].count("tool_loop") == 1
 
 
+@pytest.mark.parametrize("answer_failure", ["blank", "exception"])
+def test_selected_document_blank_or_failed_answer_is_a_safe_failed_reply(
+    firestore_fake, monkeypatch, answer_failure,
+):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+    monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
+                        _polling_offload)
+
+    class FailingDocumentModel(_RuntimeModel):
+        def generate(self, **kwargs):
+            if kwargs.get("mode") == "tool_loop" and answer_failure == "exception":
+                self.calls.append(("tool_loop", kwargs.get("contents"), kwargs.get("tools")))
+                raise RuntimeError("synthetic private tool-loop failure")
+            return super().generate(**kwargs)
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    client.collection("transcript_index").document("doc-1").set({
+        "meeting_id": "meeting-1", "source_file": "Planning", "parent_id": "root-1",
+        "dialog_date": "2026-01-02", "status": "synced",
+    })
+    client.collection("folders").document("root-1").set({
+        "folder_id": "root-1", "name": "Root", "parent_id": "pytest-synthetic-root",
+    })
+    route = _route()
+    route.update({"target_ref": "doc-1", "substantive_text": "Summarize the decision."})
+    answer = "   " if answer_failure == "blank" else "unused"
+    bot, model = _Bot(), FailingDocumentModel(route, answer)
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model,
+                                     root_folder_id="pytest-synthetic-root")
+
+    result = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert result.value == "failed"
+    assert [mode for mode, _contents, _tools in model.calls] == ["routing", "tool_loop"]
+    assert [row[1] for row in bot.sent] == [
+        "Starting to process dialog #1.",
+        "An error occurred while processing your request. Please try again.",
+    ]
+    conversation_id = repository.get_route_control(
+        context_id, operation["operation_id"],
+    )["conversation_id"]
+    turns = repository.list_turns(context_id, conversation_id)
+    assert [turn["role"] for turn in turns] == ["user"]
+
+
+def test_document_answer_persistence_interruption_replays_checkpointed_answer(
+    firestore_fake, monkeypatch,
+):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+    monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
+                        _polling_offload)
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    client.collection("transcript_index").document("doc-1").set({
+        "meeting_id": "meeting-1", "source_file": "Planning", "parent_id": "root-1",
+        "dialog_date": "2026-01-02", "status": "synced",
+    })
+    client.collection("folders").document("root-1").set({
+        "folder_id": "root-1", "name": "Root", "parent_id": "pytest-synthetic-root",
+    })
+    route = _route()
+    route.update({"target_ref": "doc-1", "substantive_text": "Summarize the decision."})
+    bot, model = _Bot(), _RuntimeModel(route, "The saved answer is available.")
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model,
+                                     root_folder_id="pytest-synthetic-root")
+    append_turn = repository.append_turn
+    injected = {"fail": True}
+
+    def fail_first_model_turn(context_id, conversation_id, *, role, **kwargs):
+        if role == "model" and injected["fail"]:
+            injected["fail"] = False
+            raise RuntimeError("synthetic answer persistence interruption")
+        return append_turn(context_id, conversation_id, role=role, **kwargs)
+
+    repository.append_turn = fail_first_model_turn
+    first = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+    assert first.value == "running"
+    assert [row[1] for row in bot.sent] == ["Starting to process dialog #1."]
+
+    second = asyncio.run(runtime(context_id, operation, lease, command=command),
+                          loop_factory=_selector_loop)
+
+    assert second.value == "completed"
+    assert [row[1] for row in bot.sent] == [
+        "Starting to process dialog #1.", "The saved answer is available.",
+    ]
+    assert [mode for mode, _contents, _tools in model.calls].count("tool_loop") == 1
+    conversation_id = repository.get_route_control(
+        context_id, operation["operation_id"],
+    )["conversation_id"]
+    assert [turn["role"] for turn in repository.list_turns(
+        context_id, conversation_id,
+    )] == ["user", "model"]
+
+
 def test_router_receives_ordered_safe_results_from_predecessor_search(firestore_fake):
     from services.connectors.telegram.repository import TelegramRepository
     from services.connectors.telegram.runtime import TelegramCommandRuntime
@@ -2340,7 +2602,7 @@ def test_unknown_explicit_document_tool_target_fails_closed(firestore_fake, monk
 
     assert result.value == "failed"
     assert [mode for mode, _contents, _tools in model.calls] == ["routing"]
-    assert bot.sent[0][1] == "I could not complete that request. Please clarify."
+    assert bot.sent[0][1] == "An error occurred while processing your request. Please try again."
     assert not any(row[1] == "Starting to process dialog #1." for row in bot.sent)
     context = repository.get_context(context_id)
     assert context["last_doc_id"] is None and context["active_conversation_id"] is None
