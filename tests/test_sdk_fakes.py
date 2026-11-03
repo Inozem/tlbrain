@@ -255,19 +255,24 @@ def test_docs_required_revision_control_is_traced_and_stale_revision_fails(sdk_f
     assert documents.get(documentId="doc-1").execute()["revisionId"] == "rev-1"
     sdk_fakes.docs.queue("documents.batchUpdate", response={"writeControl": {"requiredRevisionId": "rev-2"}})
     documents.batchUpdate(
-        documentId="doc-1", body={"requests": []},
-        writeControl={"requiredRevisionId": "rev-1"},
+        documentId="doc-1", body={
+            "requests": [], "writeControl": {"requiredRevisionId": "rev-1"},
+        },
     ).execute()
 
     sdk_fakes.docs.queue("documents.batchUpdate", response={"ok": True})
     with pytest.raises(RuntimeError, match="Stale Docs revision"):
         documents.batchUpdate(
-            documentId="doc-1", body={"requests": []},
-            writeControl={"requiredRevisionId": "rev-1"},
+            documentId="doc-1", body={
+                "requests": [], "writeControl": {"requiredRevisionId": "rev-1"},
+            },
         ).execute()
     update = [event for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate"]
-    assert update[0]["arguments"]["writeControl"] == {"requiredRevisionId": "rev-1"}
-    assert update[1]["arguments"]["writeControl"] == {"requiredRevisionId": "rev-1"}
+    assert "writeControl" not in update[0]["arguments"]
+    assert update[0]["arguments"]["body"]["writeControl"] == {"requiredRevisionId": "rev-1"}
+    assert update[1]["arguments"]["body"]["writeControl"] == {"requiredRevisionId": "rev-1"}
+    with pytest.raises(TypeError, match="Unsupported documents.batchUpdate options: writeControl"):
+        documents.batchUpdate(documentId="doc-1", body={"requests": []}, writeControl={})
 
 
 def test_gemini_audio_files_and_function_call_signatures_are_preserved(sdk_fakes):

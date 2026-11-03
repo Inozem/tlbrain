@@ -1076,6 +1076,7 @@ def test_default_app_numbered_retry_saves_failed_dialog_without_replacing_newer_
         }
     sdk_fakes.drive.queue("files.create", response={"id": "doc-numbered-retry"})
     empty_document = {"revisionId": "rev-empty", "body": {"content": [
+        {"sectionBreak": {"sectionStyle": {}}},
         {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
     ]}}
     for _ in range(12):
@@ -1263,6 +1264,7 @@ def test_committed_save_recovers_cleanup_after_source_and_request_are_gone(
         sdk_fakes.drive.queue("files.create", response={"id": target_folder_id})
     sdk_fakes.drive.queue("files.create", response={"id": doc_id})
     empty_document = {"revisionId": "rev-empty", "body": {"content": [
+        {"sectionBreak": {"sectionStyle": {}}},
         {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
     ]}}
     for _ in range(12):
@@ -3714,6 +3716,7 @@ def test_default_app_retry_reuses_real_doc_after_fill_403(
     }
 
     empty_document = {"revisionId": "rev-empty", "body": {"content": [
+        {"sectionBreak": {"sectionStyle": {}}},
         {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
     ]}}
     for _ in range(12):

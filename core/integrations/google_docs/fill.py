@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from core.integrations.google_drive.files import read_native_doc_metadata
 
 _DOC_MIME_TYPE = "application/vnd.google-apps.document"
+_STRUCTURAL_ELEMENT_KEYS = {"sectionBreak", "paragraph", "table", "tableOfContents"}
+_STRUCTURAL_METADATA_KEYS = {"startIndex", "endIndex"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,7 +20,7 @@ class GoogleDocFill:
 
 
 def _document_text(document: object) -> tuple[str | None, str | None]:
-    """Return full text and revision only for a supported paragraph body."""
+    """Return full text and revision for supported paragraph body content."""
     if not isinstance(document, dict):
         return None, None
     revision = document.get("revisionId")
@@ -30,8 +32,28 @@ def _document_text(document: object) -> tuple[str | None, str | None]:
         return None, revision
 
     parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict) or not isinstance(item.get("paragraph"), dict):
+    for index, item in enumerate(content):
+        if not isinstance(item, dict):
+            return None, revision
+        structural_keys = item.keys() & _STRUCTURAL_ELEMENT_KEYS
+        if (
+            len(structural_keys) != 1
+            or item.keys() - _STRUCTURAL_ELEMENT_KEYS - _STRUCTURAL_METADATA_KEYS
+        ):
+            return None, revision
+        if "sectionBreak" in item:
+            section_break = item.get("sectionBreak")
+            if (
+                index != 0
+                or not isinstance(section_break, dict)
+                or (
+                    "sectionStyle" in section_break
+                    and not isinstance(section_break.get("sectionStyle"), dict)
+                )
+            ):
+                return None, revision
+            continue
+        if not isinstance(item.get("paragraph"), dict):
             return None, revision
         paragraph = item.get("paragraph")
         elements = paragraph.get("elements") if isinstance(paragraph, dict) else None
@@ -44,6 +66,8 @@ def _document_text(document: object) -> tuple[str | None, str | None]:
             if not isinstance(text_run, dict) or not isinstance(text_run.get("content"), str):
                 return None, revision
             parts.append(text_run["content"])
+    if not parts:
+        return None, revision
     text = "".join(parts)
     # Docs terminates every paragraph with a structural newline. Remove only
     # the final one so user-provided trailing blank lines remain intact.
@@ -107,8 +131,10 @@ def fill_google_doc_safely(
     try:
         response = docs.documents().batchUpdate(
             documentId=document_id,
-            body={"requests": requests},
-            writeControl={"requiredRevisionId": expected_revision_id},
+            body={
+                "requests": requests,
+                "writeControl": {"requiredRevisionId": expected_revision_id},
+            },
         ).execute()
     except Exception:
         recovered_text, recovered_revision = _read_document(docs, document_id)

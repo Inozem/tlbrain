@@ -181,7 +181,7 @@ class _Request:
             raise TypeError(f"Unsupported execute options: {', '.join(kwargs)}")
         _record(self.boundary, self.operation, **self.args)
         if self.boundary == "docs" and self.operation == "documents.batchUpdate":
-            write_control = self.args.get("writeControl") or {}
+            write_control = self.args.get("body", {}).get("writeControl") or {}
             required_revision = write_control.get("requiredRevisionId")
             document_id = self.args["documentId"]
             current_revision = _STATE.docs_revisions.get(document_id)
@@ -226,7 +226,7 @@ class _Resource:
             },
             "documents": {
                 "get": {"documentId", "includeTabsContent", "suggestionsViewMode"},
-                "batchUpdate": {"documentId", "body", "writeControl"},
+                "batchUpdate": {"documentId", "body"},
             },
         }
         allowed_options = supported.get(self.name, {}).get(operation)

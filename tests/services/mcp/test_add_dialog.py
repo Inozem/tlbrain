@@ -207,7 +207,7 @@ def _install_document_boundary(
             doc_id = args["documentId"]
             body = args["body"]
             current = documents[doc_id]
-            write_control = args.get("writeControl") or body.get("writeControl") or {}
+            write_control = body.get("writeControl") or {}
             required_revision = write_control.get("requiredRevisionId")
             if required_revision is not None and required_revision != current["revisionId"]:
                 raise RuntimeError("Stale Docs revision in test boundary")
@@ -230,15 +230,18 @@ def _install_document_boundary(
             return {
                 "documentId": doc_id,
                 "revisionId": document["revisionId"],
-                "body": {"content": [{
-                    "startIndex": 0,
-                    "endIndex": len(text) + 1,
-                    "paragraph": {"elements": [{
+                "body": {"content": [
+                    {"startIndex": 0, "endIndex": 1, "sectionBreak": {"sectionStyle": {}}},
+                    {
                         "startIndex": 1,
                         "endIndex": len(text) + 1,
-                        "textRun": {"content": text},
-                    }]},
-                }]},
+                        "paragraph": {"elements": [{
+                            "startIndex": 1,
+                            "endIndex": len(text) + 1,
+                            "textRun": {"content": text},
+                        }]},
+                    },
+                ]},
             }
         return original_execute(request, **kwargs)
 

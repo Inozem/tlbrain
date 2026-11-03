@@ -29,6 +29,7 @@ DOC_ID = "native-doc-a"
 TITLE = "Synthetic dialog title"
 PARENT_ID = "synthetic-folder"
 CONTENT = "DATE: 2026-04-02\nPROVIDER: manual\n---\nAda :: hello\n"
+SECTION_BREAK = {"sectionBreak": {"sectionStyle": {}}}
 
 
 def _reconcile(drive, *, save_intent_id: str = SAVE_ID, expected_parent_id: str = PARENT_ID):
@@ -392,6 +393,7 @@ def test_lost_docs_insert_response_reads_back_exact_text_without_retrying_insert
     sdk_fakes.docs.queue(
         "documents.get",
         response={"revisionId": "rev-1", "body": {"content": [
+            SECTION_BREAK,
             {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
         ]}},
     )
@@ -405,6 +407,7 @@ def test_lost_docs_insert_response_reads_back_exact_text_without_retrying_insert
             "revisionId": "rev-2",
             "body": {
                 "content": [
+                    SECTION_BREAK,
                     {"paragraph": {"elements": [{"textRun": {"content": CONTENT + "\n"}}]}}
                 ]
             },
@@ -429,7 +432,7 @@ def test_lost_docs_insert_response_reads_back_exact_text_without_retrying_insert
         "files.get",
     ]
     update = next(event["arguments"] for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate")
-    assert update["writeControl"]["requiredRevisionId"] == "rev-1"
+    assert update["body"]["writeControl"]["requiredRevisionId"] == "rev-1"
     assert update["body"]["requests"][0]["insertText"]["text"] == CONTENT
 
 
@@ -437,6 +440,7 @@ def test_revision_conflict_is_reread_and_reported_without_blind_overwrite(sdk_fa
     sdk_fakes.docs.queue(
         "documents.get",
         response={"revisionId": "rev-1", "body": {"content": [
+            SECTION_BREAK,
             {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
         ]}},
     )
@@ -447,6 +451,7 @@ def test_revision_conflict_is_reread_and_reported_without_blind_overwrite(sdk_fa
             "revisionId": "rev-foreign",
             "body": {
                 "content": [
+                    SECTION_BREAK,
                     {"paragraph": {"elements": [{"textRun": {"content": "foreign edit\n"}}]}}
                 ]
             },
@@ -464,13 +469,14 @@ def test_revision_conflict_is_reread_and_reported_without_blind_overwrite(sdk_fa
         "documents.get",
     ]
     update = next(event["arguments"] for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate")
-    assert update["writeControl"]["requiredRevisionId"] == "rev-1"
+    assert update["body"]["writeControl"]["requiredRevisionId"] == "rev-1"
 
 
 def test_exact_doc_confirms_without_write_and_reads_modified_time(sdk_fakes):
     sdk_fakes.docs.queue(
         "documents.get",
         response={"revisionId": "rev-exact", "body": {"content": [
+            SECTION_BREAK,
             {"paragraph": {"elements": [{"textRun": {"content": CONTENT + "\n"}}]}}
         ]}},
     )
@@ -500,10 +506,92 @@ def test_document_text_preserves_desired_trailing_newline_after_structural_newli
     assert revision == "rev-exact"
 
 
+@pytest.mark.parametrize("content", [
+    [SECTION_BREAK],
+    [{"sectionBreak": {}}],
+    [SECTION_BREAK, {"table": {"tableRows": []}}],
+    [{"sectionBreak": {}, "table": {"tableRows": []}},
+     {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}],
+    [{"sectionBreak": {}, "paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
+     {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}],
+    [{"sectionBreak": {}, "unknownElement": {}},
+     {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}],
+    [{"sectionBreak": {"sectionStyle": "invalid"}},
+     {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}],
+])
+def test_unsupported_structural_content_is_not_treated_as_empty(content):
+    from core.integrations.google_docs.fill import _document_text
+
+    text, revision = _document_text({
+        "revisionId": "rev-unsupported",
+        "body": {"content": content},
+    })
+
+    assert text is None
+    assert revision == "rev-unsupported"
+
+
+def test_installed_docs_sdk_posts_revision_guard_in_request_body_over_static_http():
+    import json
+    import httplib2
+    from googleapiclient.discovery import build_from_document
+    from googleapiclient.discovery_cache import get_static_doc
+    from core.integrations.google_docs.fill import fill_google_doc_safely
+
+    posted_bodies = []
+    calls = []
+    responses = [
+        {
+            "revisionId": "rev-native-empty",
+            "body": {"content": [
+                {"startIndex": 0, "endIndex": 1, **SECTION_BREAK},
+                {"startIndex": 1, "endIndex": 2, "paragraph": {
+                    "elements": [{"startIndex": 1, "endIndex": 2,
+                                  "textRun": {"content": "\n"}}],
+                }},
+            ]},
+        },
+        {"writeControl": {"requiredRevisionId": "rev-native-filled"}},
+    ]
+
+    class StaticHttp:
+        def request(self, uri, method="GET", body=None, headers=None, **kwargs):
+            calls.append((method, uri, kwargs))
+            if method == "POST":
+                posted_bodies.append(json.loads(body))
+            result = responses.pop(0)
+            response = httplib2.Response({"status": "200", "content-type": "application/json"})
+            return response, json.dumps(result).encode("utf-8")
+
+    docs = build_from_document(get_static_doc("docs", "v1"), http=StaticHttp())
+    drive = SimpleNamespace(files=lambda: SimpleNamespace(get=lambda **_kwargs: SimpleNamespace(
+        execute=lambda: {
+            "id": "synthetic-native-doc",
+            "mimeType": "application/vnd.google-apps.document",
+            "modifiedTime": "synthetic-modified-time",
+        }
+    )))
+
+    result = fill_google_doc_safely(
+        docs, drive=drive, document_id="synthetic-native-doc", text=CONTENT,
+        speaker_ranges=[(31, 34)], expected_revision_id="rev-native-empty",
+    )
+
+    assert result.state == "confirmed", calls
+    assert result.revision_id == "rev-native-filled"
+    assert len(posted_bodies) == 1
+    assert posted_bodies[0]["writeControl"] == {"requiredRevisionId": "rev-native-empty"}
+    assert posted_bodies[0]["requests"][0] == {
+        "insertText": {"location": {"index": 1}, "text": CONTENT},
+    }
+    assert responses == []
+
+
 def test_empty_doc_is_inserted_once_with_guard_and_post_fill_metadata(sdk_fakes):
     sdk_fakes.docs.queue(
         "documents.get",
         response={"revisionId": "rev-1", "body": {"content": [
+            SECTION_BREAK,
             {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
         ]}},
     )
@@ -519,7 +607,7 @@ def test_empty_doc_is_inserted_once_with_guard_and_post_fill_metadata(sdk_fakes)
     updates = [event for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate"]
     assert len(updates) == 1
     update = updates[0]["arguments"]
-    assert update["writeControl"]["requiredRevisionId"] == "rev-1"
+    assert update["body"]["writeControl"]["requiredRevisionId"] == "rev-1"
     assert update["body"]["requests"][0]["insertText"] == {"location": {"index": 1}, "text": CONTENT}
     assert update["body"]["requests"][1]["updateTextStyle"]["range"] == {"startIndex": 32, "endIndex": 35}
 
@@ -554,6 +642,7 @@ def test_empty_doc_with_changed_revision_conflicts_without_mutation(sdk_fakes):
 
 def test_unresolved_docs_insert_response_remains_unknown_without_retry(sdk_fakes):
     empty_doc = {"revisionId": "rev-1", "body": {"content": [
+        SECTION_BREAK,
         {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}}
     ]}}
     sdk_fakes.docs.queue("documents.get", response=empty_doc)
