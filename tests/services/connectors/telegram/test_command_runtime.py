@@ -1913,6 +1913,154 @@ def test_runtime_store_returns_bound_and_unbound_scoped_documents(firestore_fake
     assert repository.get_context(context_id)["last_doc_id"] == "saved-doc-b"
 
 
+def test_runtime_store_publishes_search_selection_idempotently_and_preserves_context(firestore_fake):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    number = repository.bind_document(
+        context_id, "doc-existing", "conversation-existing", metadata={},
+        now=now, update_last_doc=False,
+    )
+    repository.ensure_conversation(
+        context_id, "conversation-existing", kind="document", doc_id="doc-existing",
+        dialog_number=number, now=now,
+    )
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.update({
+        "active_conversation_id": "conversation-existing",
+        "selected_dialog_number": number,
+        "last_doc_id": "doc-existing",
+        "active_draft_id": "draft-collecting",
+        "selection_sequence": 4,
+    })
+    operations = context_ref.collection("operations")
+    operations.document(operation["operation_id"]).update({
+        "route_control": {
+            "status": "ok", "kind": "search", "search_session_id": "search-current",
+        },
+    })
+    repository.ensure_conversation(
+        context_id, "search-current", kind="search", now=now,
+    )
+    store = TelegramRuntimeStore(repository, context_id=context_id)
+    kwargs = {
+        "conversation_id": "search-current", "owner": lease.owner,
+        "fence": lease.fence, "now": now,
+    }
+
+    assert store.publish_search_selection(operation["operation_id"], **kwargs)
+    first_context = repository.get_context(context_id)
+    assert first_context["active_conversation_id"] == "search-current"
+    assert first_context["selected_dialog_number"] is None
+    assert first_context["selection_sequence"] == 5
+    assert first_context["last_doc_id"] == "doc-existing"
+    assert first_context["active_draft_id"] == "draft-collecting"
+
+    assert store.publish_search_selection(operation["operation_id"], **kwargs)
+    second_context = repository.get_context(context_id)
+    assert second_context["selection_sequence"] == 5
+    binding = context_ref.collection("document_bindings").stream()
+    assert len(binding) == 1
+    assert binding[0].to_dict()["doc_id"] == "doc-existing"
+
+
+@pytest.mark.parametrize(("route_kind", "route_session_id", "conversation_kind", "fence", "binding_error"), [
+    ("search", "search-other", "search", 1, True),
+    ("substantive", "search-current", "search", 1, True),
+    ("search", "search-current", "document", 1, True),
+    ("search", "search-current", "search", 2, False),
+])
+def test_runtime_store_refuses_stale_or_mismatched_search_selection(
+    firestore_fake, route_kind, route_session_id, conversation_kind, fence, binding_error,
+):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.collection("operations").document(operation["operation_id"]).update({
+        "route_control": {
+            "status": "ok", "kind": route_kind, "search_session_id": route_session_id,
+        },
+    })
+    context_ref.collection("conversations").document("search-current").set({
+        "conversation_id": "search-current", "kind": conversation_kind,
+    })
+    store = TelegramRuntimeStore(repository, context_id=context_id)
+
+    if binding_error:
+        with pytest.raises(ValueError, match="search selection binding is invalid"):
+            store.publish_search_selection(
+                operation["operation_id"], conversation_id="search-current",
+                owner=lease.owner, fence=fence, now=now,
+            )
+    else:
+        assert not store.publish_search_selection(
+            operation["operation_id"], conversation_id="search-current",
+            owner=lease.owner, fence=fence, now=now,
+        )
+    unchanged = repository.get_context(context_id)
+    assert unchanged["active_conversation_id"] is None
+    assert unchanged["selected_dialog_number"] is None
+    assert unchanged["selection_sequence"] == 0
+
+
+@pytest.mark.parametrize(("binding_error", "expected"), [
+    (False, "running"), (True, "failed"),
+])
+def test_search_selection_guard_retries_stale_lease_but_settles_binding_error(binding_error, expected):
+    from services.connectors.telegram.runtime.runtime import _CommandExecution
+    from services.connectors.telegram.runtime.runtime import QueueOperationState
+
+    replies = []
+
+    class Store:
+        def create_search_session(self, **_kwargs):
+            return "search-current"
+
+        def publish_search_selection(self, *_args, **_kwargs):
+            if binding_error:
+                raise ValueError("search selection binding is invalid")
+            return False
+
+    async def finish_reply(message, **kwargs):
+        replies.append((message, kwargs))
+        return QueueOperationState.FAILED
+
+    execution = object.__new__(_CommandExecution)
+    execution.context_id = "42_default"
+    execution.operation_id = "op-search"
+    execution.owner = "worker"
+    execution.fence = 1
+    execution.command = SimpleNamespace(text="synthetic search")
+    execution.replay_request = None
+    execution.search_refs = []
+    execution.store = Store()
+    execution.search = SimpleNamespace(failure=None)
+    execution.runtime = SimpleNamespace(
+        clock=lambda: datetime.now(timezone.utc),
+        repository=SimpleNamespace(list_turns=lambda *_args: pytest.fail("selection failure continued")),
+    )
+    execution.finish_reply = finish_reply
+
+    result = asyncio.run(execution._handle_global_search())
+
+    assert result.value == expected
+    if binding_error:
+        assert len(replies) == 1
+        assert replies[0][1] == {"kind": "error", "failure_final": True}
+        assert "search session" in replies[0][0]
+    else:
+        assert replies == []
+
+
 def test_runtime_offers_only_confirmed_saves_in_the_immutable_predecessor_chain(firestore_fake):
     from services.connectors.telegram.repository import TelegramRepository
     from services.connectors.telegram.runtime import TelegramCommandRuntime

@@ -543,6 +543,33 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         utterances = add_dialog["properties"]["utterances"]
         assert utterances["minItems"] == 1
         assert utterances["items"]["required"] == ["speaker", "text"]
+
+        variants = {item["properties"]["kind"]["enum"][0]: item
+                    for item in schema["anyOf"]}
+        assert tuple(variants) == (
+            "pure_switch", "search", "substantive", "save", "retry",
+        )
+        assert set(schema["required"]) == {
+            "kind", "target_ref", "target_operation_id", "dialog_number",
+            "result_refs", "substantive_text", "tool_choice", "certainty",
+        }
+        for kind in ("pure_switch", "search", "save", "retry"):
+            assert variants[kind]["properties"]["tool_choice"] == {"type": "null"}
+        for kind in ("search", "save", "retry"):
+            assert variants[kind]["properties"]["target_operation_id"] == {"type": "null"}
+        assert variants["retry"]["properties"]["dialog_number"] == {
+            "type": "integer", "minimum": 1,
+        }
+        for kind in ("pure_switch", "search", "substantive", "save"):
+            assert variants[kind]["properties"]["dialog_number"] == {
+                "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
+            }
+        assert variants["substantive"]["properties"]["substantive_text"] == {
+            "type": "string", "minLength": 1, "pattern": r".*\S.*",
+        }
+        assert schema["properties"]["target_operation_id"] == {
+            "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+        }
         assert utterances["items"]["additionalProperties"] is False
         assert by_name["list_folders"]["properties"]["arguments"] == catalog["list_folders"]
         assert by_name["list_folders"]["properties"]["arguments"].get("required", []) == []

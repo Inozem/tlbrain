@@ -183,6 +183,55 @@ class TelegramRuntimeStore:
         self.pending_search = None
         return str(result.get("conversation_id", ""))
 
+    def publish_search_selection(self, operation_id: str, *, conversation_id: str,
+                                 owner: str, fence: int, now: datetime) -> bool:
+        """Select this operation's persisted search session under its queue fence."""
+        context_id = self.context_id
+        if (not isinstance(context_id, str) or not isinstance(conversation_id, str)
+                or not conversation_id):
+            return False
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        operation_ref = context_ref.collection("operations").document(operation_id)
+        conversation_ref = context_ref.collection("conversations").document(conversation_id)
+
+        @firestore.transactional
+        def commit(transaction: Any) -> bool:
+            context_snapshot = context_ref.get(transaction=transaction)
+            operation_snapshot = operation_ref.get(transaction=transaction)
+            conversation_snapshot = conversation_ref.get(transaction=transaction)
+            context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
+            operation = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
+            conversation = (conversation_snapshot.to_dict() or {}
+                            if conversation_snapshot.exists else {})
+            route_control = operation.get("route_control")
+            if (not context_snapshot.exists or not operation_snapshot.exists
+                    or operation.get("operation_id") != operation_id
+                    or operation.get("context_id") not in (None, context_id)
+                    or operation.get("state") != "running"
+                    or not validate_context_queue_lease(
+                        context, operation_id, owner=owner, fence=fence,
+                        now=now, expiry=context.get("lock_expires_at"))):
+                return False
+            if (not isinstance(route_control, Mapping)
+                    or route_control.get("kind") != "search"
+                    or route_control.get("search_session_id") != conversation_id
+                    or not conversation_snapshot.exists
+                    or conversation.get("conversation_id") != conversation_id
+                    or conversation.get("kind") != "search"):
+                raise ValueError("search selection binding is invalid")
+            if (context.get("active_conversation_id") == conversation_id
+                    and context.get("selected_dialog_number") is None):
+                return True
+            transaction.update(context_ref, {
+                "active_conversation_id": conversation_id,
+                "selected_dialog_number": None,
+                "selection_sequence": int(context.get("selection_sequence", 0)) + 1,
+                "updated_at": now,
+            })
+            return True
+
+        return commit(self.client.transaction(max_attempts=5))
+
     def publish_selection(self, operation_id: str, *, conversation_id: str,
                           dialog_number: int, owner: str, fence: int,
                           now: datetime) -> bool:

@@ -845,3 +845,60 @@ def test_invalid_or_uncertain_route_fails_closed_without_side_effects(response, 
     assert store.created_drafts == []
     assert actions.calls == []
     assert notices.sent == []
+
+
+@pytest.mark.parametrize(("response", "schema_kind", "schema_field", "expected_schema"), [
+    (_decision("search", tool_choice={"name": "query", "arguments": {"query": "synthetic topic"}}),
+     "search", "tool_choice", {"type": "null"}),
+    (_decision("pure_switch", tool_choice={"name": "list_folders", "arguments": {}}),
+     "pure_switch", "tool_choice", {"type": "null"}),
+    (_decision("save", tool_choice={"name": "query", "arguments": {"query": "synthetic topic"}}),
+     "save", "tool_choice", {"type": "null"}),
+    (_decision("retry", dialog_number=1,
+               tool_choice={"name": "query", "arguments": {"query": "synthetic topic"}}),
+     "retry", "tool_choice", {"type": "null"}),
+    (_decision("search", target_operation_id="save-1"),
+     "search", "target_operation_id", {"type": "null"}),
+    (_decision("save", target_operation_id="save-1"),
+     "save", "target_operation_id", {"type": "null"}),
+    (_decision("retry", dialog_number=1, target_operation_id="save-1"),
+     "retry", "target_operation_id", {"type": "null"}),
+    (_decision("retry", dialog_number=None),
+     "retry", "dialog_number", {"type": "integer", "minimum": 1}),
+    (_decision("retry", dialog_number=0),
+     "retry", "dialog_number", {"type": "integer", "minimum": 1}),
+    (_decision("retry", dialog_number=-1),
+     "retry", "dialog_number", {"type": "integer", "minimum": 1}),
+    (_decision("substantive", target_ref="doc-a", substantive_text=" \t\n"),
+     "substantive", "substantive_text",
+     {"type": "string", "minLength": 1, "pattern": r".*\S.*"}),
+    ({key: value for key, value in _decision(
+        "substantive", target_ref="doc-a", substantive_text="synthetic request",
+    ).items() if key != "substantive_text"}, "substantive", "substantive_text",
+     {"type": "string", "minLength": 1, "pattern": r".*\S.*"}),
+])
+def test_route_kind_cross_field_violations_fail_closed_without_effects(
+    response, schema_kind, schema_field, expected_schema,
+):
+    from services.connectors.telegram.runtime.routing import _ROUTE_SCHEMA
+
+    variant = next(item for item in _ROUTE_SCHEMA["anyOf"]
+                   if item["properties"]["kind"]["enum"] == [schema_kind])
+    assert variant["properties"][schema_field] == expected_schema
+
+    context, store, model, search, notices, actions = _harness(
+        decision=response,
+        docs={"doc-a": {}}, current="doc-a", last="doc-a", numbers={"doc-a": 1},
+        search_results=["doc-a"],
+    )
+
+    result = _call("synthetic route request", context=context, store=store,
+                   model=model, search=search, notices=notices, actions=actions)
+
+    assert result["status"] == "invalid_route"
+    assert search.calls == []
+    assert store.search_sessions == []
+    assert store.created_docs == []
+    assert store.created_drafts == []
+    assert actions.calls == []
+    assert notices.sent == []

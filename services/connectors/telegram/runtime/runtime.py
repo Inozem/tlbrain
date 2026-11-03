@@ -1200,6 +1200,19 @@ class _CommandExecution:
             result_refs=self.search_refs or [],
             error="search unavailable" if self.search.failure else None,
         )
+        try:
+            selected = await _offload(
+                self.store.publish_search_selection, self.operation_id,
+                conversation_id=session_id, owner=self.owner, fence=self.fence,
+                now=self.runtime.clock(),
+            )
+        except ValueError:
+            return await self.finish_reply(
+                "I could not open the search session. Please try again.",
+                kind="error", failure_final=True,
+            )
+        if not selected:
+            return QueueOperationState.RUNNING
         turns = await _offload(self.runtime.repository.list_turns, self.context_id, session_id)
         rows = [row for turn in turns if turn.get("role") == "tool"
                 for part in turn.get("parts", [])
