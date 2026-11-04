@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from google.cloud import firestore
@@ -95,9 +95,34 @@ class _ReceiptGroupSelection:
     group_id: str
     group_ref: Any
     existing_group: dict[str, Any]
+    reopened: bool = False
+    transport_alias_ref: Any | None = None
+    transport_alias_data: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _TransportGroupLookup:
+    """Point-lookup result, including ambiguity that must not bridge groups."""
+    group_ref: Any | None
+    group: dict[str, Any]
+    reopened: bool
+    alias_ref: Any
+    alias_data: dict[str, Any]
+    ambiguous: bool = False
 
 
 RECEIPT_TEXT_QUIET_SECONDS = 1
+
+
+def _valid_transport_timestamp(value: Any) -> int | None:
+    """Keep optional whole-second metadata inside Python/Firestore-safe dates."""
+    if type(value) is not int or value <= 0:
+        return None
+    try:
+        datetime.fromtimestamp(value, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return value
 
 
 def _receipt_group_is_open_for_draft(
@@ -109,6 +134,121 @@ def _receipt_group_is_open_for_draft(
         and isinstance(deadline, datetime) and deadline > now
         and group.get("draft_id") in (None, draft.draft_id)
     )
+
+
+def _transport_burst_matches(
+    group: Mapping[str, Any], *, context_id: str, draft: _ForwardDraft, user_id: int,
+    transport_timestamp: int, media_group_id: str | None = None,
+) -> bool:
+    """Check draft/actor/native identity before matching a transport-second edge."""
+    if not _receipt_group_eligible(group, context_id, draft, user_id):
+        return False
+    if (media_group_id is not None
+            and group.get("media_group_id") not in (None, media_group_id)):
+        return False
+    start, end = group.get("transport_start_timestamp"), group.get("transport_end_timestamp")
+    if type(start) is not int or type(end) is not int:
+        return False
+    distance = (start - transport_timestamp if transport_timestamp < start
+                else transport_timestamp - end if transport_timestamp > end else 0)
+    return distance <= 1
+
+
+def _receipt_group_eligible(
+    group: Mapping[str, Any], context_id: str, draft: _ForwardDraft, user_id: int,
+) -> bool:
+    """Limit timestamp lookup to this context's live collecting draft and actor."""
+    owner = group.get("owner_user_id")
+    return (
+        group.get("state") in {"open", "closed"}
+        and group.get("context_id") in (None, context_id)
+        and group.get("draft_id") in (None, draft.draft_id)
+        and owner in (None, 0, user_id)
+    )
+
+
+def _receipt_group_snapshot(
+    client: Any, transaction: Any, *, context_id: str, group_id: Any,
+) -> tuple[Any | None, dict[str, Any]]:
+    """Read one context-local group binding without querying the collection."""
+    if not isinstance(group_id, str):
+        return None, {}
+    ref = _document_ref(client, f"{SESSIONS}/{context_id}/receipt_groups/{group_id}")
+    snapshot = ref.get(transaction=transaction)
+    return ref, snapshot.to_dict() or {} if snapshot.exists else {}
+
+
+def _transport_alias_snapshot(
+    client: Any, transaction: Any, *, context_id: str, transport_timestamp: int,
+) -> tuple[Any, dict[str, Any]]:
+    """Read the one alias row needed when an exact native ID already wins."""
+    ref = _document_ref(
+        client,
+        f"{SESSIONS}/{context_id}/transport_receipt_seconds/{transport_timestamp}",
+    )
+    snapshot = ref.get(transaction=transaction)
+    return ref, snapshot.to_dict() or {} if snapshot.exists else {}
+
+
+def _find_transport_receipt_group(
+    client: Any, transaction: Any, *, context_id: str,
+    draft: _ForwardDraft, user_id: int, transport_timestamp: int,
+    media_group_id: str | None,
+) -> _TransportGroupLookup:
+    """Resolve exact/adjacent timestamp aliases with bounded point reads only."""
+    aliases = {
+        stamp: _document_ref(
+            client, f"{SESSIONS}/{context_id}/transport_receipt_seconds/{stamp}",
+        )
+        for stamp in (transport_timestamp, transport_timestamp - 1,
+                      transport_timestamp + 1)
+    }
+    snapshots = {stamp: ref.get(transaction=transaction) for stamp, ref in aliases.items()}
+    alias_ref = aliases[transport_timestamp]
+    alias_data = (snapshots[transport_timestamp].to_dict() or {}
+                  if snapshots[transport_timestamp].exists else {})
+
+    def candidate_ids(snapshot: Any) -> list[str]:
+        row = snapshot.to_dict() or {} if snapshot.exists else {}
+        raw = row.get("group_ids", row.get("group_id"))
+        if isinstance(raw, str):
+            return [raw]
+        if isinstance(raw, list):
+            return list(dict.fromkeys(item for item in raw if isinstance(item, str)))
+        return []
+
+    def eligible_groups(ids: list[str]) -> dict[str, tuple[Any, dict[str, Any]]]:
+        matches: dict[str, tuple[Any, dict[str, Any]]] = {}
+        for candidate_id in ids:
+            ref, group = _receipt_group_snapshot(
+                client, transaction, context_id=context_id, group_id=candidate_id,
+            )
+            if (ref is not None and _transport_burst_matches(
+                    group, context_id=context_id, draft=draft, user_id=user_id,
+                    transport_timestamp=transport_timestamp, media_group_id=media_group_id)):
+                matches[candidate_id] = (ref, group)
+        return matches
+
+    exact = eligible_groups(candidate_ids(snapshots[transport_timestamp]))
+    if len(exact) == 1:
+        ref, group = next(iter(exact.values()))
+        return _TransportGroupLookup(
+            ref, group, group.get("state") == "closed", alias_ref, alias_data,
+        )
+    if len(exact) > 1:
+        return _TransportGroupLookup(None, {}, False, alias_ref, alias_data, ambiguous=True)
+
+    neighbors: dict[str, tuple[Any, dict[str, Any]]] = {}
+    for stamp in (transport_timestamp - 1, transport_timestamp + 1):
+        neighbors.update(eligible_groups(candidate_ids(snapshots[stamp])))
+    if len(neighbors) == 1:
+        ref, group = next(iter(neighbors.values()))
+        return _TransportGroupLookup(
+            ref, group, group.get("state") == "closed", alias_ref, alias_data,
+        )
+    if len(neighbors) > 1:
+        return _TransportGroupLookup(None, {}, False, alias_ref, alias_data, ambiguous=True)
+    return _TransportGroupLookup(None, {}, False, alias_ref, alias_data)
 
 
 def _receipt_control_is_active(notification: Mapping[str, Any]) -> bool:
@@ -127,71 +267,220 @@ def _receipt_id(value: str) -> str:
     return "receipt-" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _select_text_receipt_group(
+    client: Any, transaction: Any, *, context_id: str, context: dict[str, Any],
+    draft: _ForwardDraft, user_id: int, update_id: int,
+    transport_timestamp: int | None, now: datetime,
+) -> _ReceiptGroupSelection:
+    """Resolve text/native-compatible groups by timestamp, then legacy deadline."""
+    lookup = None
+    if transport_timestamp is not None:
+        lookup = _find_transport_receipt_group(
+            client, transaction, context_id=context_id, draft=draft,
+            user_id=user_id, transport_timestamp=transport_timestamp,
+            media_group_id=None,
+        )
+        if lookup.group_ref is not None:
+            group_id = lookup.group_ref.id
+            return _ReceiptGroupSelection(
+                group_id, lookup.group_ref, lookup.group, lookup.reopened,
+                lookup.alias_ref, lookup.alias_data,
+            )
+        if lookup.ambiguous:
+            return _new_receipt_group(
+                client, transaction, context_id=context_id, draft=draft,
+                update_id=update_id, media_group_id=None,
+                transport_alias_ref=lookup.alias_ref,
+                transport_alias_data=lookup.alias_data,
+            )
+
+    active_id = context.get("open_text_receipt_group_id")
+    active_ref, active_group = _receipt_group_snapshot(
+        client, transaction, context_id=context_id, group_id=active_id,
+    )
+    use_active = (
+        isinstance(active_id, str)
+        and _receipt_group_is_open_for_draft(active_group, draft, now)
+        and _receipt_group_eligible(active_group, context_id, draft, user_id)
+    )
+    if use_active and transport_timestamp is not None:
+        timed = (type(active_group.get("transport_start_timestamp")) is int
+                 and type(active_group.get("transport_end_timestamp")) is int)
+        use_active = (not timed or _transport_burst_matches(
+            active_group, context_id=context_id, draft=draft, user_id=user_id,
+            transport_timestamp=transport_timestamp,
+        ))
+    if use_active and active_ref is not None:
+        return _ReceiptGroupSelection(
+            active_id, active_ref, active_group, False,
+            lookup.alias_ref if lookup else None,
+            lookup.alias_data if lookup else None,
+        )
+    return _new_receipt_group(
+        client, transaction, context_id=context_id, draft=draft,
+        update_id=update_id, media_group_id=None,
+        transport_alias_ref=lookup.alias_ref if lookup else None,
+        transport_alias_data=lookup.alias_data if lookup else None,
+    )
+
+
+def _select_native_receipt_group(
+    client: Any, transaction: Any, *, context_id: str, context: dict[str, Any],
+    draft: _ForwardDraft, user_id: int, update_id: int,
+    media_group_id: str, transport_timestamp: int | None, now: datetime,
+) -> _ReceiptGroupSelection:
+    """Honor exact native identity before considering mixed timestamp aliases."""
+    lookup_key = hashlib.sha256(media_group_id.encode("utf-8")).hexdigest()
+    media_groups = dict(context.get("open_media_receipt_groups", {}))
+    stored_id = media_groups.get(lookup_key)
+    stored_ref, stored_group = _receipt_group_snapshot(
+        client, transaction, context_id=context_id, group_id=stored_id,
+    )
+    exact = (
+        stored_ref is not None
+        and stored_group.get("media_group_id") == media_group_id
+        and _receipt_group_eligible(stored_group, context_id, draft, user_id)
+    )
+    if exact:
+        exact_open = _receipt_group_is_open_for_draft(stored_group, draft, now)
+        if exact_open or transport_timestamp is not None:
+            return _receipt_group_selection_for_native(
+                stored_id, stored_ref, stored_group, media_groups, lookup_key,
+                context, transport_timestamp, client, transaction, context_id,
+                reopened=stored_group.get("state") == "closed",
+            )
+
+    lookup = None
+    if transport_timestamp is not None:
+        lookup = _find_transport_receipt_group(
+            client, transaction, context_id=context_id, draft=draft,
+            user_id=user_id, transport_timestamp=transport_timestamp,
+            media_group_id=media_group_id,
+        )
+        if lookup.group_ref is not None:
+            return _receipt_group_selection_for_native(
+                lookup.group_ref.id, lookup.group_ref, lookup.group,
+                media_groups, lookup_key, context, transport_timestamp,
+                client, transaction, context_id, reopened=lookup.reopened,
+                alias_ref=lookup.alias_ref, alias_data=lookup.alias_data,
+            )
+
+    active_id = context.get("open_text_receipt_group_id")
+    active_ref, active_group = _receipt_group_snapshot(
+        client, transaction, context_id=context_id, group_id=active_id,
+    )
+    active_timing_matches = (
+        transport_timestamp is None
+        or not (type(active_group.get("transport_start_timestamp")) is int
+                and type(active_group.get("transport_end_timestamp")) is int)
+        or _transport_burst_matches(
+            active_group, context_id=context_id, draft=draft, user_id=user_id,
+            transport_timestamp=transport_timestamp, media_group_id=media_group_id,
+        )
+    )
+    if (
+        not (lookup is not None and lookup.ambiguous)
+        and
+        active_ref is not None
+        and active_group.get("media_group_id") in (None, media_group_id)
+        and _receipt_group_eligible(active_group, context_id, draft, user_id)
+        and _receipt_group_is_open_for_draft(active_group, draft, now)
+        and active_timing_matches
+    ):
+        return _receipt_group_selection_for_native(
+            active_id, active_ref, active_group, media_groups, lookup_key,
+            context, transport_timestamp, client, transaction, context_id,
+            alias_ref=lookup.alias_ref if lookup else None,
+            alias_data=lookup.alias_data if lookup else None,
+        )
+    created = _new_receipt_group(
+        client, transaction, context_id=context_id, draft=draft,
+        update_id=update_id, media_group_id=media_group_id,
+        transport_alias_ref=lookup.alias_ref if lookup else None,
+        transport_alias_data=lookup.alias_data if lookup else None,
+    )
+    media_groups[lookup_key] = created.group_id
+    context["open_media_receipt_groups"] = media_groups
+    return created
+
+
+def _receipt_group_selection_for_native(
+    group_id: str, group_ref: Any, group: dict[str, Any],
+    media_groups: dict[str, Any], lookup_key: str, context: dict[str, Any],
+    transport_timestamp: int | None, client: Any, transaction: Any,
+    context_id: str, *, reopened: bool = False,
+    alias_ref: Any | None = None, alias_data: dict[str, Any] | None = None,
+) -> _ReceiptGroupSelection:
+    """Bind exact native identity while preserving a timed second alias."""
+    media_groups[lookup_key] = group_id
+    context["open_media_receipt_groups"] = media_groups
+    if transport_timestamp is not None and alias_ref is None:
+        alias_ref, alias_data = _transport_alias_snapshot(
+            client, transaction, context_id=context_id,
+            transport_timestamp=transport_timestamp,
+        )
+    return _ReceiptGroupSelection(
+        group_id, group_ref, group, reopened, alias_ref, alias_data,
+    )
+
+
+def _new_receipt_group(
+    client: Any, transaction: Any, *, context_id: str, draft: _ForwardDraft,
+    update_id: int, media_group_id: str | None,
+    transport_alias_ref: Any | None = None,
+    transport_alias_data: dict[str, Any] | None = None,
+) -> _ReceiptGroupSelection:
+    """Allocate a new native/text group after compatible candidates are read."""
+    seed = f"{context_id}:{'media:' + media_group_id if media_group_id else 'text:' + draft.draft_id}:{update_id}"
+    group_id = _receipt_id(seed)
+    group_ref = _document_ref(client, f"{SESSIONS}/{context_id}/receipt_groups/{group_id}")
+    group_ref.get(transaction=transaction)
+    return _ReceiptGroupSelection(
+        group_id, group_ref, {}, False, transport_alias_ref, transport_alias_data,
+    )
+
+
 def _select_receipt_group(
     client: Any, transaction: Any, *, context_id: str, context: dict[str, Any],
-    draft: _ForwardDraft, update_id: int, media_group_id: str | None, now: datetime,
+    draft: _ForwardDraft, update_id: int, user_id: int,
+    media_group_id: str | None, transport_timestamp: int | None, now: datetime,
 ) -> _ReceiptGroupSelection:
-    """Join a matching open native/text group or create a fresh group epoch."""
+    """Select through native identity or deterministic text timestamp aliases."""
     if media_group_id is not None:
-        seed = f"{context_id}:media:{media_group_id}"
-        lookup_key = hashlib.sha256(media_group_id.encode("utf-8")).hexdigest()
-        media_groups = dict(context.get("open_media_receipt_groups", {}))
-        group_id = media_groups.get(lookup_key)
-        group_ref = (_document_ref(client, f"{SESSIONS}/{context_id}/receipt_groups/{group_id}")
-                     if isinstance(group_id, str) else None)
-        snapshot = group_ref.get(transaction=transaction) if group_ref is not None else None
-        existing = (snapshot.to_dict() or {} if snapshot is not None and snapshot.exists else {})
-        if not _receipt_group_is_open_for_draft(existing, draft, now):
-            text_id = context.get("open_text_receipt_group_id")
-            text_ref = (_document_ref(client, f"{SESSIONS}/{context_id}/receipt_groups/{text_id}")
-                        if isinstance(text_id, str) and text_id != group_id else None)
-            text_snapshot = text_ref.get(transaction=transaction) if text_ref is not None else None
-            text_group = (text_snapshot.to_dict() or {}
-                          if text_snapshot is not None and text_snapshot.exists else {})
-            if (_receipt_group_is_open_for_draft(text_group, draft, now)
-                    and text_group.get("media_group_id") in (None, media_group_id)):
-                group_id, group_ref, existing = text_id, text_ref, text_group
-            else:
-                group_id = None
-        if group_id is None:
-            group_id = _receipt_id(f"{seed}:{update_id}")
-            group_ref = _document_ref(client, f"{SESSIONS}/{context_id}/receipt_groups/{group_id}")
-            group_ref.get(transaction=transaction)
-            existing = {}
-        media_groups[lookup_key] = group_id
-        context["open_media_receipt_groups"] = media_groups
-    else:
-        group_id = context.get("open_text_receipt_group_id")
-        group_ref = (_document_ref(client, f"{SESSIONS}/{context_id}/receipt_groups/{group_id}")
-                     if isinstance(group_id, str) else None)
-        snapshot = group_ref.get(transaction=transaction) if group_ref is not None else None
-        existing = (snapshot.to_dict() or {} if snapshot is not None and snapshot.exists else {})
-        if not _receipt_group_is_open_for_draft(existing, draft, now):
-            group_id = _receipt_id(f"{context_id}:text:{draft.draft_id}:{update_id}")
-            group_ref = _document_ref(client, f"{SESSIONS}/{context_id}/receipt_groups/{group_id}")
-            group_ref.get(transaction=transaction)
-            existing = {}
-    assert isinstance(group_id, str) and group_ref is not None
-    return _ReceiptGroupSelection(group_id, group_ref, existing)
+        return _select_native_receipt_group(
+            client, transaction, context_id=context_id, context=context,
+            draft=draft, user_id=user_id, update_id=update_id,
+            media_group_id=media_group_id, transport_timestamp=transport_timestamp,
+            now=now,
+        )
+    return _select_text_receipt_group(
+        client, transaction, context_id=context_id, context=context,
+        draft=draft, user_id=user_id, update_id=update_id,
+        transport_timestamp=transport_timestamp, now=now,
+    )
 
 
 def _prepare_receipt_group(
     client: Any, transaction: Any, *, context_id: str, context: dict[str, Any],
     draft: _ForwardDraft, update_id: int, media_group_id: str | None,
-    accepted: bool, user_id: int, now: datetime,
+    transport_timestamp: int | None, accepted: bool, user_id: int, now: datetime,
 ) -> _ReceiptGroupPreparation:
     """Read and stage one durable card group, its initial send and quiet-close wakeup."""
     selection = _select_receipt_group(
         client, transaction, context_id=context_id, context=context, draft=draft,
-        update_id=update_id, media_group_id=media_group_id, now=now,
+        update_id=update_id, user_id=user_id, media_group_id=media_group_id,
+        transport_timestamp=transport_timestamp, now=now,
     )
     group_id, group_ref = selection.group_id, selection.group_ref
     existing_group = selection.existing_group
-    notification_id = "tgcard-" + hashlib.sha256(group_id.encode("utf-8")).hexdigest()
+    active_notification_id = existing_group.get("notification_id")
+    notification_id = (active_notification_id if isinstance(active_notification_id, str)
+                       else "tgcard-" + hashlib.sha256(group_id.encode("utf-8")).hexdigest())
     notification_ref = client.collection(NOTIFICATIONS).document(notification_id)
     notification_snapshot = notification_ref.get(transaction=transaction)
     notification = notification_snapshot.to_dict() or {} if notification_snapshot.exists else {}
     is_new = not bool(existing_group)
+    reopened = selection.reopened
     if notification and (
             notification.get("receipt_terminal") is True
             or notification.get("save_operation_id") is not None
@@ -204,7 +493,7 @@ def _prepare_receipt_group(
         notification = notification_snapshot.to_dict() or {} if notification_snapshot.exists else {}
     card_new = not bool(notification)
     previous_ref = previous_data = None
-    if is_new:
+    if card_new or reopened:
         previous_id = context.get("latest_receipt_notification_id")
         if isinstance(previous_id, str) and previous_id != notification_id:
             previous_ref = client.collection(NOTIFICATIONS).document(previous_id)
@@ -229,8 +518,24 @@ def _prepare_receipt_group(
         "deadline_at": deadline, "accepted_message_ids": accepted_ids,
         "skipped_count": skipped_count, "owner_user_id": user_id,
         "media_group_id": media_group_id or existing_group.get("media_group_id"),
+        "epoch": _integer(existing_group.get("epoch", 1), "epoch", minimum=1),
         "created_at": existing_group.get("created_at", now), "updated_at": now,
     }
+    if transport_timestamp is not None:
+        existing_start = _valid_transport_timestamp(
+            existing_group.get("transport_start_timestamp"),
+        )
+        existing_end = _valid_transport_timestamp(
+            existing_group.get("transport_end_timestamp"),
+        )
+        group["transport_start_timestamp"] = min(
+            transport_timestamp, existing_start or transport_timestamp,
+        )
+        group["transport_end_timestamp"] = max(
+            transport_timestamp, existing_end or transport_timestamp,
+        )
+    if reopened:
+        group["epoch"] = _integer(existing_group.get("epoch", 1), "epoch", minimum=1) + 1
     if card_new:
         body = (f"Dialog #{draft.dialog_number}: Thinking…\n\n"
                 "Forward the remaining messages from this conversation, then press Save.") if draft.draft_id else (
@@ -286,6 +591,7 @@ def _prepare_receipt_group(
     initial_task = None
     initial_prepared = None
     retire_prepared = None
+    refresh_prepared = None
     extra_ids: list[str] = []
     if card_new:
         initial_id = "tgcard-send-" + hashlib.sha256(notification_id.encode()).hexdigest()
@@ -295,17 +601,28 @@ def _prepare_receipt_group(
             schedule_at=now, now=now, context_id=context_id,
             notification_id=notification_id,
         )
-        if previous_ref is not None and previous_data is not None and _receipt_control_is_active(previous_data):
-            retire_id = "tgcard-retire-" + hashlib.sha256(
-                f"{previous_data.get('notification_id')}:{update_id}".encode()
-            ).hexdigest()
-            retire_prepared = prepare_outbox_record_in_transaction(
-                client, transaction, retire_id,
-                target_kind=OutboxTargetKind.TELEGRAM_DISPATCH, generation=1,
-                schedule_at=now, now=now, context_id=context_id,
-                notification_id=previous_data["notification_id"],
-            )
-            extra_ids.append(retire_prepared[2].outbox_id)
+    if reopened and not card_new:
+        refresh_id = "tgcard-refresh-" + hashlib.sha256(
+            f"{group_id}:{group.get('epoch')}".encode()
+        ).hexdigest()
+        refresh_prepared = prepare_outbox_record_in_transaction(
+            client, transaction, refresh_id,
+            target_kind=OutboxTargetKind.TELEGRAM_DISPATCH, generation=1,
+            schedule_at=now, now=now, context_id=context_id,
+            notification_id=notification_id,
+        )
+        extra_ids.append(refresh_prepared[2].outbox_id)
+    if previous_ref is not None and previous_data is not None and _receipt_control_is_active(previous_data):
+        retire_id = "tgcard-retire-" + hashlib.sha256(
+            f"{previous_data.get('notification_id')}:{update_id}".encode()
+        ).hexdigest()
+        retire_prepared = prepare_outbox_record_in_transaction(
+            client, transaction, retire_id,
+            target_kind=OutboxTargetKind.TELEGRAM_DISPATCH, generation=1,
+            schedule_at=now, now=now, context_id=context_id,
+            notification_id=previous_data["notification_id"],
+        )
+        extra_ids.append(retire_prepared[2].outbox_id)
     close_id = "tgcard-close-" + hashlib.sha256(f"{group_id}:{update_id}".encode()).hexdigest()
     close_prepared = prepare_outbox_record_in_transaction(
         client, transaction, close_id,
@@ -313,14 +630,33 @@ def _prepare_receipt_group(
         schedule_at=deadline, now=now, context_id=context_id,
         notification_id=notification_id,
     )
+    if selection.transport_alias_ref is not None:
+        alias_row = dict(selection.transport_alias_data or {})
+        previous_ids = alias_row.get("group_ids", alias_row.get("group_id", []))
+        if isinstance(previous_ids, str):
+            previous_ids = [previous_ids]
+        elif not isinstance(previous_ids, list):
+            previous_ids = []
+        group_ids = list(dict.fromkeys(
+            [item for item in previous_ids if isinstance(item, str)] + [group_id]
+        ))
+        alias_row.pop("group_id", None)
+        alias_row.update({
+            "transport_timestamp": transport_timestamp,
+            "group_ids": group_ids,
+            "updated_at": now,
+        })
+        transaction.set(selection.transport_alias_ref, alias_row)
     if initial_prepared is not None:
         write_prepared_outbox_record(transaction, initial_prepared)
         initial_task = initial_prepared[2]
     if retire_prepared is not None:
         write_prepared_outbox_record(transaction, retire_prepared)
+    if refresh_prepared is not None:
+        write_prepared_outbox_record(transaction, refresh_prepared)
     write_prepared_outbox_record(transaction, close_prepared)
     close_task = close_prepared[2]
-    if is_new:
+    if is_new or reopened:
         context["pending_receipt_groups"] = _integer(
             context.get("pending_receipt_groups", 0), "pending_receipt_groups"
         ) + 1
@@ -691,6 +1027,7 @@ class _TelegramIntakeMixin:
         topic_name: str | None = None,
         message: Mapping[str, object],
         media_group_id: str | None = None,
+        transport_timestamp: int | None = None,
         now: datetime,
     ) -> TelegramIntakeResult:
         update_id = _integer(update_id, "update_id")
@@ -707,6 +1044,7 @@ class _TelegramIntakeMixin:
             raise ValueError("message must contain only normalized source-message fields")
         if media_group_id is not None and (not isinstance(media_group_id, str) or not media_group_id):
             raise ValueError("media_group_id must be non-empty text or None")
+        transport_timestamp = _valid_transport_timestamp(transport_timestamp)
         message_id = _integer(message.get("message_id"), "message_id", minimum=1)
         original_date = message.get("original_date")
         if original_date is not None:
@@ -766,7 +1104,9 @@ class _TelegramIntakeMixin:
             receipt_work = _prepare_receipt_group(
                 self.client, transaction, context_id=context_id,
                 context=loaded.data, draft=draft, update_id=update_id,
-                media_group_id=media_group_id, accepted=True, user_id=user_id, now=now,
+                media_group_id=media_group_id,
+                transport_timestamp=transport_timestamp,
+                accepted=True, user_id=user_id, now=now,
             )
             notification_id = receipt_work.notification_ref.id
             outbox_id = (receipt_work.initial_task.outbox_id
@@ -816,6 +1156,7 @@ class _TelegramIntakeMixin:
         topic_name: str | None = None,
         message_id: int,
         media_group_id: str | None = None,
+        transport_timestamp: int | None = None,
         now: datetime,
     ) -> TelegramIntakeResult:
         """Durably acknowledge a contentless/unsupported forward without a draft."""
@@ -835,6 +1176,7 @@ class _TelegramIntakeMixin:
         context_ref = self.client.collection(SESSIONS).document(context_id)
         if media_group_id is not None and (not isinstance(media_group_id, str) or not media_group_id):
             raise ValueError("media_group_id must be non-empty text or None")
+        transport_timestamp = _valid_transport_timestamp(transport_timestamp)
 
         @firestore.transactional
         def _txn(transaction: firestore.Transaction) -> TelegramIntakeResult:
@@ -861,6 +1203,7 @@ class _TelegramIntakeMixin:
             work = _prepare_receipt_group(
                 self.client, transaction, context_id=context_id, context=loaded.data,
                 draft=draft, update_id=update_id, media_group_id=media_group_id,
+                transport_timestamp=transport_timestamp,
                 accepted=False, user_id=user_id, now=now,
             )
             group_ref, group = work.group_ref, work.group

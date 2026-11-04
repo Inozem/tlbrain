@@ -19,12 +19,29 @@ def _integer(value: Any) -> int | None:
     return value if type(value) is int else None
 
 
+def _transport_timestamp(message: Mapping[str, Any]) -> int | None:
+    """Read Telegram's whole-second transport time without changing source dates."""
+    timestamp = _integer(message.get("date"))
+    if timestamp is None or timestamp <= 0:
+        return None
+    try:
+        datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return timestamp
+
+
 _SAVE_CALLBACK = re.compile(r"^s:([A-Za-z0-9_-]{1,48})$")
 
 
 def _telegram_date(value: Any) -> datetime | None:
     stamp = _integer(value)
-    return datetime.fromtimestamp(stamp, tz=timezone.utc) if stamp is not None else None
+    if stamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(stamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def normalize_forward(message: Mapping[str, Any]) -> dict[str, Any]:
@@ -282,6 +299,7 @@ class TelegramIntake:
                 message_id=normalized["message_id"],
                 media_group_id=(message.get("media_group_id")
                                 if isinstance(message.get("media_group_id"), str) else None),
+                transport_timestamp=_transport_timestamp(message),
                 now=self.clock(),
             )
             self._publish_if_accepted(accepted)
@@ -295,6 +313,7 @@ class TelegramIntake:
             user_id=user_id,
             media_group_id=(message.get("media_group_id")
                             if isinstance(message.get("media_group_id"), str) else None),
+            transport_timestamp=_transport_timestamp(message),
             now=self.clock(),
         )
         self._publish_if_accepted(accepted)

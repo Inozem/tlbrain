@@ -95,7 +95,7 @@ def _forward(update_id: int, *, chat_id: int = 42, user_id: int = 7, message_id:
         "update_id": update_id,
         "message": {
             "message_id": message_id or update_id + 100,
-            "date": 1_798_000_000,
+            "date": 1_798_000_000 + update_id * 2,
             "chat": {"id": chat_id, "type": "private"},
             "from": {"id": user_id},
             "forward_origin": {"type": "user", "sender_user": {"id": 91}},
@@ -197,7 +197,9 @@ def test_receipt_text_quiet_window_is_durable_and_stale_close_cannot_regress_lat
 
     first = intake.handle_update(_forward(50))
     current[0] = NOW.replace(microsecond=500_000)
-    second = intake.handle_update(_forward(51))
+    second_update = _forward(51)
+    second_update["message"]["date"] = 1_798_000_000 + 50 * 2 + 1
+    second = intake.handle_update(second_update)
     assert first.notification_id == second.notification_id
     assert first.outbox_id != second.outbox_id
 
@@ -210,7 +212,9 @@ def test_receipt_text_quiet_window_is_durable_and_stale_close_cannot_regress_lat
 
     # The deadline has passed, but the earlier close task has not run yet.
     current[0] = NOW + timedelta(seconds=1.6)
-    third = intake.handle_update(_forward(52))
+    third_update = _forward(52)
+    third_update["message"]["date"] = 1_798_000_000 + 50 * 2 + 4
+    third = intake.handle_update(third_update)
     assert third.notification_id != first.notification_id
     context = repository.get_context(first.context_id)
     assert context["pending_receipt_groups"] == 2
@@ -240,6 +244,287 @@ def test_receipt_text_quiet_window_is_durable_and_stale_close_cannot_regress_lat
     assert replayed["revision"] == revision
 
 
+def test_transport_timed_burst_reopens_its_closed_group_after_webhook_delay(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    publisher = _Publisher()
+    current = [NOW]
+    intake = _intake(repository, publisher, clock=lambda: current[0])
+    transport_second = 1_798_100_000
+
+    first_update = _forward(54)
+    first_update["message"]["date"] = transport_second
+    first_update["message"]["forward_origin"]["date"] = transport_second - 100_000
+    first = intake.handle_update(first_update)
+    current[0] = NOW + timedelta(seconds=1.1)
+    repository.refresh_receipt_card(first.notification_id, now=current[0])
+    assert repository.get_context(first.context_id)["pending_receipt_groups"] == 0
+
+    # Delivery took 9.7 seconds; the next member still identifies the same batch.
+    current[0] = NOW + timedelta(seconds=9.7)
+    second_update = _forward(55)
+    second_update["message"]["date"] = transport_second + 1
+    second = intake.handle_update(second_update)
+    assert second.notification_id == first.notification_id
+    assert repository.get_context(first.context_id)["pending_receipt_groups"] == 1
+    assert repository.get_update_receipt(first.context_id, 55)["receipt_group_id"] == (
+        repository.get_update_receipt(first.context_id, 54)["receipt_group_id"]
+    )
+
+    current[0] = NOW + timedelta(seconds=10.8)
+    repository.refresh_receipt_card(first.notification_id, now=current[0])
+    current[0] = NOW + timedelta(seconds=10.9)
+    third_update = _forward(56)
+    third_update["message"]["date"] = transport_second
+    third = intake.handle_update(third_update)
+    assert third.notification_id == first.notification_id
+    current[0] = NOW + timedelta(seconds=12.0)
+    repository.refresh_receipt_card(first.notification_id, now=current[0])
+    current[0] = NOW + timedelta(seconds=12.1)
+    fourth_update = _forward(57)
+    fourth_update["message"]["date"] = transport_second + 1
+    fourth = intake.handle_update(fourth_update)
+    assert fourth.notification_id == first.notification_id
+
+    current[0] = NOW + timedelta(seconds=13.2)
+    repository.refresh_receipt_card(first.notification_id, now=current[0])
+    ready = repository.get_notification(first.notification_id)
+    group_id = repository.get_update_receipt(first.context_id, 54)["receipt_group_id"]
+    group = _read_doc(client, f"telegram_sessions/{first.context_id}/receipt_groups/{group_id}")
+    source = _read_doc(client, _message_path(first.context_id, first.draft_id, 154))
+    assert group["accepted_message_ids"] == [54, 55, 56, 57]
+    assert group["epoch"] == 4
+    assert repository.get_context(first.context_id)["pending_receipt_groups"] == 0
+    assert "4 messages received" in ready["body"]
+    assert ready["reply_markup"]["inline_keyboard"][0][0]["text"] == "Save"
+    assert source["original_date"] == datetime.fromtimestamp(
+        transport_second - 100_000, tz=timezone.utc,
+    )
+    assert "transport_timestamp" not in source
+
+
+def test_distinct_transport_bursts_and_legacy_timestamp_fallback(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    current = [NOW]
+    intake = _intake(repository, _Publisher(), clock=lambda: current[0])
+    first_update = _forward(58)
+    first_update["message"]["date"] = 1_798_200_000
+    first = intake.handle_update(first_update)
+    current[0] = NOW + timedelta(milliseconds=100)
+    distinct_update = _forward(59)
+    distinct_update["message"]["date"] = 1_798_200_002
+    distinct = intake.handle_update(distinct_update)
+    assert distinct.notification_id != first.notification_id
+
+    malformed_update = _forward(60)
+    malformed_update["message"].pop("date")
+    legacy = intake.handle_update(malformed_update)
+    current[0] = NOW + timedelta(milliseconds=500)
+    missing_update = _forward(61)
+    missing_update["message"]["date"] = "not-a-timestamp"
+    legacy_join = intake.handle_update(missing_update)
+    assert legacy_join.notification_id == legacy.notification_id
+
+    # When adjacent aliases point at two distinct groups, an intervening
+    # timestamp creates its own group instead of bridging the existing groups.
+    ambiguous_a = _forward(68, chat_id=44)
+    ambiguous_a["message"]["date"] = 1_798_210_000
+    group_a = intake.handle_update(ambiguous_a)
+    ambiguous_b = _forward(69, chat_id=44)
+    ambiguous_b["message"]["date"] = 1_798_210_004
+    group_b = intake.handle_update(ambiguous_b)
+    between_update = _forward(70, chat_id=44)
+    between_update["message"]["date"] = 1_798_210_002
+    between = intake.handle_update(between_update)
+    ambiguous_update = _forward(71, chat_id=44)
+    ambiguous_update["message"]["date"] = 1_798_210_003
+    separate = intake.handle_update(ambiguous_update)
+    assert len({group_a.notification_id, group_b.notification_id,
+                between.notification_id, separate.notification_id}) == 4
+
+
+def test_sliding_transport_gap_and_late_older_group_preserve_latest_card(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    current = [NOW]
+    intake = _intake(repository, _Publisher(), clock=lambda: current[0])
+    base_second = 1_798_300_000
+
+    first_a_update = _forward(62)
+    first_a_update["message"]["date"] = base_second
+    first_a = intake.handle_update(first_a_update)
+    current[0] = NOW + timedelta(seconds=1.1)
+    repository.refresh_receipt_card(first_a.notification_id, now=current[0])
+    current[0] = NOW + timedelta(seconds=2)
+    first_b_update = _forward(63)
+    first_b_update["message"]["date"] = base_second + 5
+    first_b = intake.handle_update(first_b_update)
+    assert first_a.notification_id != first_b.notification_id
+
+    # A(0), B(5), then a delayed A(0): the persisted timestamp lookup finds A
+    # without regressing the latest-card pointer from B.
+    current[0] = NOW + timedelta(seconds=3.1)
+    repository.refresh_receipt_card(first_b.notification_id, now=current[0])
+    ready_b = repository.get_notification(first_b.notification_id)
+    assert ready_b["reply_markup"]["inline_keyboard"]
+    current[0] = NOW + timedelta(seconds=9)
+    delayed_a_update = _forward(64)
+    delayed_a_update["message"]["date"] = base_second
+    delayed_a = intake.handle_update(delayed_a_update)
+    assert delayed_a.notification_id == first_a.notification_id
+    assert delayed_a.additional_outbox_ids
+    assert delayed_a.additional_outbox_ids[0] in intake.publisher.outbox_ids
+    immediate_refresh = _read_doc(client, f"task_outbox/{delayed_a.additional_outbox_ids[0]}")
+    assert immediate_refresh["notification_id"] == first_a.notification_id
+    retire_task_id = next(
+        outbox_id for outbox_id in delayed_a.additional_outbox_ids
+        if _read_doc(client, f"task_outbox/{outbox_id}")["notification_id"] == first_b.notification_id
+    )
+    assert retire_task_id in intake.publisher.outbox_ids
+    latest_before_close = repository.get_context(first_a.context_id)
+    assert latest_before_close["latest_receipt_notification_id"] == first_b.notification_id
+    assert latest_before_close["pending_receipt_groups"] == 1
+    assert repository.get_notification(first_b.notification_id)["reply_markup"] == {
+        "inline_keyboard": [],
+    }
+
+    current[0] = NOW + timedelta(seconds=10.1)
+    repository.refresh_receipt_card(first_a.notification_id, now=current[0])
+    latest_b = repository.get_notification(first_b.notification_id)
+    assert latest_b["body"].startswith("Dialog #1: Ready - 3 messages received.")
+    assert latest_b["reply_markup"]["inline_keyboard"][0][0]["text"] == "Save"
+
+    # A continuous action spanning more than one timestamp second still groups
+    # while each consecutive transport-second gap is at most one second.
+    current[0] = NOW + timedelta(seconds=20)
+    continuous_first = _forward(65, chat_id=43)
+    continuous_first["message"]["date"] = base_second + 20
+    one = intake.handle_update(continuous_first)
+    continuous_second = _forward(66, chat_id=43)
+    continuous_second["message"]["date"] = base_second + 21
+    two = intake.handle_update(continuous_second)
+    continuous_third = _forward(67, chat_id=43)
+    continuous_third["message"]["date"] = base_second + 22
+    three = intake.handle_update(continuous_third)
+    assert one.notification_id == two.notification_id == three.notification_id
+
+
+def test_transport_alias_filters_other_actor_before_resolving_adjacent_group(
+    firestore_fake,
+):
+    repository, client = _repository(firestore_fake)
+    current = [NOW]
+    intake = _intake(repository, _Publisher(), clock=lambda: current[0])
+    transport_second = 1_798_400_000
+    first_update = _forward(72)
+    first_update["message"]["date"] = transport_second
+    first = intake.handle_update(first_update)
+    first_group_id = repository.get_update_receipt(
+        first.context_id, 72,
+    )["receipt_group_id"]
+    foreign_group_id = "receipt-foreign-owner"
+    client.collection("telegram_sessions").document(first.context_id).collection(
+        "receipt_groups").document(foreign_group_id).set({
+            "group_id": foreign_group_id, "context_id": first.context_id,
+            "draft_id": first.draft_id, "owner_user_id": 8,
+            "media_group_id": None, "state": "closed",
+            "transport_start_timestamp": transport_second + 1,
+            "transport_end_timestamp": transport_second + 1,
+        })
+    client.collection("telegram_sessions").document(first.context_id).collection(
+        "transport_receipt_seconds").document(str(transport_second + 1)).set({
+            "transport_timestamp": transport_second + 1,
+            "group_ids": [foreign_group_id],
+        })
+
+    second_update = _forward(73)
+    second_update["message"]["date"] = transport_second + 1
+    second = intake.handle_update(second_update)
+    assert second.notification_id == first.notification_id
+    assert repository.get_update_receipt(first.context_id, 73)["receipt_group_id"] == first_group_id
+    alias = client.collection("telegram_sessions").document(first.context_id).collection(
+        "transport_receipt_seconds").document(str(transport_second + 1)).get().to_dict()
+    assert set(alias["group_ids"]) == {foreign_group_id, first_group_id}
+
+
+def test_repository_discards_out_of_range_transport_metadata(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    accepted = repository.accept_forward(
+        74, chat_id=42, user_id=7,
+        message={"message_id": 174, "text": "preserved source bytes"},
+        transport_timestamp=10**100, now=NOW,
+    )
+    context = repository.get_context(accepted.context_id)
+    group_id = repository.get_update_receipt(accepted.context_id, 74)["receipt_group_id"]
+    group = _read_doc(
+        client, f"telegram_sessions/{accepted.context_id}/receipt_groups/{group_id}",
+    )
+    source = _read_doc(client, _message_path(accepted.context_id, accepted.draft_id, 174))
+    assert context["active_draft_id"] == accepted.draft_id
+    assert "transport_start_timestamp" not in group
+    assert source["text"] == "preserved source bytes"
+
+
+def test_native_identity_reopens_closed_group_and_keeps_expired_open_epoch(firestore_fake):
+    repository, _client = _repository(firestore_fake)
+    current = [NOW]
+    intake = _intake(repository, _Publisher(), clock=lambda: current[0])
+
+    legacy_update = _forward(75)
+    legacy_update["message"].pop("date")
+    legacy_update["message"]["media_group_id"] = "legacy-native"
+    legacy = intake.handle_update(legacy_update)
+    current[0] = NOW + timedelta(seconds=1.1)
+    repository.refresh_receipt_card(legacy.notification_id, now=current[0])
+    current[0] = NOW + timedelta(seconds=9)
+    next_legacy = _forward(76)
+    next_legacy["message"].pop("date")
+    next_legacy["message"]["media_group_id"] = "legacy-native"
+    legacy_followup = intake.handle_update(next_legacy)
+    assert legacy_followup.notification_id != legacy.notification_id
+
+    timed_current = [NOW]
+    timed_intake = _intake(repository, _Publisher(), clock=lambda: timed_current[0])
+    timed_update = _forward(77, chat_id=43)
+    timed_update["message"]["media_group_id"] = "timed-native"
+    timed = timed_intake.handle_update(timed_update)
+    timed_current[0] = NOW + timedelta(seconds=1.1)
+    repository.refresh_receipt_card(timed.notification_id, now=timed_current[0])
+    timed_context = repository.get_context(timed.context_id)
+    timed_group_id = repository.get_update_receipt(timed.context_id, 77)["receipt_group_id"]
+    timed_group = _read_doc(
+        _client, f"telegram_sessions/{timed.context_id}/receipt_groups/{timed_group_id}",
+    )
+    assert timed_group["state"] == "closed"
+    assert timed_context["pending_receipt_groups"] == 0
+    timed_current[0] = NOW + timedelta(seconds=9)
+    delayed_timed_update = _forward(78, chat_id=43)
+    delayed_timed_update["message"]["media_group_id"] = "timed-native"
+    delayed_timed_update["message"]["date"] = timed_update["message"]["date"] + 5
+    delayed_timed = timed_intake.handle_update(delayed_timed_update)
+    assert delayed_timed.notification_id == timed.notification_id
+    assert repository.get_context(timed.context_id)["pending_receipt_groups"] == 1
+
+    expired_current = [NOW]
+    expired_intake = _intake(repository, _Publisher(), clock=lambda: expired_current[0])
+    expired_update = _forward(79, chat_id=44)
+    expired_update["message"]["media_group_id"] = "expired-native"
+    expired = expired_intake.handle_update(expired_update)
+    expired_current[0] = NOW + timedelta(seconds=2)
+    expired_followup_update = _forward(80, chat_id=44)
+    expired_followup_update["message"]["media_group_id"] = "expired-native"
+    expired_followup_update["message"]["date"] = expired_update["message"]["date"] + 5
+    expired_followup = expired_intake.handle_update(expired_followup_update)
+    assert expired_followup.notification_id == expired.notification_id
+    expired_group_id = repository.get_update_receipt(
+        expired.context_id, 79,
+    )["receipt_group_id"]
+    expired_group = _read_doc(
+        _client, f"telegram_sessions/{expired.context_id}/receipt_groups/{expired_group_id}",
+    )
+    assert expired_group["state"] == "open"
+    assert expired_group["epoch"] == 1
+    assert repository.get_context(expired.context_id)["pending_receipt_groups"] == 1
+
+
 def test_unsupported_first_joins_supported_text_card_and_all_unsupported_never_get_save(
     firestore_fake,
 ):
@@ -253,12 +538,21 @@ def test_unsupported_first_joins_supported_text_card_and_all_unsupported_never_g
     unsupported["message"]["media_group_id"] = "native-photo-group"
     skipped = intake.handle_update(unsupported)
     assert skipped.draft_id is None
-    current[0] = NOW + timedelta(milliseconds=400)
-    supported = intake.handle_update(_forward(61))
+    current[0] = NOW + timedelta(seconds=1.1)
+    repository.refresh_receipt_card(skipped.notification_id, now=current[0])
+    first_group_id = repository.get_update_receipt(skipped.context_id, 60)["receipt_group_id"]
+    first_group = _read_doc(
+        client, f"telegram_sessions/{skipped.context_id}/receipt_groups/{first_group_id}",
+    )
+    assert first_group["state"] == "closed"
+    current[0] = NOW + timedelta(seconds=2)
+    supported_update = _forward(61)
+    supported_update["message"]["date"] = unsupported["message"]["date"] + 1
+    supported = intake.handle_update(supported_update)
     assert supported.notification_id == skipped.notification_id
     assert supported.draft_id
     assert len(repository.get_draft(supported.context_id, supported.draft_id)["ordered_message_ids"]) == 1
-    current[0] = NOW + timedelta(seconds=2)
+    current[0] = NOW + timedelta(seconds=4)
     repository.refresh_receipt_card(supported.notification_id, now=current[0])
     card = repository.get_notification(supported.notification_id)
     assert "1 messages received" in card["body"]
@@ -291,13 +585,16 @@ def test_native_media_groups_stay_separate_and_text_joins_latest_open_group(fire
 
     third_update = _forward(72)
     third_update["message"]["media_group_id"] = "native-a"
+    third_update["message"]["date"] = first_update["message"]["date"] + 1
     third = intake.handle_update(third_update)
     assert third.notification_id == first.notification_id
     assert repository.get_update_receipt(first.context_id, 72)["receipt_group_id"] == (
         repository.get_update_receipt(first.context_id, 70)["receipt_group_id"]
     )
 
-    standalone = intake.handle_update(_forward(73))
+    standalone_update = _forward(73)
+    standalone_update["message"]["date"] = second_update["message"]["date"] + 1
+    standalone = intake.handle_update(standalone_update)
     assert standalone.notification_id == second.notification_id
     group_id = repository.get_update_receipt(first.context_id, 70)["receipt_group_id"]
     group = _read_doc(
@@ -620,7 +917,9 @@ def test_webhook_persists_thinking_card_and_schedules_close_from_canonical_outbo
     assert close_task["schedule_at"] == NOW + timedelta(seconds=1)
 
     current[0] = NOW + timedelta(milliseconds=300)
-    second = asyncio.run(post(_forward(81)))
+    second_update = _forward(81)
+    second_update["message"]["date"] = _forward(80)["message"]["date"] + 1
+    second = asyncio.run(post(second_update))
     assert second.status_code == 200
     second_receipt = repository.get_update_receipt("42_default", 81)
     assert second_receipt["notification_id"] == receipt["notification_id"]

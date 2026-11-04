@@ -313,6 +313,113 @@ def test_receipt_notification_closes_quiet_group_and_edits_ready_save_card(fires
     assert len(callback_data.encode("utf-8")) <= 64
 
 
+def test_slow_transport_matched_burst_reuses_delivered_card_across_close_epochs(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    clock, telegram = _Clock(), _Telegram()
+    transport_second = 1_798_100_000
+
+    first = repo.accept_forward(
+        120, chat_id=-10042, thread_id=5, user_id=7,
+        message={"message_id": 130, "text": "one"},
+        transport_timestamp=transport_second, now=clock(),
+    )
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    assert _run(publisher.publish(first.notification_id)) == "delivered"
+    known_message_id = repo.get_notification(first.notification_id)["message_id"]
+    assert known_message_id == 901
+
+    # The first card can become Ready and be delivered before the sequential
+    # webhook backlog reaches the remaining messages from the same batch.
+    clock.advance(1.1)
+    assert _run(publisher.publish(first.notification_id)) == "delivered"
+    assert "Ready - 1 messages received" in telegram.edited[-1][2]
+
+    clock.advance(8.6)
+    second = repo.accept_forward(
+        121, chat_id=-10042, thread_id=5, user_id=7,
+        message={"message_id": 131, "text": "two"},
+        transport_timestamp=transport_second + 1, now=clock(),
+    )
+    assert second.notification_id == first.notification_id
+    assert _run(publisher.publish(first.notification_id)) == "delivered"
+    assert "Thinking" in telegram.edited[-1][2]
+    assert repo.get_notification(first.notification_id)["message_id"] == known_message_id
+
+    clock.advance(1.2)
+    assert _run(publisher.publish(first.notification_id)) == "delivered"
+    assert "Ready - 2 messages received" in telegram.edited[-1][2]
+
+    third = repo.accept_forward(
+        122, chat_id=-10042, thread_id=5, user_id=7,
+        message={"message_id": 132, "text": "three"},
+        transport_timestamp=transport_second, now=clock(),
+    )
+    assert third.notification_id == first.notification_id
+    clock.advance(1.1)
+    assert _run(publisher.publish(first.notification_id)) == "delivered"
+    assert "Ready - 3 messages received" in telegram.edited[-1][2]
+
+    clock.advance(0.1)
+    fourth = repo.accept_forward(
+        123, chat_id=-10042, thread_id=5, user_id=7,
+        message={"message_id": 133, "text": "four"},
+        transport_timestamp=transport_second + 1, now=clock(),
+    )
+    assert fourth.notification_id == first.notification_id
+    clock.advance(1.1)
+    assert _run(publisher.publish(first.notification_id)) == "delivered"
+
+    ready = repo.get_notification(first.notification_id)
+    assert len(telegram.sent) == 1
+    assert repo.get_notification(first.notification_id)["message_id"] == known_message_id
+    assert ready["body"].startswith("Dialog #1: Ready - 4 messages received.")
+    assert ready["reply_markup"]["inline_keyboard"][0][0]["text"] == "Save"
+
+
+def test_failed_base_card_reuses_one_active_replacement_for_later_members(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    clock = _Clock()
+    telegram = _Telegram(failures=1, failure_category="forbidden")
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    timestamp = 1_798_110_000
+
+    first = repo.accept_forward(
+        124, chat_id=42, user_id=7, media_group_id="replacement-native",
+        message={"message_id": 134, "text": "first"},
+        transport_timestamp=timestamp, now=clock(),
+    )
+    assert _run(publisher.publish(first.notification_id)) == "failed"
+    failed_base = repo.get_notification(first.notification_id)
+    assert failed_base["send_attempts_started"] == 1
+
+    second = repo.accept_forward(
+        125, chat_id=42, user_id=7, media_group_id="replacement-native",
+        message={"message_id": 135, "text": "second"},
+        transport_timestamp=timestamp, now=clock(),
+    )
+    assert second.notification_id != first.notification_id
+    assert _run(publisher.publish(second.notification_id)) == "delivered"
+    active_replacement = repo.get_notification(second.notification_id)
+    known_message_id = active_replacement["message_id"]
+    assert known_message_id == 901
+
+    third = repo.accept_forward(
+        126, chat_id=42, user_id=7, media_group_id="replacement-native",
+        message={"message_id": 136, "text": "third"},
+        transport_timestamp=timestamp, now=clock(),
+    )
+    assert third.notification_id == second.notification_id
+    assert _run(publisher.publish(third.notification_id)) == "delivered"
+
+    assert repo.get_notification(first.notification_id) == failed_base
+    current = repo.get_notification(second.notification_id)
+    assert current["message_id"] == known_message_id
+    assert current["send_attempts_started"] == 1
+    assert len(telegram.sent) == 2
+    assert len(telegram.edited) == 1
+
+
 def test_unsupported_first_generic_send_does_not_satisfy_new_draft_first_ack(firestore_fake):
     client = firestore_fake.client_class()
     repo = TelegramRepository(client)

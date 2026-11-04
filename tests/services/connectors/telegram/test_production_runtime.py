@@ -691,6 +691,181 @@ def test_default_save_repository_roundtrips_large_stage_payload_as_bounded_parts
     assert stored_sizes and max(stored_sizes) < 1_000_000
 
 
+def test_default_app_reuses_one_card_for_transport_burst_after_sequential_webhook_gaps(
+    firestore_fake, monkeypatch,
+):
+    """Drive delayed burst members through authenticated ASGI and canonical tasks."""
+    from datetime import timedelta
+    from core.integrations.firestore.outbox import get_outbox_record, task_payload
+    from services.connectors.telegram.app.main import create_app
+    from services.connectors.telegram.client import TelegramClient
+    from services.connectors.telegram.repository import TelegramRepository
+
+    clock_now = [datetime.now(timezone.utc)]
+    real_datetime = datetime
+
+    class ControlledDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = clock_now[0]
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr("services.connectors.telegram.intake.datetime", ControlledDateTime)
+    from services.connectors.telegram.app import main as telegram_main
+    original_notification_runtime = telegram_main._notification_runtime
+
+    def controlled_notification_runtime():
+        publisher = original_notification_runtime()
+        publisher.clock = lambda: clock_now[0]
+        return publisher
+
+    monkeypatch.setattr(telegram_main, "_notification_runtime", controlled_notification_runtime)
+    db = firestore_fake.client_class()
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
+    monkeypatch.setattr("services.connectors.telegram.app.main._allowed_user_ids", lambda: {7})
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CONTROL_QUEUE", "pytest-telegram-control-queue")
+    monkeypatch.setenv("TELEGRAM_CONTROL_URL", "https://telegram.pytest.invalid/internal/dispatch")
+    monkeypatch.setenv("TELEGRAM_DELIVERY_URL", "https://telegram.pytest.invalid/internal/deliver")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://task-worker.pytest.invalid")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "pytest-task-worker@synthetic-project.invalid")
+
+    task_requests = []
+    enqueue_fake = lambda **kwargs: task_requests.append(kwargs)
+    monkeypatch.setattr("core.integrations.cloud_tasks.client.enqueue_task", enqueue_fake)
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_fake)
+    sent = []
+
+    def bot_response(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        payload = json.loads(request.content)
+        sent.append((method, payload))
+        if method == "answerCallbackQuery":
+            return httpx.Response(200, json={"ok": True, "result": True})
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 900 + len(sent)}})
+
+    original_init = TelegramClient.__init__
+
+    def telegram_client_init(self, token, *, http_client=None, timeout=30.0):
+        return original_init(self, token, http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(bot_response)), timeout=timeout)
+
+    monkeypatch.setattr(TelegramClient, "__init__", telegram_client_init)
+    app = create_app(
+        webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
+        oidc_verifier=lambda _token: type("Identity", (), {"authorized": True})(),
+    )
+    seen_outboxes = set()
+
+    async def post(path, payload, *, secret=False):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as client:
+            headers = ({"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"}
+                       if secret else {"Authorization": "Bearer fake-task"})
+            return await client.post(path, headers=headers, json=payload)
+
+    def deliver_due_notifications():
+        due = [item for item in task_requests
+               if item.get("body", {}).get("target_kind") == "telegram_dispatch"
+               and item["body"].get("notification_id")
+               and item["body"].get("outbox_id") not in seen_outboxes
+               and (item.get("schedule_time") is None
+                    or item["schedule_time"] <= clock_now[0])]
+        for item in due:
+            body = item["body"]
+            record = get_outbox_record(db, body["outbox_id"])
+            assert record is not None and task_payload(record) == body
+            response = asyncio.run(post("/internal/deliver", body), loop_factory=_selector_loop)
+            assert response.status_code == 200, response.text
+            seen_outboxes.add(body["outbox_id"])
+
+    transport_base = 1_793_320_000
+    previous_webhook_time = clock_now[0]
+    old_save_data = None
+    old_card = None
+    for index, (gap, transport_offset) in enumerate(((0, 0), (9.7, 1), (1.2, 1), (1.2, 2))):
+        if gap:
+            elapsed = (clock_now[0] - previous_webhook_time).total_seconds()
+            clock_now[0] += timedelta(seconds=max(0, gap - elapsed))
+        update = {"update_id": 19001 + index, "message": {
+            "message_id": 101 + index, "date": transport_base + transport_offset,
+            "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+            "forward_origin": {"type": "user", "sender_user": {"id": 44, "first_name": "Ada"},
+                               "date": transport_base - 5000 - index},
+            "text": f"synthetic forwarded source {index + 1}",
+        }}
+        accepted = asyncio.run(post("/telegram/webhook", update, secret=True),
+                               loop_factory=_selector_loop)
+        assert accepted.status_code == 200, accepted.text
+        previous_webhook_time = clock_now[0]
+        deliver_due_notifications()
+        if index == 1:
+            reopened_edits = [(method, payload) for method, payload in sent
+                              if method == "editMessageText"
+                              and payload.get("message_id") == old_card["message_id"]]
+            assert reopened_edits
+            thinking_edit = reopened_edits[-1][1]
+            assert "Thinking" in thinking_edit["text"]
+            assert thinking_edit["reply_markup"] == {"inline_keyboard": []}
+            stale = {"update_id": 19100, "callback_query": {
+                "id": "stale-burst-save", "from": {"id": 7}, "data": old_save_data,
+                "message": {"message_id": old_card["message_id"],
+                            "date": transport_base + 10,
+                            "chat": {"id": 77, "type": "private"}},
+            }}
+            stale_response = asyncio.run(post("/telegram/webhook", stale, secret=True),
+                                         loop_factory=_selector_loop)
+            assert stale_response.status_code == 200, stale_response.text
+            assert not any(row.to_dict().get("update_id") == 19100 for row in
+                           db.collection("telegram_sessions").document(old_card["context_id"])
+                           .collection("commands").stream())
+        if index < 3:
+            clock_now[0] += timedelta(seconds=1.1)
+            deliver_due_notifications()
+            if index == 0:
+                initial_card = next(item["body"]["notification_id"] for item in task_requests
+                                    if item.get("body", {}).get("target_kind") == "telegram_dispatch"
+                                    and item["body"].get("notification_id"))
+                old_card = TelegramRepository(db).get_notification(initial_card)
+                old_save_data = old_card["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    clock_now[0] += timedelta(seconds=1.1)
+    deliver_due_notifications()
+
+    sends = [(method, payload) for method, payload in sent if method == "sendMessage"]
+    edits = [(method, payload) for method, payload in sent if method == "editMessageText"]
+    assert len(sends) == 1
+    notification_id = next(item["body"]["notification_id"] for item in task_requests
+                           if item.get("body", {}).get("target_kind") == "telegram_dispatch"
+                           and item["body"].get("notification_id"))
+    card = TelegramRepository(db).get_notification(notification_id)
+    assert card["receipt_accepted_count"] == 4
+    assert card["state"] == "delivered"
+    assert card["reply_markup"]["inline_keyboard"][0][0]["text"] == "Save"
+    assert {payload["message_id"] for _, payload in edits} == {card["message_id"]}
+    assert any("Ready" in payload.get("text", "") for _, payload in edits)
+    assert any("Dialog #1" in payload.get("text", "") for _, payload in edits)
+    assert len({item["body"]["notification_id"] for item in task_requests
+                if item.get("body", {}).get("target_kind") == "telegram_dispatch"
+                and item["body"].get("notification_id")}) == 1
+
+    callback_data = card["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    current = {"update_id": 19101, "callback_query": {
+        "id": "current-burst-save", "from": {"id": 7}, "data": callback_data,
+        "message": {"message_id": card["message_id"], "date": transport_base + 10,
+                    "chat": {"id": 77, "type": "private"}},
+    }}
+    current_response = asyncio.run(post("/telegram/webhook", current, secret=True),
+                                   loop_factory=_selector_loop)
+    assert current_response.status_code == 200, current_response.text
+    commands = [row.to_dict() for row in db.collection("telegram_sessions").document(
+        card["context_id"]).collection("commands").stream()]
+    accepted_save = next(command for command in commands if command.get("update_id") == 19101)
+    assert accepted_save["cutoff_message_ids"] == [101, 102, 103, 104]
+    assert accepted_save["action_metadata"]["action"] == "receipt_save"
+
+
 def test_default_app_forward_then_save_runs_canonical_pipeline_and_waits_for_real_index_receipt(
     firestore_fake, sdk_fakes, monkeypatch,
 ):
