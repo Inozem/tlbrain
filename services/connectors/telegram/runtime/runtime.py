@@ -21,6 +21,7 @@ from core.operations.retries import ConfirmedStageFailure, ConfirmedStageSuccess
 from services.connectors.telegram.agent import TelegramAgent, TelegramCommandProcessor
 from services.connectors.telegram.client import TelegramClient
 from services.connectors.telegram.context import build_conversation_history
+from services.connectors.telegram.formatting import rich_markdown_safe_chunk_indices
 from services.connectors.telegram.models import TelegramContext
 from services.connectors.telegram.notifications import TelegramNotificationPublisher
 from services.connectors.telegram.repository import TelegramRepository
@@ -375,7 +376,9 @@ class _DurableCommandReplies:
                 else f"{self.operation_id}:{kind}:{index}")
         return "telegram-command-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
-    async def deliver(self, body: str, *, kind: str = "final") -> _DeliveryStatus:
+    async def deliver(
+        self, body: str, *, kind: str = "final", presentation: str = "plain",
+    ) -> _DeliveryStatus:
         context_ref = self.repository.client.collection("telegram_sessions").document(self.context_id)
         operation_ref = context_ref.collection("operations").document(self.operation_id)
         initial_operation = operation_ref.get().to_dict() or {}
@@ -387,7 +390,15 @@ class _DurableCommandReplies:
         chunk_work = _command_reply_chunks(
             body, kind=kind, bound_receipt_card=has_receipt_card,
         )
+        safe_rich_chunks = rich_markdown_safe_chunk_indices(
+            (index, chunk) for index, chunk, _chunk_kind in chunk_work
+        )
         for index, chunk, chunk_kind in chunk_work:
+            chunk_presentation = (
+                "rich_markdown"
+                if presentation == "rich_markdown" and index in safe_rich_chunks
+                else None
+            )
             notification_id = self.notification_id(chunk_kind, index)
             notification_ref = self.repository.client.collection("notification_outbox").document(
                 notification_id)
@@ -432,6 +443,7 @@ class _DurableCommandReplies:
                     card_revision = int(card.get("revision", 1)) + 1
                     card.update({
                         "body": chunk, "reply_markup": {"inline_keyboard": []},
+                        "presentation": chunk_presentation,
                         "receipt_control_token": None,
                         "receipt_control_owner_user_id": None,
                         "receipt_terminal": True,
@@ -453,6 +465,7 @@ class _DurableCommandReplies:
                     kind=chunk_kind, body=chunk, now=now,
                     context_data=context, existing_data=existing,
                     operation_id=self.operation_id,
+                    presentation=chunk_presentation,
                 )
                 if not snapshot.exists:
                     tx.set(notification_ref, row)
@@ -697,6 +710,7 @@ class _CommandExecution:
         self.lease, self.command, self.retry_governor = lease, command, retry_governor
         self.operation_id = _value(operation, "operation_id")
         self.owner, self.fence = _value(lease, "owner"), _value(lease, "fence")
+        self._has_verified_metadata = False
 
     async def run(self) -> QueueOperationState:
         """Validate the lease, compose ports, route, then settle the selected flow."""
@@ -1143,9 +1157,15 @@ class _CommandExecution:
         )
 
     async def finish_reply(self, body: str, *, kind: str = "final",
+                           presentation: str = "plain",
                            failure_final: bool = False) -> QueueOperationState:
         """Settle queue state only after every deterministic reply chunk is handled."""
-        status = await self.replies.deliver(body, kind=kind)
+        if presentation == "plain":
+            status = await self.replies.deliver(body, kind=kind)
+        else:
+            status = await self.replies.deliver(
+                body, kind=kind, presentation=presentation,
+            )
         if status == "delivered":
             return QueueOperationState.FAILED if failure_final else QueueOperationState.COMPLETED
         if status == "pending":
@@ -1516,7 +1536,9 @@ class _CommandExecution:
             if isinstance(answer, QueueOperationState):
                 return answer
             await self._persist_chat_turn("model", answer)
-        return await self.finish_reply(answer)
+        return await self.finish_reply(
+            answer, presentation=("plain" if self._has_verified_metadata else "rich_markdown"),
+        )
 
     async def _finish_processing_error(self) -> QueueOperationState:
         """Deliver a fixed safe error and release the operation as failed."""
@@ -1732,6 +1754,7 @@ class _CommandExecution:
             return QueueOperationState.RUNNING
         if results is None:
             return QueueOperationState.RUNNING
+        self._has_verified_metadata = bool(results)
         body = answer
         for result in results:
             if not isinstance(result, Mapping):
@@ -1849,7 +1872,9 @@ class _CommandExecution:
                 return answer
             if not await self._persist_visible_document_answer(conversation_id, answer):
                 return QueueOperationState.RUNNING
-            delivery = await self.finish_reply(answer)
+            delivery = await self.finish_reply(
+                answer, presentation=("plain" if self._has_verified_metadata else "rich_markdown"),
+            )
             if delivery != QueueOperationState.COMPLETED:
                 return delivery
         elif result in {QueueOperationState.COMPLETED, QueueOperationState.FAILED}:
@@ -1861,7 +1886,10 @@ class _CommandExecution:
                     return answer
                 if not await self._persist_visible_document_answer(conversation_id, answer):
                     return QueueOperationState.RUNNING
-                return await self.finish_reply(answer)
+                return await self.finish_reply(
+                    answer,
+                    presentation=("plain" if self._has_verified_metadata else "rich_markdown"),
+                )
             if result == QueueOperationState.COMPLETED:
                 route = await _offload(self.runtime.repository.get_route_control,
                                        self.context_id, self.operation_id)

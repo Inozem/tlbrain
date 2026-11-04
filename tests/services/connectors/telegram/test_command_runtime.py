@@ -606,11 +606,11 @@ class _Bot:
     def __init__(self):
         self.sent = []
 
-    async def send_message(self, chat_id, text, *, message_thread_id=None):
+    async def send_message(self, chat_id, text, *, message_thread_id=None, presentation=None):
         self.sent.append((chat_id, text, message_thread_id))
         return {"message_id": len(self.sent)}
 
-    async def edit_message_text(self, chat_id, message_id, text):
+    async def edit_message_text(self, chat_id, message_id, text, *, presentation=None):
         self.sent.append((chat_id, text, None))
         return {"message_id": message_id}
 
@@ -681,6 +681,102 @@ def test_long_receipt_save_result_keeps_card_and_durable_overflow_chunks(firesto
     assert card["body"].startswith("Dialog #1: Saved and indexed. Folder: ")
     assert delivered_text == body
     assert len(publisher.calls) == 2
+
+
+def test_receipt_terminal_rich_edit_replays_same_card_after_lost_ack(firestore_fake):
+    import httpx
+    from services.connectors.telegram.client import TelegramClient
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.runtime import _DurableCommandReplies
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    operation_ref = (client.collection("telegram_sessions").document(context_id)
+                     .collection("operations").document(operation["operation_id"]))
+    operation_ref.update({"receipt_card_notification_id": "receipt-rich-card",
+                          "target_draft_id": "draft-1"})
+    card_ref = client.collection("notification_outbox").document("receipt-rich-card")
+    card_ref.set({
+        "notification_id": "receipt-rich-card", "context_id": context_id,
+        "draft_id": "draft-1", "receipt_card": True, "kind": "draft_ack",
+        "save_operation_id": operation["operation_id"],
+        "receipt_terminal": False, "revision": 1, "state": "delivered",
+        "body": "Dialog #1: Saving...", "reply_markup": {"inline_keyboard": []},
+        "chat_id": 42, "message_id": 901, "send_attempts_started": 1,
+        "edit_attempts_started": 0,
+    })
+    now = [datetime.now(timezone.utc)]
+    calls = []
+    lose_first_edit_ack = {"value": True}
+
+    def response(request):
+        payload = json.loads(request.content)
+        method = request.url.path.rsplit("/", 1)[-1]
+        calls.append((method, payload))
+        if method == "editMessageText" and lose_first_edit_ack["value"]:
+            lose_first_edit_ack["value"] = False
+            raise httpx.ReadTimeout("synthetic lost edit acknowledgement")
+        if method == "editMessageText":
+            return httpx.Response(400, json={
+                "ok": False, "error_code": 400,
+                "description": "Bad Request: message is not modified",
+            })
+        return httpx.Response(200, json={
+            "ok": True, "result": {"message_id": payload.get("message_id", 901)},
+        })
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(response))
+    first_publisher = TelegramNotificationPublisher(
+        repository, TelegramClient("123456:synthetic-token", http_client=http),
+        clock=lambda: now[0],
+    )
+    body = "Answer: **Saved** in _unassigned."
+
+    def replies(publisher):
+        return _DurableCommandReplies(
+            repository=repository, publisher=publisher, context_id=context_id,
+            operation_id=operation["operation_id"], owner=lease.owner,
+            fence=lease.fence, clock=lambda: now[0],
+        )
+
+    async def exercise():
+        try:
+            first = await replies(first_publisher).deliver(
+                body, presentation="rich_markdown",
+            )
+            row = repository.get_notification("receipt-rich-card")
+            assert first == "pending"
+            assert row["message_id"] == 901 and row["presentation"] == "rich_markdown"
+            assert row["reply_markup"] == {"inline_keyboard": []}
+            assert row["edit_attempts_by_revision"]["2"] == 1
+
+            now[0] += timedelta(seconds=1)
+            restarted_publisher = TelegramNotificationPublisher(
+                repository, TelegramClient("123456:synthetic-token", http_client=http),
+                clock=lambda: now[0],
+            )
+            assert await replies(restarted_publisher).deliver(
+                body, presentation="rich_markdown",
+            ) == "delivered"
+            assert await replies(restarted_publisher).deliver(
+                body, presentation="rich_markdown",
+            ) == "delivered"
+        finally:
+            await http.aclose()
+
+    asyncio.run(exercise(), loop_factory=_selector_loop)
+    assert [method for method, _payload in calls] == ["editMessageText", "editMessageText"]
+    assert calls[0][1]["rich_message"] == {"markdown": body}
+    assert calls[1][1]["rich_message"] == {"markdown": body}
+    assert all(payload["reply_markup"] == {"inline_keyboard": []}
+               and "text" not in payload and "parse_mode" not in payload
+               for _method, payload in calls)
+    card = repository.get_notification("receipt-rich-card")
+    assert card["message_id"] == 901 and card["presentation"] == "rich_markdown"
+    assert card["state"] == "delivered" and card["edit_attempts_by_revision"]["2"] == 2
+    assert card["send_attempts_started"] == 1
 
 
 def test_stale_reply_fence_never_publishes_a_status_as_notification_id(firestore_fake):
@@ -848,7 +944,7 @@ def test_provider_pending_chunk_blocks_later_chunks_and_status_check_reuses_fina
     def handler(request):
         import json as json_module
         payload = json_module.loads(request.content)
-        sends.append(payload["text"])
+        sends.append(payload.get("text") or payload["rich_message"]["markdown"])
         return responses.pop(0)
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -2371,11 +2467,11 @@ def test_document_route_publishes_notice_then_answer_and_replays_saved_history(
     from services.connectors.telegram.runtime import runtime as runtime_module
     deliver = runtime_module._DurableCommandReplies.deliver
     crashes = {"count": 0}
-    async def interrupted(self, body, *, kind="final"):
+    async def interrupted(self, body, *, kind="final", presentation="plain"):
         if kind == "final" and crashes["count"] == 0:
             crashes["count"] += 1
             raise RuntimeError("simulated interruption after model checkpoint")
-        return await deliver(self, body, kind=kind)
+        return await deliver(self, body, kind=kind, presentation=presentation)
     monkeypatch.setattr(runtime_module._DurableCommandReplies, "deliver", interrupted)
     with pytest.raises(RuntimeError, match="simulated interruption"):
         asyncio.run(runtime(context_id, operation, lease, command=command),

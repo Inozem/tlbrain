@@ -81,6 +81,7 @@ def test_default_app_webhook_dispatch_routes_real_greeting_and_delivers_durable_
     from core.integrations.firestore.outbox import get_outbox_record, task_payload
     from services.connectors.telegram.app.main import create_app
     from services.connectors.telegram.client import TelegramClient
+    from services.connectors.telegram.repository import TelegramRepository
 
     db = firestore_fake.client_class()
     monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
@@ -125,8 +126,9 @@ def test_default_app_webhook_dispatch_routes_real_greeting_and_delivers_durable_
             function_call=types.FunctionCall(name="route_command", args=route),
         )]))],
     ))
+    agent_answer = "* **Root & Co**\n  * **Nested_Folder**\n* **Another**"
     sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
-        candidates=[types.Candidate(content=types.Content(parts=[types.Part(text="Hello there!")]))],
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(text=agent_answer)]))],
     ))
     app = create_app(
         webhook_secret="synthetic-webhook-secret", telegram_enabled=True,
@@ -172,8 +174,18 @@ def test_default_app_webhook_dispatch_routes_real_greeting_and_delivers_durable_
     assert app.state.telegram_queue_worker is not None
     assert len([row for row in sdk_fakes.trace
                 if row["boundary"] == "gemini" and row["operation"] == "generate_content"]) == 2
-    assert [payload["text"] for method, payload in sent if method == "sendMessage"] == ["Hello there!"]
     context_id, operation_id = body["context_id"], body["operation_id"]
+    rich_replies = [payload["rich_message"]["markdown"] for method, payload in sent
+                    if method == "sendRichMessage"]
+    assert rich_replies == [agent_answer]
+    assert len([payload for method, payload in sent if method == "sendRichMessage"]) == 1
+    physical_sends = [(method, payload) for method, payload in sent
+                      if method in {"sendMessage", "sendRichMessage"}]
+    assert len(physical_sends) == 1
+    assert physical_sends[0][0] == "sendRichMessage"
+    assert physical_sends[0][1]["rich_message"]["markdown"] == agent_answer
+    assert all("text" not in payload and "parse_mode" not in payload
+               for method, payload in sent if method == "sendRichMessage")
     operation = (db.collection("telegram_sessions").document(context_id)
                  .collection("operations").document(operation_id).get().to_dict())
     assert operation["state"] == "completed"
@@ -182,6 +194,28 @@ def test_default_app_webhook_dispatch_routes_real_greeting_and_delivers_durable_
         operation["notification_id"]
     ).get().to_dict()
     assert notification["state"] == "delivered"
+    assert notification["body"] == agent_answer
+    assert notification["presentation"] == "rich_markdown"
+    context = db.collection("telegram_sessions").document(context_id).get().to_dict()
+    turns = TelegramRepository(db).list_turns(context_id, context["active_conversation_id"])
+    assert turns[-1]["parts"][0]["text"] == agent_answer
+
+    sends_before_replay = len(sent)
+    model_calls_before_replay = len([
+        row for row in sdk_fakes.trace
+        if row["boundary"] == "gemini" and row["operation"] == "generate_content"
+    ])
+    replay = asyncio.run(dispatch_task(), loop_factory=_selector_loop)
+    assert replay.status_code == 200
+    assert replay.json() in ({"status": "noop"}, {"status": "processed"})
+    assert len(sent) == sends_before_replay
+    assert len([row for row in sdk_fakes.trace
+                if row["boundary"] == "gemini"
+                and row["operation"] == "generate_content"]) == model_calls_before_replay
+    assert len([(method, payload) for method, payload in sent
+                if method in {"sendMessage", "sendRichMessage"}]) == 1
+    assert [payload["rich_message"]["markdown"] for method, payload in sent
+            if method == "sendRichMessage"] == [agent_answer]
 
 
 def test_default_app_forward_question_followup_use_current_draft_full_history(
@@ -307,7 +341,8 @@ def test_default_app_forward_question_followup_use_current_draft_full_history(
         "text": long_question,
     }}), loop_factory=_selector_loop)
 
-    assert [payload["text"] for method, payload in sent if method == "sendMessage"][-3:] == [
+    assert [payload["rich_message"]["markdown"] for method, payload in sent
+            if method == "sendRichMessage"][-3:] == [
         "The kickoff is April 17.", "It is April 17.", "Keep the April 17 kickoff date.",
     ]
     gemini_calls = [event["arguments"] for event in sdk_fakes.trace
@@ -1445,7 +1480,8 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
     )
     assert tool_calls[0][2] is None
     assert tool_calls[0][3] is not None
-    assert [payload["text"] for method, payload in sent if method == "sendMessage"] == [
+    assert [payload["rich_message"]["markdown"] for method, payload in sent
+            if method == "sendRichMessage"] == [
         "The milestone date is June 12.",
     ], sent
     assert operation["route_control"]["target_doc_id"] == "doc-selected"
@@ -1463,8 +1499,8 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
     assert len(wire_requests) == 2
     assert len(tool_calls) == 1
     assert len([payload for method, payload in sent
-                if method == "sendMessage"
-                and payload.get("text") == "The milestone date is June 12."]) == 1
+                if method == "sendRichMessage"
+                and payload.get("rich_message", {}).get("markdown") == "The milestone date is June 12."]) == 1
     gemini_http.close()
 
 
@@ -1925,7 +1961,8 @@ def test_default_asgi_selected_document_routes_query_then_answers_over_real_gemi
     )
     assert tool_calls[0][2] is None
     assert tool_calls[0][3] is not None
-    delivered = [payload["text"] for method, payload in sent if method == "sendMessage"]
+    delivered = [payload["rich_message"]["markdown"] for method, payload in sent
+                 if method == "sendRichMessage"]
     assert len(delivered) == 1
     assert delivered == ["The milestone date is June 12."]
     assert operation["route_control"]["target_doc_id"] == "doc-selected"
@@ -1952,8 +1989,8 @@ def test_default_asgi_selected_document_routes_query_then_answers_over_real_gemi
     assert len(wire_requests) == 4
     assert len(tool_calls) == 1
     assert len([payload for method, payload in sent
-                if method == "sendMessage"
-                and payload.get("text") == delivered[0]]) == 1
+                if method == "sendRichMessage"
+                and payload.get("rich_message", {}).get("markdown") == delivered[0]]) == 1
     gemini_http.close()
 
 
@@ -2202,6 +2239,5 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
                 if event["boundary"] == "qdrant"
                 and event["operation"] == "query_points"]) == retrieval_query_count
     assert len([payload for method, payload in sent
-                if method == "sendMessage"
-                and payload.get("text") == delivered[0]]) == 1
+                if method == "sendMessage" and payload.get("text") == delivered[0]]) == 1
     gemini_http.close()

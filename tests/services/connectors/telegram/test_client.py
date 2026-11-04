@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from services.connectors.telegram.client import TelegramAPIError, TelegramClient
+from services.connectors.telegram.formatting import rich_markdown_safe_chunk_indices
 
 
 pytestmark = pytest.mark.offline
@@ -55,6 +56,84 @@ def test_send_edit_and_get_file_use_fixed_origin_and_single_http_attempts():
     assert all(request.url.scheme == "https" and request.url.host == "api.telegram.org" for request in requests)
     assert all(TOKEN in request.url.path for request in requests)
     assert requests[0].content == b'{"chat_id":10,"text":"hello","message_thread_id":7}'
+
+
+def test_rich_send_and_edit_use_native_payload_without_parse_mode():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 11}})
+
+    async def run():
+        client, http = _client(handler)
+        try:
+            body = "📁 **Root**\n- `file_name` & <value>"
+            await client.send_message(
+                10, body, message_thread_id=7, presentation="rich_markdown",
+            )
+            await client.edit_message_text(
+                10, 11, body, presentation="rich_markdown",
+                reply_markup={"inline_keyboard": []},
+            )
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+    assert [request.url.path.rsplit("/", 1)[-1] for request in requests] == [
+        "sendRichMessage", "editMessageText",
+    ]
+    assert requests[0].content == (
+        '{"chat_id":10,"rich_message":{"markdown":"📁 **Root**\\n- `file_name` & <value>"},'
+        '"message_thread_id":7}'
+    ).encode()
+    assert requests[1].content == (
+        '{"chat_id":10,"message_id":11,"rich_message":{"markdown":"📁 **Root**\\n- `file_name` & <value>"},'
+        '"reply_markup":{"inline_keyboard":[]}}'
+    ).encode()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"parse_mode": "MarkdownV2"}, {"reply_markup": {"inline_keyboard": []}},
+])
+def test_rich_send_rejects_unsupported_options_before_http(kwargs):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 11}})
+
+    async def run():
+        client, http = _client(handler)
+        try:
+            with pytest.raises(ValueError):
+                await client.send_message(10, "**bold**", presentation="rich_markdown", **kwargs)
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+    assert requests == []
+
+
+def test_rich_chunk_safety_keeps_lists_and_falls_back_for_split_constructs():
+    tree = "* **Root & Co**\n  * **Nested_Folder**\n* **Another**"
+    assert rich_markdown_safe_chunk_indices([(0, tree)]) == {0}
+    assert rich_markdown_safe_chunk_indices([(
+        0, "> **Quote**\n1) **Folder**\n- **_unassigned**",
+    )]) == {0}
+    assert rich_markdown_safe_chunk_indices([(0, "Literal <tag> text")]) == set()
+
+    assert rich_markdown_safe_chunk_indices([
+        (0, "**" + "a" * 3998), (1, "b" * 3998 + "**"),
+    ]) == set()
+    assert rich_markdown_safe_chunk_indices([
+        (0, "[label](https://example.test/"), (1, "path)") ,
+    ]) == set()
+    assert rich_markdown_safe_chunk_indices([
+        (0, "```python\n" + "x" * 3989),
+        (1, "y" * 4000),
+        (2, "z" * 3989 + "\n```"),
+    ]) == set()
 
 
 def test_callback_methods_validate_boolean_results_and_markup_is_sent():

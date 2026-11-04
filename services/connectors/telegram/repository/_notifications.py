@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from google.cloud import firestore
 
+from services.connectors.telegram.formatting import delivery_presentation
 from services.connectors.telegram.models import TelegramDraftState
 from services.connectors.telegram.repository._common import (
     NOTIFICATIONS,
@@ -333,11 +334,14 @@ class _TelegramNotificationMixin:
     def revise_notification(
         self, notification_id: str, *, body: str, now: datetime,
         reply_markup: Mapping[str, Any] | None = None,
+        presentation: str | None = None,
     ) -> dict[str, Any]:
         """Persist a new body revision without releasing an active delivery lease."""
         notification_id = _identifier(notification_id, "notification_id")
         if not isinstance(body, str) or not body.strip() or len(body) > 4096:
             raise ValueError("body must be non-empty text of at most 4096 characters")
+        if presentation not in (None, "rich_markdown"):
+            raise ValueError("presentation is invalid")
         now = _aware(now, "now")
         ref = self.client.collection(NOTIFICATIONS).document(notification_id)
 
@@ -365,7 +369,8 @@ class _TelegramNotificationMixin:
                 and isinstance(data.get("retry_not_before"), datetime)
                 else None
             )
-            updates = {"body": body, "revision": new_revision,
+            updates = {"body": body, "presentation": presentation,
+                       "revision": new_revision,
                        "desired_status_revision": new_revision,
                        "state": (data.get("state") if data.get("in_flight_attempt_id")
                                  else "pending"),
@@ -382,6 +387,7 @@ class _TelegramNotificationMixin:
     def create_notification(
         self, notification_id: str, *, context_id: str, kind: str, body: str, now: datetime,
         dialog_number: int | None = None, operation_id: str | None = None,
+        presentation: str | None = None,
     ) -> dict[str, Any]:
         """Create an explicit notification using only the persisted delivery route."""
         notification_id, context_id = _identifier(notification_id, "notification_id"), _identifier(context_id, "context_id")
@@ -408,6 +414,7 @@ class _TelegramNotificationMixin:
                 context_data=context_snap.to_dict() or {}, existing_data=(
                     snap.to_dict() or {} if snap.exists else None
                 ), dialog_number=dialog_number, operation_id=operation_id,
+                presentation=presentation,
             )
             if not snap.exists:
                 transaction.set(notification_ref, row)
@@ -419,6 +426,7 @@ class _TelegramNotificationMixin:
         self, notification_id: str, *, context_id: str, kind: str, body: str, now: datetime,
         context_data: Mapping[str, Any], existing_data: Mapping[str, Any] | None = None,
         dialog_number: int | None = None, operation_id: str | None = None,
+        presentation: str | None = None,
     ) -> dict[str, Any]:
         """Validate/build a notification row after its context and ledger reads."""
         notification_id = _identifier(notification_id, "notification_id")
@@ -431,6 +439,8 @@ class _TelegramNotificationMixin:
             dialog_number = _integer(dialog_number, "dialog_number", minimum=1)
         if operation_id is not None:
             operation_id = _identifier(operation_id, "operation_id")
+        if presentation not in (None, "rich_markdown"):
+            raise ValueError("presentation is invalid")
         now = _aware(now, "now")
         chat_id = context_data.get("chat_id")
         if type(chat_id) is not int:
@@ -449,7 +459,7 @@ class _TelegramNotificationMixin:
             if identity != expected:
                 raise ValueError("notification ID already belongs to a different identity")
             return dict(existing_data)
-        return {
+        row = {
             "notification_id": notification_id, "context_id": context_id, "kind": kind,
             "body": body, "chat_id": chat_id, "thread_id": thread_id, "message_id": None,
             "dialog_number": dialog_number, "operation_id": operation_id,
@@ -460,6 +470,9 @@ class _TelegramNotificationMixin:
             "terminal_failure": None, "last_error": None, "delivered_at": None,
             "failed_at": None, "created_at": now, "updated_at": now,
         }
+        if presentation is not None:
+            row["presentation"] = presentation
+        return row
 
 
     def reserve_notification_attempt(
@@ -496,6 +509,16 @@ class _TelegramNotificationMixin:
                 data["unknown_send_outcome"] = True
                 data["last_outcome"] = "unknown"
             is_send = data.get("message_id") is None
+            original_presentation = data.get("presentation")
+            resolved_presentation = delivery_presentation(
+                original_presentation, is_send=is_send,
+                reply_markup=data.get("reply_markup"),
+            )
+            rich_markup_fallback = resolved_presentation != original_presentation
+            if rich_markup_fallback:
+                # Keep the row's revision metadata aligned with the supported
+                # one-request plain send that must retain this keyboard.
+                data["presentation"] = resolved_presentation
             attempts = _integer(data.get("send_attempts_started", 0), "send_attempts_started")
             if is_send and attempts >= NOTIFICATION_MAX_SENDS:
                 terminal = "delivery_unknown" if data.get("unknown_send_outcome") else "failed"
@@ -509,6 +532,8 @@ class _TelegramNotificationMixin:
             updates = {"state": "sending" if is_send else "editing", "in_flight_attempt_id": attempt_id,
                        "attempt_revision": revision, "attempt_expires_at": now + NOTIFICATION_ATTEMPT_LEASE,
                        "updated_at": now}
+            if rich_markup_fallback:
+                updates["presentation"] = None
             numbered_revision = data.get("receipt_numbered_revision")
             numbered_body = (isinstance(data.get("body"), str)
                              and data["body"].startswith("Dialog #"))

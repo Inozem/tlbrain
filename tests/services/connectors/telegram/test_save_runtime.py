@@ -3130,8 +3130,18 @@ def test_pending_save_survives_more_than_three_canonical_work_slices(
         for message in contents:
             if isinstance(message, dict) and message.get("role") in {"model", "user"}:
                 genai_types.Content.model_validate(message)
-    assert any(method == "sendMessage" and source in payload.get("text", "")
-               for method, payload in runtime.sent)
+    expected_followup = (
+        f"Here is the transcript for Dialog #{draft['dialog_number']}: {source}"
+    )
+    answer_sends = [
+        (method, payload) for method, payload in runtime.sent
+        if (payload.get("text") == expected_followup
+            or payload.get("rich_message", {}).get("markdown") == expected_followup)
+    ]
+    assert len(answer_sends) == 1
+    assert answer_sends[0][0] == "sendRichMessage"
+    assert answer_sends[0][1]["rich_message"]["markdown"] == expected_followup
+    assert "text" not in answer_sends[0][1] and "parse_mode" not in answer_sends[0][1]
 
 
 def test_default_worker_saves_501_unicode_source_rows_over_one_mib(

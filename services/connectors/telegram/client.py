@@ -70,15 +70,27 @@ class TelegramClient:
         message_thread_id: int | None = None,
         parse_mode: str | None = None,
         reply_markup: dict[str, Any] | None = None,
+        presentation: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if presentation not in (None, "rich_markdown"):
+            raise ValueError("presentation is invalid")
+        if presentation == "rich_markdown":
+            if parse_mode is not None or reply_markup is not None:
+                raise ValueError("rich sends do not support parse_mode or reply_markup")
+            payload: dict[str, Any] = {
+                "chat_id": chat_id, "rich_message": {"markdown": text},
+            }
+            method = "sendRichMessage"
+        else:
+            payload = {"chat_id": chat_id, "text": text}
+            method = "sendMessage"
         if message_thread_id is not None:
             payload["message_thread_id"] = message_thread_id
-        if parse_mode is not None:
+        if presentation is None and parse_mode is not None:
             payload["parse_mode"] = parse_mode
-        if reply_markup is not None:
+        if presentation is None and reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        return await self._call("sendMessage", payload)
+        return await self._call(method, payload)
 
     async def answer_callback_query(
         self, callback_query_id: str, *, text: str | None = None, show_alert: bool = False,
@@ -125,9 +137,18 @@ class TelegramClient:
         *,
         parse_mode: str | None = None,
         reply_markup: dict[str, Any] | None = None,
+        presentation: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
-        if parse_mode is not None:
+        if presentation not in (None, "rich_markdown"):
+            raise ValueError("presentation is invalid")
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
+        if presentation == "rich_markdown":
+            if parse_mode is not None:
+                raise ValueError("rich edits do not support parse_mode")
+            payload["rich_message"] = {"markdown": text}
+        else:
+            payload["text"] = text
+        if presentation is None and parse_mode is not None:
             payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup

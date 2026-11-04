@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 import socket
 import threading
@@ -47,7 +48,8 @@ class _Telegram:
         self.sent = []
         self.edited = []
 
-    async def send_message(self, chat_id, text, *, message_thread_id=None, reply_markup=None):
+    async def send_message(self, chat_id, text, *, message_thread_id=None, reply_markup=None,
+                           presentation=None):
         entry = (chat_id, text, message_thread_id)
         self.sent.append(entry if reply_markup is None else (*entry, reply_markup))
         if self.failures:
@@ -57,7 +59,8 @@ class _Telegram:
             raise TimeoutError("synthetic unknown outcome")
         return {"message_id": 901}
 
-    async def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
+    async def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None,
+                                presentation=None):
         entry = (chat_id, message_id, text)
         self.edited.append(entry if reply_markup is None else (*entry, reply_markup))
         return {"message_id": message_id}
@@ -281,6 +284,172 @@ def test_ack_is_immutable_and_progress_send_then_edit_adds_no_conversation_turn(
     ]
     assert telegram.edited == [(-10042, 901, "updated progress")]
     assert len(repo.list_messages(accepted.context_id, accepted.draft_id)) == 1
+
+
+def test_publisher_uses_persisted_presentation_and_keeps_legacy_rows_plain(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    requests = []
+
+    def handler(request):
+        requests.append((request.url.path.rsplit("/", 1)[-1], request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 901}})
+
+    async_http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    telegram = TelegramClient("123456:synthetic-token", http_client=async_http)
+    clock = _Clock()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    tree = "* **Root & Co**\n  * **Nested_Folder**\n* **Another**"
+    repo.create_notification(
+        "rich-answer", context_id=accepted.context_id, kind="final", body=tree,
+        presentation="rich_markdown", now=clock(),
+    )
+    repo.create_notification(
+        "legacy-answer", context_id=accepted.context_id, kind="final", body="* literal *",
+        now=clock(),
+    )
+    repo.create_notification(
+        "rich-keyboard", context_id=accepted.context_id, kind="progress",
+        body="**Ready**", presentation="rich_markdown", now=clock(),
+    )
+    keyboard = {"inline_keyboard": [[{"text": "Save", "callback_data": "save:token"}]]}
+    client.collection("notification_outbox").document("rich-keyboard").update({
+        "reply_markup": keyboard,
+    })
+
+    async def publish_both():
+        try:
+            assert await publisher.publish("rich-answer") == "delivered"
+            assert await publisher.publish("legacy-answer") == "delivered"
+            assert await publisher.publish("rich-keyboard") == "delivered"
+        finally:
+            await async_http.aclose()
+
+    _run(publish_both())
+    assert [method for method, _body in requests] == [
+        "sendRichMessage", "sendMessage", "sendMessage",
+    ]
+    assert json.loads(requests[0][1]) == {
+        "chat_id": -10042, "rich_message": {"markdown": tree}, "message_thread_id": 5,
+    }
+    assert json.loads(requests[1][1]) == {
+        "chat_id": -10042, "text": "* literal *", "message_thread_id": 5,
+    }
+    assert json.loads(requests[2][1]) == {
+        "chat_id": -10042, "text": "**Ready**", "message_thread_id": 5,
+        "reply_markup": keyboard,
+    }
+    assert repo.get_notification("rich-answer")["presentation"] == "rich_markdown"
+    assert "presentation" not in repo.get_notification("legacy-answer")
+    assert repo.get_notification("rich-keyboard")["presentation"] is None
+
+
+def test_plain_rich_plain_revisions_keep_wire_format_and_stale_edit_does_not_clobber(
+    firestore_fake,
+):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    clock = _Clock()
+    requests = []
+    pending_plain_revision = {"done": False}
+    notification_id = "format-revisions"
+    body = "Literal <tag> & _unassigned *status*"
+
+    def handler(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        payload = json.loads(request.content)
+        requests.append((method, payload))
+        if method == "editMessageText" and not pending_plain_revision["done"]:
+            pending_plain_revision["done"] = True
+            repo.revise_notification(notification_id, body=body, now=clock())
+        return httpx.Response(200, json={
+            "ok": True, "result": {"message_id": payload.get("message_id", 944)},
+        })
+
+    repo.create_notification(
+        notification_id, context_id=accepted.context_id, kind="progress",
+        body="Initial plain", now=clock(),
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    publisher = TelegramNotificationPublisher(
+        repo, TelegramClient("123456:synthetic-token", http_client=http), clock=clock,
+    )
+
+    async def exercise():
+        try:
+            assert await publisher.publish(notification_id) == "delivered"
+            repo.revise_notification(
+                notification_id, body="**Formatted answer**", presentation="rich_markdown",
+                now=clock(),
+            )
+            assert await publisher.publish(notification_id) == "pending"
+            row = repo.get_notification(notification_id)
+            assert row["body"] == body and row["presentation"] is None
+            assert row["message_id"] == 944 and row["revision"] == 3
+            assert await publisher.publish(notification_id) == "delivered"
+        finally:
+            await http.aclose()
+
+    _run(exercise())
+    assert [method for method, _payload in requests] == [
+        "sendMessage", "editMessageText", "editMessageText",
+    ]
+    assert requests[0][1]["text"] == "Initial plain"
+    assert requests[1][1]["rich_message"] == {"markdown": "**Formatted answer**"}
+    assert "text" not in requests[1][1] and "parse_mode" not in requests[1][1]
+    assert requests[2][1]["text"] == body
+    assert "rich_message" not in requests[2][1]
+    final = repo.get_notification(notification_id)
+    assert final["body"] == body and final["presentation"] is None
+    assert final["message_id"] == 944
+    assert final["edit_attempts_started"] == 2
+
+
+def test_rich_unknown_send_replays_only_rich_with_bounded_lifetime_budget(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    clock = _Clock()
+    requests = []
+
+    def handler(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        requests.append((method, json.loads(request.content)))
+        raise httpx.ReadTimeout("synthetic accepted Rich send with lost acknowledgement")
+
+    repo.create_notification(
+        "rich-unknown-send", context_id=accepted.context_id, kind="final",
+        body="**Complete rich answer**", presentation="rich_markdown", now=clock(),
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async def exercise():
+        try:
+            for attempt, expected, delay in (
+                (1, "retry", 0), (2, "retry", 1), (3, "delivery_unknown", 2),
+            ):
+                if delay:
+                    clock.advance(delay)
+                restarted_publisher = TelegramNotificationPublisher(
+                    repo, TelegramClient("123456:synthetic-token", http_client=http), clock=clock,
+                )
+                assert await restarted_publisher.publish("rich-unknown-send") == expected
+                assert len(requests) == attempt
+            exhausted_publisher = TelegramNotificationPublisher(
+                repo, TelegramClient("123456:synthetic-token", http_client=http), clock=clock,
+            )
+            assert await exhausted_publisher.publish("rich-unknown-send") == "delivery_unknown"
+        finally:
+            await http.aclose()
+
+    _run(exercise())
+    assert [method for method, _payload in requests] == ["sendRichMessage"] * 3
+    assert all(payload["rich_message"] == {"markdown": "**Complete rich answer**"}
+               and "text" not in payload and "parse_mode" not in payload
+               for _method, payload in requests)
+    row = repo.get_notification("rich-unknown-send")
+    assert row["presentation"] == "rich_markdown"
+    assert row["state"] == "delivery_unknown" and row["message_id"] is None
+    assert row["send_attempts_started"] == 3
 
 
 def test_receipt_notification_closes_quiet_group_and_edits_ready_save_card(firestore_fake):
@@ -666,7 +835,8 @@ def test_unknown_send_followed_by_rate_limits_keeps_delivery_unknown_semantics(f
             super().__init__()
             self.outcomes = ["timeout", "rate_limited", "rate_limited"]
 
-        async def send_message(self, chat_id, text, *, message_thread_id=None, reply_markup=None):
+        async def send_message(self, chat_id, text, *, message_thread_id=None, reply_markup=None,
+                               presentation=None):
             self.sent.append((chat_id, text, message_thread_id, reply_markup))
             category = self.outcomes.pop(0)
             raise TelegramAPIError(category, retry_after=7 if category == "rate_limited" else None)
@@ -697,7 +867,7 @@ def test_stale_edit_rate_limit_waits_and_reuses_the_same_message(firestore_fake)
             self.notification_id = notification_id
             self.once = True
 
-        async def edit_message_text(self, chat_id, message_id, text):
+        async def edit_message_text(self, chat_id, message_id, text, *, presentation=None):
             self.edited.append((chat_id, message_id, text))
             if self.once:
                 self.once = False

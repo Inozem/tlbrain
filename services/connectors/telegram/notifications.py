@@ -12,6 +12,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from services.connectors.telegram.client import TelegramAPIError
+from services.connectors.telegram.formatting import delivery_presentation
 from services.connectors.telegram.repository import TelegramRepository
 
 
@@ -154,10 +155,16 @@ class TelegramNotificationPublisher:
         revision = reservation["attempt_revision"]
         retry_after = None
         try:
+            presentation = delivery_presentation(
+                reservation.get("presentation"), is_send=reservation["is_send"],
+                reply_markup=reservation.get("reply_markup"),
+            )
             if reservation["is_send"]:
                 kwargs = {"message_thread_id": thread_id}
                 if reservation.get("reply_markup") is not None:
                     kwargs["reply_markup"] = reservation["reply_markup"]
+                if presentation == "rich_markdown":
+                    kwargs["presentation"] = "rich_markdown"
                 response = await self.client.send_message(chat_id, body, **kwargs)
                 message_id = response.get("message_id") if isinstance(response, dict) else None
                 if type(message_id) is not int or message_id < 1:
@@ -168,6 +175,8 @@ class TelegramNotificationPublisher:
                 kwargs = {}
                 if reservation.get("reply_markup") is not None:
                     kwargs["reply_markup"] = reservation["reply_markup"]
+                if presentation == "rich_markdown":
+                    kwargs["presentation"] = "rich_markdown"
                 await self.client.edit_message_text(chat_id, reservation["message_id"], body, **kwargs)
                 outcome, message_id = "edited", None
         except TelegramAPIError as exc:
