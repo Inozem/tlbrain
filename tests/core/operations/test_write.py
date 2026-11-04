@@ -44,6 +44,29 @@ def _configure_firestore(monkeypatch, firestore_fake, fake_clock):
     return client
 
 
+def _install_firestore_map_name_boundary(monkeypatch):
+    """Reject Firestore's reserved ``__.*__`` map field names at writes."""
+    from tests.fixtures.firestore_fake import FakeTransaction
+
+    original_set = FakeTransaction.set
+
+    def validate_map(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(key, str) and key.startswith("__") and key.endswith("__"):
+                    raise ValueError("Firestore map field names may not match __.*__")
+                validate_map(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                validate_map(child)
+
+    def strict_set(self, reference, document_data, merge=False):
+        validate_map(document_data)
+        return original_set(self, reference, document_data, merge)
+
+    monkeypatch.setattr(FakeTransaction, "set", strict_set)
+
+
 def test_move_transcript_uses_real_guard_and_replays_without_resolving_path(
     monkeypatch, firestore_fake, fake_clock,
 ):
@@ -348,6 +371,7 @@ def test_move_folder_guards_descendant_documents_and_rejects_changed_membership(
 def test_rename_folder_and_create_folder_use_guarded_drive_and_registry_state(
     monkeypatch, firestore_fake, fake_clock,
 ):
+    _install_firestore_map_name_boundary(monkeypatch)
     client = _configure_firestore(monkeypatch, firestore_fake, fake_clock)
     state = {"drive": {"id": "folder-a", "name": "Old", "parents": ["parent"]},
              "folder": {"name": "Old", "parent_id": "parent"}}
@@ -408,6 +432,10 @@ def test_rename_folder_and_create_folder_use_guarded_drive_and_registry_state(
                         lambda folder_id, name, parent, _db=None: created.update(folder={"name": name, "parent_id": parent}))
     assert write.create_folder("Created", context=context) == "folder-created"
     assert created["folder"] == {"name": "Created", "parent_id": "parent"}
+    monkeypatch.setattr(write.drive_client, "create_folder", lambda *_a, **_k: pytest.fail(
+        "confirmed create_folder replay must not create a second Drive folder"))
+    assert write.create_folder("Created", context=context) == "folder-created"
+    assert created["drive"]["id"] == "folder-created"
 
 
 def test_fresh_rename_folder_to_its_current_name_keeps_legacy_conflict(

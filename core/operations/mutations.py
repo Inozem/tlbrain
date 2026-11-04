@@ -73,12 +73,16 @@ class _SentUnconfirmed(Exception):
     """A sent provider write whose single post-write read-back did not prove it."""
 
 
-_RESULT_MARKER = "__tlbrain_mutation_result_v1__"
+_RESULT_MARKER = "tlbrain_mutation_result_v1"
+_LEGACY_RESULT_MARKER = "__tlbrain_mutation_result_v1__"
 
 
 def _unwrap_result(value: Any) -> Any:
-    if isinstance(value, dict) and set(value) == {_RESULT_MARKER}:
-        return value[_RESULT_MARKER]
+    if isinstance(value, dict):
+        if set(value) == {_RESULT_MARKER}:
+            return value[_RESULT_MARKER]
+        if set(value) == {_LEGACY_RESULT_MARKER}:
+            return value[_LEGACY_RESULT_MARKER]
     return value
 
 

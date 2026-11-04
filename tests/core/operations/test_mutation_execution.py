@@ -56,6 +56,29 @@ def _execute(client, lease, **overrides):
     return execute_mutation(client, **arguments)
 
 
+def _install_firestore_map_name_boundary(monkeypatch):
+    """Reject Firestore's reserved ``__.*__`` map field names at writes."""
+    from tests.fixtures.firestore_fake import FakeTransaction
+
+    original_set = FakeTransaction.set
+
+    def validate_map(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(key, str) and key.startswith("__") and key.endswith("__"):
+                    raise ValueError("Firestore map field names may not match __.*__")
+                validate_map(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                validate_map(child)
+
+    def strict_set(self, reference, document_data, merge=False):
+        validate_map(document_data)
+        return original_set(self, reference, document_data, merge)
+
+    monkeypatch.setattr(FakeTransaction, "set", strict_set)
+
+
 def test_confirmed_replay_reuses_result_including_none_without_provider_calls(firestore_fake):
     client = firestore_fake.client_class()
     lease = _lease(client)
@@ -70,6 +93,64 @@ def test_confirmed_replay_reuses_result_including_none_without_provider_calls(fi
     assert _execute(client, lease, **args) is None
     assert _execute(client, lease, **args) is None
     assert calls == ["read", ("write", None), "read"]
+
+
+def test_successful_result_storage_uses_firestore_legal_map_fields(monkeypatch, firestore_fake):
+    _install_firestore_map_name_boundary(monkeypatch)
+    client = firestore_fake.client_class()
+    lease = _lease(client)
+    calls = []
+    args = {
+        "read_back": lambda: calls.append("read") or MutationSnapshot(
+            "sha256:old" if calls.count("read") == 1 else "sha256:desired"
+        ),
+        "mutation_callback": lambda revision: calls.append(("write", revision)) or "folder-created",
+    }
+
+    assert _execute(client, lease, **args) == "folder-created"
+    from core.integrations.firestore.mutations import get_mutation_result
+    found, stored = get_mutation_result(client, OPERATION_ID, "effect-a")
+    assert found and stored == {"tlbrain_mutation_result_v1": "folder-created"}
+    assert _execute(client, lease, **args) == "folder-created"
+    assert calls == ["read", ("write", None), "read"]
+
+
+def test_successful_none_result_is_durably_confirmed_and_replayed(monkeypatch, firestore_fake):
+    _install_firestore_map_name_boundary(monkeypatch)
+    client = firestore_fake.client_class()
+    lease = _lease(client)
+    calls = []
+    args = {
+        "read_back": lambda: calls.append("read") or MutationSnapshot(
+            "sha256:old" if calls.count("read") == 1 else "sha256:desired"
+        ),
+        "mutation_callback": lambda revision: calls.append(("write", revision)) or None,
+    }
+
+    assert _execute(client, lease, **args) is None
+    from core.integrations.firestore.mutations import get_mutation_result
+    found, stored = get_mutation_result(client, OPERATION_ID, "effect-a")
+    assert found and stored == {"tlbrain_mutation_result_v1": None}
+    assert _execute(client, lease, **args) is None
+    assert calls == ["read", ("write", None), "read"]
+
+
+def test_confirmed_legacy_result_envelope_remains_readable_with_exact_match(firestore_fake):
+    client = firestore_fake.client_class()
+    lease = _lease(client)
+    _execute(client, lease)
+    effect_ref = client.collection("dialog_operations").document(OPERATION_ID).collection(
+        "effects",
+    ).document("effect-a")
+
+    effect_ref.update({"result": {"__tlbrain_mutation_result_v1__": "legacy-result"}})
+    assert _execute(client, lease, mutation_callback=lambda _: pytest.fail("confirmed replay must not write")) == "legacy-result"
+
+    effect_ref.update({"result": {"__tlbrain_mutation_result_v1__": "literal", "extra": True}})
+    assert _execute(client, lease, mutation_callback=lambda _: pytest.fail("confirmed replay must not write")) == {
+        "__tlbrain_mutation_result_v1__": "literal",
+        "extra": True,
+    }
 
 
 def test_immutable_identity_conflict_is_rejected_before_provider_calls(firestore_fake):
@@ -551,6 +632,48 @@ def test_unresolved_effect_blocks_same_resource_after_takeover_but_independent_w
         mutation_callback=lambda _: pytest.fail("must not redispatch"),
         result_from_snapshot=lambda _: "reconciled",
     ) == "reconciled"
+    assert get_resource_guard(client, "document:a").unsettled_effect_ids == ()
+
+
+def test_verified_reconciliation_releases_guard_for_next_conflicting_write(monkeypatch, firestore_fake):
+    _install_firestore_map_name_boundary(monkeypatch)
+    client = firestore_fake.client_class()
+    lease = _lease(client)
+    with pytest.raises(MutationOutcomeUnknown):
+        _execute(
+            client, lease,
+            read_back=lambda: MutationSnapshot("sha256:old"),
+            mutation_callback=lambda _: (_ for _ in ()).throw(TimeoutError("uncertain")),
+        )
+
+    assert _execute(
+        client, lease,
+        read_back=lambda: MutationSnapshot("sha256:desired"),
+        mutation_callback=lambda _: pytest.fail("reconciliation must not redispatch"),
+        result_from_snapshot=lambda _: "verified-result",
+    ) == "verified-result"
+    assert get_resource_guard(client, "document:a").unsettled_effect_ids == ()
+
+    next_operation_id = "next-conflicting-mutation-operation"
+    create_operation(
+        client, operation_id=next_operation_id, origin=OperationOrigin.MCP,
+        caller_binding="synthetic-caller", immutable_input_digest="sha256:next-input",
+        immutable_input_ref="next-input-ref", now=NOW,
+    )
+    next_lease = claim_operation(
+        client, next_operation_id, owner="next-worker", now=NOW, lease_seconds=30,
+    )
+    assert next_lease is not None
+    snapshots = iter((MutationSnapshot("sha256:desired"), MutationSnapshot("sha256:second-desired")))
+    assert execute_mutation(
+        client, operation_id=next_operation_id, effect_id="effect-b", owner="next-worker",
+        fence=next_lease.fence, kind="content_update", resources=("document:a",),
+        payload_digest="sha256:second-payload", desired_state_digest="sha256:second-desired",
+        expected_pre_state="sha256:desired", expected_revision=None,
+        policy=MutationPolicy.DRIVE_METADATA, now=NOW,
+        read_back=lambda: next(snapshots),
+        mutation_callback=lambda _: "second-result",
+    ) == "second-result"
     assert get_resource_guard(client, "document:a").unsettled_effect_ids == ()
 
 
