@@ -84,7 +84,13 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
             return None, "invalid_route"
         tool_choice = {"name": name, "arguments": arguments,
                        "link_requested": link_requested}
-    if kind != "substantive" and tool_choice is not None:
+    if kind == "search":
+        if (not isinstance(text, str) or not text.strip() or tool_choice is None
+                or tool_choice["name"] != "query" or target_ref is not None
+                or target_operation_id is not None or dialog_number is not None
+                or result_refs):
+            return None, "invalid_route"
+    elif kind != "substantive" and tool_choice is not None:
         return None, "invalid_route"
     if target_operation_id is not None and kind not in {"pure_switch", "substantive"}:
         return None, "invalid_route"
@@ -101,7 +107,7 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
         "target_operation_id": target_operation_id,
         "dialog_number": dialog_number,
         "result_refs": list(result_refs),
-        "substantive_text": text if kind == "substantive" else None,
+        "substantive_text": text if kind in {"substantive", "search"} else None,
         "tool_choice": tool_choice,
     }, "ok"
 
@@ -311,16 +317,20 @@ async def _request_route(
 
 
 async def _run_search_route(
-    *, text: str, context: Any, store: Any, search: Any,
+    *, text: str, arguments: Mapping[str, Any], context: Any, store: Any, search: Any,
 ) -> dict[str, Any]:
-    """Search in isolation and record the result session without switching focus."""
+    """Run the validated query arguments and record an isolated result session."""
+    query = arguments.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return {"status": "invalid_route"}
     error = None
     try:
-        refs = list(await search.search(text))
+        refs = list(await search.search(dict(arguments)))
     except Exception:
         refs, error = [], "search unavailable"
     session_id = store.create_search_session(
-        context_id=context.context_id, query=text, result_refs=refs, error=error,
+        context_id=context.context_id, query=query, result_refs=refs, error=error,
+        search_filters=dict(arguments),
     )
     return {
         "status": "ok", "kind": "search", "result_refs": refs,
@@ -500,7 +510,8 @@ async def route_message(
     kind = decision["kind"]
     if kind == "search":
         return await _run_search_route(
-            text=text, context=context, store=store, search=search,
+            text=text, arguments=decision["tool_choice"]["arguments"],
+            context=context, store=store, search=search,
         )
 
     if kind == "save":
@@ -550,7 +561,8 @@ def _control_route_record(route: Any) -> dict[str, Any]:
     number = route.get("dialog_number")
     if type(number) is int and number > 0:
         safe["dialog_number"] = number
-    if route.get("kind") == "substantive":
+    route_kind = route.get("kind")
+    if isinstance(route_kind, str) and route_kind in {"substantive", "search"}:
         choice = route.get("tool_choice")
         if choice is not None:
             if not isinstance(choice, Mapping) or set(choice) - {
@@ -568,6 +580,8 @@ def _control_route_record(route: Any) -> dict[str, Any]:
             if (not isinstance(name, str) or name not in OPERATIONS
                     or not isinstance(link_requested, bool)
                     or (link_requested and name != "get_transcript")
+                    or (route_kind == "search"
+                        and (name != "query" or link_requested))
                     or (arguments.get("doc_id") is not None
                         and arguments["doc_id"] != safe.get("target_doc_id"))):
                 safe["status"] = "invalid_route"
@@ -576,7 +590,12 @@ def _control_route_record(route: Any) -> dict[str, Any]:
                 "name": name, "arguments": arguments,
                 "link_requested": link_requested,
             }
-    if route.get("kind") == "search":
+    if route_kind == "search":
+        if route.get("search_protocol") == "agent-v1" and "tool_choice" not in safe:
+            safe["status"] = "invalid_route"
+            return safe
+        if route.get("search_protocol") == "agent-v1":
+            safe["search_protocol"] = "agent-v1"
         refs = route.get("result_refs")
         session_id = route.get("search_session_id")
         if (not isinstance(refs, list)

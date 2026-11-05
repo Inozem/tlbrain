@@ -402,8 +402,9 @@ class _TelegramCommandMixin:
         if retry_request_operation_id is not None and number is None:
             raise ValueError("retry work routes require a dialog_number")
         choice = route.get("tool_choice")
+        search_mode = route.get("search_protocol") == "agent-v1"
         if choice is not None:
-            if kind != "substantive" or not isinstance(choice, Mapping) or set(choice) - {
+            if kind not in {"substantive", "search"} or not isinstance(choice, Mapping) or set(choice) - {
                 "name", "arguments", "link_requested",
             }:
                 raise ValueError("tool_choice is invalid")
@@ -416,13 +417,18 @@ class _TelegramCommandMixin:
             if (not isinstance(name, str) or name not in OPERATIONS
                     or not isinstance(link_requested, bool)
                     or (link_requested and name != "get_transcript")
-                    or (arguments.get("doc_id") is not None
+                    or (kind == "search" and (name != "query" or link_requested))
+                    or (not search_mode and arguments.get("doc_id") is not None
                         and arguments["doc_id"] != safe.get("target_doc_id"))):
                 raise ValueError("tool_choice is invalid")
             safe["tool_choice"] = {
                 "name": name, "arguments": arguments,
                 "link_requested": link_requested,
             }
+        if kind == "search":
+            if route.get("search_protocol") != "agent-v1" or choice is None:
+                raise ValueError("search route protocol is invalid")
+            safe["search_protocol"] = "agent-v1"
         refs = route.get("result_refs")
         if refs is not None:
             if (kind != "search" or not isinstance(refs, list)
@@ -434,6 +440,11 @@ class _TelegramCommandMixin:
             if kind != "search" or not isinstance(session_id, str) or not session_id:
                 raise ValueError("search_session_id is invalid")
             safe["search_session_id"] = session_id
+        if route.get("search_protocol") == "agent-v1" and kind != "search":
+            if (kind != "substantive" or not isinstance(safe.get("conversation_id"), str)
+                    or not safe.get("conversation_id")):
+                raise ValueError("search continuation binding is invalid")
+            safe["search_protocol"] = "agent-v1"
         return safe
 
     def _command_for_operation(

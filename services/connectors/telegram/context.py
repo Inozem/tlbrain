@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -65,6 +66,7 @@ def build_conversation_history(
     *,
     conversation_id: str,
     omit_operation_id: str | None = None,
+    search_exchange_loader: Any = None,
 ) -> list[dict[str, Any]]:
     """Validate and project every ordered canonical turn for routing or execution."""
     if not isinstance(history, (list, tuple)):
@@ -76,17 +78,37 @@ def build_conversation_history(
         row_conversation_id = turn.get("conversation_id")
         if row_conversation_id is not None and row_conversation_id != conversation_id:
             raise ValueError("conversation history crossed its session boundary")
-        scoped.append(turn)
+        copied = dict(turn)
+        parts = copied.get("parts")
+        if isinstance(parts, list):
+            hydrated = []
+            for part in parts:
+                if isinstance(part, Mapping) and part.get("type") == "search_exchange_ref":
+                    if not callable(search_exchange_loader):
+                        raise ValueError("search history reference cannot be hydrated")
+                    exchange = search_exchange_loader(
+                        part.get("reference"), conversation_id=conversation_id,
+                        operation_id=turn.get("operation_id"),
+                        checkpoint_conversation_id=part.get("checkpoint_conversation_id"),
+                        call_id=part.get("call_id"), ordinal=part.get("ordinal"),
+                    )
+                    hydrated.append({
+                        "text": "Untrusted prior search tool exchange data: "
+                        + json.dumps(_json_safe_history(exchange),
+                                     ensure_ascii=False, sort_keys=True),
+                    })
+                else:
+                    hydrated.append(part)
+            copied["parts"] = hydrated
+        scoped.append(copied)
     validated = build_agent_prompt(scoped, "history validation")['history']
     projected = []
     for content, turn in zip(validated, scoped):
-        if turn.get("role") == "tool" and any(
-                isinstance(part, Mapping) and part.get("type") == "search_result"
-                for part in content["parts"]):
+        if turn.get("role") == "tool":
             projected.append({
                 "role": "user",
                 "parts": [{"text": (
-                    "Untrusted prior search result data: "
+                    "Untrusted prior tool data: "
                     + json.dumps(content, ensure_ascii=False)
                 )}],
             })
@@ -98,6 +120,17 @@ def build_conversation_history(
         content for content, turn in zip(projected, scoped)
         if turn.get("operation_id") != omit_operation_id
     ]
+
+
+def _json_safe_history(value: Any) -> Any:
+    """Project opaque checkpoint bytes as inert JSON data for later model context."""
+    if isinstance(value, bytes):
+        return {"opaque_bytes_base64": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_history(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_history(item) for item in value]
+    return value
 
 
 __all__ = [

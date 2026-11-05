@@ -553,17 +553,27 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
             "kind", "target_ref", "target_operation_id", "dialog_number",
             "result_refs", "substantive_text", "tool_choice", "certainty",
         }
-        for kind in ("pure_switch", "search", "save", "retry"):
+        for kind in ("pure_switch", "save", "retry"):
             assert variants[kind]["properties"]["tool_choice"] == {"type": "null"}
+        search_choice = variants["search"]["properties"]["tool_choice"]
+        assert search_choice["properties"]["name"]["enum"] == ["query"]
+        assert search_choice["properties"]["arguments"] == catalog["query"]
+        assert "substantive_text" in variants["search"]["required"]
+        assert "tool_choice" in variants["search"]["required"]
         for kind in ("search", "save", "retry"):
             assert variants[kind]["properties"]["target_operation_id"] == {"type": "null"}
         assert variants["retry"]["properties"]["dialog_number"] == {
             "type": "integer", "minimum": 1,
         }
-        for kind in ("pure_switch", "search", "substantive", "save"):
+        for kind in ("pure_switch", "substantive", "save"):
             assert variants[kind]["properties"]["dialog_number"] == {
                 "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
             }
+        assert variants["search"]["properties"]["target_ref"] == {"type": "null"}
+        assert variants["search"]["properties"]["result_refs"] == {
+            "type": "array", "maxItems": 0, "items": {"type": "string"},
+        }
+        assert variants["search"]["properties"]["dialog_number"] == {"type": "null"}
         assert variants["substantive"]["properties"]["substantive_text"] == {
             "type": "string", "minLength": 1, "pattern": r".*\S.*",
         }
@@ -1064,6 +1074,7 @@ def test_structured_route_choice_uses_validated_allowlisted_tool_and_pinned_targ
     assert persisted.application_route == {
         "name": "get_transcript", "arguments": {"doc_id": "doc-pinned"},
         "ordinal": 0, "target_doc_id": "doc-pinned",
+        "call_id": "application-operation-pinned-0",
     }
     assert persisted.model_round_count == 1
 
@@ -1103,6 +1114,28 @@ def test_structured_route_choice_uses_validated_allowlisted_tool_and_pinned_targ
             executor_factory=bind,
         )
     assert len(executor.calls) == 1
+
+
+def test_selected_search_can_dispatch_confirmed_transcript_without_document_pin():
+    executor = FakeExecutor()
+    agent = _agent(model=SequenceModel([{"text": "done", "parts": [{"text": "done"}]}]),
+                   executor=executor)
+    result = agent.dispatch_tool_choice(
+        name="get_transcript", arguments={"doc_id": "confirmed-doc"},
+        target_doc_id=None, conversation_id="private-search-op",
+        delivery_id="search-op", executor_factory=lambda *_args: executor,
+        allowed_tools={"get_transcript"},
+    )
+    assert result["operation"] == "get_transcript"
+    assert executor.calls == [("get_transcript", {"doc_id": "confirmed-doc"}, 0)]
+
+    with pytest.raises(ValueError, match="target does not match"):
+        agent.dispatch_tool_choice(
+            name="get_transcript", arguments={"doc_id": "other-doc"},
+            target_doc_id=None, conversation_id="private-global-op",
+            delivery_id="global-op", executor_factory=lambda *_args: executor,
+        )
+    assert executor.calls == [("get_transcript", {"doc_id": "confirmed-doc"}, 0)]
 
 
 def test_signed_legacy_part_with_route_like_id_remains_a_native_vendor_call():

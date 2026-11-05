@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import socket
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -1029,7 +1030,7 @@ def test_no_document_list_folders_uses_validated_registry_executor(firestore_fak
                          loop_factory=_selector_loop)
 
     assert result.value == "completed"
-    assert [row[0] for row in model.calls] == ["routing"]
+    assert [row[0] for row in model.calls] == ["routing", "tool_loop"]
     assert len(bot.sent) == 1
     assert repository.get_conversation(context_id, "search-existing").kind.value == "search"
     route_prompt = json.loads(model.calls[0][1][0]["parts"][0]["text"])
@@ -1692,8 +1693,17 @@ def test_pinned_route_failure_replay_does_not_call_model_or_save(
 def _search_route():
     return {"kind": "search", "target_ref": None,
             "target_operation_id": None, "dialog_number": None,
-            "result_refs": [], "substantive_text": None,
-            "tool_choice": None, "certainty": "certain"}
+            "result_refs": [], "substantive_text": "find planning notes",
+            "tool_choice": {"name": "query", "arguments": {"query": "find planning notes"}},
+            "certainty": "certain"}
+
+
+def _patch_registry_query(monkeypatch, function):
+    from dataclasses import replace
+    from core.operations import registry
+    operations = dict(registry.OPERATIONS)
+    operations["query"] = replace(operations["query"], function=function)
+    monkeypatch.setattr(registry, "OPERATIONS", operations)
 
 
 def test_search_route_is_governed_replayable_and_isolated(monkeypatch, firestore_fake):
@@ -1704,10 +1714,17 @@ def test_search_route_is_governed_replayable_and_isolated(monkeypatch, firestore
     monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
                         _polling_offload)
     calls = []
-    monkeypatch.setattr("core.operations.read.query",
+    long_source = "Павел обсудил план 🌿 " * 3000
+    _patch_registry_query(monkeypatch,
                         lambda **kwargs: calls.append(kwargs) or (
-                            [{"doc_id": "doc-search", "title": "Planning"}],
-                            {"total": 1, "query": kwargs["query"]},
+                            [{"doc_id": "doc-search", "title": "Planning",
+                              "dialog_date": "2026-10-01", "folder_path": ["Research"],
+                              "segments": [{"range": [4, 4], "dialog": [{
+                                  "speaker": "Pavel", "text": long_source,
+                                  "order_index": 4,
+                              }]}]}],
+                            {"total_matches": 1, "returned_segments": 1,
+                             "truncated": False, "query": kwargs["query"]},
                         ))
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
@@ -1730,8 +1747,27 @@ def test_search_route_is_governed_replayable_and_isolated(monkeypatch, firestore
 
     assert first.value == replay.value == "completed"
     assert len(calls) == 1
+    model_contents = next(contents for mode, contents, _tools in model.calls
+                          if mode == "tool_loop")
+    application_data = next(part["text"] for turn in model_contents
+                            if turn.get("role") == "user"
+                            for part in turn.get("parts", [])
+                            if isinstance(part, Mapping)
+                            and "Untrusted application tool result data follows" in part.get("text", ""))
+    assert '"query":"find planning notes"' in application_data
+    assert long_source in application_data
+    turns = repository.list_turns(
+        context_id, repository.get_context(context_id)["active_conversation_id"],
+    )
+    tool_turn = next(turn for turn in turns if turn.get("role") == "tool"
+                     and isinstance(turn.get("tool_correlation"), Mapping)
+                     and turn["tool_correlation"].get("name") == "query")
+    reference = tool_turn["parts"][0]["reference"]
+    assert reference["payload"].get("_input_ref")
+    assert tool_turn["tool_correlation"]["arguments"] == {"query": "find planning notes"}
     assert len(bot.sent) == sent
-    assert bot.sent[0][1] == "Search results: Planning"
+    assert bot.sent[0][1] == "A safe answer."
+    assert calls[0]["query"] == "find planning notes"
     assert not any(value.get("kind") == "document"
                    for path, value in firestore_fake.documents.items()
                    if path.startswith(f"telegram_sessions/{context_id}/conversations/"))
@@ -1749,7 +1785,7 @@ def test_search_provider_failures_use_three_stage_budget_and_safe_error(monkeypa
     def fail_query(**kwargs):
         calls.append(kwargs)
         raise RuntimeError("private search provider details")
-    monkeypatch.setattr("core.operations.read.query", fail_query)
+    _patch_registry_query(monkeypatch, fail_query)
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
     context_id, operation, lease, command = _runtime_queue_item(client)
@@ -1825,7 +1861,7 @@ def test_search_route_uses_one_real_embedding_attempt_per_durable_retry(
         path.rsplit("/", 1)[-1] for path in firestore_fake.documents
         if path.startswith(
             f"telegram_sessions/{context_id}/operations/{operation['operation_id']}/stages/"
-        ) and "telegram-search-" in path
+        ) and "telegram-tool-00" in path
     )
     assert governor.get_stage(
         operation["operation_id"], search_stage_key,
@@ -1882,7 +1918,7 @@ def test_search_route_governs_qdrant_failures_from_both_parallel_branches(
         path.rsplit("/", 1)[-1] for path in firestore_fake.documents
         if path.startswith(
             f"telegram_sessions/{context_id}/operations/{operation['operation_id']}/stages/"
-        ) and "telegram-search-" in path
+        ) and "telegram-tool-00" in path
     )
     stage = governor.get_stage(operation["operation_id"], search_stage_key)
     assert stage.failures == 3
@@ -2374,6 +2410,9 @@ def test_search_selection_guard_retries_stale_lease_but_settles_binding_error(bi
     execution.fence = 1
     execution.command = SimpleNamespace(text="synthetic search")
     execution.replay_request = None
+    execution.pinned = {"status": "ok", "kind": "search",
+                        "search_session_id": "search-current", "result_refs": []}
+    execution.search_session_id = "search-current"
     execution.search_refs = []
     execution.store = Store()
     execution.search = SimpleNamespace(failure=None)
@@ -2782,3 +2821,223 @@ def test_unknown_explicit_document_tool_target_fails_closed(firestore_fake, monk
     assert not any(row[1] == "Starting to process dialog #1." for row in bot.sent)
     context = repository.get_context(context_id)
     assert context["last_doc_id"] is None and context["active_conversation_id"] is None
+
+
+def test_search_executor_rejects_filter_widening_before_provider_io():
+    from services.connectors.telegram.runtime.runtime import _SearchOnlyExecutor
+
+    class Executor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, **kwargs):
+            self.calls.append(kwargs)
+            return ([], {"total_matches": 0})
+
+    executor = Executor()
+    guarded = _SearchOnlyExecutor(
+        executor,
+        initial_filters={"query": "launch", "folder_path": ["Client"],
+                         "date_from": "2026-01-01", "date_to": "2026-12-31"},
+    )
+    with pytest.raises(ValueError, match="removed a selected filter"):
+        guarded.execute(
+            name="query", arguments={"query": "launch", "folder_path": ["Client"],
+                                      "date_to": "2026-12-31"},
+            call_ordinal=1,
+        )
+    assert executor.calls == []
+    result = guarded.execute(
+        name="query", arguments={"query": "refined launch", "keywords": "new terms",
+                                  "folder_path": ["Client", "Research"],
+                                  "date_from": "2026-02-01", "date_to": "2026-11-30"},
+        call_ordinal=2,
+    )
+    assert result["segments"] == []
+    assert executor.calls == [{
+        "name": "query", "arguments": {
+            "query": "refined launch", "keywords": "new terms",
+            "folder_path": ["Client", "Research"],
+            "date_from": "2026-02-01", "date_to": "2026-11-30",
+        }, "call_ordinal": 2,
+    }]
+
+
+def test_search_executor_transcript_read_uses_confirmed_doc_without_query_filters():
+    from services.connectors.telegram.runtime.runtime import _SearchOnlyExecutor
+
+    class Executor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, **kwargs):
+            self.calls.append(kwargs)
+            return ([], {"truncated": False})
+
+    executor = Executor()
+    guarded = _SearchOnlyExecutor(
+        executor, allowed_doc_ids=lambda: {"known-doc"},
+        initial_filters={"query": "Pavel", "keywords": "speakers",
+                         "folder_path": ["Client"], "date_from": "2026-01-01"},
+    )
+    assert guarded.execute(
+        name="get_transcript", arguments={"doc_id": "known-doc"}, call_ordinal=1,
+    )["segments"] == []
+    assert executor.calls[0]["name"] == "get_transcript"
+    with pytest.raises(PermissionError, match="read-only"):
+        guarded.execute(name="create_folder", arguments={"name": "Forbidden"}, call_ordinal=2)
+    assert len(executor.calls) == 1
+
+
+def test_search_query_stage_keeps_provider_billing_error_nonretryable(firestore_fake):
+    from google.genai.errors import ClientError
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryBudgetExceeded, RetryGovernor
+    from core.utils.retry import ProviderBoundaryError
+    from services.connectors.telegram.runtime.runtime import (
+        _GovernedExecutor, _SearchOnlyExecutor,
+    )
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    error = ProviderBoundaryError("gemini", ClientError(402, {"error": {
+        "code": 402, "status": "RESOURCE_EXHAUSTED",
+    }}))
+
+    class Executor:
+        calls = 0
+
+        def execute(self, **_kwargs):
+            self.calls += 1
+            raise error
+
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(
+            client, client.collection("telegram_sessions").document(context_id)),
+        error_classifier=telegram_error_classifier,
+    )
+    inner = Executor()
+    guarded = _SearchOnlyExecutor(_GovernedExecutor(
+        inner, governor, operation["operation_id"], lease,
+        lambda: now, lambda: True,
+    ))
+    with pytest.raises(ProviderBoundaryError):
+        guarded.execute(name="query", arguments={"query": "synthetic query"}, call_ordinal=0)
+    stage = governor.get_stage(operation["operation_id"], "telegram-tool-00")
+    assert stage.failures == 1
+    assert stage.last_error.retryable is False
+    with pytest.raises(RetryBudgetExceeded):
+        guarded.execute(name="query", arguments={"query": "synthetic query"}, call_ordinal=0)
+    assert inner.calls == 1
+
+
+def test_search_exchange_payload_is_bounded_verified_and_fenced(firestore_fake):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    client = firestore_fake.client_class()
+    _repository = TelegramRepository(client=client)
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    now = datetime.now(timezone.utc)
+    ledger = FirestoreAgentLedger(
+        client, context_id=context_id, operation_id=operation["operation_id"],
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    source = "speaker :: synthetic Unicode evidence 🌿 " * 25000
+    call = {"id": "call-1", "name": "query", "arguments": {"query": "synthetic"},
+            "ordinal": 0, "round": -1, "thought_signature": b"opaque-signature"}
+    reference = ledger.save_search_exchange(
+        "search-session", checkpoint_conversation_id="private-checkpoint",
+        call=call, canonical_call_id="call-1",
+        result={"segments": [{"text": source}], "metadata": {"truncated": False}},
+    )
+    exchange = ledger.load_search_exchange(
+        reference, conversation_id="search-session", operation_id=operation["operation_id"],
+        checkpoint_conversation_id="private-checkpoint", call_id="call-1", ordinal=0,
+    )
+    assert exchange["call"]["thought_signature"] == b"opaque-signature"
+    assert exchange["result"]["segments"][0]["text"] == source
+    assert all(len(json.dumps(row, ensure_ascii=False, default=str).encode("utf-8"))
+               < 1024 * 1024 for row in firestore_fake.documents.values())
+
+    with pytest.raises(ValueError, match="binding"):
+        ledger.load_search_exchange(
+            {**reference, "call_id": "tampered"}, conversation_id="search-session",
+            operation_id=operation["operation_id"],
+            checkpoint_conversation_id="private-checkpoint", call_id="call-1", ordinal=0,
+        )
+    other_context = FirestoreAgentLedger(
+        client, context_id="other-context", operation_id=operation["operation_id"],
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    with pytest.raises(ValueError, match="binding"):
+        other_context.load_search_exchange(
+            reference, conversation_id="search-session", operation_id=operation["operation_id"],
+            checkpoint_conversation_id="private-checkpoint", call_id="call-1", ordinal=0,
+        )
+    with pytest.raises(ValueError, match="binding"):
+        ledger.load_search_exchange(
+            None, conversation_id="search-session", operation_id=operation["operation_id"],
+            checkpoint_conversation_id="private-checkpoint", call_id="call-1", ordinal=0,
+        )
+
+    client.collection("telegram_sessions").document(context_id).update({"fence": 2})
+    with pytest.raises(PermissionError, match="stale"):
+        ledger.save_search_exchange(
+            "search-session", checkpoint_conversation_id="private-checkpoint",
+            call={**call, "ordinal": 1}, canonical_call_id="call-2",
+            result={"segments": [{"text": source}]},
+        )
+
+
+@pytest.mark.parametrize("command_present", [True, False])
+def test_trusted_legacy_search_pin_replays_canonical_cards_without_model(
+    firestore_fake, command_present,
+):
+    import hashlib
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    session_id = "search-" + hashlib.sha256(
+        f"{context_id}\0{operation['operation_id']}".encode("utf-8")
+    ).hexdigest()
+    now = datetime.now(timezone.utc)
+    repository.ensure_conversation(
+        context_id, session_id, kind="search",
+        search_filters={"query": command.text, "keywords": None,
+                        "folder_path": None, "date_from": None, "date_to": None}, now=now,
+    )
+    repository.append_turn(
+        context_id, session_id, turn_id="legacy-search-card",
+        operation_id=operation["operation_id"], role="tool",
+        parts=[{"type": "search_result", "status": "ok",
+                "results": [{"doc_id": "doc-one", "title": "Known result"}],
+                "metadata": {"truncated": False}, "error": None}], now=now,
+    )
+    client.collection("telegram_sessions").document(context_id).collection(
+        "operations").document(operation["operation_id"]).update({
+            "route_control": {"status": "ok", "kind": "search",
+                              "result_refs": ["doc-one"],
+                              "search_session_id": session_id},
+        })
+    model, bot = _RuntimeModel(_route()), _Bot()
+    runtime = TelegramCommandRuntime(
+        repository=repository, save_handler=object(), client=bot,
+        model=model, clock=lambda: now,
+    )
+
+    state = asyncio.run(
+        runtime(context_id, operation, lease,
+                command=command if command_present else None),
+        loop_factory=_selector_loop,
+    )
+
+    assert state.value == "completed"
+    assert model.calls == []
+    assert bot.sent and "Known result" in bot.sent[0][1]

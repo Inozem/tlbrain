@@ -82,20 +82,27 @@ def _cards(
 
 def _stored_outcome(repository: Any, context_id: str, conversation_id: str) -> dict[str, Any] | None:
     turns = repository.list_turns(context_id, conversation_id)
+    results: list[Any] = []
+    metadata = None
+    status = None
+    error = None
     for turn in turns:
         if turn.get("role") != "tool" or not isinstance(turn.get("parts"), list):
             continue
         for part in turn["parts"]:
             if isinstance(part, Mapping) and part.get("type") == "search_result":
-                return {
-                    "status": part.get("status"),
-                    "kind": "search",
-                    "conversation_id": conversation_id,
-                    "results": part.get("results", []),
-                    "metadata": part.get("metadata"),
-                    "error": part.get("error"),
-                }
-    return None
+                rows = part.get("results", [])
+                if isinstance(rows, list):
+                    results.extend(rows)
+                metadata = part.get("metadata", metadata)
+                status = part.get("status", status)
+                error = part.get("error", error)
+    if status is None:
+        return None
+    return {
+        "status": status, "kind": "search", "conversation_id": conversation_id,
+        "results": results, "metadata": metadata, "error": error,
+    }
 
 
 def _prepare_search_session(

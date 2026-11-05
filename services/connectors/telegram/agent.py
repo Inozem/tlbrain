@@ -170,6 +170,7 @@ class TelegramAgent:
         target_doc_id: str | None = None,
         executor_factory: Callable[[str, str, Any], Any] | None = None,
         execution_context: Any = None,
+        allowed_tools: set[str] | frozenset[str] | None = None,
     ) -> dict[str, Any]:
         """Run one operation with an optional per-invocation pinned executor."""
         if target_doc_id is not None and (not isinstance(target_doc_id, str) or not target_doc_id):
@@ -179,7 +180,7 @@ class TelegramAgent:
         try:
             executor = (
                 executor_factory(target_doc_id, delivery_id, execution_context)
-                if target_doc_id is not None and executor_factory is not None
+                if executor_factory is not None
                 else self.tool_executor
             )
         except Exception:
@@ -197,7 +198,7 @@ class TelegramAgent:
             self._append_application_context(contents, state.application_route, application_result)
         replay_failure = self._replay_saved_rounds(
             contents, state, conversation_id=conversation_id, delivery_id=delivery_id,
-            executor=executor, target_doc_id=target_doc_id,
+            executor=executor, target_doc_id=target_doc_id, allowed_tools=allowed_tools,
         )
         if replay_failure:
             return replay_failure
@@ -207,7 +208,7 @@ class TelegramAgent:
         while state.model_round_count < self.max_rounds:
             result = self._run_model_round(
                 contents, state, conversation_id=conversation_id, delivery_id=delivery_id,
-                executor=executor, target_doc_id=target_doc_id,
+                executor=executor, target_doc_id=target_doc_id, allowed_tools=allowed_tools,
             )
             if result is not None:
                 return result
@@ -217,18 +218,23 @@ class TelegramAgent:
         )
 
     def dispatch_tool_choice(
-        self, *, name: str, arguments: Any, target_doc_id: str,
+        self, *, name: str, arguments: Any, target_doc_id: str | None,
         conversation_id: str, delivery_id: str,
         executor_factory: Callable[[str, str, Any], Any],
         execution_context: Any = None,
         link_requested: bool = False,
+        allowed_tools: set[str] | frozenset[str] | None = None,
     ) -> Any:
         """Dispatch one structured route choice through the common operation schema."""
         validated = registry.validate_arguments(name, arguments)
-        if not isinstance(target_doc_id, str) or not target_doc_id:
+        if target_doc_id is not None and (not isinstance(target_doc_id, str) or not target_doc_id):
             raise ValueError("operation target is invalid")
+        if allowed_tools is not None and name not in allowed_tools:
+            raise ValueError("tool is not allowed in this operation")
         argument_doc_id = validated.get("doc_id")
-        if argument_doc_id is not None and argument_doc_id != target_doc_id:
+        if (argument_doc_id is not None and argument_doc_id != target_doc_id
+                and not (target_doc_id is None and allowed_tools is not None
+                         and name == "get_transcript")):
             raise ValueError("operation target does not match the routed target")
         if not isinstance(link_requested, bool) or (link_requested and name != "get_transcript"):
             raise ValueError("requested link is invalid")
@@ -261,10 +267,11 @@ class TelegramAgent:
             if state.rounds or state.calls:
                 raise ValueError("persisted tool choice does not match the routed operation")
             ordinal = 0
-            call = {"id": None, "name": name, "arguments": validated,
+            call = {"id": f"application-{delivery_id}-0", "name": name, "arguments": validated,
                     "ordinal": ordinal, "round": -1}
             route = {"name": name, "arguments": validated, "ordinal": ordinal,
-                     "target_doc_id": target_doc_id}
+                     "target_doc_id": target_doc_id,
+                     "call_id": f"application-{delivery_id}-0"}
             state.application_route = route
             state.calls.append(call)
             self.ledger.save_application_route(
@@ -310,6 +317,7 @@ class TelegramAgent:
         self, contents: list[Any], state: _ToolLoopState, *,
         conversation_id: str, delivery_id: str, executor: Any,
         target_doc_id: str | None,
+        allowed_tools: set[str] | frozenset[str] | None = None,
     ) -> dict[str, Any] | None:
         for round_index, saved_round in enumerate(state.rounds):
             if round_index == state.application_route_round:
@@ -320,6 +328,9 @@ class TelegramAgent:
             round_calls = state.calls[call_start:call_start + call_count]
             if not round_calls and _calls_from(response):
                 return self._failure("The persisted tool request is incomplete.", state.usage)
+            if allowed_tools is not None and any(
+                    call.get("name") not in allowed_tools for call in round_calls):
+                return self._failure("The persisted tool request is not allowed.", state.usage)
 
             self._append_model_response(contents, response)
             failure = self._run_calls(
@@ -349,12 +360,17 @@ class TelegramAgent:
         self, contents: list[Any], state: _ToolLoopState, *,
         conversation_id: str, delivery_id: str, executor: Any,
         target_doc_id: str | None,
+        allowed_tools: set[str] | frozenset[str] | None = None,
     ) -> dict[str, Any] | None:
+        catalog = get_tool_catalog()["tools"]
+        if allowed_tools is not None:
+            catalog = [tool for tool in catalog if tool["name"] in allowed_tools]
         response = self.model.generate(
-            contents=contents, mode="tool_loop", tools=get_tool_catalog()["tools"],
+            contents=contents, mode="tool_loop", tools=catalog,
         )
         try:
-            calls = self._validate_calls(response, state, target_doc_id=target_doc_id)
+            calls = self._validate_calls(response, state, target_doc_id=target_doc_id,
+                                         allowed_tools=allowed_tools)
         except (ValueError, TypeError):
             self._persist_model_round(response, [], state, conversation_id, delivery_id)
             return self._failure("The requested tool operation was invalid.", state.usage)
@@ -377,11 +393,14 @@ class TelegramAgent:
     @staticmethod
     def _validate_calls(
         response: Any, state: _ToolLoopState, *, target_doc_id: str | None = None,
+        allowed_tools: set[str] | frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
         next_ordinal = max((int(call["ordinal"]) for call in state.calls), default=-1) + 1
         round_index = state.model_round_count
         validated = []
         for index, call in enumerate(_calls_from(response)):
+            if allowed_tools is not None and call["name"] not in allowed_tools:
+                raise ValueError("tool is not allowed in this operation")
             arguments = registry.validate_arguments(call["name"], call["arguments"])
             if (target_doc_id is not None and "doc_id" in arguments
                     and arguments["doc_id"] != target_doc_id):

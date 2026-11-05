@@ -170,6 +170,83 @@ class FirestoreAgentLedger:
             return self._json_value(payload)
         return dict(stored)
 
+    def save_search_exchange(
+        self, conversation_id: str, *, checkpoint_conversation_id: str,
+        call: Mapping[str, Any], canonical_call_id: str, result: Any,
+    ) -> dict[str, Any]:
+        """Store one complete search tool exchange with immutable call binding."""
+        ordinal = call.get("ordinal")
+        if type(ordinal) is not int or ordinal < 0:
+            raise ValueError("search call ordinal is invalid")
+        call_id = canonical_call_id
+        name = call.get("name")
+        arguments = call.get("arguments")
+        if (not isinstance(call_id, str) or not call_id
+                or not isinstance(name, str) or not isinstance(arguments, Mapping)):
+            raise ValueError("search call identity is invalid")
+        kind = f"search-history-{ordinal:08d}"
+        envelope = {
+            "context_id": self.context_id,
+            "conversation_id": conversation_id,
+            "checkpoint_conversation_id": checkpoint_conversation_id,
+            "operation_id": self.operation_id,
+            "call_id": call_id,
+            "ordinal": ordinal,
+            "provenance": "application" if call.get("round") == -1 else "model",
+            "call": dict(call),
+            "result": result,
+        }
+        return {
+            "version": 1, "context_id": self.context_id,
+            "conversation_id": conversation_id, "operation_id": self.operation_id,
+            "checkpoint_conversation_id": checkpoint_conversation_id,
+            "call_id": call_id, "ordinal": ordinal, "payload_kind": kind,
+            "payload": self._store_payload(kind, envelope,
+                                           write_assertion=self._assert_current),
+        }
+
+    def load_search_exchange(
+        self, reference: Any, *, conversation_id: str, operation_id: str,
+        checkpoint_conversation_id: str, call_id: str, ordinal: int,
+    ) -> dict[str, Any]:
+        """Hydrate an immutable search exchange after verifying every binding."""
+        if (not isinstance(reference, Mapping) or reference.get("version") != 1
+                or reference.get("context_id") != self.context_id
+                or reference.get("conversation_id") != conversation_id
+                or reference.get("operation_id") != operation_id
+                or reference.get("checkpoint_conversation_id") != checkpoint_conversation_id
+                or reference.get("call_id") != call_id
+                or reference.get("ordinal") != ordinal):
+            raise ValueError("search history reference binding is invalid")
+        kind = reference.get("payload_kind")
+        payload_ref = reference.get("payload")
+        expected_kind = f"search-history-{ordinal:08d}"
+        if kind != expected_kind or not isinstance(payload_ref, Mapping):
+            raise ValueError("search history reference is invalid")
+        digest = payload_ref.get("sha256")
+        byte_length = payload_ref.get("byte_length")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or type(byte_length) is not int or byte_length < 0):
+            raise ValueError("search history payload integrity metadata is invalid")
+        input_ref = payload_ref.get("_input_ref")
+        if input_ref is not None:
+            data_operation = "telegram-ledger-" + hashlib.sha256(
+                f"{self.context_id}\0{operation_id}\0{kind}\0{digest}".encode()
+            ).hexdigest()
+            if input_ref != f"dialog_operations/{data_operation}/input_parts/manifest":
+                raise ValueError("search history payload reference is not bound")
+        value = self._load_payload(payload_ref)
+        encoded = self._json_bytes(value)
+        if hashlib.sha256(encoded).hexdigest() != digest or len(encoded) != byte_length:
+            raise ValueError("search history payload integrity check failed")
+        if (not isinstance(value, Mapping) or value.get("context_id") != self.context_id
+                or value.get("conversation_id") != conversation_id
+                or value.get("checkpoint_conversation_id") != checkpoint_conversation_id
+                or value.get("operation_id") != operation_id
+                or value.get("call_id") != call_id or value.get("ordinal") != ordinal):
+            raise ValueError("search history payload binding is invalid")
+        return dict(value)
+
     def load_turn(self, conversation_id: str, delivery_id: str) -> dict[str, Any] | None:
         ref = self._ref(delivery_id)
         snapshot = ref.get()

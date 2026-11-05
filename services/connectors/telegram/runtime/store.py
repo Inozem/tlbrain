@@ -168,17 +168,25 @@ class TelegramRuntimeStore:
         return number
 
     def create_search_session(self, *, context_id: str, query: str,
-                              result_refs: list[str], error: str | None) -> str:
+                              result_refs: list[str], error: str | None,
+                              search_filters: Mapping[str, Any] | None = None) -> str:
         from services.connectors.telegram.search_sessions import run_search
         operation_id = self.operation_id or ("search-" + hashlib.sha256(
             f"{context_id}\0{query}".encode("utf-8")).hexdigest())
         pending = self.pending_search
         retrieve = None
-        if pending and pending[0] == query:
+        if (pending and isinstance(pending[0], Mapping)
+                and pending[0].get("query") == query
+                and (search_filters is None or dict(pending[0]) == dict(search_filters))):
             segments, metadata = pending[1], pending[2]
             retrieve = lambda **kwargs: (segments, metadata)
+        filters = dict(search_filters or {})
         result = run_search(context_id=context_id, operation_id=operation_id,
                             query=query, repository=self.repository,
+                            keywords=filters.get("keywords"),
+                            folder_path=filters.get("folder_path"),
+                            date_from=filters.get("date_from"),
+                            date_to=filters.get("date_to"),
                             now=datetime.now(timezone.utc), retrieve=retrieve)
         self.pending_search = None
         return str(result.get("conversation_id", ""))
@@ -204,6 +212,12 @@ class TelegramRuntimeStore:
             conversation = (conversation_snapshot.to_dict() or {}
                             if conversation_snapshot.exists else {})
             route_control = operation.get("route_control")
+            route_session = (route_control.get("search_session_id")
+                             if isinstance(route_control, Mapping)
+                             and route_control.get("kind") == "search" else
+                             route_control.get("conversation_id")
+                             if isinstance(route_control, Mapping)
+                             and route_control.get("search_protocol") == "agent-v1" else None)
             if (not context_snapshot.exists or not operation_snapshot.exists
                     or operation.get("operation_id") != operation_id
                     or operation.get("context_id") not in (None, context_id)
@@ -213,8 +227,7 @@ class TelegramRuntimeStore:
                         now=now, expiry=context.get("lock_expires_at"))):
                 return False
             if (not isinstance(route_control, Mapping)
-                    or route_control.get("kind") != "search"
-                    or route_control.get("search_session_id") != conversation_id
+                    or route_session != conversation_id
                     or not conversation_snapshot.exists
                     or conversation.get("conversation_id") != conversation_id
                     or conversation.get("kind") != "search"):

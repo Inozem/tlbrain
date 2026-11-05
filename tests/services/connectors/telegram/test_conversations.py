@@ -104,9 +104,14 @@ def test_conversation_history_keeps_all_ordered_turns_and_rejects_malformed_rows
         for index, role in enumerate(("user", "model", "user", "model", "tool", "user"), 1)
     ]
     projected = build_conversation_history(history, conversation_id="chat")
-    assert [row["parts"][0]["text"] for row in projected] == [
-        "turn-1", "turn-2", "turn-3", "turn-4", "turn-5", "turn-6",
+    assert [row["role"] for row in projected] == [
+        "user", "model", "user", "model", "user", "user",
     ]
+    assert ["turn-1" in row["parts"][0]["text"] for row in projected] == [
+        True, False, False, False, False, False,
+    ]
+    assert all(f"turn-{index}" in projected[index - 1]["parts"][0]["text"]
+               for index in (2, 3, 4, 5, 6))
     with pytest.raises(ValueError, match="unsupported"):
         build_conversation_history(
             [*history, {"conversation_id": "chat", "role": "system", "parts": []}],
@@ -117,6 +122,31 @@ def test_conversation_history_keeps_all_ordered_turns_and_rejects_malformed_rows
             [*history, {"conversation_id": "other", "role": "user", "parts": []}],
             conversation_id="chat",
         )
+
+
+def test_hydrated_search_history_projects_opaque_signature_as_untrusted_json():
+    history = [{
+        "conversation_id": "search-session", "operation_id": "prior-operation",
+        "role": "tool", "parts": [{
+            "type": "search_exchange_ref", "call_id": "call-1", "ordinal": 0,
+            "checkpoint_conversation_id": "private-checkpoint", "reference": {"version": 1},
+        }],
+    }]
+
+    projected = build_conversation_history(
+        history, conversation_id="search-session",
+        search_exchange_loader=lambda *_args, **_kwargs: {
+            "call": {"thought_signature": b"opaque\\x00signature"},
+            "result": {"segments": []},
+        },
+    )
+
+    text = projected[0]["parts"][0]["text"]
+    assert projected[0]["role"] == "user"
+    assert {row["role"] for row in projected} <= {"user", "model"}
+    assert "Untrusted prior tool data" in text
+    assert "opaque_bytes_base64" in text
+    assert "functionCall" not in text
 
 
 def test_draft_session_record_is_separate_and_creation_is_idempotent(firestore_fake):

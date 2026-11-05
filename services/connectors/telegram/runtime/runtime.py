@@ -31,6 +31,10 @@ from services.connectors.telegram.runtime.routing import GeminiCommandRouter
 from services.connectors.telegram.runtime.store import TelegramRuntimeStore
 from services.connectors.telegram.runtime.tools import TelegramRegistryExecutor
 from services.connectors.telegram.runtime.save_fencing import _provider_error_retryable
+from services.connectors.telegram.runtime.search_agent import (
+    _SEARCH_READ_TOOLS, SearchAgentMixin, _SearchOnlyExecutor,
+    _search_read_retryable,
+)
 
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-command-runtime")
 _PROCESSING_ERROR_REPLY = "An error occurred while processing your request. Please try again."
@@ -160,11 +164,12 @@ def _safe_response(response: Any) -> dict[str, Any]:
 class _GovernedExecutor:
     def __init__(self, executor: TelegramRegistryExecutor, governor: Any,
                  operation_id: str, lease: Any, clock: Any, lease_check: Any,
-                 payload_codec: Any = None):
+                 payload_codec: Any = None, retryable: Any = None):
         self.executor, self.governor = executor, governor
         self.operation_id, self.lease, self.clock = operation_id, lease, clock
         self.lease_check = lease_check
         self.payload_codec = payload_codec
+        self.retryable = retryable
         self.failure: tuple[BaseException, bool] | None = None
         self.failure_stage: str | None = None
 
@@ -185,7 +190,7 @@ class _GovernedExecutor:
                 self.operation_id, stage_key,
                 lambda: self._pack(stage_key, self.executor.execute(
                     name=name, arguments=arguments, call_ordinal=call_ordinal)),
-                retryable=_provider_error_retryable,
+                retryable=self.retryable or _provider_error_retryable,
                 reconcile=lambda: self._reconcile(stage_key, name, arguments, call_ordinal),
                 now=self.clock(), owner=_value(self.lease, "owner"),
                 fence=_value(self.lease, "fence"),
@@ -292,23 +297,28 @@ class _SearchPort:
                     return _SearchPort._json_safe(method())
         return str(value)
 
-    async def search(self, query: str) -> list[str]:
+    async def search(self, query: str | Mapping[str, Any]) -> list[str]:
         from core.operations import read
+        filters = dict(query) if isinstance(query, Mapping) else {"query": query}
+        query_text = filters.get("query")
+        if not isinstance(query_text, str) or not query_text.strip():
+            raise ValueError("search requires a nonblank validated query")
         if not await _offload(self.lease_check):
             raise PermissionError("Telegram operation lease is stale")
         if self.governor is None:
             try:
-                segments, metadata = await _offload(read.query, query=query)
+                segments, metadata = await _offload(read.query, **filters)
             except Exception:
                 self.failure = ("search", False)
                 raise
         else:
-            stage_key = "telegram-search-" + hashlib.sha256(query.encode("utf-8")).hexdigest()[:32]
+            signature = json.dumps(filters, ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":"))
+            stage_key = "telegram-search-" + hashlib.sha256(signature.encode("utf-8")).hexdigest()[:32]
             def retrieve() -> Any:
                 from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
-                segments, metadata = read.query(
-                    query=query, retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
-                )
+                segments, metadata = read.query(**filters,
+                                                retry_policy=SINGLE_ATTEMPT_RETRY_POLICY)
                 return {"segments": self._json_safe(segments),
                         "metadata": self._json_safe(metadata)}
             try:
@@ -335,7 +345,7 @@ class _SearchPort:
                     terminal = False
                 self.failure = (stage_key, terminal)
                 raise
-        self.store.pending_search = (query, segments, metadata)
+        self.store.pending_search = (filters, segments, metadata)
         return [row["doc_id"] for row in segments if isinstance(row, Mapping)
                 and isinstance(row.get("doc_id"), str)]
 
@@ -680,7 +690,22 @@ class TelegramCommandRuntime:
                     and route.get("status") in {"ok", "success"}
                     and route.get("kind") == "search"):
                 results = []
-                for doc_id in route.get("result_refs", []):
+                doc_ids = list(route.get("result_refs", []))
+                session_id = route.get("search_session_id")
+                if isinstance(session_id, str) and session_id:
+                    turns = self.repository.list_turns(context_id, session_id)
+                    for turn in turns:
+                        if turn.get("role") != "tool":
+                            continue
+                        for part in turn.get("parts", []):
+                            if (isinstance(part, Mapping)
+                                    and part.get("type") == "search_result"):
+                                for card in part.get("results", []):
+                                    if isinstance(card, Mapping):
+                                        doc_id = card.get("doc_id")
+                                        if isinstance(doc_id, str) and doc_id not in doc_ids:
+                                            doc_ids.append(doc_id)
+                for doc_id in doc_ids:
                     card = rows_by_id.get(doc_id)
                     if card is not None:
                         results.append({key: card[key] for key in (
@@ -700,7 +725,7 @@ class TelegramCommandRuntime:
         ).run()
 
 
-class _CommandExecution:
+class _CommandExecution(SearchAgentMixin):
     """Own the context, ports, route, and reply state for one queue invocation."""
 
     def __init__(self, runtime: TelegramCommandRuntime, context_id: str,
@@ -711,6 +736,7 @@ class _CommandExecution:
         self.operation_id = _value(operation, "operation_id")
         self.owner, self.fence = _value(lease, "owner"), _value(lease, "fence")
         self._has_verified_metadata = False
+        self.search_offload = _offload
 
     async def run(self) -> QueueOperationState:
         """Validate the lease, compose ports, route, then settle the selected flow."""
@@ -978,12 +1004,14 @@ class _CommandExecution:
             self.decision = None
             self.decision_status = pinned_status
             return
+        self.route_history_error = False
         try:
             self.chat_conversation_id, self.route_history, self.route_conversation = (
                 await self._routing_conversation()
             )
         except Exception:
             self.chat_conversation_id, self.route_history, self.route_conversation = None, [], None
+            self.route_history_error = True
         checkpoint_conversation_id = await _offload(
             self.ledger.checkpoint_conversation_id, self.operation_id,
         )
@@ -997,6 +1025,23 @@ class _CommandExecution:
                            self.operation_id)
         )
         self.raw_decision = self._pinned_decision() if self._has_pinned_decision() else None
+        if self.route_history_error:
+            self.raw_decision = {}
+            self.decision, self.decision_status = None, "error"
+            return
+        if await self._trusted_legacy_search_pin():
+            self.raw_decision = self._pinned_decision()
+            self.decision = {
+                "kind": "search", "target_ref": None,
+                "target_operation_id": None, "dialog_number": None,
+                "result_refs": list(self.pinned.get("result_refs", [])),
+                "substantive_text": self.replay_request or (
+                    self.command.text if self.command is not None else None
+                ),
+                "tool_choice": None, "certainty": "certain",
+            }
+            self.decision_status = "ok"
+            return
         if self.raw_decision is None and self.chat_conversation_id is not None:
             try:
                 self.raw_decision = await _offload(
@@ -1028,6 +1073,67 @@ class _CommandExecution:
             except Exception:
                 self.raw_decision = {}
         self.decision, self.decision_status = _valid_response(self.raw_decision)
+
+    def _load_search_exchange(
+        self, reference: Any, *, conversation_id: str, operation_id: str,
+        checkpoint_conversation_id: str, call_id: str, ordinal: int,
+    ) -> dict[str, Any]:
+        """Verify canonical history against its operation and private checkpoint."""
+        if (not isinstance(operation_id, str) or not operation_id
+                or not isinstance(checkpoint_conversation_id, str)
+                or type(ordinal) is not int or not isinstance(call_id, str)):
+            raise ValueError("search history binding is incomplete")
+        expected_checkpoint = "telegram-global-" + hashlib.sha256(
+            f"{self.context_id}\0{operation_id}".encode("utf-8")
+        ).hexdigest()
+        if checkpoint_conversation_id != expected_checkpoint:
+            raise ValueError("search checkpoint binding is invalid")
+        operation_ref = (self.runtime.repository.client.collection("telegram_sessions")
+                         .document(self.context_id).collection("operations")
+                         .document(operation_id))
+        operation = operation_ref.get().to_dict() or {}
+        if (operation.get("context_id", self.context_id) != self.context_id
+                or operation.get("operation_id") != operation_id):
+            raise ValueError("search history operation is missing")
+        route = operation.get("route_control")
+        bound_session = None
+        if isinstance(route, Mapping):
+            if route.get("kind") == "search" and route.get("search_protocol") == "agent-v1":
+                bound_session = route.get("search_session_id")
+            elif route.get("search_protocol") == "agent-v1":
+                bound_session = route.get("conversation_id")
+        if bound_session != conversation_id:
+            raise ValueError("search history operation crossed its session binding")
+        checkpoint = (operation_ref.collection("agent_checkpoints")
+                      .document("turn").get().to_dict() or {})
+        if checkpoint.get("conversation_id") != expected_checkpoint:
+            raise ValueError("search agent checkpoint binding is invalid")
+        loader = FirestoreAgentLedger(
+            self.runtime.repository.client, context_id=self.context_id,
+            operation_id=self.operation_id, owner=self.owner, fence=self.fence,
+            clock=self.runtime.clock,
+        )
+        exchange = loader.load_search_exchange(
+            reference, conversation_id=conversation_id, operation_id=operation_id,
+            checkpoint_conversation_id=checkpoint_conversation_id,
+            call_id=call_id, ordinal=ordinal,
+        )
+        source_ledger = FirestoreAgentLedger(
+            self.runtime.repository.client, context_id=self.context_id,
+            operation_id=operation_id, owner=self.owner, fence=self.fence,
+            clock=self.runtime.clock,
+        )
+        source = source_ledger.load_turn(checkpoint_conversation_id, operation_id)
+        calls = source.get("tool_calls", []) if isinstance(source, Mapping) else []
+        results = source.get("tool_results", {}) if isinstance(source, Mapping) else {}
+        saved_call = next((item for item in calls if isinstance(item, Mapping)
+                           and item.get("ordinal") == ordinal), None)
+        saved_result = results.get(str(ordinal)) if isinstance(results, Mapping) else None
+        if (saved_call is None or saved_result is None
+                or dict(saved_call) != exchange.get("call")
+                or saved_result != exchange.get("result")):
+            raise ValueError("search history differs from its immutable checkpoint")
+        return exchange
 
     async def _routing_conversation(self) -> tuple[str, list[dict[str, Any]], Any]:
         """Load only the currently selected session history for routing context."""
@@ -1099,7 +1205,10 @@ class _CommandExecution:
         history = await _offload(
             self.runtime.repository.list_turns, self.context_id, conversation_id,
         )
-        canonical = build_conversation_history(history, conversation_id=conversation_id)
+        canonical = await _offload(
+            build_conversation_history, history, conversation_id=conversation_id,
+            search_exchange_loader=self._load_search_exchange,
+        )
         requests = [
             part.get("text") for turn in history
             if turn.get("operation_id") == self.operation_id and turn.get("role") == "user"
@@ -1116,6 +1225,27 @@ class _CommandExecution:
             "ok", "success", "uncertain", "invalid_route", "error",
         }
 
+    async def _trusted_legacy_search_pin(self) -> bool:
+        """Recognize only old canonical search pins tied to their operation identity."""
+        if (not isinstance(self.pinned, Mapping)
+                or self.pinned.get("status") not in {"ok", "success"}
+                or self.pinned.get("kind") != "search"
+                or self.pinned.get("search_protocol") is not None
+                or not isinstance(self.pinned.get("search_session_id"), str)):
+            return False
+        refs = self.pinned.get("result_refs", [])
+        if not isinstance(refs, list) or any(not isinstance(item, str) for item in refs):
+            return False
+        expected = "search-" + hashlib.sha256(
+            f"{self.context_id}\0{self.operation_id}".encode("utf-8")
+        ).hexdigest()
+        if self.pinned.get("search_session_id") != expected:
+            return False
+        conversation = await _offload(
+            self.runtime.repository.get_conversation, self.context_id, expected,
+        )
+        return bool(conversation is not None and conversation.kind.value == "search")
+
     def _pinned_decision(self) -> dict[str, Any]:
         return {
             "kind": self.pinned.get("kind"), "target_ref": self.pinned.get("target_doc_id"),
@@ -1124,29 +1254,61 @@ class _CommandExecution:
             "result_refs": self.pinned.get("result_refs", []),
             "substantive_text": (
                 self.replay_request or getattr(self, "canonical_request", None)
-            ) if self.pinned.get("kind") == "substantive" else None,
+            ) if self.pinned.get("kind") in {"substantive", "search"} else None,
             "tool_choice": self.pinned.get("tool_choice"),
             "certainty": "certain" if self.pinned.get("status") in {"ok", "success"}
             else "uncertain",
         }
 
     async def _prepare_search(self) -> None:
-        """Reuse pinned search results or perform retrieval for a new search route."""
+        """Bind new agent searches to an isolated session without raw-text retrieval."""
         self.search_refs: list[str] | None = None
         self.search_session_id: str | None = None
-        if self.decision is None or self.decision["kind"] != "search":
+        self.search_continuation = False
+        if self.decision is None:
             return
-        if isinstance(self.pinned, Mapping) and isinstance(
-                self.pinned.get("search_session_id"), str):
-            self.search_refs = list(self.pinned.get("result_refs", []))
-            self.search_session_id = self.pinned["search_session_id"]
-        elif self.command is not None:
-            try:
-                self.search_refs = await self.search.search(self.command.text)
-            except Exception:
-                self.search_refs = []
+        if self.decision["kind"] == "search":
+            if (isinstance(self.pinned, Mapping)
+                    and self.pinned.get("search_protocol") != "agent-v1"
+                    and isinstance(self.pinned.get("search_session_id"), str)):
+                # Legacy terminal search rows retain their old saved-result replay.
+                self.search_refs = list(self.pinned.get("result_refs", []))
+                self.search_session_id = self.pinned["search_session_id"]
+                return
+            self.search_refs = []
             self.search_session_id = "search-" + hashlib.sha256(
-                f"{self.context_id}\0{self.operation_id}".encode()).hexdigest()
+                f"{self.context_id}\0{self.operation_id}".encode("utf-8")
+            ).hexdigest()
+        elif (self.decision["kind"] == "substantive"
+              and self.route_conversation is not None
+              and self.route_conversation.kind.value == "search"
+              and self.decision.get("target_ref") is None
+              and self.decision.get("target_operation_id") is None
+              and self.decision.get("dialog_number") is None):
+            self.search_continuation = True
+            self.search_session_id = self.chat_conversation_id
+            self.search_refs = []
+            if self.decision.get("tool_choice") is not None:
+                choice = self.decision["tool_choice"]
+                name = choice["name"]
+                if name not in _SEARCH_READ_TOOLS:
+                    self.search_continuation = False
+                    self.search_session_id = None
+                elif (name == "get_transcript"
+                      and choice["arguments"].get("doc_id") not in
+                      await _offload(self._search_allowed_doc_ids)):
+                    self.decision, self.decision_status = None, "invalid_route"
+                    self.search_continuation = False
+        if (self.decision is not None and self.decision["kind"] == "search"
+                and isinstance(self.pinned, Mapping)
+                and self.pinned.get("search_protocol") == "agent-v1"):
+            if (not isinstance(self.pinned.get("tool_choice"), Mapping)
+                    or self.pinned["tool_choice"].get("name") != "query"):
+                self.decision, self.decision_status = None, "invalid_route"
+        if self.search_session_id is None:
+            return
+        if isinstance(self.pinned, Mapping) and isinstance(self.pinned.get("search_session_id"), str):
+            self.search_refs = list(self.pinned.get("result_refs", []))
 
     def _compose_replies(self) -> None:
         """Create the durable chunk publisher and queue-state settlement callback."""
@@ -1209,7 +1371,9 @@ class _CommandExecution:
             and decision.get("target_operation_id") is None
             and decision.get("dialog_number") is None
             and decision.get("tool_choice") is not None
-            and decision.get("tool_choice", {}).get("arguments", {}).get("doc_id") is None
+            and (decision.get("tool_choice", {}).get("arguments", {}).get("doc_id") is None
+                 or (self.search_continuation
+                     and decision.get("tool_choice", {}).get("name") == "get_transcript"))
             and decision.get("tool_choice", {}).get("name") in {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
                 "sync_status", "sync_changes", "add_dialog",
@@ -1299,6 +1463,8 @@ class _CommandExecution:
 
     async def _persist_global_route(self) -> bool:
         """Durably pin the selected route and its replay checkpoint before side effects."""
+        if await self._trusted_legacy_search_pin():
+            return True
         decision = self.decision
         if (decision is None and isinstance(self.pinned, Mapping)
                 and self.pinned.get("status") == self.decision_status
@@ -1316,19 +1482,26 @@ class _CommandExecution:
             if decision.get("kind") == "search":
                 record["result_refs"] = list(self.search_refs or [])
                 record["search_session_id"] = self.search_session_id
+                if self.search_session_id is not None and self.search_refs == []:
+                    record["tool_choice"] = decision.get("tool_choice")
+                    record["search_protocol"] = "agent-v1"
+            elif self.search_continuation:
+                record["conversation_id"] = self.search_session_id
+                record["search_protocol"] = "agent-v1"
             prompt = (
-                decision.get("substantive_text") if decision.get("kind") == "substantive"
+                decision.get("substantive_text") if decision.get("kind") in {"substantive", "search"}
                 else self.command.text if self.command is not None else self.replay_request
             )
             if decision.get("kind") in {"substantive", "search", "save"} and isinstance(prompt, str):
                 await _offload(self.ledger.save_request, self.global_conversation_id,
                                self.operation_id, prompt)
         try:
-            return bool(await _offload(
+            persisted = bool(await _offload(
                 self.runtime.repository.persist_route, self.operation_id, record,
                 context_id=self.context_id, owner=self.owner, fence=self.fence,
                 now=self.runtime.clock(),
             ))
+            return persisted
         except Exception:
             return False
 
@@ -1410,13 +1583,18 @@ class _CommandExecution:
         )
 
     async def _handle_global_search(self) -> QueueOperationState:
-        """Create the durable search session and render its visible result summaries."""
-        query = self.command.text if self.command is not None else self.replay_request or ""
-        session_id = await _offload(
-            self.store.create_search_session, context_id=self.context_id, query=query,
-            result_refs=self.search_refs or [],
-            error="search unavailable" if self.search.failure else None,
-        )
+        """Run a new or continuing search conversation through the governed agent."""
+        if (isinstance(self.pinned, Mapping)
+                and self.pinned.get("kind") == "search"
+                and self.pinned.get("search_protocol") != "agent-v1"):
+            return await self._handle_legacy_global_search()
+        return await self._run_search_agent()
+
+    async def _handle_legacy_global_search(self) -> QueueOperationState:
+        """Replay historical search sessions using their already persisted result cards."""
+        session_id = self.search_session_id
+        if not isinstance(session_id, str) or not session_id:
+            return QueueOperationState.FAILED
         try:
             selected = await _offload(
                 self.store.publish_search_selection, self.operation_id,
@@ -1447,23 +1625,10 @@ class _CommandExecution:
             failure_final=bool(self.search.failure),
         )
 
-    @staticmethod
-    def _format_search_row(row: Mapping[str, Any]) -> str:
-        """Format one result card using only its safe title, date, and folder metadata."""
-        title = row.get("title", row.get("doc_id", ""))
-        details = [str(title)] if title else []
-        date_value = row.get("date", row.get("dialog_date", row.get("created_at")))
-        folder = row.get("folder_path", row.get("folder"))
-        if isinstance(date_value, str) and date_value:
-            details.append(date_value)
-        if isinstance(folder, list):
-            folder = " / ".join(str(part) for part in folder)
-        if isinstance(folder, str) and folder:
-            details.append(folder)
-        return " | ".join(details)
-
     async def _handle_global_chat(self) -> QueueOperationState:
         """Run global agent chat or a checkpointed route-selected tool call."""
+        if self.search_continuation:
+            return await self._run_search_agent()
         prompt = (
             self.decision.get("substantive_text")
             if self.command is not None and self.decision is not None

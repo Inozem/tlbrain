@@ -77,12 +77,14 @@ class FakeStore:
             self.document_bindings[binding_key] = number
         return self.document_bindings[binding_key]
 
-    def create_search_session(self, *, context_id, query, result_refs, error=None):
+    def create_search_session(self, *, context_id, query, result_refs, error=None,
+                              search_filters=None):
         session_id = f"search-{len(self.search_sessions) + 1}"
         self.search_sessions.append({
             "session_id": session_id,
             "context_id": context_id,
             "query": query,
+            "search_filters": dict(search_filters or {}),
             "result_refs": list(result_refs),
             "error": error,
         })
@@ -144,6 +146,13 @@ def _decision(kind="substantive", **overrides):
         "tool_choice": None,
         "certainty": "certain",
     }
+    if kind == "search":
+        value.update({
+            "substantive_text": "synthetic standalone search intent",
+            "tool_choice": {"name": "query", "arguments": {
+                "query": "synthetic search query",
+            }},
+        })
     value.update(overrides)
     return value
 
@@ -490,8 +499,10 @@ def test_unverified_or_non_chain_save_target_fails_without_last_fallback(target_
 
 
 def test_explicit_search_creates_only_search_session_then_selects_existing_result():
+    arguments = {"query": "synthetic search query", "folder_path": ["Client"],
+                 "date_from": "2026-01-01", "date_to": "2026-12-31"}
     context, store, model, search, notices, actions = _harness(
-        decision=_decision("search", result_refs=["doc-imported"]),
+        decision=_decision("search", tool_choice={"name": "query", "arguments": arguments}),
         docs={"doc-current": {}, "doc-imported": {"title": "Found"}},
         current="doc-current", numbers={"doc-current": 1},
         search_results=["doc-imported"],
@@ -503,6 +514,8 @@ def test_explicit_search_creates_only_search_session_then_selects_existing_resul
     assert searched["result_refs"] == ["doc-imported"]
     assert searched["search_session_id"] == store.search_sessions[0]["session_id"]
     assert store.search_sessions[0]["context_id"] == context.context_id
+    assert search.calls == [arguments]
+    assert store.search_sessions[0]["search_filters"] == arguments
     assert (context.active_conversation_id, context.selected_dialog_number) == initial_selection
     assert notices.sent == []
     assert store.created_docs == []
@@ -892,8 +905,8 @@ def test_malformed_explicit_uncertain_route_is_invalid():
 
 
 @pytest.mark.parametrize(("response", "schema_kind", "schema_field", "expected_schema"), [
-    (_decision("search", tool_choice={"name": "query", "arguments": {"query": "synthetic topic"}}),
-     "search", "tool_choice", {"type": "null"}),
+    (_decision("search", tool_choice={"name": "list_folders", "arguments": {}}),
+     "search", "tool_choice", None),
     (_decision("pure_switch", tool_choice={"name": "list_folders", "arguments": {}}),
      "pure_switch", "tool_choice", {"type": "null"}),
     (_decision("save", tool_choice={"name": "query", "arguments": {"query": "synthetic topic"}}),
@@ -928,7 +941,12 @@ def test_route_kind_cross_field_violations_fail_closed_without_effects(
 
     variant = next(item for item in _ROUTE_SCHEMA["anyOf"]
                    if item["properties"]["kind"]["enum"] == [schema_kind])
-    assert variant["properties"][schema_field] == expected_schema
+    if schema_kind == "search" and schema_field == "tool_choice":
+        from services.connectors.telegram.runtime.routing import _tool_choice_schemas
+        expected_schema = next(item for item in _tool_choice_schemas()
+                               if item["properties"]["name"]["enum"] == ["query"])
+    if expected_schema is not None:
+        assert variant["properties"][schema_field] == expected_schema
 
     context, store, model, search, notices, actions = _harness(
         decision=response,
@@ -946,3 +964,28 @@ def test_route_kind_cross_field_violations_fail_closed_without_effects(
     assert store.created_drafts == []
     assert actions.calls == []
     assert notices.sent == []
+
+
+def test_search_route_native_schema_matches_server_target_constraints():
+    from services.connectors.telegram.runtime.routing import _ROUTE_SCHEMA
+
+    search = next(item for item in _ROUTE_SCHEMA["anyOf"]
+                  if item["properties"]["kind"]["enum"] == ["search"])
+    properties = search["properties"]
+    assert properties["target_ref"] == {"type": "null"}
+    assert properties["target_operation_id"] == {"type": "null"}
+    assert properties["dialog_number"] == {"type": "null"}
+    assert properties["result_refs"] == {
+        "type": "array", "maxItems": 0, "items": {"type": "string"},
+    }
+
+    # Other route kinds retain their broader or kind-specific target semantics.
+    variants = {
+        item["properties"]["kind"]["enum"][0]: item["properties"]
+        for item in _ROUTE_SCHEMA["anyOf"]
+    }
+    assert "target_ref" not in variants["substantive"]
+    assert "result_refs" not in variants["substantive"]
+    assert variants["retry"]["dialog_number"] == {
+        "type": "integer", "minimum": 1,
+    }
