@@ -233,6 +233,7 @@ class _TelegramCommittedSaveRuntime:
             receipt_ref=shared["receipt_ref"], receipt_version=shared.get("receipt_version"),
             receipt_digest=hashlib.sha256(receipt_payload).hexdigest(),
             origin_binding=(context_id, draft_id, manifest_digest),
+            doc_id=core_operation.doc_id,
             dialog_date=core_operation.date or "",
             classification_outcome=classification_outcome,
         ), False

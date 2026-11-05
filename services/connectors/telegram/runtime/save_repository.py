@@ -402,6 +402,24 @@ class FirestoreTelegramSaveRepository:
             self._verify_save_receipt, receipt, draft_id, manifest_digest,
         )
 
+    async def load_completed_doc_id(self, draft_id: str, manifest_digest: str) -> str | None:
+        """Resolve the document ID from this save's verified shared operation."""
+        return await _offload(self._load_completed_doc_id, draft_id, manifest_digest)
+
+    def _load_completed_doc_id(self, draft_id: str, manifest_digest: str) -> str | None:
+        from core.integrations.firestore.operations import get_operation
+
+        operation = get_operation(self.client, self.operation_id)
+        if (operation is None or operation.state.value != "completed"
+                or not isinstance(operation.doc_id, str) or not operation.doc_id):
+            return None
+        draft = self.repository.get_draft(self.context_id, draft_id)
+        if (not isinstance(draft, Mapping)
+                or draft.get("manifest_digest") != manifest_digest
+                or draft.get("active_save_operation_id") != self.operation_id):
+            return None
+        return operation.doc_id
+
     def _verify_save_receipt(self, receipt: Mapping[str, Any], draft_id: str,
                              manifest_digest: str) -> bool:
         from core.integrations.firestore.operations import get_operation

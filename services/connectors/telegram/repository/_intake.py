@@ -43,6 +43,13 @@ class _ForwardContext:
     active_draft_id: str | None
     draft_data: dict[str, Any]
     busy: bool
+    ingress_binding_ref: Any | None = None
+    ingress_binding: dict[str, Any] | None = None
+    ingress_operation_ref: Any | None = None
+    ingress_operation: dict[str, Any] | None = None
+    ingress_command_ref: Any | None = None
+    ingress_command: dict[str, Any] | None = None
+    ingress_admission: bool = False
 
 
 @dataclass(slots=True)
@@ -464,6 +471,7 @@ def _prepare_receipt_group(
     client: Any, transaction: Any, *, context_id: str, context: dict[str, Any],
     draft: _ForwardDraft, update_id: int, media_group_id: str | None,
     transport_timestamp: int | None, accepted: bool, user_id: int, now: datetime,
+    source_message_id: int | None = None,
 ) -> _ReceiptGroupPreparation:
     """Read and stage one durable card group, its initial send and quiet-close wakeup."""
     selection = _select_receipt_group(
@@ -504,9 +512,12 @@ def _prepare_receipt_group(
 
     deadline = now + timedelta(seconds=RECEIPT_TEXT_QUIET_SECONDS)
     accepted_ids = list(existing_group.get("accepted_message_ids", []))
+    source_message_ids = list(existing_group.get("source_message_ids", []))
     skipped_count = _integer(existing_group.get("skipped_count", 0), "skipped_count")
     if accepted:
         accepted_ids.append(update_id)
+        if type(source_message_id) is int:
+            source_message_ids.append(source_message_id)
     else:
         skipped_count += 1
     group = {
@@ -516,6 +527,7 @@ def _prepare_receipt_group(
         "dialog_number": draft.dialog_number if draft.draft_id else existing_group.get("dialog_number"),
         "notification_id": notification_id, "state": "open",
         "deadline_at": deadline, "accepted_message_ids": accepted_ids,
+        "source_message_ids": source_message_ids,
         "skipped_count": skipped_count, "owner_user_id": user_id,
         "media_group_id": media_group_id or existing_group.get("media_group_id"),
         "epoch": _integer(existing_group.get("epoch", 1), "epoch", minimum=1),
@@ -682,6 +694,10 @@ def _load_forward_context(
     chat_id: int,
     thread_id: int | None,
     topic_name: str | None,
+    user_id: int,
+    message_id: int,
+    transport_timestamp: int | None,
+    media_group_id: str | None,
     now: datetime,
 ) -> _ForwardContext:
     """Load context and active draft state before the transaction writes."""
@@ -698,9 +714,96 @@ def _load_forward_context(
     draft_data = (active_snap.to_dict() or {}) if active_snap is not None and active_snap.exists else {}
     if active_draft_id and draft_data.get("state") != TelegramDraftState.COLLECTING.value:
         active_draft_id, active_ref, draft_data = None, None, {}
+    reserved_id = context.get("reserved_operation_id") or context.get("active_operation_id")
+    ingress_id = reserved_id if isinstance(reserved_id, str) else None
+    ingress_binding_ref = ingress_binding = None
+    ingress_operation_ref = ingress_operation = None
+    ingress_command_ref = ingress_command = None
+    ingress_admission = False
+    if isinstance(ingress_id, str) and ingress_id and ingress_id == reserved_id:
+        ingress_binding_ref = context_ref.collection("ingress_bindings").document(ingress_id)
+        binding_snapshot = ingress_binding_ref.get(transaction=transaction)
+        ingress_binding = binding_snapshot.to_dict() or {} if binding_snapshot.exists else None
+        ingress_operation_ref = context_ref.collection("operations").document(ingress_id)
+        operation_snapshot = ingress_operation_ref.get(transaction=transaction)
+        ingress_operation = operation_snapshot.to_dict() or {} if operation_snapshot.exists else None
+        command_id = str(ingress_binding.get("command_id", "")) if ingress_binding else ""
+        if not command_id:
+            input_ref = (ingress_operation or {}).get("input_ref")
+            parts = input_ref.split("/") if isinstance(input_ref, str) else []
+            if (len(parts) == 4 and parts[:3] == [SESSIONS, context_id, "commands"]
+                    and parts[3].isdigit()):
+                command_ref = context_ref.collection("commands").document(parts[3])
+                command_snapshot = command_ref.get(transaction=transaction)
+                ingress_command_ref = command_ref
+                ingress_command = command_snapshot.to_dict() or {} if command_snapshot.exists else None
+        else:
+            ingress_command_ref = context_ref.collection("commands").document(command_id)
+            command_snapshot = ingress_command_ref.get(transaction=transaction)
+            ingress_command = command_snapshot.to_dict() or {} if command_snapshot.exists else None
+        stamp = ingress_binding.get("transport_timestamp") if ingress_binding else None
+        candidate_message_id = ingress_binding.get("candidate_message_id") if ingress_binding else None
+        max_deadline = ingress_binding.get("max_deadline_at") if ingress_binding else None
+        bound_group = ingress_binding.get("receipt_group_id") if ingress_binding else None
+        in_burst = (
+            type(stamp) is int and type(transport_timestamp) is int
+            and abs(stamp - transport_timestamp) <= 1
+            and type(candidate_message_id) is int
+            and candidate_message_id < message_id
+            and (isinstance(bound_group, str)
+                 or message_id <= candidate_message_id + 20)
+        )
+        same_receipt_group = True
+        if isinstance(bound_group, str):
+            same_receipt_group = False
+            if (active_ref is not None and active_draft_id is not None
+                    and type(transport_timestamp) is int):
+                lookup = _find_transport_receipt_group(
+                    client, transaction, context_id=context_id,
+                    draft=_ForwardDraft(
+                        False, active_ref, active_draft_id,
+                        _integer(draft_data.get("dialog_number"), "dialog_number", minimum=1),
+                        str(draft_data.get("conversation_id", "")), draft_data,
+                    ),
+                    user_id=user_id, transport_timestamp=transport_timestamp,
+                    media_group_id=media_group_id,
+                )
+                same_receipt_group = (
+                    not lookup.ambiguous and lookup.group_ref is not None
+                    and lookup.group_ref.id == bound_group
+                )
+        bound_draft = ingress_binding.get("draft_id") if ingress_binding else None
+        same_active_draft = (
+            (bound_draft is None and active_draft_id is None)
+            or (bound_draft is None
+                and draft_data.get("state") == TelegramDraftState.COLLECTING.value)
+            or (isinstance(bound_draft, str) and bound_draft == active_draft_id
+                and draft_data.get("state") == TelegramDraftState.COLLECTING.value)
+        )
+        save_free = not any(context.get(key) for key in (
+            "pending_save_operation_id", "pending_save_intent_id",
+        ))
+        ingress_admission = bool(
+            isinstance(ingress_binding, Mapping)
+            and ingress_binding.get("context_id") == context_id
+            and ingress_binding.get("operation_id") == ingress_id
+            and ingress_binding.get("owner_user_id") == user_id
+            and ingress_binding.get("state") in {"pending", "collecting", "sealed"}
+            and (ingress_binding.get("state") != "pending"
+                 or not isinstance(max_deadline, datetime) or now <= max_deadline)
+            and in_burst and same_receipt_group and same_active_draft and save_free
+            and isinstance(ingress_operation, Mapping)
+            and ingress_operation.get("state") in {"pending", "running"}
+            and isinstance(ingress_command, Mapping)
+            and ingress_command.get("context_id") == context_id
+            and ingress_command.get("operation_id") == ingress_id
+        )
     return _ForwardContext(
         context, active_ref, active_draft_id, draft_data,
-        bool(context.get("reserved_operation_id") or context.get("active_operation_id")),
+        bool(context.get("reserved_operation_id") or context.get("active_operation_id"))
+        and not ingress_admission,
+        ingress_binding_ref, ingress_binding, ingress_operation_ref, ingress_operation,
+        ingress_command_ref, ingress_command, ingress_admission,
     )
 
 
@@ -902,6 +1005,12 @@ def _persist_accepted_forward(
     previous_notification: dict[str, Any] | None,
     additional_outbox_ids: tuple[str, ...],
     receipt_group_new: bool,
+    ingress_binding_ref: Any | None = None,
+    ingress_binding: dict[str, Any] | None = None,
+    ingress_operation: dict[str, Any] | None = None,
+    ingress_operation_ref: Any | None = None,
+    ingress_command: dict[str, Any] | None = None,
+    ingress_command_ref: Any | None = None,
 ) -> "TelegramIntakeResult":
     """Persist an accepted forward and its receipt atomically."""
     if draft.is_new:
@@ -924,6 +1033,45 @@ def _persist_accepted_forward(
     transaction.set(message_ref, _source_data(source))
     draft.data["ordered_message_ids"] = list(draft.data.get("ordered_message_ids", [])) + [message_id]
     transaction.set(draft.ref, draft.data)
+    if ingress_binding_ref is not None and ingress_binding is not None:
+        previous_draft_id = ingress_binding.get("draft_id")
+        previous_group_id = ingress_binding.get("receipt_group_id")
+        if (previous_draft_id not in (None, draft.draft_id)
+                or previous_group_id not in (None, receipt_group.get("group_id"))):
+            raise ValueError("forwarding input no longer matches its ingress binding")
+        binding = dict(ingress_binding)
+        matched_ids = binding.get("matched_message_ids", [])
+        if not isinstance(matched_ids, list):
+            matched_ids = []
+        binding.update({
+            "draft_id": draft.draft_id,
+            "receipt_group_id": receipt_group.get("group_id"),
+            "matched_message_ids": list(dict.fromkeys(
+                [value for value in matched_ids if type(value) is int] + [message_id]
+            )),
+            "last_forward_at": now,
+            "deadline_at": min(
+                now + timedelta(seconds=1), binding.get("max_deadline_at")
+                if isinstance(binding.get("max_deadline_at"), datetime)
+                else now + timedelta(seconds=1),
+            ),
+        })
+        if ingress_operation and ingress_operation.get("state") == "pending":
+            binding["state"] = "collecting"
+        if not binding.get("source_binding_finalized"):
+            if ingress_command_ref is not None and ingress_command is not None:
+                command = dict(ingress_command)
+                command.update({
+                    "draft_id": draft.draft_id,
+                    "dialog_number": draft.dialog_number,
+                    "cutoff_message_ids": list(draft.data.get("ordered_message_ids", [])),
+                    "cutoff_intake_sequence": intake_sequence,
+                })
+                transaction.set(ingress_command_ref, command)
+            binding["source_binding_finalized"] = True
+        else:
+            binding["state"] = "sealed"
+        transaction.set(ingress_binding_ref, binding)
     context.update({"chat_id": chat_id, "thread_id": thread_id,
                     "active_draft_id": draft.draft_id, "draft_status": "collecting",
                     "next_intake_sequence": intake_sequence + 1, "updated_at": now})
@@ -1080,7 +1228,8 @@ class _TelegramIntakeMixin:
                 return _receipt_result(receipt_snap.to_dict() or {}, context_id)
             loaded = _load_forward_context(
                 self.client, transaction, context_ref, context_id,
-                chat_id, thread_id, topic_name, now,
+                chat_id, thread_id, topic_name, user_id, message_id,
+                transport_timestamp, media_group_id, now,
             )
             if loaded.busy:
                 return _persist_busy_receipt(
@@ -1107,6 +1256,7 @@ class _TelegramIntakeMixin:
                 media_group_id=media_group_id,
                 transport_timestamp=transport_timestamp,
                 accepted=True, user_id=user_id, now=now,
+                source_message_id=message_id,
             )
             notification_id = receipt_work.notification_ref.id
             outbox_id = (receipt_work.initial_task.outbox_id
@@ -1141,6 +1291,12 @@ class _TelegramIntakeMixin:
                 previous_notification=prepared.previous_notification,
                 additional_outbox_ids=prepared.additional_outbox_ids,
                 receipt_group_new=prepared.receipt_group_new,
+                ingress_binding_ref=(loaded.ingress_binding_ref if loaded.ingress_admission else None),
+                ingress_binding=(loaded.ingress_binding if loaded.ingress_admission else None),
+                ingress_operation=(loaded.ingress_operation if loaded.ingress_admission else None),
+                ingress_operation_ref=(loaded.ingress_operation_ref if loaded.ingress_admission else None),
+                ingress_command=(loaded.ingress_command if loaded.ingress_admission else None),
+                ingress_command_ref=(loaded.ingress_command_ref if loaded.ingress_admission else None),
             )
 
         return _txn(self.client.transaction(max_attempts=5))
@@ -1185,7 +1341,8 @@ class _TelegramIntakeMixin:
                 return _receipt_result(receipt_snap.to_dict() or {}, context_id)
             loaded = _load_forward_context(
                 self.client, transaction, context_ref, context_id,
-                chat_id, thread_id, topic_name, now,
+                chat_id, thread_id, topic_name, user_id, message_id,
+                transport_timestamp, media_group_id, now,
             )
             if loaded.busy:
                 return _persist_busy_receipt(

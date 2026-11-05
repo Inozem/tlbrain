@@ -114,6 +114,7 @@ class TelegramCompletionCertificate:
     dialog_date: str = ""
     classification_outcome: str | None = None
     skipped_utterance_count: int = 0
+    doc_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -546,6 +547,12 @@ class TelegramSaveWorkflow:
         if verified is not True:
             raise ValueError("save receipt could not be verified")
 
+        doc_id = (receipt.get("doc_id") if isinstance(receipt, Mapping) else None)
+        if not isinstance(doc_id, str) or not doc_id:
+            load_doc_id = getattr(self.repository, "load_completed_doc_id", None)
+            if callable(load_doc_id):
+                doc_id = await _await(load_doc_id(sealed.draft_id, sealed.manifest_digest))
+
         receipt_ref = _safe_id(receipt.get("receipt_ref"), "receipt reference")
         receipt_payload = json.dumps(
             dict(receipt), sort_keys=True, separators=(",", ":"), default=str,
@@ -560,6 +567,7 @@ class TelegramSaveWorkflow:
             receipt_version=receipt.get("receipt_version"),
             receipt_digest=hashlib.sha256(receipt_payload).hexdigest(),
             origin_binding=(sealed.context_id, sealed.draft_id, sealed.manifest_digest),
+            doc_id=doc_id if isinstance(doc_id, str) and doc_id else None,
             dialog_date=sealed.dialog_date,
             classification_outcome=classification_outcome,
             skipped_utterance_count=skipped_count,

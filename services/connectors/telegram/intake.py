@@ -272,6 +272,8 @@ class TelegramIntake:
             thread_id=thread_id,
             topic_name=message_topic_name(message),
             command=parse_command(text),
+            message_id=_integer(message.get("message_id")),
+            transport_timestamp=_transport_timestamp(message),
             now=self.clock(),
         )
         self._publish_if_accepted(accepted)

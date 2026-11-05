@@ -471,10 +471,10 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
     catalog_before = deepcopy(get_tool_catalog()["tools"])
     wire_requests = []
     route = {
-        "kind": "substantive", "target_ref": None,
+        "kind": "annotation", "target_ref": None,
         "target_operation_id": None, "dialog_number": None,
-        "result_refs": [], "substantive_text": "Summarize the decision.",
-        "tool_choice": {"name": "query", "arguments": {"query": "budget"}},
+        "result_refs": [], "substantive_text": "The project reference means the Atlas migration.",
+        "tool_choice": None,
         "certainty": "certain",
     }
 
@@ -558,7 +558,7 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         variants = {item["properties"]["kind"]["enum"][0]: item
                     for item in schema["anyOf"]}
         assert tuple(variants) == (
-            "pure_switch", "search", "substantive", "save", "retry",
+            "pure_switch", "search", "substantive", "save", "retry", "annotation",
         )
         assert set(schema["required"]) == {
             "kind", "target_ref", "target_operation_id", "dialog_number",
@@ -588,6 +588,22 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         assert variants["substantive"]["properties"]["substantive_text"] == {
             "type": "string", "minLength": 1, "pattern": r".*\S.*",
         }
+        assert variants["annotation"]["properties"]["substantive_text"] == {
+            "type": "string", "minLength": 1, "pattern": r".*\S.*",
+        }
+        assert variants["annotation"]["properties"]["target_operation_id"] == {
+            "type": "null",
+        }
+        assert variants["annotation"]["properties"]["tool_choice"] == {
+            "type": "null",
+        }
+        assert variants["annotation"]["properties"]["result_refs"] == {
+            "type": "array", "maxItems": 0, "items": {"type": "string"},
+        }
+        assert variants["annotation"]["properties"]["dialog_number"] == (
+            variants["substantive"]["properties"]["dialog_number"]
+        )
+        assert schema["properties"]["target_ref"] == {"type": "null"}
         assert utterances["items"]["additionalProperties"] is False
         assert by_name["list_folders"]["properties"]["arguments"] == catalog["list_folders"]
         assert by_name["list_folders"]["properties"]["arguments"].get("required", []) == []

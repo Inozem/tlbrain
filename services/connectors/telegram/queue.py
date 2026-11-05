@@ -420,6 +420,18 @@ class TelegramQueueWorker:
         if isinstance(operation, Mapping):
             operation_id = operation.get("operation_id", operation_id)
             input_ref = operation.get("input_ref", input_ref)
+        if (isinstance(operation_id, str) and isinstance(input_ref, str)
+                and input_ref.startswith(f"{SESSIONS}/{context_id}/drafts/")
+                and "/annotations/" in input_ref):
+            operation_ref = (self.client.collection(SESSIONS).document(context_id)
+                             .collection("operations").document(operation_id))
+            operation_snapshot = operation_ref.get()
+            operation_data = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
+            if (operation_data.get("operation_id") == operation_id
+                    and operation_data.get("input_ref") == input_ref
+                    and operation_data.get("telegram_internal_kind") == "annotation_apply"):
+                return None
+            raise ValueError("queued annotation operation input reference is invalid")
         parts = input_ref.split("/") if isinstance(input_ref, str) else []
         if (not isinstance(operation_id, str) or not operation_id
                 or len(parts) != 4 or parts[:3] != [SESSIONS, context_id, "commands"]
@@ -467,7 +479,7 @@ class TelegramQueueWorker:
                     or not isinstance(route, Mapping)
                     or route.get("status") not in {"ok", "success"}
                     or route.get("kind") not in {
-                        "pure_switch", "substantive", "search", "save", "retry",
+                        "pure_switch", "substantive", "search", "save", "retry", "annotation",
                     }):
                 raise ValueError("queued command candidate is unavailable")
             return None

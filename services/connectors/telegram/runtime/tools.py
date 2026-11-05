@@ -94,6 +94,25 @@ class TelegramRegistryExecutor:
         checkpoint = checkpoint_ref.get().to_dict() or {}
         if (prior is not None and prior.state == OperationState.COMPLETED
                 and "result" in checkpoint):
+            identity = json.dumps({"name": name, "arguments": validated},
+                                  sort_keys=True, separators=(",", ":"),
+                                  ensure_ascii=False)
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            input_ref = (f"telegram_sessions/{context_id}/operations/{parent_id}"
+                         f"/agent_checkpoints/tool-{int(call_ordinal)}")
+            expected_input = {"name": name, "arguments": validated, "digest": digest}
+            if (prior.immutable_input_digest != digest
+                    or prior.immutable_input_ref != input_ref
+                    or prior.caller_binding != f"telegram:{context_id}:{parent_id}"
+                    or prior.origin_operation_ref
+                    != f"telegram_sessions/{context_id}/operations/{parent_id}"
+                    or checkpoint.get("operation_id") != operation_id
+                    or checkpoint.get("validated_input") != expected_input):
+                return None
+            try:
+                self._assert_queue_lease_live()
+            except PermissionError:
+                return None
             return deepcopy(checkpoint["result"])
         return None
 
@@ -134,9 +153,11 @@ class TelegramRegistryExecutor:
         identity = json.dumps({"name": name, "arguments": arguments}, sort_keys=True,
                               separators=(",", ":"), ensure_ascii=False)
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        operation_id = "telegram-tool-" + hashlib.sha256(
-            f"{parent_id}\0{ordinal}".encode("utf-8")
-        ).hexdigest()
+        operation_id = (
+            "telegram-tool-" + hashlib.sha256(
+                f"{parent_id}\0{ordinal}".encode("utf-8")
+            ).hexdigest()
+        )
         input_ref = (f"telegram_sessions/{context_id}/operations/{parent_id}"
                      f"/agent_checkpoints/tool-{ordinal}")
         create_operation(
@@ -180,7 +201,8 @@ class TelegramRegistryExecutor:
                 raise PermissionError("global tool operation completion was fenced")
             return result_value
         write_context = WriteContext(
-            operation_id=operation_id, effect_id=stable_effect_id(parent_id, ordinal),
+            operation_id=operation_id,
+            effect_id=stable_effect_id(parent_id, ordinal),
             owner=owner, fence=claimed.fence, client=self.client, clock=now_fn,
         )
         context = {**self.context, "last_doc_id": self.execution_context.get("last_doc_id")}

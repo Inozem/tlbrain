@@ -21,7 +21,7 @@ from services.connectors.telegram.save import TelegramSavePending
 from services.connectors.telegram.errors import TelegramDirectSaveInterrupted
 
 
-_ROUTE_KINDS = frozenset({"pure_switch", "search", "substantive", "save", "retry"})
+_ROUTE_KINDS = frozenset({"pure_switch", "search", "substantive", "save", "retry", "annotation"})
 
 
 def _failure(status: str, *, kind: str | None = None) -> dict[str, Any]:
@@ -97,6 +97,10 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
     if kind == "substantive":
         if not isinstance(text, str) or not text.strip():
             return None, "invalid_route"
+    if kind == "annotation":
+        if (not isinstance(text, str) or not text.strip() or tool_choice is not None
+                or target_operation_id is not None or result_refs):
+            return None, "invalid_route"
     if kind == "retry" and type(dialog_number) is not int:
         return None, "invalid_route"
     if certainty == "uncertain":
@@ -107,7 +111,7 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
         "target_operation_id": target_operation_id,
         "dialog_number": dialog_number,
         "result_refs": list(result_refs),
-        "substantive_text": text if kind in {"substantive", "search"} else None,
+        "substantive_text": text if kind in {"substantive", "search", "annotation"} else None,
         "tool_choice": tool_choice,
     }, "ok"
 
@@ -548,8 +552,9 @@ def _control_route_record(route: Any) -> dict[str, Any]:
     allowed_kinds = _ROUTE_KINDS
     for field in (
         "status", "kind", "target_doc_id", "conversation_id",
-        "target_draft_id", "target_operation_id", "dependency_operation_id",
-        "retry_request_operation_id",
+        "target_draft_id", "target_conversation_id",
+        "target_operation_id", "dependency_operation_id",
+        "retry_request_operation_id", "annotation_text",
     ):
         value = route.get(field)
         if field == "status" and (not isinstance(value, str) or value not in allowed_statuses):
@@ -623,7 +628,7 @@ def _operation_route_status(route: Any) -> str:
         } else "invalid_route"
     kind = route.get("kind")
     if not isinstance(kind, str) or kind not in {
-        "pure_switch", "substantive", "search", "save", "retry",
+        "pure_switch", "substantive", "search", "save", "retry", "annotation",
     }:
         return "invalid_route"
     if kind == "search":
@@ -641,6 +646,11 @@ def _operation_route_status(route: Any) -> str:
     if kind == "retry":
         number = route.get("dialog_number")
         return "ok" if type(number) is int and number > 0 else "invalid_route"
+    if kind == "annotation":
+        text = route.get("annotation_text")
+        has_target = (isinstance(route.get("target_doc_id"), str)
+                      or isinstance(route.get("target_draft_id"), str))
+        return "ok" if (has_target and isinstance(text, str) and text.strip()) else "invalid_route"
     if (
         not isinstance(route.get("target_doc_id"), str)
         or not route.get("target_doc_id")

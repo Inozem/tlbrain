@@ -705,3 +705,46 @@ class TelegramSaveRuntime(_TelegramSharedSaveRuntime, _TelegramCommittedSaveRunt
             return True
 
         return bool(commit(self.repository.client.transaction()))
+
+    def load_completion_certificate(self, context_id: str, operation: Any, lease: Any) -> Any:
+        """Load this fenced save's certificate after canonical completion proof."""
+        from core.integrations.firestore.operations import get_operation
+        from services.connectors.telegram.app.terminal_notifications import (
+            _verified_completion_details,
+        )
+        from services.connectors.telegram.runtime.save_repository import (
+            FirestoreTelegramSaveRepository,
+        )
+
+        operation_id = _get(operation, "operation_id")
+        binding = self._captured_binding(context_id, operation)
+        if (not isinstance(operation_id, str) or binding is None
+                or not isinstance(_get(lease, "owner"), str)
+                or type(_get(lease, "fence")) is not int):
+            return None
+        draft_id, _intent_id = binding
+        ledger = self._ledger(context_id, operation_id, lease)
+        repository = FirestoreTelegramSaveRepository(
+            self.repository, context_id=context_id, operation_id=operation_id,
+            owner=_get(lease, "owner"), fence=_get(lease, "fence"),
+            clock=self.clock, ledger=ledger,
+        )
+        repository._assert_current()
+        certificate = repository._load_current_completion_certificate(context_id)
+        if (not isinstance(certificate, Mapping)
+                or certificate.get("context_id") != context_id
+                or certificate.get("draft_id") != draft_id
+                or certificate.get("operation_id") != operation_id):
+            return None
+        draft = self.repository.get_draft(context_id, draft_id)
+        shared = get_operation(self.repository.client, operation_id)
+        if not isinstance(draft, Mapping) or shared is None:
+            return None
+        verified, _folder_path, _outcome = _verified_completion_details(
+            self.repository.client, shared, operation_id, dict(draft),
+        )
+        if not verified or not isinstance(shared.doc_id, str) or not shared.doc_id:
+            return None
+        result = dict(certificate)
+        result["doc_id"] = shared.doc_id
+        return result

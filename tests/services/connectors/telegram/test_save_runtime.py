@@ -2324,6 +2324,343 @@ def test_default_freeform_save_delivers_saving_before_blocked_provider_work(
                 if event["boundary"] == "drive" and event["operation"] == "files.create"]
 
 
+def test_default_asgi_leading_context_accepts_six_forwards_while_dispatch_routes(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A leading composer comment stays bound while default model routing is in flight."""
+    from services.connectors.telegram.runtime.routing import GeminiCommandRouter
+    from services.connectors.telegram.repository import TelegramRepository
+
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    comment = "\u041c\u043e\u0439 \u0434\u0438\u0430\u043b\u043e\u0433 \u0441 \u043c\u0430\u043c\u043e\u0439"
+    runtime.route_response("annotation", substantive_text=comment)
+    assert asyncio.run(runtime.webhook({"update_id": 30100, "message": {
+        "message_id": 300, "date": 1793321000,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "text": comment,
+    }}), loop_factory=_selector_loop).status_code == 200
+    dispatch = next(item["body"] for item in reversed(runtime.task_requests)
+                    if item["body"].get("target_kind") == "telegram_dispatch"
+                    and not item["body"].get("notification_id"))
+
+    entered, release = threading.Event(), threading.Event()
+    route_context = {}
+    route_results = []
+    original_route = GeminiCommandRouter.route
+
+    def gated_route(self, **kwargs):
+        metadata = kwargs.get("context_metadata")
+        route_context.update(metadata if isinstance(metadata, dict) else {})
+        entered.set()
+        if not release.wait(8):
+            raise TimeoutError("test route gate was not released")
+        result = original_route(self, **kwargs)
+        route_results.append(result)
+        return result
+
+    monkeypatch.setattr(GeminiCommandRouter, "route", gated_route)
+    responses, failures = [], []
+
+    def run_dispatch():
+        try:
+            responses.append(asyncio.run(runtime.dispatch(dispatch), loop_factory=_selector_loop))
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=run_dispatch, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(8), "default route did not enter while waiting for the forwards"
+        assert route_context.get("forwarding_context_candidate") is True
+        assert route_context.get("forwarding_source_bound") is False
+        for index in range(6):
+            message_id = 301 + index
+            update = {"update_id": 30101 + index, "message": {
+                "message_id": message_id, "date": 1793321000,
+                "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+                "forward_origin": {
+                    "type": "user", "sender_user": {"id": 44, "first_name": "Mom"},
+                    "date": 1793310000 + index,
+                },
+                "text": f"Forwarded source line {index + 1}.",
+            }}
+            response = asyncio.run(runtime.webhook(update), loop_factory=_selector_loop)
+            assert response.status_code == 200, response.text
+        release.set()
+        worker.join(12)
+        assert not worker.is_alive(), "default queue dispatch did not finish"
+        assert not failures, failures
+        assert responses and responses[0].status_code == 200
+    finally:
+        release.set()
+        worker.join(8)
+
+    repository = TelegramRepository(runtime.db)
+    assert route_results and route_results[0].get("kind") == "annotation", route_results
+    operation = (runtime.db.collection("telegram_sessions").document(dispatch["context_id"])
+                 .collection("operations").document(dispatch["operation_id"]).get().to_dict())
+    assert route_results, (route_context, operation)
+    assert operation["state"] == "completed", operation
+    assert operation["route_control"]["kind"] == "annotation"
+    draft_id = operation["route_control"]["target_draft_id"]
+    assert isinstance(draft_id, str)
+    messages = repository.list_messages(dispatch["context_id"], draft_id)
+    assert [row["message_id"] for row in messages] == list(range(301, 307))
+    annotations = repository.list_draft_annotations(dispatch["context_id"], draft_id)
+    assert len(annotations) == 1
+    assert annotations[0]["text"] == comment
+    assert annotations[0]["state"] == "pending_save"
+    assert annotations[0]["provenance"]["source_message_ids"] == list(range(301, 307))
+    group_id = annotations[0]["provenance"]["receipt_group_id"]
+    group = (runtime.db.collection("telegram_sessions").document(dispatch["context_id"])
+             .collection("receipt_groups").document(group_id).get().to_dict())
+    assert group["accepted_message_ids"] == list(range(30101, 30107))
+    assert not any(
+        row.get("kind") == "error" and "processing another request" in row.get("body", "")
+        for row in (snapshot.to_dict() or {} for snapshot in
+                    runtime.db.collection("notification_outbox").stream())
+    )
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "qdrant" and event["operation"] == "query_points"]
+
+
+def test_default_asgi_annotation_route_waits_without_falling_back_to_old_selected_document(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A pinned annotation resumes after source arrival without adopting old selection."""
+    from services.connectors.telegram.repository import TelegramRepository
+
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    repository = TelegramRepository(runtime.db)
+    context_id, doc_id = "77_default", "older-synced-document"
+    runtime.db.collection("transcript_index").document(doc_id).set({
+        "doc_id": doc_id, "source_file": "Older dialog", "provider": "telegram",
+        "status": "synced",
+    })
+    number = repository.bind_document(
+        context_id, doc_id, "older-document-conversation",
+        metadata={"title": "Older dialog"}, now=runtime.clock(), update_last_doc=False,
+    )
+    repository.ensure_conversation(
+        context_id, "older-document-conversation", kind="document", doc_id=doc_id,
+        dialog_number=number, now=runtime.clock(),
+    )
+    runtime.db.collection("telegram_sessions").document(context_id).set({
+        "active_conversation_id": "older-document-conversation",
+        "selected_dialog_number": number, "last_doc_id": doc_id,
+    }, merge=True)
+    comment = "\u041c\u043e\u0439 \u0434\u0438\u0430\u043b\u043e\u0433 \u0441 \u043c\u0430\u043c\u043e\u0439. " + ("\u041a\u043e\u043d\u0442\u0435\u043a\u0441\u0442 \u043f\u0440\u043e\u0435\u043a\u0442 \u042e\u043f\u0438\u0442\u0435\u0440 \U0001f642. " * 5000)
+    runtime.route_response("annotation", substantive_text=comment)
+    assert asyncio.run(runtime.webhook({"update_id": 30200, "message": {
+        "message_id": 400, "date": 1793321100,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7}, "text": comment,
+    }}), loop_factory=_selector_loop).status_code == 200
+    first_dispatch = next(item["body"] for item in reversed(runtime.task_requests)
+                          if item["body"].get("target_kind") == "telegram_dispatch"
+                          and not item["body"].get("notification_id"))
+    first_result = asyncio.run(runtime.dispatch(first_dispatch), loop_factory=_selector_loop)
+    assert first_result.status_code == 200, first_result.text
+    operation = (runtime.db.collection("telegram_sessions").document(context_id)
+                 .collection("operations").document(first_dispatch["operation_id"]).get().to_dict())
+    assert operation["state"] in {"pending", "running"}, {
+        key: operation.get(key) for key in (
+            "state", "error", "route_control", "route_result", "reply_body",
+            "telegram_internal_kind", "finished_at",
+        )
+    }
+    assert operation["route_control"]["kind"] == "annotation"
+    assert "annotation_text" not in operation["route_control"]
+    assert operation["route_control"]["annotation_payload"]["_input_ref"].endswith(
+        "/input_parts/manifest"
+    )
+    assert operation["route_control"].get("target_doc_id") is None
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "qdrant" and event["operation"] == "upsert"]
+
+
+    for index in range(6):
+        assert asyncio.run(runtime.webhook({"update_id": 30201 + index, "message": {
+            "message_id": 401 + index, "date": 1793321100,
+            "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+            "forward_origin": {
+                "type": "user", "sender_user": {"id": 44, "first_name": "Mom"},
+                "date": 1793310100 + index,
+            },
+            "text": f"Deferred source line {index + 1}.",
+        }}), loop_factory=_selector_loop).status_code == 200
+
+    annotation_notification_id = repository.get_context(context_id)[
+        "latest_receipt_notification_id"
+    ]
+    annotation_ack_task = next(
+        item["body"] for item in runtime.task_requests
+        if item["body"].get("notification_id") == annotation_notification_id
+        and item["body"].get("outbox_id", "").startswith("tgcard-send-")
+    )
+    assert asyncio.run(runtime.deliver(annotation_ack_task),
+                       loop_factory=_selector_loop).status_code == 200
+    close_task = next(
+        item["body"] for item in reversed(runtime.task_requests)
+        if item["body"].get("notification_id") == annotation_notification_id
+        and item["body"].get("outbox_id", "").startswith("tgcard-close-")
+    )
+    assert asyncio.run(runtime.deliver(close_task),
+                       loop_factory=_selector_loop).status_code == 200
+    ready_card = repository.get_notification(annotation_notification_id)
+    save_button = ready_card["reply_markup"]["inline_keyboard"][0][0]
+    assert save_button["text"] == "Save"
+    callback_data = save_button["callback_data"]
+
+    wake = next(item["body"] for item in reversed(runtime.task_requests)
+                if item["body"].get("target_kind") == "telegram_dispatch"
+                and item["body"].get("operation_id") == first_dispatch["operation_id"]
+                and item["body"].get("outbox_id") != first_dispatch["outbox_id"]
+                and not item["body"].get("notification_id"))
+    resumed = asyncio.run(runtime.dispatch(wake), loop_factory=_selector_loop)
+    assert resumed.status_code == 200, resumed.text
+    operation = (runtime.db.collection("telegram_sessions").document(context_id)
+                 .collection("operations").document(first_dispatch["operation_id"]).get().to_dict())
+    assert operation["state"] == "completed"
+    assert operation["route_control"].get("target_doc_id") is None
+    draft_id = operation["route_control"]["target_draft_id"]
+    annotations = repository.list_draft_annotations(context_id, draft_id)
+    assert len(annotations) == 1 and annotations[0]["text"] == comment
+    assert [row["message_id"] for row in repository.list_messages(context_id, draft_id)] == list(
+        range(401, 407)
+    )
+    assert repository.get_notification(annotation_notification_id)[
+        "receipt_control_token"
+    ] == ready_card["receipt_control_token"]
+    assert asyncio.run(runtime.webhook({"update_id": 30300, "callback_query": {
+        "id": "annotation-settled-save-click", "from": {"id": 7},
+        "data": callback_data,
+        "message": {"message_id": ready_card["message_id"], "date": 1793321200,
+                    "chat": {"id": 77, "type": "private"}},
+    }}), loop_factory=_selector_loop).status_code == 200
+    save_operation = repository.get_context(context_id)["reserved_operation_id"]
+    save_row = (runtime.db.collection("telegram_sessions").document(context_id)
+                .collection("operations").document(save_operation).get().to_dict())
+    assert save_row["typed_action"]["action"] == "receipt_save"
+    assert save_row["typed_action"]["notification_id"] == annotation_notification_id
+    assert save_row["typed_action"]["card_revision"] == ready_card["revision"]
+    assert save_row["typed_action"]["dialog_number"] == ready_card["dialog_number"]
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "qdrant" and event["operation"] == "upsert"]
+
+def test_default_router_later_context_attaches_to_current_saved_dialog(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A model-confirmed later annotation may target the selected saved dialog."""
+    from google.genai import types
+    from services.connectors.telegram.repository import TelegramRepository
+
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    repository = TelegramRepository(runtime.db)
+    doc_id = "saved-context-target"
+    runtime.db.collection("transcript_index").document(doc_id).set({
+        "doc_id": doc_id, "source_file": "A saved dialog", "provider": "telegram",
+        "status": "synced", "parent_id": "folder-client", "dialog_date": "2026-11-01",
+    })
+    conversation_id = "saved-context-conversation"
+    number = repository.bind_document(
+        "77_default", doc_id, conversation_id,
+        metadata={"title": "A saved dialog", "parent_id": "folder-client"},
+        now=runtime.clock(),
+    )
+    repository.ensure_conversation(
+        "77_default", conversation_id, kind="document", doc_id=doc_id,
+        dialog_number=number, now=runtime.clock(),
+    )
+    note = "Dmitry uses ‘the project’ to mean Project Jupiter."
+    runtime.route_response(
+        "annotation", target_ref=doc_id, dialog_number=number, substantive_text=note,
+    )
+    assert asyncio.run(runtime.webhook({"update_id": 30400, "message": {
+        "message_id": 500, "date": 1793321300,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "text": "Add that context to this dialog.",
+    }}), loop_factory=_selector_loop).status_code == 200
+    dispatch = next(item["body"] for item in reversed(runtime.task_requests)
+                    if item["body"].get("target_kind") == "telegram_dispatch"
+                    and not item["body"].get("notification_id"))
+    sdk_fakes.gemini.queue("embed_content", response=types.EmbedContentResponse(
+        embeddings=[types.ContentEmbedding(values=[0.25] * 768)],
+    ))
+    from core.indexing.user_facts import prepare_user_fact
+    _, _, fact_payload = prepare_user_fact(doc_id, note, db=runtime.db)
+    existing_fact = [type("Point", (), {"payload": fact_payload})()]
+    for existing in ([], [], existing_fact, existing_fact, existing_fact):
+        sdk_fakes.qdrant.queue("retrieve", response=existing)
+    from uuid import UUID
+    stable_point_id = "88a20ef4-1ee9-4eed-9f42-3f2643445ad1"
+    monkeypatch.setattr("core.operations.effects.uuid4", lambda: UUID(stable_point_id))
+    response = asyncio.run(runtime.dispatch(dispatch), loop_factory=_selector_loop)
+    assert response.status_code == 200, response.text
+    operation = (runtime.db.collection("telegram_sessions").document("77_default")
+                 .collection("operations").document(dispatch["operation_id"]).get().to_dict())
+    assert operation["route_control"]["kind"] == "annotation"
+    assert operation["route_control"]["target_doc_id"] == doc_id
+    annotations = repository.list_conversation_annotations("77_default", conversation_id)
+    assert len(annotations) == 1 and annotations[0]["text"] == note, {
+        "operation": operation,
+        "notifications": [snapshot.to_dict() for snapshot in
+                           runtime.db.collection("notification_outbox").stream()],
+        "sent": runtime.sent,
+    }
+    assert annotations[0]["state"] == "applied"
+    assert annotations[0]["doc_id"] == doc_id
+    fact_upserts = [event for event in sdk_fakes.trace
+                    if event["boundary"] == "qdrant" and event["operation"] == "upsert"]
+    assert len(fact_upserts) == 1
+    assert fact_upserts[0]["arguments"]["points"][0].payload == fact_payload
+    assert fact_upserts[0]["arguments"]["points"][0].id == stable_point_id
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.create"]
+
+
+def test_default_router_later_context_stages_on_current_unsaved_draft(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A later model-confirmed comment uses the captured active draft source."""
+    from services.connectors.telegram.repository import TelegramRepository
+
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    repository = TelegramRepository(runtime.db)
+    forward = {"update_id": 30500, "message": {
+        "message_id": 600, "date": 1793321400,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "forward_origin": {"type": "user", "sender_user": {"id": 44},
+                           "date": 1793310400},
+        "text": "A forwarded line in the current unsaved dialog.",
+    }}
+    assert asyncio.run(runtime.webhook(forward), loop_factory=_selector_loop).status_code == 200
+    ack = next(item["body"] for item in runtime.task_requests
+               if item["body"].get("notification_id"))
+    assert asyncio.run(runtime.deliver(ack), loop_factory=_selector_loop).status_code == 200
+    note = "The person called the project ‘Jupiter’ earlier."
+    runtime.route_response("annotation", substantive_text=note)
+    assert asyncio.run(runtime.webhook({"update_id": 30501, "message": {
+        "message_id": 601, "date": 1793321420,
+        "chat": {"id": 77, "type": "private"}, "from": {"id": 7},
+        "text": "Add this context to the dialog.",
+    }}), loop_factory=_selector_loop).status_code == 200
+    dispatch = next(item["body"] for item in reversed(runtime.task_requests)
+                    if item["body"].get("target_kind") == "telegram_dispatch"
+                    and not item["body"].get("notification_id"))
+    response = asyncio.run(runtime.dispatch(dispatch), loop_factory=_selector_loop)
+    assert response.status_code == 200, response.text
+    operation = (runtime.db.collection("telegram_sessions").document("77_default")
+                 .collection("operations").document(dispatch["operation_id"]).get().to_dict())
+    assert operation["route_control"]["kind"] == "annotation"
+    draft_id = operation["route_control"]["target_draft_id"]
+    assert repository.list_messages("77_default", draft_id)[0]["message_id"] == 600
+    annotations = repository.list_draft_annotations("77_default", draft_id)
+    assert len(annotations) == 1 and annotations[0]["text"] == note
+    assert annotations[0]["state"] == "pending_save"
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.create"]
+
+
 def test_default_app_delivers_unsupported_forward_notice_once(firestore_fake, sdk_fakes, monkeypatch):
     runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
     update = {"update_id": 18701, "message": {

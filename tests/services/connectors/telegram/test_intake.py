@@ -44,6 +44,56 @@ def test_command_parser_preserves_complete_long_text():
     assert parsed.text.endswith("TAIL MUST SURVIVE")
 
 
+def test_leading_text_and_long_burst_keep_source_ids_and_head_binding(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    intake = _intake(repository, _Publisher(), clock=lambda: NOW)
+    timestamp = int(NOW.timestamp())
+    command = _command(101, "Мой диалог с мамой")
+    command["message"]["date"] = timestamp
+    intake.handle_update(command)
+    results = []
+    for index in range(100):
+        forwarded = _forward(102 + index, message_id=202 + index)
+        forwarded["message"]["date"] = timestamp
+        results.append(intake.handle_update(forwarded))
+    assert all(_value(result, "accepted") for result in results)
+    context = repository.get_context("42_default")
+    operation_id = context["reserved_operation_id"]
+    binding = repository.get_ingress_binding("42_default", operation_id)
+    assert binding["matched_message_ids"] == list(range(202, 302))
+    receipt = repository.get_update_receipt("42_default", 102)
+    group = _read_doc(
+        client, f"telegram_sessions/42_default/receipt_groups/{receipt['receipt_group_id']}",
+    )
+    assert group["accepted_message_ids"] == list(range(102, 202))
+    assert group["source_message_ids"] == list(range(202, 302))
+
+
+def test_queued_text_does_not_take_admission_from_reserved_head(firestore_fake):
+    repository, _ = _repository(firestore_fake)
+    intake = _intake(repository, _Publisher(), clock=lambda: NOW)
+    timestamp = int(NOW.timestamp())
+    first = _command(201, "Мой диалог с мамой")
+    first["message"].update(message_id=801, date=timestamp)
+    intake.handle_update(first)
+    first_source = _forward(202, message_id=802)
+    first_source["message"]["date"] = timestamp
+    intake.handle_update(first_source)
+    second = _command(203, "a queued question")
+    second["message"].update(message_id=900, date=timestamp)
+    intake.handle_update(second)
+    results = []
+    for index in range(5):
+        forwarded = _forward(204 + index, message_id=803 + index)
+        forwarded["message"]["date"] = timestamp
+        results.append(intake.handle_update(forwarded))
+    assert all(_value(result, "accepted") for result in results)
+    context = repository.get_context("42_default")
+    binding = repository.get_ingress_binding("42_default", context["reserved_operation_id"])
+    assert binding["candidate_message_id"] == 801
+    assert binding["matched_message_ids"] == [802, 803, 804, 805, 806, 807]
+
+
 def _repository(firestore_fake):
     repository_type = importlib.import_module(
         "services.connectors.telegram.repository"

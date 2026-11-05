@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from google.cloud import firestore
@@ -262,6 +262,7 @@ def _register_command_operation(
     now: datetime,
     snapshot: _CommandSnapshot,
     action_metadata: Mapping[str, Any] | None = None,
+    ingress_binding_id: str | None = None,
 ) -> Any:
     """Reserve the FIFO operation and create its outbox before queue writes begin."""
     def create_command_outbox() -> None:
@@ -278,6 +279,8 @@ def _register_command_operation(
         )
 
     operation_fields = _command_link_metadata(snapshot)
+    if ingress_binding_id is not None:
+        operation_fields["ingress_binding_id"] = ingress_binding_id
     if action_metadata is not None:
         operation_fields["typed_action"] = dict(action_metadata)
     return register_operation_in_transaction(
@@ -325,6 +328,7 @@ def _persist_command_acceptance(
     state: _CommandAcceptanceState,
     operation: Any,
     now: datetime,
+    ingress_binding: Mapping[str, Any] | None = None,
 ) -> "TelegramIntakeResult":
     """Persist command, context, and replay receipt after all transaction reads."""
     snapshot = state.snapshot
@@ -346,6 +350,11 @@ def _persist_command_acceptance(
     transaction.set(identity.command_ref, state.command_data)
     transaction.set(identity.context_ref, state.context)
     transaction.set(identity.receipt_ref, receipt)
+    if ingress_binding is not None:
+        binding_ref = identity.context_ref.collection("ingress_bindings").document(
+            identity.operation_id
+        )
+        transaction.set(binding_ref, dict(ingress_binding))
     return TelegramIntakeResult(
         True,
         identity.context_id,
@@ -358,6 +367,49 @@ def _persist_command_acceptance(
     )
 
 
+def _bind_text_to_recent_receipt_group(
+    client: Any, transaction: Any, *, context_id: str, context: Mapping[str, Any],
+    draft_id: str | None, user_id: int, message_id: int | None,
+    transport_timestamp: int | None,
+) -> dict[str, Any] | None:
+    """Return an exact forward-first burst binding when transport evidence agrees."""
+    group_id = context.get("latest_receipt_group_id")
+    if (not isinstance(group_id, str) or not isinstance(draft_id, str)
+            or message_id is None or type(transport_timestamp) is not int):
+        return None
+    group_ref = client.collection(SESSIONS).document(context_id).collection(
+        "receipt_groups"
+    ).document(group_id)
+    snapshot = group_ref.get(transaction=transaction)
+    group = snapshot.to_dict() or {} if snapshot.exists else {}
+    start, end = group.get("transport_start_timestamp"), group.get("transport_end_timestamp")
+    max_message_id = group.get("max_message_id")
+    source_ids = group.get("source_message_ids")
+    if not isinstance(source_ids, list):
+        source_ids = []
+    source_ids = [value for value in source_ids if type(value) is int]
+    if type(max_message_id) is not int:
+        max_message_id = max(source_ids, default=0)
+    distance = (start - transport_timestamp if type(start) is int and transport_timestamp < start
+                else transport_timestamp - end if type(end) is int and transport_timestamp > end
+                else 0)
+    if not (
+        group.get("context_id") in (None, context_id)
+        and group.get("draft_id") == draft_id
+        and group.get("owner_user_id") in (None, 0, user_id)
+        and group.get("state") in {"open", "closed"}
+        and type(start) is int and type(end) is int and distance <= 1
+        and max_message_id < message_id
+    ):
+        return None
+    return {
+        "draft_id": draft_id,
+        "receipt_group_id": group_id,
+        "matched_message_ids": source_ids,
+        "state": "collecting",
+    }
+
+
 class _TelegramCommandMixin:
     """Persist idempotent command acceptance and operation registration."""
 
@@ -368,7 +420,7 @@ class _TelegramCommandMixin:
             "ok", "success", "invalid_route", "uncertain", "error",
             "not_found", "unconfirmed",
         }
-        allowed_kinds = {"pure_switch", "search", "substantive", "save", "retry"}
+        allowed_kinds = {"pure_switch", "search", "substantive", "save", "retry", "annotation"}
         status = route.get("status")
         kind = route.get("kind")
         if not isinstance(status, str) or status not in allowed_status:
@@ -384,7 +436,7 @@ class _TelegramCommandMixin:
                 raise ValueError("selection_policy is invalid")
             safe["selection_policy"] = selection_policy
         for field in (
-            "target_doc_id", "conversation_id", "target_draft_id",
+            "target_doc_id", "conversation_id", "target_conversation_id", "target_draft_id",
             "target_operation_id", "dependency_operation_id",
         ):
             value = route.get(field)
@@ -445,6 +497,41 @@ class _TelegramCommandMixin:
             if kind != "search" or not isinstance(session_id, str) or not session_id:
                 raise ValueError("search_session_id is invalid")
             safe["search_session_id"] = session_id
+        if kind == "annotation":
+            payload = route.get("annotation_payload")
+            text_digest = route.get("annotation_text_sha256")
+            legacy_text = route.get("annotation_text")
+            if (payload is None and isinstance(legacy_text, str) and legacy_text.strip()):
+                safe["annotation_text"] = legacy_text
+            elif (not isinstance(payload, Mapping)
+                    or not isinstance(text_digest, str)
+                    or len(text_digest) != 64
+                    or any(char not in "0123456789abcdef" for char in text_digest)):
+                raise ValueError("annotation payload is invalid")
+            if isinstance(payload, Mapping):
+                inline = payload.get("_inline")
+                input_ref = payload.get("_input_ref")
+                if (isinstance(inline, str) and set(payload) <= {
+                        "_inline", "sha256", "byte_length"
+                    }):
+                    if (not inline.strip() or type(payload.get("byte_length")) is not int
+                        or payload["byte_length"] < 0
+                        or not isinstance(payload.get("sha256"), str)):
+                        raise ValueError("inline annotation payload is invalid")
+                elif (isinstance(input_ref, str)
+                    and input_ref.startswith("dialog_operations/telegram-ledger-")
+                    and input_ref.endswith("/input_parts/manifest")
+                    and type(payload.get("byte_length")) is int
+                    and payload["byte_length"] > 0
+                    and isinstance(payload.get("sha256"), str)
+                    and type(payload.get("max_part_bytes")) is int):
+                    safe["annotation_payload"] = dict(payload)
+                else:
+                    raise ValueError("annotation payload reference is invalid")
+            if isinstance(payload, Mapping) and "_inline" in payload:
+                safe["annotation_payload"] = dict(payload)
+            if isinstance(text_digest, str):
+                safe["annotation_text_sha256"] = text_digest
         if route.get("search_protocol") == "agent-v1" and kind != "search":
             if (kind != "substantive" or not isinstance(safe.get("conversation_id"), str)
                     or not safe.get("conversation_id")):
@@ -599,6 +686,18 @@ class _TelegramCommandMixin:
         value = (snapshot.to_dict() or {}).get("route_control")
         return dict(value) if isinstance(value, Mapping) else None
 
+    def get_ingress_binding(self, context_id: str, operation_id: str) -> dict[str, Any] | None:
+        """Read this operation's server-owned provisional forwarding association."""
+        context_id = _identifier(context_id, "context_id")
+        operation_id = _identifier(operation_id, "operation_id")
+        snapshot = (self.client.collection(SESSIONS).document(context_id)
+                    .collection("ingress_bindings").document(operation_id).get())
+        row = snapshot.to_dict() or {} if snapshot.exists else None
+        if (not isinstance(row, Mapping) or row.get("context_id") != context_id
+                or row.get("operation_id") != operation_id):
+            return None
+        return dict(row)
+
     def get_switch_notice_state(self, context_id: str, operation_id: str) -> str | None:
         """Read the durable switch-notice disposition for transport replay."""
         context_id = _identifier(context_id, "context_id")
@@ -714,6 +813,8 @@ class _TelegramCommandMixin:
         thread_id: int | None,
         topic_name: str | None,
         command: Any,
+        message_id: int | None,
+        transport_timestamp: int | None,
         now: datetime,
     ) -> TelegramIntakeResult:
         """Coordinate the all-reads-first freeform command reservation."""
@@ -733,6 +834,30 @@ class _TelegramCommandMixin:
             command=command,
             now=now,
         )
+        ingress_binding = None
+        if command.kind == "freeform" and message_id is not None:
+            recent_source = _bind_text_to_recent_receipt_group(
+                self.client, transaction, context_id=identity.context_id,
+                context=state.context, draft_id=state.snapshot.draft_id,
+                user_id=user_id, message_id=message_id,
+                transport_timestamp=transport_timestamp,
+            )
+            ingress_binding = {
+                "context_id": identity.context_id,
+                "operation_id": identity.operation_id,
+                "owner_user_id": user_id,
+                "candidate_message_id": message_id,
+                "transport_timestamp": transport_timestamp,
+                "state": "collecting" if recent_source else "pending",
+                "draft_id": recent_source.get("draft_id") if recent_source else None,
+                "receipt_group_id": recent_source.get("receipt_group_id") if recent_source else None,
+                "matched_message_ids": recent_source.get("matched_message_ids", [])
+                if recent_source else [],
+                "source_binding_finalized": bool(recent_source),
+                "created_at": now,
+                "deadline_at": now + timedelta(seconds=1 if recent_source else 5),
+                "max_deadline_at": now + timedelta(seconds=30),
+            }
         operation = _register_command_operation(
             self.client,
             transaction,
@@ -742,6 +867,7 @@ class _TelegramCommandMixin:
             snapshot=state.snapshot,
             action_metadata=(command.action_metadata
                              if isinstance(command.action_metadata, Mapping) else None),
+            ingress_binding_id=(identity.operation_id if ingress_binding is not None else None),
         )
         _update_command_context(
             state.context,
@@ -752,6 +878,9 @@ class _TelegramCommandMixin:
             sequence=operation.sequence,
             now=now,
         )
+        if (ingress_binding is not None
+                and state.context.get("reserved_operation_id") == identity.operation_id):
+            state.context["pending_ingress_operation_id"] = identity.operation_id
         return _persist_command_acceptance(
             transaction,
             identity=identity,
@@ -759,6 +888,7 @@ class _TelegramCommandMixin:
             state=state,
             operation=operation,
             now=now,
+            ingress_binding=ingress_binding,
         )
 
 
@@ -771,6 +901,8 @@ class _TelegramCommandMixin:
         thread_id: int | None = None,
         topic_name: str | None = None,
         command: Any,
+        message_id: int | None = None,
+        transport_timestamp: int | None = None,
         now: datetime,
     ) -> TelegramIntakeResult:
         """Accept command text and reserve its FIFO position with a save cutoff."""
@@ -788,6 +920,10 @@ class _TelegramCommandMixin:
             raise ValueError("topic_name must be a string or None")
         if not isinstance(command, TelegramCommand):
             raise TypeError("command must be a TelegramCommand")
+        if message_id is not None:
+            message_id = _integer(message_id, "message_id", minimum=1)
+        if transport_timestamp is not None:
+            transport_timestamp = _integer(transport_timestamp, "transport_timestamp", minimum=1)
         context_id = build_context_id(chat_id, thread_id)
         identity = _prepare_command_identity(
             self.client,
@@ -807,6 +943,8 @@ class _TelegramCommandMixin:
                 thread_id=thread_id,
                 topic_name=topic_name,
                 command=command,
+                message_id=message_id,
+                transport_timestamp=transport_timestamp,
                 now=now,
             )
 
@@ -911,6 +1049,7 @@ class _TelegramCommandMixin:
                 transaction, identity=identity, update_id=update_id,
                 chat_id=chat_id, user_id=user_id, thread_id=thread_id,
                 topic_name=context.get("topic_name"), command=command, now=now,
+                message_id=None, transport_timestamp=None,
             )
             write_prepared_outbox_record(transaction, saving_outbox)
             next_revision = _integer(row.get("revision", 1), "revision", minimum=1) + 1
