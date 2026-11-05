@@ -7,6 +7,7 @@ from dataclasses import fields
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +40,7 @@ from services.connectors.telegram.runtime.search_agent import (
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-command-runtime")
 _PROCESSING_ERROR_REPLY = "An error occurred while processing your request. Please try again."
 _UNCERTAIN_ROUTE_REPLY = "I could not determine what you want me to do. Please clarify."
+_LOGGER = logging.getLogger(__name__)
 
 
 class _AcceptedDraftContextInvalid(ValueError):
@@ -966,12 +968,15 @@ class _CommandExecution(SearchAgentMixin):
             lease_check=self.lease_check, ledger=self.ledger,
         )
 
-    def executor_factory(self, target_doc_id: str, delivery_id: str, extra: Any) -> Any:
+    def executor_factory(self, target_doc_id: str, delivery_id: str, extra: Any, *,
+                         allow_scoped_transcript: bool = False) -> Any:
         """Create a scoped registry executor wrapped in durable retry governance."""
         scoped = {**self.executor_context, "target_doc_id": target_doc_id,
-                  "clock": self.runtime.clock}
+                  "clock": self.runtime.clock,
+                  "allow_scoped_transcript": False}
         if isinstance(extra, Mapping):
             scoped.update(extra)
+        scoped["allow_scoped_transcript"] = allow_scoped_transcript
         executor = TelegramRegistryExecutor(
             client=self.runtime.repository.client, context=scoped,
             save_handler=self.runtime.save_handler, execution_context=scoped,
@@ -1009,9 +1014,15 @@ class _CommandExecution(SearchAgentMixin):
             self.chat_conversation_id, self.route_history, self.route_conversation = (
                 await self._routing_conversation()
             )
-        except Exception:
+        except Exception as error:
             self.chat_conversation_id, self.route_history, self.route_conversation = None, [], None
             self.route_history_error = True
+            _LOGGER.warning(
+                "telegram route history load failed",
+                extra={"operation_id": self.operation_id, "phase": "routing",
+                       "code": "history_load_failed",
+                       "exception_class": type(error).__name__},
+            )
         checkpoint_conversation_id = await _offload(
             self.ledger.checkpoint_conversation_id, self.operation_id,
         )
@@ -1070,8 +1081,14 @@ class _CommandExecution(SearchAgentMixin):
                     },
                     history=self.route_history,
                 ) if self.command is not None else {}
-            except Exception:
+            except Exception as error:
                 self.raw_decision = {}
+                _LOGGER.warning(
+                    "telegram route selection failed",
+                    extra={"operation_id": self.operation_id, "phase": "routing",
+                           "code": "route_selection_failed",
+                           "exception_class": type(error).__name__},
+                )
         self.decision, self.decision_status = _valid_response(self.raw_decision)
 
     def _load_search_exchange(
@@ -1294,11 +1311,13 @@ class _CommandExecution(SearchAgentMixin):
                 if name not in _SEARCH_READ_TOOLS:
                     self.search_continuation = False
                     self.search_session_id = None
-                elif (name == "get_transcript"
-                      and choice["arguments"].get("doc_id") not in
-                      await _offload(self._search_allowed_doc_ids)):
-                    self.decision, self.decision_status = None, "invalid_route"
-                    self.search_continuation = False
+                elif name == "get_transcript":
+                    doc_id = choice["arguments"].get("doc_id")
+                    if isinstance(doc_id, str):
+                        allowed_ids = await _offload(self._search_allowed_doc_ids)
+                        if doc_id not in allowed_ids:
+                            self.decision, self.decision_status = None, "invalid_route"
+                            self.search_continuation = False
         if (self.decision is not None and self.decision["kind"] == "search"
                 and isinstance(self.pinned, Mapping)
                 and self.pinned.get("search_protocol") == "agent-v1"):

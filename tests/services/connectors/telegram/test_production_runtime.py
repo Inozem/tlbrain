@@ -2263,9 +2263,11 @@ def test_default_asgi_selected_document_routes_query_then_answers_over_real_gemi
     gemini_http.close()
 
 
-@pytest.mark.parametrize("include_result", [True, False])
+@pytest.mark.parametrize(("include_result", "folder_read"), [
+    (True, False), (False, False), (True, True),
+])
 def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_gemini_http(
-    firestore_fake, sdk_fakes, monkeypatch, include_result,
+    firestore_fake, sdk_fakes, monkeypatch, include_result, folder_read,
 ):
     """Route search from a selected document into a separate durable session."""
     import httpx
@@ -2276,6 +2278,16 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
     from services.connectors.telegram.app.main import create_app
     from services.connectors.telegram.client import TelegramClient
     from services.connectors.telegram.repository import TelegramRepository
+
+    tool_execution = []
+    from services.connectors.telegram.runtime import tools as runtime_tools
+    original_invoke_tool = runtime_tools.invoke_tool
+
+    def observe_tool(name, arguments, **kwargs):
+        tool_execution.append((name, dict(arguments), dict(kwargs.get("context", {}))))
+        return original_invoke_tool(name, arguments, **kwargs)
+
+    monkeypatch.setattr(runtime_tools, "invoke_tool", observe_tool)
 
     db = firestore_fake.client_class()
     monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: db)
@@ -2462,6 +2474,32 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
                     "thoughtSignature": "c3ludGhldGljLXJvdXRlLXNpZw==",
                 }],
             }}]})
+        if route_count == 1 and include_result and folder_read and native_read_count == 0:
+            native_read_count += 1
+            assert "application-tool-result-data" in serialized_contents
+            assert {item["name"] for item in payload["tools"][0]["functionDeclarations"]} == {
+                "query", "get_transcript", "list_recent_transcripts", "list_folders",
+            }
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"id": "folder-list-call", "name": "list_folders",
+                                     "args": {}},
+                    "thoughtSignature": "c3ludGhldGljLWZvbGRlci1saXN0",
+                }],
+            }}]})
+        if route_count == 1 and include_result and folder_read and native_read_count == 1:
+            native_read_count += 1
+            assert "functionResponse" in serialized_contents
+            assert "Client" in serialized_contents
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"id": "folder-transcript-call", "name": "get_transcript",
+                                     "args": {"folder_path": ["Client"],
+                                              "date_from": "2026-01-01",
+                                              "date_to": "2026-12-31", "limit": 5}},
+                    "thoughtSignature": "c3ludGhldGljLWZvbGRlci1yZWFk",
+                }],
+            }}]})
         if route_count == 1 and include_result and native_read_count == 0:
             native_read_count += 1
             assert "application-tool-result-data" in serialized_contents
@@ -2538,7 +2576,17 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
     assert processed.json() in ({"status": "processed"}, {"status": "noop"})
     operation = (db.collection("telegram_sessions").document(context_id)
                  .collection("operations").document(dispatch["operation_id"]).get().to_dict())
-    assert operation["state"] == "completed", f"generation={generation_requests} request_count={len(wire_requests)} sent={sent} route={operation.get('route_control')}"
+    assert operation["state"] == "completed"
+    if folder_read:
+        folder_read_call = next(call for call in tool_execution
+                                if call[0] == "get_transcript")
+        assert folder_read_call[1] == {
+            "folder_path": ["Client"], "date_from": "2026-01-01",
+            "date_to": "2026-12-31", "limit": 5,
+        }
+        assert folder_read_call[2]["target_doc_id"] is None
+        assert folder_read_call[2]["last_doc_id"] is None
+        assert folder_read_call[2]["allow_scoped_transcript"] is True
 
     second_dispatch = None
     if include_result:
@@ -2636,14 +2684,16 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
                                  and event["operation"] == "query_points"])
     assert retrieval_query_count == 3
     assert sum(request.url.path.endswith(":generateContent")
-               for request in wire_requests) == (5 if include_result else 2)
+               for request in wire_requests) == (
+                   6 if folder_read else 5 if include_result else 2
+               )
     assert sum(request.url.path.endswith(":batchEmbedContents")
                for request in wire_requests) == 2
 
     duplicate = asyncio.run(post("/internal/dispatch", dispatch), loop_factory=_selector_loop)
     assert duplicate.status_code == 200, duplicate.text
     assert duplicate.json() in ({"status": "noop"}, {"status": "processed"})
-    assert len(wire_requests) == (7 if include_result else 4)
+    assert len(wire_requests) == (8 if folder_read else 7 if include_result else 4)
     assert len([event for event in sdk_fakes.trace
                 if event["boundary"] == "qdrant"
                 and event["operation"] == "query_points"]) == retrieval_query_count

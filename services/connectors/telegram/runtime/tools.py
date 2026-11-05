@@ -52,7 +52,8 @@ class TelegramRegistryExecutor:
         if name == "get_transcript":
             if arg_doc is None and isinstance(pinned, str) and pinned:
                 validated["doc_id"] = pinned
-            elif arg_doc is None:
+            elif (arg_doc is None
+                  and self.execution_context.get("allow_scoped_transcript") is not True):
                 raise ValueError("transcript reads require a pinned document")
         self._assert_queue_lease_live()
         if name == "add_dialog":

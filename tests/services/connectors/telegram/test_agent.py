@@ -512,11 +512,22 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         )
 
         request = json.loads(wire_requests[0].content)
+        route_prompt = json.loads(request["contents"][0]["parts"][0]["text"])
+        assert "metadata and past saves alone are not explicit document selection" in route_prompt["instruction"]
+        assert "target_ref=null, target_operation_id=null, and dialog_number=null" in route_prompt["instruction"]
         declaration = request["tools"][0]["functionDeclarations"][0]
         schema = _wire_parameters_schema(declaration)
         assert request["toolConfig"]["functionCallingConfig"]["mode"] == "ANY"
         assert declaration["name"] == "route_command"
         assert schema["additionalProperties"] is False
+        assert schema["properties"]["target_ref"] == {"type": "null"}
+        assert schema["properties"]["target_operation_id"] == {"type": "null"}
+        assert route_prompt["response_schema"]["properties"]["target_ref"] == {
+            "type": "null",
+        }
+        assert route_prompt["response_schema"]["properties"]["target_operation_id"] == {
+            "type": "null",
+        }
         tool_choice_schema = schema["properties"]["tool_choice"]
         assert tool_choice_schema["anyOf"][-1] == {"type": "null"}
         choices = tool_choice_schema["anyOf"][:-1]
@@ -577,9 +588,6 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         assert variants["substantive"]["properties"]["substantive_text"] == {
             "type": "string", "minLength": 1, "pattern": r".*\S.*",
         }
-        assert schema["properties"]["target_operation_id"] == {
-            "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
-        }
         assert utterances["items"]["additionalProperties"] is False
         assert by_name["list_folders"]["properties"]["arguments"] == catalog["list_folders"]
         assert by_name["list_folders"]["properties"]["arguments"].get("required", []) == []
@@ -588,7 +596,6 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
             "type": "boolean",
         }
         for field_name, field_type in (
-            ("target_ref", "string"), ("target_operation_id", "string"),
             ("dialog_number", "integer"), ("tool_choice", "object"),
             ("substantive_text", "string"),
         ):
@@ -600,6 +607,65 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         assert "additional_properties" not in json.dumps(schema)
         assert wire_requests[0].url.path.endswith(f"models/{MODEL}:generateContent")
         assert request["generationConfig"]["thinkingConfig"]["thinking_level"] == "MINIMAL"
+    finally:
+        http_client.close()
+
+
+def test_router_selector_schema_uses_only_supplied_candidates_on_real_sdk_wire(monkeypatch):
+    import httpx
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.runtime.routing import GeminiCommandRouter, _ROUTE_SCHEMA
+    from services.connectors.telegram.tools import get_tool_catalog
+
+    schema_before = deepcopy(_ROUTE_SCHEMA)
+    catalog_before = deepcopy(get_tool_catalog()["tools"])
+    wire_requests = []
+
+    def respond(request):
+        wire_requests.append(request)
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"functionCall": {
+                "id": "synthetic-route-call", "name": "route_command",
+                "args": {
+                    "kind": "substantive", "target_ref": "synthetic-doc",
+                    "target_operation_id": "synthetic-predecessor",
+                    "dialog_number": None, "result_refs": [],
+                    "substantive_text": "summarize this document",
+                    "tool_choice": None, "certainty": "certain",
+                },
+            }}],
+        }}]})
+
+    client, http_client = _real_sdk_client(monkeypatch, respond)
+    try:
+        router = GeminiCommandRouter(GeminiAgent(client=client))
+        result = router.route(
+            text="Summarize the selected document",
+            candidates=[{"doc_id": "synthetic-doc", "title": "Synthetic"}],
+            recent_search_results=[{"doc_id": "synthetic-recent-doc"}],
+            operation_candidates=[{"operation_id": "synthetic-predecessor"}],
+            context_metadata={"last_doc_id": "synthetic-doc"},
+        )
+        assert result["target_ref"] == "synthetic-doc"
+        request = json.loads(wire_requests[0].content)
+        prompt = json.loads(request["contents"][0]["parts"][0]["text"])
+        declaration = request["tools"][0]["functionDeclarations"][0]
+        wire_schema = _wire_parameters_schema(declaration)
+        expected_ref = {"anyOf": [
+            {"type": "string", "enum": [
+                "synthetic-doc", "synthetic-recent-doc", "last",
+            ]}, {"type": "null"},
+        ]}
+        expected_operation = {"anyOf": [
+            {"type": "string", "enum": ["synthetic-predecessor"]},
+            {"type": "null"},
+        ]}
+        assert wire_schema["properties"]["target_ref"] == expected_ref
+        assert wire_schema["properties"]["target_operation_id"] == expected_operation
+        assert prompt["response_schema"]["properties"]["target_ref"] == expected_ref
+        assert prompt["response_schema"]["properties"]["target_operation_id"] == expected_operation
+        assert _ROUTE_SCHEMA == schema_before
+        assert get_tool_catalog()["tools"] == catalog_before
     finally:
         http_client.close()
 
@@ -709,6 +775,46 @@ def test_full_telegram_catalog_serializes_raw_json_schemas_without_mutating_inpu
             assert _wire_parameters_schema(by_name[name]) == original_by_name[name]
         for item in serialized:
             _wire_parameters_schema(item)
+    finally:
+        http_client.close()
+
+
+def test_pinned_transcript_schema_is_scoped_on_actual_gemini_wire(monkeypatch):
+    import httpx
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.tools import get_tool_catalog
+
+    wire_requests = []
+
+    def respond(request):
+        wire_requests.append(request)
+        return httpx.Response(200, json={"candidates": [{"content": {
+            "role": "model", "parts": [{"text": "synthetic answer"}],
+        }}]})
+
+    catalog_before = deepcopy(get_tool_catalog()["tools"])
+    client, http_client = _real_sdk_client(monkeypatch, respond)
+    try:
+        agent = _telegram_agent()(
+            model=GeminiAgent(client=client), ledger=FakeLedger(),
+            tool_executor=FakeExecutor(),
+        )
+        result = agent.run(
+            conversation_id="synthetic-pinned-conversation",
+            delivery_id="synthetic-pinned-operation",
+            history=[{"role": "user", "parts": [{"text": "synthetic request"}]}],
+            target_doc_id="synthetic-pinned-doc",
+            executor_factory=lambda *_args: FakeExecutor(),
+        )
+        assert result["status"] == "ok"
+        request = json.loads(wire_requests[0].content)
+        declarations = request["tools"][0]["functionDeclarations"]
+        transcript = next(item for item in declarations
+                          if item["name"] == "get_transcript")
+        schema = _wire_parameters_schema(transcript)
+        assert schema["properties"]["doc_id"]["enum"] == ["synthetic-pinned-doc"]
+        assert "doc_id" not in schema.get("required", [])
+        assert get_tool_catalog()["tools"] == catalog_before
     finally:
         http_client.close()
 

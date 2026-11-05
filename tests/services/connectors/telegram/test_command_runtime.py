@@ -1776,11 +1776,23 @@ def test_search_route_is_governed_replayable_and_isolated(monkeypatch, firestore
                if path.startswith(f"telegram_sessions/{context_id}/conversations/"))
 
 
-def test_search_provider_failures_use_three_stage_budget_and_safe_error(monkeypatch, firestore_fake):
+def test_search_provider_failures_use_three_stage_budget_and_safe_error(
+    monkeypatch, firestore_fake, caplog,
+):
     from core.integrations.firestore.operation_queue import QueueOperationRetryStore
     from core.operations.retries import RetryGovernor
     from services.connectors.telegram.repository import TelegramRepository
     from services.connectors.telegram.runtime import TelegramCommandRuntime
+    from services.connectors.telegram.runtime.runtime import _CommandExecution
+    caplog.set_level("WARNING")
+    settlements = []
+    settle = _CommandExecution._settle_governed_failure
+
+    async def count_settlement(self):
+        settlements.append(self.operation_id)
+        return await settle(self)
+
+    monkeypatch.setattr(_CommandExecution, "_settle_governed_failure", count_settlement)
     calls = []
     def fail_query(**kwargs):
         calls.append(kwargs)
@@ -1805,8 +1817,45 @@ def test_search_provider_failures_use_three_stage_budget_and_safe_error(monkeypa
 
     assert [state.value for state in states] == ["running", "running", "failed"]
     assert len(calls) == 3
+    assert settlements == [operation["operation_id"]] * 3
     assert "operation_id=op-runtime" in bot.sent[-1][1]
     assert "private search provider details" not in bot.sent[-1][1]
+    assert "private search provider details" not in caplog.text
+
+
+def test_route_failure_diagnostic_contains_only_bounded_safe_fields(
+    firestore_fake, caplog,
+):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    class FailingModel:
+        def generate(self, **_kwargs):
+            raise RuntimeError("synthetic provider body with raw request and source text")
+
+    caplog.set_level("WARNING")
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(client)
+    bot = _Bot()
+    runtime = TelegramCommandRuntime(
+        repository=repository, save_handler=object(), client=bot,
+        model=FailingModel(),
+    )
+
+    state = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert state.value == "failed"
+    record = next(record for record in caplog.records
+                  if record.message == "telegram route selection failed")
+    assert record.operation_id == operation["operation_id"]
+    assert record.phase == "routing"
+    assert record.code == "route_selection_failed"
+    assert record.exception_class == "RuntimeError"
+    assert "synthetic provider body" not in caplog.text
+    assert "raw request" not in caplog.text
+    assert "private request" not in caplog.text
 
 
 def test_search_route_uses_one_real_embedding_attempt_per_durable_retry(
@@ -2887,6 +2936,378 @@ def test_search_executor_transcript_read_uses_confirmed_doc_without_query_filter
     with pytest.raises(PermissionError, match="read-only"):
         guarded.execute(name="create_folder", arguments={"name": "Forbidden"}, call_ordinal=2)
     assert len(executor.calls) == 1
+
+
+def test_search_executor_allows_only_server_scoped_folder_transcript_read():
+    from services.connectors.telegram.runtime.runtime import _SearchOnlyExecutor
+
+    class Executor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, **kwargs):
+            self.calls.append(kwargs)
+            return ([], {"truncated": False})
+
+    args = {"folder_path": ["Synthetic Client"], "date_from": "2026-01-01",
+            "date_to": "2026-12-31", "limit": 5}
+    executor = Executor()
+    allowed = _SearchOnlyExecutor(
+        executor, initial_filters={"query": "synthetic question",
+                                   "folder_path": ["Synthetic Client"],
+                                   "date_from": "2026-01-01", "date_to": "2026-12-31"},
+        allow_scoped_transcript=True,
+    )
+    assert allowed.execute(name="get_transcript", arguments=args, call_ordinal=1)["segments"] == []
+    assert executor.calls[0]["arguments"] == args
+
+    ordinary = _SearchOnlyExecutor(executor)
+    with pytest.raises(PermissionError, match="confirmed result"):
+        ordinary.execute(name="get_transcript", arguments=args, call_ordinal=2)
+    assert len(executor.calls) == 1
+
+
+def test_registry_executor_requires_server_scoped_flag_for_folder_transcript(monkeypatch):
+    from services.connectors.telegram.runtime.tools import TelegramRegistryExecutor
+
+    calls = []
+    monkeypatch.setattr(
+        "services.connectors.telegram.runtime.tools.invoke_tool",
+        lambda name, arguments, **kwargs: calls.append((name, arguments, kwargs))
+        or {"segments": [], "metadata": {"truncated": False}},
+    )
+    arguments = {"folder_path": ["Synthetic Client"], "limit": 3}
+    ordinary = TelegramRegistryExecutor(
+        client=None, context={"last_doc_id": None}, save_handler=object(),
+        execution_context={"target_doc_id": None},
+    )
+    ordinary._assert_queue_lease_live = lambda: None
+    with pytest.raises(ValueError, match="pinned document"):
+        ordinary.execute(name="get_transcript", arguments=arguments, call_ordinal=0)
+    assert calls == []
+
+    scoped = TelegramRegistryExecutor(
+        client=None, context={"last_doc_id": None}, save_handler=object(),
+        execution_context={"target_doc_id": None, "allow_scoped_transcript": True},
+    )
+    scoped._assert_queue_lease_live = lambda: None
+    scoped.execute(name="get_transcript", arguments=arguments, call_ordinal=1)
+    assert calls[0][0:2] == ("get_transcript", arguments)
+    assert calls[0][2]["context"]["last_doc_id"] is None
+
+
+@pytest.mark.parametrize(("arguments", "confirmed", "accepted"), [
+    ({"folder_path": ["Synthetic Client"], "date_from": "2026-01-01",
+      "limit": 3}, set(), True),
+    ({"doc_id": "synthetic-confirmed-doc"}, {"synthetic-confirmed-doc"}, True),
+    ({"doc_id": "synthetic-unconfirmed-doc"}, {"synthetic-confirmed-doc"}, False),
+    ({"limit": 3}, set(), True),
+])
+def test_search_continuation_accepts_scoped_folder_read_and_keeps_doc_confirmation(
+    arguments, confirmed, accepted,
+):
+    from services.connectors.telegram.runtime.runtime import _CommandExecution
+
+    execution = object.__new__(_CommandExecution)
+    execution.decision = {
+        "kind": "substantive", "target_ref": None,
+        "target_operation_id": None, "dialog_number": None,
+        "tool_choice": {"name": "get_transcript", "arguments": arguments},
+    }
+    execution.route_conversation = SimpleNamespace(
+        kind=SimpleNamespace(value="search"), search_filters=(
+            {} if arguments == {"limit": 3}
+            else {"folder_path": ["Synthetic Client"]}
+        ),
+    )
+    execution.chat_conversation_id = "synthetic-search-session"
+    execution.pinned = None
+    execution._search_allowed_doc_ids = lambda: confirmed
+
+    asyncio.run(execution._prepare_search())
+
+    assert execution.search_continuation is accepted
+    if accepted:
+        assert execution.search_session_id == "synthetic-search-session"
+        assert execution.decision is not None
+    else:
+        assert execution.search_session_id == "synthetic-search-session"
+        assert execution.decision is None
+
+
+def test_search_confirmations_follow_current_query_and_verified_exchange_only():
+    from services.connectors.telegram.runtime.search_agent import SearchAgentMixin
+
+    old_args = {"query": "synthetic old", "folder_path": ["Old Client"]}
+    new_args = {"query": "synthetic new", "folder_path": ["New Client"]}
+    prior_turn = {
+        "role": "tool", "operation_id": "synthetic-prior-op",
+        "tool_correlation": {"name": "query", "arguments": old_args},
+        "source_refs": [{"doc_id": "synthetic-unverified-doc"}],
+        "parts": [{"type": "search_exchange_ref", "reference": {"version": 1},
+                   "call_id": "synthetic-prior-call", "ordinal": 2,
+                   "checkpoint_conversation_id": "synthetic-prior-checkpoint"}],
+    }
+    value = object.__new__(SearchAgentMixin)
+    value.context_id = "synthetic-context"
+    value.operation_id = "synthetic-current-op"
+    value.global_conversation_id = "synthetic-current-checkpoint"
+    value.search_session_id = "synthetic-search-session"
+    value.route_conversation = SimpleNamespace(
+        kind=SimpleNamespace(value="search"), search_filters=old_args,
+    )
+    checkpoint = {
+        "application_route": {"name": "query", "arguments": new_args},
+        "tool_calls": [{"ordinal": 0, "name": "query", "arguments": new_args}],
+        "tool_results": {"0": {"segments": [{"doc_id": "synthetic-new-doc"}]}},
+    }
+    value.ledger = SimpleNamespace(load_turn=lambda *_: checkpoint)
+    value.runtime = SimpleNamespace(
+        repository=SimpleNamespace(list_turns=lambda *_: [prior_turn]),
+    )
+    value._load_search_exchange = lambda *_a, **_k: {
+        "call": {"name": "query", "arguments": old_args},
+        "result": {"segments": [{"doc_id": "synthetic-old-doc"}]},
+    }
+
+    assert value._search_allowed_doc_ids() == {"synthetic-new-doc"}
+
+    checkpoint.clear()
+    checkpoint.update({
+        "tool_calls": [{"ordinal": 0, "name": "list_recent_transcripts",
+                        "arguments": {"folder_path": ["Old Client"]}}],
+        "tool_results": {"0": {"transcripts": [
+            {"doc_id": "synthetic-listed-doc", "parent_id": "synthetic-folder"},
+        ], "total": 1}},
+    })
+    value.route_conversation.search_filters = {"folder_path": ["Old Client"]}
+    value._load_search_exchange = lambda *_a, **_k: {
+        "call": {"name": "query", "arguments": old_args},
+        "result": {"segments": [{"doc_id": "synthetic-confirmed-doc"}]},
+    }
+    assert value._search_allowed_doc_ids() == {
+        "synthetic-listed-doc", "synthetic-confirmed-doc",
+    }
+
+
+@pytest.mark.parametrize("protocol", [None, "agent-v1"])
+def test_legacy_search_card_confirmation_requires_bound_operation(firestore_fake, protocol):
+    import hashlib
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.search_agent import SearchAgentMixin
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, source_operation = "synthetic-context", "synthetic-legacy-operation"
+    session_id = "search-" + hashlib.sha256(
+        f"{context_id}\0{source_operation}".encode("utf-8")
+    ).hexdigest()
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    filters = {"query": "synthetic discovery", "folder_path": None,
+               "date_from": None, "date_to": None}
+    repository.ensure_conversation(context_id, session_id, kind="search",
+                                   search_filters=filters, now=now)
+    route_control = {"kind": "search", "status": "ok",
+                     "result_refs": ["synthetic-legacy-confirmed-doc"],
+                     "search_session_id": session_id}
+    if protocol is not None:
+        route_control["search_protocol"] = protocol
+    client.collection("telegram_sessions").document(context_id).collection(
+        "operations").document(source_operation).set({
+            "operation_id": source_operation, "context_id": context_id,
+            "state": "completed",
+            "route_control": route_control,
+        })
+    repository.append_turn(
+        context_id, session_id, turn_id="synthetic-legacy-card",
+        operation_id=source_operation, role="tool", now=now,
+        parts=[{"type": "search_result", "status": "ok", "results": [
+            {"doc_id": "synthetic-legacy-confirmed-doc"},
+        ], "metadata": {"truncated": False}, "error": None}],
+    )
+    value = object.__new__(SearchAgentMixin)
+    value.context_id = context_id
+    value.operation_id = "synthetic-current-operation"
+    value.global_conversation_id = "synthetic-private-checkpoint"
+    value.search_session_id = session_id
+    value.route_conversation = repository.get_conversation(context_id, session_id)
+    value.runtime = SimpleNamespace(repository=repository)
+    value.ledger = SimpleNamespace(load_turn=lambda *_: {})
+
+    expected = set() if protocol == "agent-v1" else {"synthetic-legacy-confirmed-doc"}
+    assert value._search_allowed_doc_ids() == expected
+
+    if protocol is None:
+        client.collection("telegram_sessions").document(context_id).collection(
+            "operations").document(source_operation).update({"context_id": "other-context"})
+        assert value._search_allowed_doc_ids() == set()
+
+
+@pytest.mark.parametrize("name,args", [
+    ("get_transcript", {"folder_path": ["Synthetic Client"], "limit": 2}),
+    ("list_recent_transcripts", {"date_from": "2026-02-01", "limit": 2}),
+])
+def test_search_content_and_listing_reads_cannot_remove_accepted_bounds(name, args):
+    from services.connectors.telegram.runtime.runtime import _SearchOnlyExecutor
+
+    class Executor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, **kwargs):
+            self.calls.append(kwargs)
+            return ([], {}) if kwargs["name"] == "get_transcript" else {"transcripts": []}
+
+    executor = Executor()
+    guarded = _SearchOnlyExecutor(
+        executor, allowed_doc_ids=lambda: {"synthetic-doc"},
+        initial_filters={"query": "synthetic question",
+                         "folder_path": ["Synthetic Client"],
+                         "date_from": "2026-01-01", "date_to": "2026-12-31"},
+        allow_scoped_transcript=True,
+    )
+    with pytest.raises(ValueError, match="removed a selected filter"):
+        guarded.execute(name=name, arguments=args, call_ordinal=1)
+    assert executor.calls == []
+
+
+def test_search_transcript_confirmation_recognizes_listing_result_shape():
+    from services.connectors.telegram.runtime.search_agent import (
+        _arguments_preserve_search_bounds, _confirmed_result_documents,
+    )
+
+    result = {"transcripts": [{"doc_id": "synthetic-listed-doc",
+                               "parent_id": "synthetic-folder",
+                               "dialog_date": "2026-04-03"}],
+              "total": 1, "returned": 1, "offset": 0, "limit": 20,
+              "has_more": False}
+    assert _confirmed_result_documents(result)[0]["doc_id"] == "synthetic-listed-doc"
+    bounds = {"folder_path": ["Synthetic Client"], "date_from": "2026-01-01"}
+    assert _arguments_preserve_search_bounds(
+        bounds, {"folder_path": ["Synthetic Client", "Subfolder"],
+                 "date_from": "2026-03-01"},
+    )
+    assert not _arguments_preserve_search_bounds(
+        bounds, {"date_from": "2026-03-01"},
+    )
+
+
+def test_search_history_persists_confirmed_prefix_and_skips_pending_call():
+    from services.connectors.telegram.runtime.search_agent import SearchAgentMixin
+
+    class Ledger:
+        def load_turn(self, _conversation_id, _operation_id):
+            return {"tool_calls": [
+                {"id": "synthetic-call-0", "name": "list_recent_transcripts",
+                 "arguments": {"folder_path": ["Synthetic Client"]}, "ordinal": 0},
+                {"id": "synthetic-call-1", "name": "get_transcript",
+                 "arguments": {"doc_id": "synthetic-listed-doc"}, "ordinal": 1},
+            ], "tool_results": {"0": {"transcripts": [{
+                "doc_id": "synthetic-listed-doc", "parent_id": "synthetic-folder",
+            }], "total": 1}}}
+
+        def save_search_exchange(self, _conversation_id, **kwargs):
+            return f"synthetic-exchange-{kwargs['call']['ordinal']}"
+
+    class Repository:
+        def __init__(self):
+            self.rows = []
+
+        def append_turn(self, *args, **kwargs):
+            self.rows.append(kwargs)
+
+    harness = object.__new__(SearchAgentMixin)
+    harness.context_id = "synthetic-context"
+    harness.operation_id = "synthetic-operation"
+    harness.global_conversation_id = "synthetic-checkpoint"
+    harness.ledger = Ledger()
+    harness.runtime = SimpleNamespace(
+        repository=Repository(),
+        clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    harness.owner, harness.fence = "synthetic-owner", 1
+
+    harness._persist_search_tool_history("synthetic-search-session")
+
+    assert len(harness.runtime.repository.rows) == 1
+    row = harness.runtime.repository.rows[0]
+    assert row["tool_correlation"]["name"] == "list_recent_transcripts"
+    assert row["source_refs"] == [{"doc_id": "synthetic-listed-doc"}]
+
+
+def test_listing_confirmation_hydrates_from_real_ledger_after_execution_restart(
+    firestore_fake,
+):
+    import hashlib
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.runtime import _CommandExecution
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, _command = _runtime_queue_item(client)
+    session_id = "search-" + hashlib.sha256(
+        f"{context_id}\0{operation['operation_id']}".encode("utf-8")
+    ).hexdigest()
+    private_id = "telegram-global-" + hashlib.sha256(
+        f"{context_id}\0{operation['operation_id']}".encode("utf-8")
+    ).hexdigest()
+    now = datetime.now(timezone.utc)
+    repository.ensure_conversation(
+        context_id, session_id, kind="search",
+        search_filters={"query": "synthetic listing"}, now=now,
+    )
+    client.collection("telegram_sessions").document(context_id).collection(
+        "operations").document(operation["operation_id"]).update({
+            "route_control": {"kind": "search", "status": "ok",
+                              "search_protocol": "agent-v1",
+                              "search_session_id": session_id},
+        })
+    ledger = FirestoreAgentLedger(
+        client, context_id=context_id, operation_id=operation["operation_id"],
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    call = {"id": "synthetic-list-call", "name": "list_recent_transcripts",
+            "arguments": {"folder_path": ["Synthetic Client"]},
+            "ordinal": 0, "round": 0}
+    result = {"transcripts": [{
+        "doc_id": "synthetic-listed-doc", "parent_id": "synthetic-client-folder",
+        "title": "Synthetic meeting", "dialog_date": "2026-04-03",
+        "status": "synced",
+    }], "total": 1, "returned": 1, "offset": 0, "limit": 20,
+        "has_more": False}
+    ledger.save_turn(private_id, operation["operation_id"],
+                     model_response={"parts": []}, tool_calls=[call])
+    ledger.save_tool_result(private_id, operation["operation_id"], 0, result)
+    reference = ledger.save_search_exchange(
+        session_id, checkpoint_conversation_id=private_id,
+        call=call, canonical_call_id=call["id"], result=result,
+    )
+    repository.append_turn(
+        context_id, session_id, turn_id="synthetic-list-exchange",
+        operation_id=operation["operation_id"], role="tool", now=now,
+        parts=[{"type": "search_exchange_ref", "reference": reference,
+                "call_id": call["id"], "ordinal": 0,
+                "checkpoint_conversation_id": private_id}],
+        tool_correlation={"name": call["name"], "arguments": call["arguments"]},
+        source_refs=[{"doc_id": "synthetic-listed-doc"}],
+    )
+
+    restarted = object.__new__(_CommandExecution)
+    restarted.runtime = SimpleNamespace(repository=repository, clock=lambda: now)
+    restarted.context_id = context_id
+    restarted.operation_id = operation["operation_id"]
+    restarted.global_conversation_id = private_id
+    restarted.search_session_id = session_id
+    restarted.route_conversation = repository.get_conversation(context_id, session_id)
+    restarted.owner, restarted.fence = lease.owner, lease.fence
+    restarted.ledger = ledger
+
+    assert restarted._search_allowed_doc_ids() == {"synthetic-listed-doc"}
+    assert ledger.load_search_exchange(
+        reference, conversation_id=session_id, operation_id=operation["operation_id"],
+        checkpoint_conversation_id=private_id, call_id=call["id"], ordinal=0,
+    )["result"]["transcripts"][0]["doc_id"] == "synthetic-listed-doc"
 
 
 def test_search_query_stage_keeps_provider_billing_error_nonretryable(firestore_fake):

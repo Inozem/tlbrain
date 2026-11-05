@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import inspect
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +18,7 @@ from core.operations import registry
 from services.connectors.telegram.tools import get_tool_catalog
 
 _PERSISTED_ROUNDS = "_telegram_tool_loop_rounds"
+_LOGGER = logging.getLogger(__name__)
 
 
 async def _call_sync_or_async(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -362,7 +364,7 @@ class TelegramAgent:
         target_doc_id: str | None,
         allowed_tools: set[str] | frozenset[str] | None = None,
     ) -> dict[str, Any] | None:
-        catalog = get_tool_catalog()["tools"]
+        catalog = self._scoped_tool_catalog(target_doc_id)
         if allowed_tools is not None:
             catalog = [tool for tool in catalog if tool["name"] in allowed_tools]
         response = self.model.generate(
@@ -371,8 +373,14 @@ class TelegramAgent:
         try:
             calls = self._validate_calls(response, state, target_doc_id=target_doc_id,
                                          allowed_tools=allowed_tools)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as error:
             self._persist_model_round(response, [], state, conversation_id, delivery_id)
+            _LOGGER.warning(
+                "telegram model tool call rejected",
+                extra={"operation_id": delivery_id, "phase": "tool_validation",
+                       "code": "invalid_tool_call",
+                       "exception_class": type(error).__name__},
+            )
             return self._failure("The requested tool operation was invalid.", state.usage)
 
         serialized = self._persist_model_round(
@@ -389,6 +397,21 @@ class TelegramAgent:
         if not calls:
             return self._final_answer(state)
         return None
+
+    @staticmethod
+    def _scoped_tool_catalog(target_doc_id: str | None) -> list[dict[str, Any]]:
+        """Constrain supplied document IDs to the immutable invocation pin."""
+        catalog = deepcopy(get_tool_catalog()["tools"])
+        if target_doc_id is None:
+            return catalog
+        for tool in catalog:
+            if tool.get("name") == "get_transcript":
+                properties = tool["parameters_json_schema"].get("properties", {})
+                doc_id = properties.get("doc_id")
+                if isinstance(doc_id, dict):
+                    doc_id["enum"] = [target_doc_id]
+                break
+        return catalog
 
     @staticmethod
     def _validate_calls(
