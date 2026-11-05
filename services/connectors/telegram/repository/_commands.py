@@ -378,6 +378,11 @@ class _TelegramCommandMixin:
         safe: dict[str, Any] = {"status": status}
         if kind is not None:
             safe["kind"] = kind
+        selection_policy = route.get("selection_policy")
+        if selection_policy is not None:
+            if selection_policy != "silent_v1" or kind not in {"pure_switch", "substantive"}:
+                raise ValueError("selection_policy is invalid")
+            safe["selection_policy"] = selection_policy
         for field in (
             "target_doc_id", "conversation_id", "target_draft_id",
             "target_operation_id", "dependency_operation_id",

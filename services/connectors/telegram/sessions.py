@@ -558,6 +558,9 @@ def _control_route_record(route: Any) -> dict[str, Any]:
             continue
         if isinstance(value, str) and value:
             safe[field] = value
+    if (route.get("selection_policy") == "silent_v1"
+            and safe.get("kind") in {"pure_switch", "substantive"}):
+        safe["selection_policy"] = "silent_v1"
     number = route.get("dialog_number")
     if type(number) is int and number > 0:
         safe["dialog_number"] = number
@@ -698,11 +701,15 @@ async def _invoke_operation_router(
 def _persist_operation_route(
     route: Any, *, operation_id: str, context: Any, repository: Any,
     owner: str | None, fence: int | None, now: datetime | None,
+    selection_policy: str | None = None,
 ) -> _PersistedOperationRoute | None:
     """Validate and persist only allowlisted route metadata before any side effect."""
     validation_status = _operation_route_status(route)
     route_record = _control_route_record(route)
     route_record["status"] = validation_status
+    if (selection_policy == "silent_v1" and validation_status == "ok"
+            and route_record.get("kind") in {"pure_switch", "substantive"}):
+        route_record["selection_policy"] = selection_policy
     clear_candidate = getattr(repository, "clear_command_candidate", None)
     context_id = getattr(context, "context_id", None)
     if callable(clear_candidate):
@@ -852,8 +859,29 @@ async def _confirm_selection_change(
     owner: str | None = None, fence: int | None = None,
     now: datetime | None = None,
 ) -> bool | str | None:
-    """Confirm the notice before publishing a changed selection, unless already sent."""
+    """Publish silent selections under the live fence or satisfy the legacy notice barrier."""
     context_id = getattr(context, "context_id", None)
+    policy = route.get("selection_policy") if isinstance(route, Mapping) else None
+    if policy == "silent_v1":
+        same_target = context.active_conversation_id == conversation_id
+        requires_publish = (
+            not same_target
+            or (isinstance(route, Mapping) and route.get("kind") == "pure_switch")
+        )
+        if not requires_publish:
+            return False
+        if selection_publisher is None:
+            return "pending"
+        try:
+            published = selection_publisher(
+                operation_id, conversation_id=conversation_id,
+                dialog_number=number,
+            )
+            if inspect.isawaitable(published):
+                published = await published
+        except Exception:
+            return "pending"
+        return True if published is True else "pending"
     set_notice_state = getattr(repository, "set_switch_notice_state", None)
     prior_notice_state = None
     getter = getattr(repository, "get_switch_notice_state", None)
@@ -1080,14 +1108,14 @@ async def _release_notice_waiter(queue: Any, operation_id: str) -> None:
         await released
 
 
-async def _wait_for_switch_notice(
+async def _confirm_route_selection(
     *, route: Any, operation_id: str, target_doc_id: str,
     conversation_id: str, number: int, context: Any, notifications: Any,
     selection_publisher: Callable[..., Any] | None, repository: Any,
     queue: Any, owner: str | None, fence: int | None, now: datetime | None,
     kind: Any,
 ) -> dict[str, Any] | None:
-    """Return a retry/error result until the notice barrier allows selection."""
+    """Return a retry/error result until this route's selection policy is satisfied."""
     changed_focus = await _confirm_selection_change(
         route=route, operation_id=operation_id,
         target_doc_id=target_doc_id, conversation_id=conversation_id,
@@ -1100,7 +1128,10 @@ async def _wait_for_switch_notice(
         return {"status": "switch_notice_undelivered", "kind": kind}
     if changed_focus == "pending":
         await _release_notice_waiter(queue, operation_id)
-        return {"status": "switch_notice_pending", "kind": kind}
+        status = "selection_pending" if (
+            isinstance(route, Mapping) and route.get("selection_policy") == "silent_v1"
+        ) else "switch_notice_pending"
+        return {"status": status, "kind": kind}
     return None
 
 
@@ -1110,7 +1141,7 @@ async def _finish_conversation_route(
     queue: Any, selection_publisher: Callable[..., Any] | None,
     owner: str | None, fence: int | None, now: datetime | None,
 ) -> dict[str, Any]:
-    """Enforce the switch notice barrier before a pure switch or conversation turn."""
+    """Select a validated target before finishing a pure switch or conversation turn."""
     target = _conversation_route_target(state.route_record)
     if target is None:
         return {"status": "invalid_route", **({"kind": kind} if kind else {})}
@@ -1119,15 +1150,15 @@ async def _finish_conversation_route(
     if kind == "substantive" and substantive_text is None:
         return {"status": "invalid_route", "kind": kind}
 
-    notice_result = await _wait_for_switch_notice(
-        route=state.route, operation_id=operation_id,
+    selection_result = await _confirm_route_selection(
+        route=state.route_record, operation_id=operation_id,
         target_doc_id=target_doc_id, conversation_id=conversation_id,
         number=number, context=context, notifications=notifications,
         selection_publisher=selection_publisher, repository=repository,
         queue=queue, owner=owner, fence=fence, now=now, kind=kind,
     )
-    if notice_result is not None:
-        return notice_result
+    if selection_result is not None:
+        return selection_result
 
     if kind == "pure_switch":
         if not _clear_command_candidate(
@@ -1166,9 +1197,20 @@ async def process_operation(
     )
     if replay_result is not None:
         return replay_result
+    if (isinstance(existing_route, Mapping)
+            and existing_route.get("selection_policy") == "silent_v1"):
+        selection_policy = "silent_v1"
+    else:
+        selection_policy = (
+            "silent_v1"
+            if existing_route is None and _operation_route_status(route) == "ok"
+            and isinstance(route, Mapping)
+            and route.get("kind") in {"pure_switch", "substantive"}
+            else None
+        )
     state = _persist_operation_route(
         route, operation_id=operation_id, context=context, repository=repository,
-        owner=owner, fence=fence, now=now,
+        owner=owner, fence=fence, now=now, selection_policy=selection_policy,
     )
     if state is None:
         return {"status": "error"}

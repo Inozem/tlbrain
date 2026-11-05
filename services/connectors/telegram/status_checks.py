@@ -304,10 +304,159 @@ class TelegramStatusChecks:
                 return notification_id
         return None
 
+    def _managed_save_dialog_number(
+        self, record: Any, queue_operation: dict[str, Any] | None,
+    ) -> int | None:
+        """Return a number only for this operation's confirmed sealed source work."""
+        if (not isinstance(record.context_id, str) or not _SAFE_ID.fullmatch(record.context_id)
+                or not isinstance(record.operation_id, str) or not _SAFE_ID.fullmatch(record.operation_id)
+                or not isinstance(queue_operation, dict)):
+            return None
+        route = queue_operation.get("route_control")
+        if (
+            queue_operation.get("operation_id") != record.operation_id
+            or queue_operation.get("state") != "running"
+            or queue_operation.get("save_operation_id") != record.operation_id
+            or not isinstance(route, dict)
+            or route.get("status") not in {"ok", "success"}
+            or route.get("kind") not in {"save", "retry"}
+        ):
+            return None
+        context_ref = self.client.collection("telegram_sessions").document(record.context_id)
+        if route.get("kind") == "retry" and not self._retry_source_binding_is_valid(
+            record, queue_operation, route, context_ref,
+        ):
+            return None
+        draft_id = queue_operation.get("target_draft_id") or route.get("target_draft_id")
+        if not isinstance(draft_id, str) or not _SAFE_ID.fullmatch(draft_id):
+            return None
+        return self._sealed_operation_dialog_number(
+            record, queue_operation, route, context_ref, draft_id,
+        )
+
+    def _retry_source_binding_is_valid(
+        self, record: Any, queue_operation: dict[str, Any],
+        route: dict[str, Any], context_ref: Any,
+    ) -> bool:
+        """Validate a retry's accepted request link or its request-less source command."""
+        request_id = queue_operation.get("retry_request_operation_id")
+        if request_id is None:
+            return self._requestless_retry_command_is_valid(
+                record, queue_operation, route, context_ref,
+            )
+        if (not isinstance(request_id, str) or not _SAFE_ID.fullmatch(request_id)
+                or route.get("retry_request_operation_id") != request_id):
+            return False
+        request_snapshot = context_ref.collection("operations").document(request_id).get()
+        request_operation = request_snapshot.to_dict() or {} if request_snapshot.exists else {}
+        request_route = request_operation.get("route_control")
+        if (
+            request_operation.get("operation_id") != request_id
+            or request_operation.get("context_id", record.context_id) != record.context_id
+            or not isinstance(request_route, dict)
+            or request_route.get("status") not in {"ok", "success"}
+            or request_route.get("kind") != "retry"
+            or request_route.get("dialog_number") != route.get("dialog_number")
+        ):
+            return False
+        return self._retry_command_receipt_is_valid(
+            context_ref, request_operation, request_id, kind="freeform",
+        )
+
+    def _requestless_retry_command_is_valid(
+        self, record: Any, queue_operation: dict[str, Any],
+        route: dict[str, Any], context_ref: Any,
+    ) -> bool:
+        """Bind a legacy direct retry to its own accepted retry command and receipt."""
+        draft_id = queue_operation.get("target_draft_id")
+        if not isinstance(draft_id, str) or not _SAFE_ID.fullmatch(draft_id):
+            return False
+        if not self._retry_command_receipt_is_valid(
+            context_ref, queue_operation, record.operation_id,
+            kind="retry", draft_id=draft_id,
+            dialog_number=route.get("dialog_number"),
+        ):
+            return False
+        command_id = queue_operation["input_ref"].rsplit("/", 1)[1]
+        command_snapshot = context_ref.collection("commands").document(command_id).get()
+        command = command_snapshot.to_dict() or {} if command_snapshot.exists else {}
+        draft_snapshot = context_ref.collection("drafts").document(draft_id).get()
+        draft = draft_snapshot.to_dict() or {} if draft_snapshot.exists else {}
+        return (
+            command.get("save_intent_id") == draft.get("immutable_save_intent_id")
+            and command.get("manifest_digest") == draft.get("manifest_digest")
+        )
+
+    def _retry_command_receipt_is_valid(
+        self, context_ref: Any, operation: dict[str, Any], operation_id: str,
+        *, kind: str, draft_id: str | None = None, dialog_number: int | None = None,
+    ) -> bool:
+        """Verify the command and accepted update receipt behind a retry operation."""
+        input_ref = operation.get("input_ref")
+        expected_prefix = f"telegram_sessions/{context_ref.id}/commands/"
+        command_id = (
+            input_ref[len(expected_prefix):]
+            if isinstance(input_ref, str) and input_ref.startswith(expected_prefix)
+            else ""
+        )
+        if not command_id.isdigit():
+            return False
+        command_snapshot = context_ref.collection("commands").document(command_id).get()
+        command = command_snapshot.to_dict() or {} if command_snapshot.exists else {}
+        update_id = command.get("update_id")
+        receipt_snapshot = (
+            context_ref.collection("updates").document(str(update_id)).get()
+            if type(update_id) is int and update_id > 0 else None
+        )
+        receipt = receipt_snapshot.to_dict() or {} if receipt_snapshot and receipt_snapshot.exists else {}
+        if (command.get("context_id") != context_ref.id
+                or command.get("operation_id") != operation_id
+                or command.get("kind") != kind
+                or type(update_id) is not int
+                or receipt.get("accepted") is not True
+                or receipt.get("context_id") != context_ref.id
+                or receipt.get("operation_id") != operation_id):
+            return False
+        if draft_id is not None and command.get("draft_id") != draft_id:
+            return False
+        return dialog_number is None or command.get("dialog_number") == dialog_number
+
+    def _sealed_operation_dialog_number(
+        self, record: Any, queue_operation: dict[str, Any],
+        route: dict[str, Any], context_ref: Any, draft_id: str,
+    ) -> int | None:
+        """Return a route-matched number only after validating its current manifest."""
+        draft_snapshot = context_ref.collection("drafts").document(draft_id).get()
+        draft = draft_snapshot.to_dict() or {} if draft_snapshot.exists else {}
+        intent_id = draft.get("immutable_save_intent_id")
+        manifest_path = draft.get("manifest_ref")
+        expected_manifest = (
+            f"telegram_sessions/{record.context_id}/drafts/{draft_id}/save_manifests/"
+            f"{record.operation_id}"
+        )
+        if (draft.get("draft_id") != draft_id or draft.get("sealed_at") is None
+                or manifest_path != expected_manifest
+                or not isinstance(draft.get("manifest_digest"), str)
+                or not draft.get("manifest_digest")
+                or draft.get("active_save_operation_id") != record.operation_id
+                or not isinstance(intent_id, str) or not _SAFE_ID.fullmatch(intent_id)):
+            return None
+        manifest_snapshot = context_ref.collection("drafts").document(draft_id).collection(
+            "save_manifests").document(record.operation_id).get()
+        manifest = manifest_snapshot.to_dict() or {} if manifest_snapshot.exists else {}
+        number = draft.get("dialog_number")
+        if (manifest.get("draft_id") != draft_id
+                or manifest.get("save_operation_id") != record.operation_id
+                or manifest.get("manifest_digest") != draft.get("manifest_digest")
+                or type(number) is not int or number < 1
+                or route.get("dialog_number") != number):
+            return None
+        return number
+
     def _managed_save_is_processing(
         self, record: Any, queue_operation: dict[str, Any] | None,
     ) -> bool:
-        """Defer fallback only for a queue-bound, sealed save/retry still cleaning up."""
+        """Defer terminal fallback for a queue-bound sealed save/retry during cleanup."""
         if (not isinstance(record.context_id, str) or not _SAFE_ID.fullmatch(record.context_id)
                 or not isinstance(record.operation_id, str) or not _SAFE_ID.fullmatch(record.operation_id)
                 or not isinstance(queue_operation, dict)):
@@ -325,8 +474,8 @@ class TelegramStatusChecks:
         draft_id = queue_operation.get("target_draft_id") or route.get("target_draft_id")
         if not isinstance(draft_id, str) or not _SAFE_ID.fullmatch(draft_id):
             return False
-        snapshot = (self.client.collection("telegram_sessions").document(record.context_id)
-                    .collection("drafts").document(draft_id).get())
+        context_ref = self.client.collection("telegram_sessions").document(record.context_id)
+        snapshot = context_ref.collection("drafts").document(draft_id).get()
         draft = snapshot.to_dict() or {} if snapshot.exists else {}
         intent_id = draft.get("immutable_save_intent_id")
         return (
@@ -434,25 +583,8 @@ class TelegramStatusChecks:
 
         context_ref = self.client.collection(SESSIONS).document(context_id)
         queue_operation = context_ref.collection("operations").document(operation_id).get()
-        input_ref = (queue_operation.to_dict() or {}).get("input_ref") if queue_operation.exists else None
-        expected_prefix = f"{SESSIONS}/{context_id}/commands/"
-        command_id = (
-            input_ref[len(expected_prefix):]
-            if isinstance(input_ref, str) and input_ref.startswith(expected_prefix)
-            else ""
-        )
-        command = (
-            context_ref.collection("commands").document(command_id).get()
-            if command_id and "/" not in command_id else None
-        )
-        draft_id = (command.to_dict() or {}).get("draft_id") if command and command.exists else None
-        draft_snapshot = context_ref.collection("drafts").document(draft_id).get() if draft_id else None
-        draft = draft_snapshot.to_dict() or {} if draft_snapshot and draft_snapshot.exists else {}
-        dialog_number = draft.get("dialog_number")
-        if type(dialog_number) is not int or dialog_number < 1:
-            context = context_ref.get().to_dict() or {}
-            selected_number = context.get("selected_dialog_number")
-            dialog_number = selected_number if type(selected_number) is int and selected_number > 0 else None
+        queue_data = queue_operation.to_dict() or {} if queue_operation.exists else None
+        dialog_number = self._managed_save_dialog_number(record, queue_data)
         body_prefix = f"Dialog #{dialog_number}: " if dialog_number is not None else ""
         body = f"{body_prefix}{description}."
         repository = TelegramRepository(self.client)

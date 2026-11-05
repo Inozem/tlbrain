@@ -247,6 +247,17 @@ def _publish_selection(repository, operation_id, *, conversation_id, dialog_numb
     }
     repository.writes.append(("selection", operation_id, deepcopy(repository.selection)))
     repository.events.append(("selection", operation_id, deepcopy(repository.selection)))
+    return True
+
+
+def _pin_legacy_route(repository, operation_id, route):
+    """Represent an immutable pre-policy route whose notice barrier must replay."""
+    repository.route_records[operation_id] = {
+        "status": "ok", "kind": route["kind"],
+        "target_doc_id": route["target_doc_id"],
+        "conversation_id": route["conversation_id"],
+        "dialog_number": route["dialog_number"],
+    }
 
 
 def _contains(value, fragment):
@@ -264,9 +275,9 @@ def _current_context(context, repository):
     )
 
 
-def test_pure_switch_changes_focus_only_after_confirmed_notice_and_never_enters_history():
+def test_pure_switch_changes_focus_silently_and_never_enters_history():
     control = "switch to dialog 2"
-    switch_notice = "Dialog #2: target conversation"
+    switch_notice = "Starting to process dialog #2."
     context, repository, router, agent, notifications, queue = _harness(
         _route("pure_switch"),
     )
@@ -286,13 +297,13 @@ def test_pure_switch_changes_focus_only_after_confirmed_notice_and_never_enters_
     assert "switch to dialog 2" not in repr(repository.route_records["op-switch"])
     assert "substantive_text" not in repository.route_records["op-switch"]
     assert "text" not in repository.route_records["op-switch"]
-    assert "Dialog #2" not in repr(repository.route_records["op-switch"])
+    assert repository.route_records["op-switch"]["selection_policy"] == "silent_v1"
     assert agent.prompts == []
     assert [row[0] for row in repository.writes] == ["route", "selection"]
-    assert notifications.attempts[0]["target_doc_id"] == "doc-target"
-    assert notifications.attempts[0]["body"] == "Starting to process dialog #2."
+    assert notifications.attempts == []
     kinds = [event[0] for event in repository.events]
-    assert kinds.index("notice_confirmed") < kinds.index("selection")
+    assert "notice_confirmed" not in kinds
+    assert "selection" in kinds
     assert "agent" not in kinds and "append" not in kinds
 
     # A later substantive prompt includes target history, never the control or
@@ -307,6 +318,28 @@ def test_pure_switch_changes_focus_only_after_confirmed_notice_and_never_enters_
     assert not _contains(prompt, switch_notice)
     assert not _contains(prompt, "old user turn")
     assert not _contains(prompt, "old answer")
+
+
+@pytest.mark.parametrize("published", [False, None])
+def test_silent_selection_requires_confirmed_fenced_publication_before_agent(published):
+    context, repository, router, agent, notifications, queue = _harness(
+        _route("substantive", substantive_text="target request"),
+    )
+
+    result = _process(
+        operation_id="op-stale-selection", context=context,
+        text="target request", repository=repository, router=router,
+        agent=agent, notifications=notifications, queue=queue,
+        selection_publisher=lambda *_args, **_kwargs: published,
+    )
+
+    assert result["status"] == "selection_pending"
+    assert repository.route_records["op-stale-selection"]["selection_policy"] == "silent_v1"
+    assert repository.selection["active_conversation_id"] == "conversation:old"
+    assert repository.conversations["conversation:target"][-1]["role"] == "model"
+    assert agent.prompts == []
+    assert notifications.attempts == []
+    assert not hasattr(repository, "switch_notice_states")
 
 
 def test_mixed_switch_persists_only_substantive_text_and_result_in_target():
@@ -340,11 +373,10 @@ def test_mixed_switch_persists_only_substantive_text_and_result_in_target():
     assert "open dialog 2" not in repr(repository.route_records["op-mixed"])
     assert "substantive_text" not in repository.route_records["op-mixed"]
     kinds = [event[0] for event in repository.events]
-    notice_position = kinds.index("notice_confirmed")
     selection_position = kinds.index("selection")
     append_position = kinds.index("append")
     agent_position = kinds.index("agent")
-    assert notice_position < selection_position < append_position < agent_position
+    assert selection_position < append_position < agent_position
     assert (repository.docs, repository.search_index) == before_saved_data
     assert not any(row[0] in {"doc", "index"} for row in repository.writes)
 
@@ -479,6 +511,10 @@ def test_orchestration_clears_candidate_only_after_successful_route_persistence(
         operation_id="op-cleanup", context=context, text="raw command envelope",
         repository=repository, router=router, agent=agent,
         notifications=notifications, queue=queue, owner="worker", fence=1,
+        selection_publisher=lambda op, *, conversation_id, dialog_number: _publish_selection(
+            repository, op, conversation_id=conversation_id,
+            dialog_number=dialog_number,
+        ),
         now=datetime.now().astimezone(),
     )
 
@@ -639,7 +675,7 @@ def test_successful_save_route_records_draft_target_without_command_text():
     assert "private route payload" not in repr(repository.route_records["op-save-route"])
 
 
-def test_route_message_notice_marker_does_not_bypass_durable_operation_barrier():
+def test_new_route_ignores_transient_notice_marker_and_selects_silently():
     route = _route("substantive", substantive_text="target request")
     route["selection_changed"] = True
     route["notice_sent"] = True
@@ -650,8 +686,7 @@ def test_route_message_notice_marker_does_not_bypass_durable_operation_barrier()
         "raw route envelope",
     )
 
-    assert len(notifications.attempts) == 1
-    assert notifications.attempts[0]["body"] == "Starting to process dialog #2."
+    assert notifications.attempts == []
     assert repository.selection["active_conversation_id"] == "conversation:target"
     assert agent.prompts[0]["prompt"]["request"] == "target request"
 
@@ -680,6 +715,7 @@ def test_three_unknown_notice_sends_release_head_and_same_operation_replay_is_su
         _route("pure_switch"),
         outcomes=["retry", "retry", "delivery_unknown"],
     )
+    _pin_legacy_route(repository, "op-unknown", router.route)
     before = repository.snapshot()
 
     first = _call("op-unknown", context, repository, router, agent, notifications, queue, control)
@@ -697,17 +733,17 @@ def test_three_unknown_notice_sends_release_head_and_same_operation_replay_is_su
     assert all(row[0] != "selection" for row in repository.writes)
     assert not any(event[0] in {"selection", "append", "agent"} for event in repository.events)
 
-    # A fresh explicit operation can retry selection with a new notice identity.
+    # A fresh explicit operation can select the target silently.
     retry = _call("op-retry", context, repository, router, agent, notifications, queue, control)
     assert retry["status"] in {"switched", "completed"}
-    assert len(notifications.attempts) == 4
-    assert notifications.attempts[-1]["notification_id"] != notifications.attempts[0]["notification_id"]
+    assert len(notifications.attempts) == 3
 
 
 def test_busy_notice_releases_head_and_replay_resumes_pinned_route():
     context, repository, router, agent, notifications, queue = _harness(
         _route("pure_switch"), outcomes=["busy"],
     )
+    _pin_legacy_route(repository, "op-busy", router.route)
     first = _call("op-busy", context, repository, router, agent, notifications, queue, "open dialog 2")
     assert first["status"] == "switch_notice_pending"
     assert queue.released == ["op-busy"]

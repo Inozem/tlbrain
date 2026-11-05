@@ -2576,9 +2576,7 @@ def test_document_route_publishes_notice_then_answer_and_replays_saved_history(
          for path, value in firestore_fake.documents.items()
          if path.startswith("notification_outbox/")],
     )
-    assert [row[1] for row in bot.sent] == [
-        "Starting to process dialog #1.", "The decision was to proceed.",
-    ]
+    assert [row[1] for row in bot.sent] == ["The decision was to proceed."]
     turns = repository.list_turns(context_id, "document-" + __import__(
         "hashlib").sha256(f"{context_id}\0doc-1".encode()).hexdigest())
     assert [turn["role"] for turn in turns] == ["user", "model"]
@@ -2633,7 +2631,6 @@ def test_selected_document_blank_or_failed_answer_is_a_safe_failed_reply(
     assert result.value == "failed"
     assert [mode for mode, _contents, _tools in model.calls] == ["routing", "tool_loop"]
     assert [row[1] for row in bot.sent] == [
-        "Starting to process dialog #1.",
         "An error occurred while processing your request. Please try again.",
     ]
     conversation_id = repository.get_route_control(
@@ -2680,15 +2677,13 @@ def test_document_answer_persistence_interruption_replays_checkpointed_answer(
     first = asyncio.run(runtime(context_id, operation, lease, command=command),
                          loop_factory=_selector_loop)
     assert first.value == "running"
-    assert [row[1] for row in bot.sent] == ["Starting to process dialog #1."]
+    assert [row[1] for row in bot.sent] == []
 
     second = asyncio.run(runtime(context_id, operation, lease, command=command),
                           loop_factory=_selector_loop)
 
     assert second.value == "completed"
-    assert [row[1] for row in bot.sent] == [
-        "Starting to process dialog #1.", "The saved answer is available.",
-    ]
+    assert [row[1] for row in bot.sent] == ["The saved answer is available."]
     assert [mode for mode, _contents, _tools in model.calls].count("tool_loop") == 1
     conversation_id = repository.get_route_control(
         context_id, operation["operation_id"],
@@ -2803,15 +2798,15 @@ def test_explicit_document_tool_target_uses_pinned_session_executor(monkeypatch,
                          loop_factory=_selector_loop)
 
     assert result.value == "completed"
-    assert bot.sent[0][1] == "Starting to process dialog #1."
+    assert bot.sent[0][1] == "The document summary."
     assert calls[0][0] == "get_transcript"
     assert calls[0][1]["doc_id"] == "doc-1"
     assert calls[0][2]["context"]["target_doc_id"] == "doc-1"
-    assert len(bot.sent) == 2
+    assert len(bot.sent) == 1
     assert repository.get_context(context_id)["last_doc_id"] == "doc-b"
 
 
-def test_runtime_pure_switch_sends_notice_without_appending_turns(firestore_fake, monkeypatch):
+def test_runtime_pure_switch_acknowledges_without_appending_turns(firestore_fake, monkeypatch):
     from services.connectors.telegram.repository import TelegramRepository
     from services.connectors.telegram.runtime import TelegramCommandRuntime
     monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
@@ -2838,11 +2833,100 @@ def test_runtime_pure_switch_sends_notice_without_appending_turns(firestore_fake
                          loop_factory=_selector_loop)
 
     assert result.value == "completed"
-    assert [row[1] for row in bot.sent] == ["Starting to process dialog #1."]
+    assert [row[1] for row in bot.sent] == ["Selected dialog #1."]
     assert [mode for mode, _contents, _tools in model.calls] == ["routing"]
     context = repository.get_context(context_id)
     assert context["selected_dialog_number"] == 1
     assert repository.list_turns(context_id, context["active_conversation_id"]) == []
+
+
+def _same_target_switch_runtime(client, *, operation_id="op-same-switch"):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, operation_id=operation_id,
+    )
+    client.collection("transcript_index").document("doc-same").set({
+        "source_file": "Same target", "parent_id": "root-same",
+    })
+    client.collection("folders").document("root-same").set({
+        "folder_id": "root-same", "name": "Root", "parent_id": "pytest-switch-root",
+    })
+    now = datetime.now(timezone.utc)
+    number = repository.bind_document(
+        context_id, "doc-same", "conversation-same",
+        metadata={"title": "Same target", "folder_path": []}, now=now,
+    )
+    repository.ensure_conversation(
+        context_id, "conversation-same", kind="document", doc_id="doc-same",
+        dialog_number=number, now=now,
+    )
+    repository.client.collection("telegram_sessions").document(context_id).update({
+        "active_conversation_id": "conversation-same",
+        "selected_dialog_number": number,
+    })
+    route = {
+        "kind": "pure_switch", "target_ref": "doc-same",
+        "target_operation_id": None, "dialog_number": number,
+        "result_refs": [], "substantive_text": None,
+        "tool_choice": None, "certainty": "certain",
+    }
+    bot, model = _Bot(), _RuntimeModel(route)
+    runtime = TelegramCommandRuntime(
+        repository=repository, save_handler=object(), client=bot,
+        model=model, root_folder_id="pytest-switch-root",
+    )
+    return repository, context_id, operation, lease, command, runtime, bot, model, number
+
+
+def test_same_target_pure_switch_publishes_under_fence_and_replay_sends_no_extra_ack(
+    firestore_fake, monkeypatch,
+):
+    monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
+                        _polling_offload)
+    values = _same_target_switch_runtime(firestore_fake.client_class())
+    repository, context_id, operation, lease, command, runtime, bot, model, number = values
+    sequence_before = repository.get_context(context_id)["selection_sequence"]
+
+    first = asyncio.run(runtime(context_id, operation, lease, command=command),
+                        loop_factory=_selector_loop)
+    second = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert first.value == second.value == "completed", (
+        first, second, repository.get_route_control(context_id, operation["operation_id"]),
+        bot.sent, model.calls,
+    )
+    assert [row[1] for row in bot.sent] == [f"Selected dialog #{number}."]
+    assert [mode for mode, _contents, _tools in model.calls] == ["routing"]
+    assert repository.get_context(context_id)["active_conversation_id"] == "conversation-same"
+    assert repository.get_context(context_id)["selection_sequence"] == sequence_before
+
+
+@pytest.mark.parametrize("published", [False, None])
+def test_same_target_pure_switch_does_not_ack_unconfirmed_fenced_publication(
+    firestore_fake, monkeypatch, published,
+):
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+    monkeypatch.setattr("services.connectors.telegram.agent._call_sync_or_async",
+                        _polling_offload)
+    monkeypatch.setattr(TelegramRuntimeStore, "publish_selection",
+                        lambda *_args, **_kwargs: published)
+    values = _same_target_switch_runtime(firestore_fake.client_class())
+    repository, context_id, operation, lease, command, runtime, bot, model, _number = values
+
+    result = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert result.value == "running", (
+        result, repository.get_route_control(context_id, operation["operation_id"]),
+        bot.sent, model.calls,
+    )
+    assert bot.sent == []
+    assert [mode for mode, _contents, _tools in model.calls] == ["routing"]
+    assert repository.get_context(context_id)["active_conversation_id"] == "conversation-same"
 
 
 def test_unknown_explicit_document_tool_target_fails_closed(firestore_fake, monkeypatch):

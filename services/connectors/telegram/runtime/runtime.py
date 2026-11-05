@@ -2081,6 +2081,10 @@ class _CommandExecution(SearchAgentMixin):
                     return await self.finish_reply(_UNCERTAIN_ROUTE_REPLY)
                 if (isinstance(route, Mapping) and route.get("status") in {"ok", "success"}
                         and route.get("kind") == "pure_switch"):
+                    if route.get("selection_policy") == "silent_v1":
+                        number = route.get("dialog_number")
+                        if type(number) is int and number > 0:
+                            return await self.finish_reply(f"Selected dialog #{number}.")
                     return result
                 return await self._finish_processing_error()
         if result == QueueOperationState.FAILED and self.decision is not None:

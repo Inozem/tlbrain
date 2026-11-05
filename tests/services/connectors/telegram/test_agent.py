@@ -1548,6 +1548,7 @@ def test_queue_command_processor_persists_structured_route_then_dispatches_pinne
         "status": "ok", "kind": "substantive",
         "target_doc_id": "doc-pinned", "conversation_id": "conversation:target",
         "dialog_number": 2,
+        "selection_policy": "silent_v1",
         "tool_choice": {
             "name": "list_folders", "arguments": {}, "link_requested": False,
         },
@@ -1634,7 +1635,10 @@ def test_route_choice_survives_cleanup_and_is_dispatched_once_after_replay():
     from services.connectors.telegram.commands import parse_command
     from core.operations.queue import QueueOperationState
 
-    context = SimpleNamespace(context_id="42_default", active_conversation_id="conversation:newer")
+    context = SimpleNamespace(
+        context_id="42_default", active_conversation_id="conversation:newer",
+        selected_dialog_number=9, selection_sequence=4,
+    )
     repository = _CommandRepository()
     executor = _CommandExecutor()
     model = SequenceModel([{"parts": [], "text": "Pinned folders are ready."}])
@@ -1661,9 +1665,19 @@ def test_route_choice_survives_cleanup_and_is_dispatched_once_after_replay():
             },
         }
 
+    def publish_selection(operation_id, *, conversation_id, dialog_number):
+        assert operation_id == "operation-replay-choice"
+        assert conversation_id == "conversation:pinned"
+        assert dialog_number == 2
+        context.active_conversation_id = conversation_id
+        context.selected_dialog_number = dialog_number
+        context.selection_sequence += 1
+        return True
+
     processor = TelegramCommandProcessor(
         context_loader=lambda *_args: context, router=router, repository=repository,
         agent=telegram_agent, notifications=SimpleNamespace(),
+        selection_publisher=publish_selection,
         executor_factory=lambda *_args: executor,
     )
     operation = {"operation_id": "operation-replay-choice"}

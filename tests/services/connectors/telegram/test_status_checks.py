@@ -345,6 +345,8 @@ def test_real_operation_without_notification_id_gets_one_stable_progress_notific
     notification = repo.get_notification(notification_ids[0])
     assert notification["kind"] == "progress"
     assert notification["operation_id"] == operation_id
+    assert notification["dialog_number"] is None
+    assert not notification["body"].startswith("Dialog #")
     assert notification["send_attempts_started"] == 0
     assert notification["revision"] == first_revision["revision"] + 2
     assert notification["body"] != first_revision["body"]
@@ -374,11 +376,13 @@ def test_queued_operation_status_works_before_shared_save_operation_exists(fires
     progress = [row for row in rows if row.get("kind") == "progress"]
     assert len(progress) == 1
     assert progress[0]["operation_id"] == operation_id
+    assert progress[0]["dialog_number"] is None
+    assert not progress[0]["body"].startswith("Dialog #")
     assert publisher.calls == [progress[0]["notification_id"]]
 
 
 @pytest.mark.parametrize("selected_dialog_number", [7, None])
-def test_regular_command_progress_does_not_require_a_draft_or_dialog_number(
+def test_regular_command_progress_is_generic_even_with_selected_dialog_number(
     firestore_fake, selected_dialog_number,
 ):
     client = firestore_fake.client_class()
@@ -400,12 +404,161 @@ def test_regular_command_progress_does_not_require_a_draft_or_dialog_number(
 
     assert _run(checks.handle_task(task_payload(record))) == "pending"
     notification = repo.get_notification(publisher.calls[0])
-    if selected_dialog_number is None:
-        assert notification["dialog_number"] is None
-        assert ":" not in notification["body"]
-    else:
-        assert notification["dialog_number"] == selected_dialog_number
-        assert notification["body"].startswith(f"Dialog #{selected_dialog_number}:")
+    assert notification["dialog_number"] is None
+    assert ":" not in notification["body"]
+
+
+@pytest.mark.parametrize("route_kind", ["save", "retry", "retry_requestless"])
+def test_bound_source_progress_uses_sealed_original_draft_number(firestore_fake, route_kind):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    operation_id = f"{route_kind}-operation"
+    persisted_kind = "retry" if route_kind.startswith("retry") else route_kind
+    old_intent = "original-save-intent"
+    manifest_ref = (
+        f"telegram_sessions/{accepted.context_id}/drafts/{accepted.draft_id}/"
+        f"save_manifests/{operation_id}"
+    )
+    route = {
+        "status": "ok", "kind": persisted_kind,
+        "target_draft_id": accepted.draft_id,
+        "dialog_number": 1,
+    }
+    operation_fields = {}
+    if route_kind == "retry":
+        request_id = "retry-request-operation"
+        request_update_id = 42
+        request_input_ref = (
+            f"telegram_sessions/{accepted.context_id}/commands/{request_update_id}"
+        )
+        route["retry_request_operation_id"] = request_id
+        context_ref.collection("operations").document(request_id).set({
+            "operation_id": request_id, "context_id": accepted.context_id,
+            "input_ref": request_input_ref,
+            "route_control": {
+                "status": "ok", "kind": "retry", "dialog_number": 1,
+            },
+        })
+        context_ref.collection("commands").document(str(request_update_id)).set({
+            "context_id": accepted.context_id, "operation_id": request_id,
+            "kind": "freeform", "update_id": request_update_id,
+        })
+        context_ref.collection("updates").document(str(request_update_id)).set({
+            "accepted": True, "context_id": accepted.context_id,
+            "operation_id": request_id,
+        })
+        operation_fields["retry_request_operation_id"] = request_id
+    elif route_kind == "retry_requestless":
+        update_id = 43
+        operation_fields["input_ref"] = (
+            f"telegram_sessions/{accepted.context_id}/commands/{update_id}"
+        )
+        context_ref.collection("commands").document(str(update_id)).set({
+            "context_id": accepted.context_id, "operation_id": operation_id,
+            "kind": "retry", "update_id": update_id,
+            "draft_id": accepted.draft_id, "dialog_number": 1,
+            "save_intent_id": old_intent,
+            "manifest_digest": "original-manifest-digest",
+        })
+        context_ref.collection("updates").document(str(update_id)).set({
+            "accepted": True, "context_id": accepted.context_id,
+            "operation_id": operation_id,
+        })
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id, "state": "running",
+        "save_operation_id": operation_id, "target_draft_id": accepted.draft_id,
+        **operation_fields,
+        "route_control": route,
+    })
+    context_ref.collection("drafts").document(accepted.draft_id).update({
+        "state": "processing", "sealed_at": ACCEPTED_AT,
+        "active_save_operation_id": operation_id,
+        "immutable_save_intent_id": old_intent,
+        "manifest_ref": manifest_ref, "manifest_digest": "original-manifest-digest",
+    })
+    context_ref.collection("drafts").document(accepted.draft_id).collection(
+        "save_manifests").document(operation_id).set({
+            "draft_id": accepted.draft_id, "save_operation_id": operation_id,
+            "manifest_digest": "original-manifest-digest",
+        })
+    publisher = _Publisher()
+    checks = _service(client, reader=_StatusReader("running"), publisher=publisher)
+    record = checks.schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)[0]
+
+    assert _run(checks.handle_task(task_payload(record))) == "running"
+    notification = repo.get_notification(publisher.calls[0])
+    assert notification["dialog_number"] == 1
+    assert notification["body"].startswith("Dialog #1:")
+    assert old_intent != operation_id
+
+
+def test_legacy_requestless_retry_still_defers_terminal_fallback_during_cleanup(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    operation_id = "legacy-retry-work"
+    update_id = 47
+    manifest_path = (
+        f"telegram_sessions/{accepted.context_id}/drafts/{accepted.draft_id}/"
+        f"save_manifests/{operation_id}"
+    )
+    context_ref.collection("commands").document(str(update_id)).set({
+        "context_id": accepted.context_id, "operation_id": operation_id,
+        "kind": "retry", "update_id": update_id,
+        "draft_id": accepted.draft_id, "dialog_number": 1,
+        "save_intent_id": "prior-intent",
+        "manifest_digest": "prior-digest",
+    })
+    context_ref.collection("updates").document(str(update_id)).set({
+        "accepted": True, "context_id": accepted.context_id,
+        "operation_id": operation_id,
+    })
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id, "context_id": accepted.context_id,
+        "state": "running", "save_operation_id": operation_id,
+        "target_draft_id": accepted.draft_id,
+        "input_ref": f"telegram_sessions/{accepted.context_id}/commands/{update_id}",
+        "route_control": {"status": "ok", "kind": "retry"},
+    })
+    context_ref.collection("drafts").document(accepted.draft_id).update({
+        "state": "processing", "sealed_at": ACCEPTED_AT,
+        "active_save_operation_id": operation_id,
+        "immutable_save_intent_id": "prior-intent",
+        "manifest_ref": manifest_path, "manifest_digest": "prior-digest",
+    })
+    context_ref.collection("drafts").document(accepted.draft_id).collection(
+        "save_manifests").document(operation_id).set({
+            "draft_id": accepted.draft_id, "save_operation_id": operation_id,
+            "manifest_digest": "prior-digest",
+        })
+    client.collection("dialog_operations").document(operation_id).set({
+        "operation_id": operation_id, "context_id": accepted.context_id,
+        "state": "completed", "final_delivery_state": "pending",
+    })
+    publisher = _Publisher()
+    checks = _service(
+        client, reader=_StatusReader("completed"), publisher=publisher,
+    )
+    checks.managed_runtime = True
+    checks.terminal_notification_updater = lambda _record: pytest.fail(
+        "terminal fallback must remain deferred during retry cleanup"
+    )
+    record = checks.schedule_checks(accepted.context_id, operation_id, ACCEPTED_AT)[0]
+
+    assert _run(checks.handle_task(task_payload(record))) == "completed"
+    progress = repo.get_notification(publisher.calls[0])
+    assert progress["kind"] == "progress"
+    assert progress["dialog_number"] is None
+    assert not progress["body"].startswith("Dialog #")
 
 
 def test_terminal_check_uses_persisted_final_lifecycle_notification(firestore_fake):

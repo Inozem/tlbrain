@@ -946,6 +946,6 @@ class TelegramCommandProcessor:
         status = result.get("status") if isinstance(result, Mapping) else None
         if status in {"completed", "switched", "ok", "processed"}:
             return QueueOperationState.COMPLETED
-        if status in {"switch_notice_pending", "switch_notice_undelivered"}:
+        if status in {"switch_notice_pending", "switch_notice_undelivered", "selection_pending"}:
             return QueueOperationState.RUNNING
         return QueueOperationState.FAILED

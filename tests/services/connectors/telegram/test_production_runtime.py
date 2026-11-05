@@ -1341,9 +1341,28 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
         context_id, "conversation-selected", kind="document", doc_id="doc-selected",
         dialog_number=number, now=now,
     )
+    other_number = repository.bind_document(
+        context_id, "doc-other", "conversation-other",
+        metadata={"title": "Other notes", "folder_path": []},
+        now=now, update_last_doc=False,
+    )
+    repository.ensure_conversation(
+        context_id, "conversation-other", kind="document", doc_id="doc-other",
+        dialog_number=other_number, now=now,
+    )
+    repository.append_turn(
+        context_id, "conversation-other", turn_id="other-question",
+        operation_id="other-operation", role="user",
+        parts=[{"text": "An unrelated prior question."}], now=now,
+    )
+    repository.append_turn(
+        context_id, "conversation-other", turn_id="other-answer",
+        operation_id="other-operation", role="model",
+        parts=[{"text": "An unrelated prior answer."}], now=now,
+    )
     db.collection("telegram_sessions").document(context_id).update({
-        "active_conversation_id": "conversation-selected",
-        "selected_dialog_number": number,
+        "active_conversation_id": "conversation-other",
+        "selected_dialog_number": other_number,
     })
     repository.append_turn(
         context_id, "conversation-selected", turn_id="prior-question",
@@ -1380,7 +1399,9 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
         payload = json.loads(request.content)
         serialized_contents = json.dumps(payload["contents"], ensure_ascii=False)
         if len(wire_requests) == 1:
-            assert "What did the team decide about the schedule?" in serialized_contents
+            assert "An unrelated prior question." in serialized_contents
+            assert "An unrelated prior answer." in serialized_contents
+            assert "They moved the launch to May." not in serialized_contents
             assert "What is the milestone date in the saved notes?" in serialized_contents
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
@@ -1392,6 +1413,7 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
         contents = payload["contents"]
         assert "What did the team decide about the schedule?" in serialized_contents
         assert "They moved the launch to May." in serialized_contents
+        assert "unrelated prior" not in serialized_contents
         assert contents[-1]["parts"][0]["text"] == route["substantive_text"]
         markers = [part["text"] for content in contents for part in content.get("parts", [])
                    if isinstance(part, dict) and isinstance(part.get("text"), str)
@@ -1486,6 +1508,10 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
         "The milestone date is June 12.",
     ], sent
     assert operation["route_control"]["target_doc_id"] == "doc-selected"
+    assert operation["route_control"]["selection_policy"] == "silent_v1"
+    assert len(sent) == 1
+    assert not any("Starting to process dialog" in str(payload.get("text", ""))
+                   for method, payload in sent)
     assert operation["route_control"]["tool_choice"]["name"] == "list_recent_transcripts"
     turns = repository.list_turns(context_id, "conversation-selected")
     assert [turn["role"] for turn in turns] == ["user", "model", "user", "model"]
@@ -1493,6 +1519,10 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
     assert turns[-2]["parts"][0]["text"] == route["substantive_text"]
     assert turns[-1]["parts"][0]["text"] == "The milestone date is June 12."
     assert all("application-tool-result-data" not in str(turn) for turn in turns)
+    selected_context = repository.get_context(context_id)
+    assert selected_context["active_conversation_id"] == "conversation-selected"
+    assert selected_context["selected_dialog_number"] == number
+    assert repository.list_turns(context_id, "conversation-other")[-2:]
 
     duplicate = asyncio.run(post("/internal/dispatch", dispatch), loop_factory=_selector_loop)
     assert duplicate.status_code == 200, duplicate.text
