@@ -139,6 +139,178 @@ def test_takeover_refreshes_same_generation_receipt_to_current_fence(firestore_f
     assert get_completion(client, "doc-1", old["content_hash"]) == current
 
 
+def test_new_index_claim_refreshes_parent_and_work_provenance_without_operation_fence_order(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    previous = _receipt(fence=12, index_fence=4)
+    client.collection("transcript_index").document("doc-1").set({**previous, "status": "synced"})
+    _guard(client, previous)
+    assert publish_completion(client, previous, now=NOW) is True
+
+    current = {
+        **previous,
+        "parent_id": "parent-moved",
+        "parent_id_hash": "sha256:parent-moved",
+        "work_manifest_ref": "legacy-index/doc-1",
+        "checkpoint_refs": ["legacy-checkpoint-5"],
+        "skipped_utterances": [2],
+        "owner": "worker-5",
+        "fence": 0,
+        "index_fence": 5,
+        "completed_at": NOW + timedelta(seconds=1),
+    }
+    client.collection("transcript_index").document("doc-1").set({**current, "status": "syncing"})
+    _guard(client, current)
+
+    assert publish_completion(client, current, now=NOW + timedelta(seconds=1)) is True
+    assert get_completion(client, "doc-1", previous["content_hash"]) == current
+
+
+def test_timestamp_only_same_claim_duplicate_preserves_original_completed_receipt(firestore_fake):
+    client = firestore_fake.client_class()
+    receipt = _receipt()
+    client.collection("transcript_index").document("doc-1").set({**receipt, "status": "syncing"})
+    _guard(client, receipt)
+    assert publish_completion(client, receipt, now=NOW) is True
+
+    duplicate = {**receipt, "completed_at": NOW + timedelta(seconds=10)}
+    client.collection("transcript_index").document("doc-1").set({**duplicate, "status": "syncing"})
+    before = dict(firestore_fake.documents)
+    assert publish_completion(client, duplicate, now=NOW + timedelta(seconds=10)) is True
+    assert get_completion(client, "doc-1", receipt["content_hash"]) == receipt
+    assert firestore_fake.documents[f"transcript_index/doc-1"]["status"] == "synced"
+    assert firestore_fake.documents[_path(receipt)] == before[_path(receipt)]
+
+
+def test_same_claim_cannot_change_completed_provenance_or_checkpoints(firestore_fake):
+    client = firestore_fake.client_class()
+    receipt = _receipt()
+    client.collection("transcript_index").document("doc-1").set({**receipt, "status": "syncing"})
+    _guard(client, receipt)
+    assert publish_completion(client, receipt, now=NOW) is True
+
+    for changes in (
+        {"work_manifest_ref": "different-run"},
+        {"checkpoint_refs": ["different-checkpoint"]},
+        {"skipped_utterances": [4]},
+    ):
+        before = dict(firestore_fake.documents)
+        with pytest.raises(ValueError, match="different receipt"):
+            publish_completion(client, {**receipt, **changes}, now=NOW)
+        assert firestore_fake.documents == before
+
+
+@pytest.mark.parametrize("candidate_changes", [
+    {"index_fence": 1},
+    {"owner": "stale-owner"},
+])
+def test_stale_claim_cannot_replace_current_completed_generation(
+    firestore_fake, candidate_changes,
+):
+    client = firestore_fake.client_class()
+    previous = _receipt(index_fence=2)
+    client.collection("transcript_index").document("doc-1").set({**previous, "status": "synced"})
+    _guard(client, previous)
+    assert publish_completion(client, previous, now=NOW) is True
+
+    current = {**previous, "owner": "worker-3", "index_fence": 3,
+               "completed_at": NOW + timedelta(seconds=1)}
+    candidate = {**current, **candidate_changes}
+    client.collection("transcript_index").document("doc-1").set({**current, "status": "syncing"})
+    _guard(client, current)
+    before = dict(firestore_fake.documents)
+    assert publish_completion(client, candidate, now=NOW + timedelta(seconds=1)) is False
+    assert firestore_fake.documents == before
+
+
+@pytest.mark.parametrize("change", [
+    {"root_folder_id": "other-root"},
+    {"content_hash": "sha256:other-content", "version": "sha256:other-content"},
+    {"version": "sha256:other-version"},
+    {"provider": "other-provider"},
+    {"parent_id": "other-parent"},
+    {"parent_id_hash": "sha256:other-parent"},
+    {"resource_epoch": 2},
+])
+def test_generation_refresh_rejects_mismatched_current_transcript_without_writes(
+    firestore_fake, change,
+):
+    client = firestore_fake.client_class()
+    previous = _receipt(index_fence=2)
+    client.collection("transcript_index").document("doc-1").set({**previous, "status": "synced"})
+    _guard(client, previous)
+    assert publish_completion(client, previous, now=NOW) is True
+
+    current = {**previous, "owner": "worker-3", "index_fence": 3,
+               "completed_at": NOW + timedelta(seconds=1)}
+    candidate = {**current, **change}
+    client.collection("transcript_index").document("doc-1").set({**current, "status": "syncing"})
+    _guard(client, current)
+    before = dict(firestore_fake.documents)
+
+    assert publish_completion(client, candidate, now=NOW + timedelta(seconds=1)) is False
+    assert firestore_fake.documents == before
+
+
+@pytest.mark.parametrize("guard_change", [
+    {"unsettled_effect_ids": ["unknown-effect"]},
+    {"finalization_reservation_id": "active-finalization",
+     "finalization_expires_at": NOW + timedelta(minutes=1)},
+    {"owner_operation_id": "active-mutation", "expires_at": NOW + timedelta(minutes=1)},
+    {"index_expires_at": NOW},
+])
+def test_generation_refresh_rejects_unresolved_resource_guard_without_writes(
+    firestore_fake, guard_change,
+):
+    client = firestore_fake.client_class()
+    previous = _receipt(index_fence=2)
+    client.collection("transcript_index").document("doc-1").set({**previous, "status": "synced"})
+    _guard(client, previous)
+    assert publish_completion(client, previous, now=NOW) is True
+
+    current = {**previous, "owner": "worker-3", "index_fence": 3,
+               "completed_at": NOW + timedelta(seconds=1)}
+    client.collection("transcript_index").document("doc-1").set({**current, "status": "syncing"})
+    _guard(client, current)
+    from core.integrations.firestore.mutations import _resource_ref
+    _resource_ref(client, "document:doc-1").update(guard_change)
+    before = dict(firestore_fake.documents)
+
+    assert publish_completion(client, current, now=NOW + timedelta(seconds=1)) is False
+    assert firestore_fake.documents == before
+
+
+@pytest.mark.parametrize("old_changes,current_changes", [
+    ({"root_folder_id": "old-root"}, {}),
+    ({"version": "sha256:old-version"}, {}),
+    ({"provider": "old-provider"}, {}),
+    ({"resource_epoch": 2}, {"resource_epoch": 1}),
+    ({}, {"index_fence": 4}),
+    ({}, {"index_fence": 3}),
+])
+def test_current_claim_cannot_replace_receipt_across_immutable_identity_or_fences(
+    firestore_fake, old_changes, current_changes,
+):
+    client = firestore_fake.client_class()
+    previous = _receipt(index_fence=4, **old_changes)
+    client.collection("transcript_index").document("doc-1").set({**previous, "status": "synced"})
+    _guard(client, previous)
+    assert publish_completion(client, previous, now=NOW) is True
+
+    current = {
+        **_receipt(), "owner": "worker-5", "index_fence": 5,
+        "completed_at": NOW + timedelta(seconds=1), **current_changes,
+    }
+    client.collection("transcript_index").document("doc-1").set({**current, "status": "syncing"})
+    _guard(client, current)
+    before = dict(firestore_fake.documents)
+
+    with pytest.raises(ValueError, match="different receipt"):
+        publish_completion(client, current, now=NOW + timedelta(seconds=1))
+    assert firestore_fake.documents == before
+
+
 def test_publish_requires_live_matching_index_guard(firestore_fake):
     client = firestore_fake.client_class()
     receipt = _receipt()

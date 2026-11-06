@@ -8,7 +8,9 @@ from typing import Any, Mapping
 from google.cloud import firestore
 
 from core.integrations.firestore.client import get_client
-from core.integrations.firestore.mutations import _resource_ref, _locked_guard
+from core.integrations.firestore.mutations import (
+    _active_completion_guard, _locked_guard, _resource_ref,
+)
 
 
 COMPLETIONS_COLLECTION = "index_completions"
@@ -131,6 +133,50 @@ def _is_current(transcript: Mapping[str, Any], receipt: Mapping[str, Any]) -> bo
     return all(transcript.get(field) == receipt.get(field) for field in _CURRENT_GENERATION_FIELDS)
 
 
+def _same_completion_proof(existing: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+    """Compare receipt proof while treating completed_at as publication metadata."""
+    previous = dict(existing)
+    current = dict(candidate)
+    previous.pop("completed_at", None)
+    current.pop("completed_at", None)
+    return previous == current
+
+
+def _can_refresh_completed_generation(
+    existing: Mapping[str, Any], candidate: Mapping[str, Any],
+) -> bool:
+    """Allow a newer current index claim to refresh the same transcript generation."""
+    stable_identity = (
+        "doc_id", "root_folder_id", "content_hash", "version", "provider",
+    )
+    return (
+        existing.get("status") == "completed"
+        and candidate.get("status") == "completed"
+        and all(existing.get(field) == candidate.get(field) for field in stable_identity)
+        and candidate.get("index_fence", 0) > existing.get("index_fence", 0)
+        and candidate.get("resource_epoch", 0) >= existing.get("resource_epoch", 0)
+    )
+
+
+def _receipt_needs_write(existing: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+    """Preserve replay proof, refresh an eligible claim, or reject conflicting evidence."""
+    if _same_completion_proof(existing, candidate):
+        return False
+    if _can_refresh_completed_generation(existing, candidate):
+        return True
+    raise ValueError("completion generation already has a different receipt")
+
+
+def _has_active_resource_mutation(guard: Mapping[str, Any], now: datetime) -> bool:
+    """Reject publication while a document mutation still owns its resource lease."""
+    expiry = guard.get("expires_at")
+    return bool(
+        guard.get("owner_operation_id")
+        and isinstance(expiry, datetime)
+        and expiry > now
+    )
+
+
 def publish_completion(
     client: Any | None,
     receipt: Mapping[str, Any],
@@ -167,46 +213,19 @@ def publish_completion(
             guard.get("index_fence") != data["index_fence"]
             or guard.get("index_owner") != data["owner"]
             or _locked_guard(guard)
+            or _active_completion_guard(guard, commit_now)
+            or _has_active_resource_mutation(guard, commit_now)
             or guard.get("resource_epoch", 0) != data["resource_epoch"]
             or not isinstance(expiry, datetime) or expiry <= commit_now):
             return False
+        write_receipt = True
         if receipt_snapshot.exists:
             existing = _validated_stored(
                 receipt_snapshot.to_dict() or {}, doc_id=data["doc_id"], content_hash=data["content_hash"],
             )
-            if existing != data:
-                stable_fields = (
-                    "doc_id", "root_folder_id", "content_hash", "version", "parent_id",
-                    "parent_id_hash", "provider", "status", "skipped_utterances", "work_manifest_ref",
-                )
-                same_checkpoints = (
-                    existing.get("checkpoint_refs", [])[:2] == data.get("checkpoint_refs", [])[:2]
-                    if not str(data.get("work_manifest_ref", "")).startswith("legacy-index/")
-                    else True
-                )
-                if (all(existing.get(field) == data.get(field) for field in stable_fields)
-                        and same_checkpoints
-                        and data.get("resource_epoch", 0) >= existing.get("resource_epoch", 0)
-                        and data.get("fence", 0) >= existing.get("fence", 0)
-                        and data.get("index_fence", 0) > existing.get("index_fence", 0)):
-                    # A takeover may republish a same-generation receipt with its
-                    # newer index fence, but cannot overwrite a changed generation.
-                    transaction.set(receipt_ref, data)
-                    transcript.update({
-                        "status": "synced", "error": None,
-                        "status_changed_at": commit_now,
-                    })
-                    transaction.set(transcript_ref, transcript)
-                    return True
-                raise ValueError("completion generation already has a different receipt")
-            else:
-                transcript.update({
-                    "status": "synced", "error": None,
-                    "status_changed_at": commit_now,
-                })
-                transaction.set(transcript_ref, transcript)
-            return True
-        transaction.set(receipt_ref, data)
+            write_receipt = _receipt_needs_write(existing, data)
+        if write_receipt:
+            transaction.set(receipt_ref, data)
         transcript.update({
             "status": "synced", "error": None,
             "status_changed_at": commit_now,

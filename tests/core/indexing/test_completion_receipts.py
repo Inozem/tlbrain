@@ -656,6 +656,47 @@ def test_managed_index_stage_uses_durable_budget_and_completed_replay(
     assert len(calls) == 2
 
 
+def test_fresh_managed_claim_with_lower_operation_fence_refreshes_current_generation(
+    firestore_fake, sdk_fakes,
+):
+    from core.indexing import processor
+    from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record
+    from core.integrations.firestore.save_intents import update_save_intent_checkpoints
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, previous, content = _save_fixture(client, sdk_fakes)
+    previous = {
+        **previous, "fence": 12, "work_manifest_ref": "prior-operation-input",
+        "checkpoint_refs": ["prior-fill", "prior-index"],
+    }
+    client.collection("transcript_index").document(DOC_ID).set({**previous, "status": "synced"})
+    _set_generation(client, DOC_ID, previous["content_hash"], previous)
+
+    outbox_id = "fresh-managed-index-dispatch"
+    create_outbox_record(
+        client, outbox_id, target_kind=OutboxTargetKind.INDEX_DISPATCH, generation=1,
+        schedule_at=NOW, now=NOW, operation_id=OPERATION_ID,
+        document_id=DOC_ID, save_intent_id=save_intent_id,
+    )
+    assert update_save_intent_checkpoints(
+        client, save_intent_id, operation_id=OPERATION_ID, owner=OWNER,
+        fence=lease.fence, now=NOW, index_checkpoint_ref=outbox_id,
+    ) is not None
+    reference = {
+        "schema_version": 1, "outbox_id": outbox_id, "target_kind": "index_dispatch",
+        "generation": 1, "operation_id": OPERATION_ID, "document_id": DOC_ID,
+        "save_intent_id": save_intent_id,
+    }
+
+    assert processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference) == "skipped"
+
+    current = _stored_generation(firestore_fake, DOC_ID, previous["content_hash"])
+    assert current["fence"] < previous["fence"]
+    assert current["index_fence"] > previous["index_fence"]
+    assert current["work_manifest_ref"] == "synthetic-dialog-input-ref"
+    assert not [event for event in sdk_fakes.trace if event["boundary"] in {"gemini", "qdrant"}]
+
+
 def test_three_managed_index_failures_are_terminal_and_duplicate_does_not_dispatch(
     firestore_fake, sdk_fakes, monkeypatch,
 ):
@@ -910,6 +951,136 @@ def test_stale_index_publisher_cannot_publish_after_new_fence(firestore_fake, fa
     assert index_completions.publish_completion(client, stale, now=fake_clock.now()) is False
     assert firestore_fake.documents == before
     assert _stored_generation(firestore_fake, DOC_ID, stale["content_hash"]) is None
+
+
+def test_ordinary_repeat_refreshes_managed_completion_without_reindexing(
+    app_root, firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+    from core.indexing.hashing import sha256_text, sha256_utterance
+    from core.parsing.parser import parse_document
+
+    content = (
+        "DATE: 2026-03-04\nPROVIDER: manual\n---\n"
+        "Speaker A :: A previously indexed synthetic transcript."
+    )
+    metadata, utterances = parse_document(content)
+    content_hash = sha256_text(content)
+    parent_hash = sha256_text(PARENT_ID)
+    transcript = {
+        "doc_id": DOC_ID, "root_folder_id": ROOT_ID, "content_hash": content_hash,
+        "version": content_hash, "parent_id": PARENT_ID, "parent_id_hash": parent_hash,
+        "provider": metadata["provider"], "status": "synced", "fence": 9,
+        "index_fence": 3, "resource_epoch": 0, "skipped_utterances": [],
+        "utterance_hashes": {
+            str(item["order_index"]): sha256_utterance(
+                item["order_index"], item["speaker"], item["text"],
+            ) for item in utterances
+        },
+    }
+    firestore_fake.client_class().collection("transcript_index").document(DOC_ID).set(transcript)
+    managed_receipt = {
+        **transcript,
+        "work_manifest_ref": "save-inputs/managed-generation",
+        "checkpoint_refs": ["fill-checkpoint", "managed-index-checkpoint"],
+        "completed_at": NOW, "error": None, "owner": "managed-index-worker",
+        "status": "completed",
+    }
+    _set_generation(firestore_fake.client_class(), DOC_ID, content_hash, managed_receipt)
+
+    assert processor.process_one(DOC_ID, PARENT_ID, ROOT_ID, content) == "skipped"
+
+    final = firestore_fake.documents[f"transcript_index/{DOC_ID}"]
+    receipt = _stored_generation(firestore_fake, DOC_ID, content_hash)
+    assert final["status"] == "synced"
+    assert final["index_fence"] == receipt["index_fence"]
+    assert receipt["work_manifest_ref"] == "legacy-index/" + DOC_ID
+    assert processor.verify_current_generation(DOC_ID, PARENT_ID, ROOT_ID, content)
+    assert not [event for event in sdk_fakes.trace if event["boundary"] in {"gemini", "qdrant"}]
+
+    from core.integrations.qdrant import writer
+    writer.upsert_user_facts([{
+        "type": "user_fact", "doc_id": DOC_ID,
+        "text": "Synthetic user fact survives parent move.", "root_folder_id": ROOT_ID,
+    }], [[0.25]])
+    trace_offset = len(sdk_fakes.trace)
+    new_parent = "completion-parent-moved"
+    assert processor.process_one(DOC_ID, new_parent, ROOT_ID, content) == "skipped"
+
+    moved = firestore_fake.documents[f"transcript_index/{DOC_ID}"]
+    moved_receipt = _stored_generation(firestore_fake, DOC_ID, content_hash)
+    assert moved["parent_id"] == new_parent
+    assert moved_receipt["parent_id"] == new_parent
+    assert moved_receipt["parent_id_hash"] == sha256_text(new_parent)
+    assert processor.verify_current_generation(DOC_ID, new_parent, ROOT_ID, content)
+    before_move = sdk_fakes.trace[:trace_offset]
+    move_events = sdk_fakes.trace[trace_offset:]
+    assert [event for event in before_move
+            if event["boundary"] == "qdrant" and event["operation"] == "upsert"]
+    assert not [event for event in move_events if event["boundary"] == "gemini"]
+    assert not [event for event in move_events
+                if event["boundary"] == "qdrant" and event["operation"] in {"upsert", "delete"}]
+    payload_calls = [event for event in move_events
+                     if event["boundary"] == "qdrant" and event["operation"] == "set_payload"]
+    assert len(payload_calls) == 1
+    assert payload_calls[0]["arguments"]["payload"] == {"parent_id": new_parent}
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+    assert payload_calls[0]["arguments"]["points"] == Filter(must=[
+        FieldCondition(key="doc_id", match=MatchValue(value=DOC_ID)),
+        FieldCondition(key="root_folder_id", match=MatchValue(value=ROOT_ID)),
+    ])
+
+
+def test_ordinary_receipt_refresh_preserves_committed_save_certificate_and_replay(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+    from core.indexing.hashing import sha256_utterance
+    from core.parsing.parser import parse_document
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, content = _save_fixture(client, sdk_fakes)
+    _, utterances = parse_document(content)
+    client.collection("transcript_index").document(DOC_ID).update({
+        "utterance_hashes": {
+            str(item["order_index"]): sha256_utterance(
+                item["order_index"], item["speaker"], item["text"],
+            ) for item in utterances
+        },
+    })
+    _synthetic_google_oauth(monkeypatch)
+    sdk_fakes.docs.queue("documents.get", response={
+        "revisionId": "synthetic-revision",
+        "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
+            for line in content.splitlines()
+        ]},
+    })
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document", "parents": [PARENT_ID], "trashed": False,
+    })
+
+    result = _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    intent_path = f"dialog_save_intents/{save_intent_id}"
+    operation_path = f"dialog_operations/{OPERATION_ID}"
+    completed_intent = firestore_fake.documents[intent_path]
+    completed_operation = firestore_fake.documents[operation_path]
+    certificate = completed_intent["completion_certificate"]
+    cleanup_authorization = completed_intent["cleanup_authorization"]
+    committed_result = completed_operation["result"]
+
+    assert processor.process_one(DOC_ID, PARENT_ID, ROOT_ID, content) == "skipped"
+    assert processor.verify_current_generation(DOC_ID, PARENT_ID, ROOT_ID, content)
+    assert firestore_fake.documents[intent_path]["completion_certificate"] == certificate
+    assert firestore_fake.documents[intent_path]["cleanup_authorization"] == cleanup_authorization
+    assert firestore_fake.documents[operation_path]["cleanup_authorization"] == cleanup_authorization
+    assert firestore_fake.documents[operation_path]["result"] == committed_result
+
+    trace_after_refresh = len(sdk_fakes.trace)
+    replayed = _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    assert replayed == result
+    assert len(sdk_fakes.trace) == trace_after_refresh
 
 
 def test_expired_finalization_fence_cannot_commit_result_or_cleanup_authorization(
