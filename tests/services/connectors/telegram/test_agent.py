@@ -515,6 +515,8 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         route_prompt = json.loads(request["contents"][0]["parts"][0]["text"])
         assert "metadata and past saves alone are not explicit document selection" in route_prompt["instruction"]
         assert "target_ref=null, target_operation_id=null, and dialog_number=null" in route_prompt["instruction"]
+        assert "declarative topic or title supplied with forwarding" in route_prompt["instruction"]
+        assert "A named project alone does not authorize corpus search" in route_prompt["instruction"]
         declaration = request["tools"][0]["functionDeclarations"][0]
         schema = _wire_parameters_schema(declaration)
         assert request["toolConfig"]["functionCallingConfig"]["mode"] == "ANY"

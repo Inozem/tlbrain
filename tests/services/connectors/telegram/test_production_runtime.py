@@ -1477,6 +1477,185 @@ def test_default_app_composer_annotation_then_save_runs_canonical_pipeline_and_w
                 )
 
 
+@pytest.mark.parametrize("selected_kind", ["search", "document"])
+@pytest.mark.parametrize("selector", ["correct_number", "none", "unknown_number"])
+def test_default_app_later_annotation_targets_accepted_draft_independent_of_focus(
+    firestore_fake, sdk_fakes, monkeypatch, selected_kind, selector,
+):
+    """A correction targets its accepted collecting draft, never old selected history."""
+    from services.connectors.telegram.repository import TelegramRepository
+    from tests.services.connectors.telegram.test_save_runtime import (
+        _default_telegram_runtime_harness,
+    )
+
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    repository = TelegramRepository(runtime.db)
+    context_id = "77_default"
+    doc_id, old_conversation = "synthetic-old-doc", "synthetic-old-conversation"
+    runtime.db.collection("transcript_index").document(doc_id).set({
+        "doc_id": doc_id, "source_file": "Unrelated saved meeting", "status": "synced",
+        "provider": "telegram", "parent_id": "folder-client",
+    })
+    old_number = repository.bind_document(
+        context_id, doc_id, old_conversation,
+        metadata={"title": "Unrelated saved meeting"}, now=runtime.clock(),
+    )
+    repository.ensure_conversation(
+        context_id, old_conversation, kind="document", doc_id=doc_id,
+        dialog_number=old_number, now=runtime.clock(),
+    )
+    common = {"chat": {"id": 77, "type": "private"}, "from": {"id": 7}}
+    for i in range(8):
+        response = asyncio.run(runtime.webhook({"update_id": 11000 + i, "message": {
+            **common, "message_id": 12000 + i, "date": 1793320000,
+            "text": f"Fictional forwarded utterance {i + 1}.",
+            "forward_origin": {"type": "user", "date": 1793310000 + i,
+                               "sender_user": {"id": 44, "first_name": "Ada"}},
+        }}))
+        assert response.status_code == 200, response.text
+    draft_id = repository.get_context(context_id)["active_draft_id"]
+    draft_before = repository.get_draft(context_id, draft_id)
+    number = draft_before["dialog_number"]
+    assert number != old_number
+    ack = next(item["body"] for item in runtime.task_requests
+               if item["body"].get("notification_id"))
+    assert asyncio.run(runtime.deliver(ack)).status_code == 200
+
+    selected_id = old_conversation
+    if selected_kind == "search":
+        selected_id = "synthetic-selected-search"
+        repository.ensure_conversation(
+            context_id, selected_id, kind="search", search_filters={"query": "unrelated"},
+            now=runtime.clock(),
+        )
+    context_ref = runtime.db.collection("telegram_sessions").document(context_id)
+    context_ref.update({"active_conversation_id": selected_id,
+                        "selected_dialog_number": old_number if selected_kind == "document" else None,
+                        "last_doc_id": doc_id})
+    turns_before = repository.list_turns(context_id, selected_id)
+    note_text = "This newly forwarded conversation concerns a fictional research integration."
+    requested_number = (number if selector == "correct_number" else
+                        number + 30 if selector == "unknown_number" else None)
+    runtime.route_response("annotation", dialog_number=requested_number, substantive_text=note_text)
+    response = asyncio.run(runtime.webhook({"update_id": 11020, "message": {
+        **common, "message_id": 12020, "date": 1793320600,
+        "text": "I mean the forwarded conversation, not those search results.",
+    }}))
+    assert response.status_code == 200, response.text
+    dispatch = next(item["body"] for item in reversed(runtime.task_requests)
+                    if item["body"].get("target_kind") == "telegram_dispatch"
+                    and item["body"].get("operation_id") and not item["body"].get("notification_id"))
+    response = asyncio.run(runtime.dispatch(dispatch))
+    assert response.status_code == 200, response.text
+    routed = context_ref.collection("operations").document(dispatch["operation_id"]).get().to_dict()
+    assert routed.get("route_control", {}).get("kind") == "annotation", routed
+    notes = repository.list_draft_annotations(context_id, draft_id)
+    if selector == "unknown_number":
+        assert notes == []
+        assert routed["state"] == "failed"
+        assert repository.list_conversation_annotations(context_id, old_conversation) == []
+        assert not [event for event in sdk_fakes.trace
+                    if event["boundary"] == "qdrant" and event["operation"] == "upsert"]
+        return
+    assert len(notes) == 1, {"state": routed.get("state"), "route": routed.get("route_control")}
+    assert notes[0]["text"] == note_text and notes[0]["state"] == "pending_save"
+    assert repository.list_conversation_annotations(context_id, old_conversation) == []
+    assert repository.list_turns(context_id, selected_id) == turns_before
+    assert repository.get_draft(context_id, draft_id)["ordered_message_ids"] == draft_before["ordered_message_ids"]
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "qdrant" and event["operation"] == "upsert"]
+
+    model_calls = len([event for event in sdk_fakes.trace
+                       if event["boundary"] == "gemini" and event["operation"] == "generate_content"])
+    assert asyncio.run(runtime.dispatch(dispatch)).status_code == 200
+    assert len(repository.list_draft_annotations(context_id, draft_id)) == 1
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "gemini" and event["operation"] == "generate_content"]) == model_calls
+
+
+def test_default_app_forwarding_topic_comment_refreshes_after_sources_arrive_during_routing(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """Reclassify once against newly verified source metadata before any search effect."""
+    import json
+
+    from services.connectors.telegram.repository import TelegramRepository
+    from tests.fixtures import sdk_fakes as sdk_boundary
+    from tests.services.connectors.telegram.test_save_runtime import (
+        _default_telegram_runtime_harness,
+    )
+
+    runtime = _default_telegram_runtime_harness(firestore_fake, sdk_fakes, monkeypatch)
+    repository = TelegramRepository(runtime.db)
+    common = {"chat": {"id": 77, "type": "private"}, "from": {"id": 7}}
+    topic_comment = "Atlas Notes and Harbor rollout"
+    runtime.route_response(
+        "search", substantive_text="Find Atlas Notes conversations.",
+        tool_choice={"name": "query", "arguments": {"query": "Atlas Notes"}},
+    )
+    runtime.route_response("annotation", substantive_text=topic_comment)
+    prompts = []
+    original = sdk_boundary._GeminiModels.generate_content
+
+    def add_sources_during_route(sdk_models, **kwargs):
+        contents = kwargs.get("contents")
+        content = contents[0]
+        parts = content.get("parts") if isinstance(content, dict) else content.parts
+        first_part = parts[0]
+        text = first_part.get("text") if isinstance(first_part, dict) else first_part.text
+        try:
+            prompt = json.loads(text)
+        except (TypeError, ValueError):
+            return original(sdk_models, **kwargs)
+        if "response_schema" in prompt and "command" in prompt:
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                for index in range(8):
+                    response = asyncio.run(runtime.webhook({"update_id": 13001 + index, "message": {
+                        **common, "message_id": 14001 + index, "date": 1793320000,
+                        "text": f"Synthetic source {index + 1}.",
+                        "forward_origin": {"type": "user", "date": 1793310000 + index,
+                                           "sender_user": {"id": 44, "first_name": "Ada"}},
+                    }}))
+                    assert response.status_code == 200, response.text
+        return original(sdk_models, **kwargs)
+
+    monkeypatch.setattr(sdk_boundary._GeminiModels, "generate_content", add_sources_during_route)
+    response = asyncio.run(runtime.webhook({"update_id": 13000, "message": {
+        **common, "message_id": 14000, "date": 1793320000, "text": topic_comment,
+    }}))
+    assert response.status_code == 200, response.text
+    dispatch = next(item["body"] for item in reversed(runtime.task_requests)
+                    if item["body"].get("target_kind") == "telegram_dispatch"
+                    and item["body"].get("operation_id") and not item["body"].get("notification_id"))
+    response = asyncio.run(runtime.dispatch(dispatch))
+    assert response.status_code == 200, response.text
+    assert len(prompts) == 2
+    assert prompts[0]["context"]["forwarding_source_bound"] is False
+    assert prompts[1]["context"]["forwarding_source_bound"] is True
+    context = repository.get_context("77_default")
+    draft_id = context["active_draft_id"]
+    notes = repository.list_draft_annotations("77_default", draft_id)
+    assert len(notes) == 1 and notes[0]["text"] == topic_comment
+    assert notes[0]["state"] == "pending_save"
+    assert repository.get_draft("77_default", draft_id)["ordered_message_ids"] == list(range(14001, 14009))
+    assert not [event for event in sdk_fakes.trace if event["boundary"] == "qdrant"
+                and event["operation"] in {"query_points", "query_batch_points", "upsert", "scroll"}]
+    assert not [event for event in sdk_fakes.trace if event["boundary"] == "gemini"
+                and event["operation"] == "embed_content"]
+
+    receipt_ack = next(item["body"] for item in runtime.task_requests
+                       if item["body"].get("notification_id"))
+    assert asyncio.run(runtime.deliver(receipt_ack)).status_code == 200
+    model_calls = len([event for event in sdk_fakes.trace
+                       if event["boundary"] == "gemini" and event["operation"] == "generate_content"])
+    assert asyncio.run(runtime.dispatch(dispatch)).status_code == 200
+    assert len(prompts) == 2
+    assert len(repository.list_draft_annotations("77_default", draft_id)) == 1
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "gemini" and event["operation"] == "generate_content"]) == model_calls
+
+
 def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemini_http(
     firestore_fake, sdk_fakes, monkeypatch,
 ):

@@ -2397,6 +2397,7 @@ def test_default_asgi_leading_context_accepts_six_forwards_while_dispatch_routes
 
     repository = TelegramRepository(runtime.db)
     assert route_results and route_results[0].get("kind") == "annotation", route_results
+    assert len(route_results) == 1, "a valid pinned annotation should resume without reclassification"
     operation = (runtime.db.collection("telegram_sessions").document(dispatch["context_id"])
                  .collection("operations").document(dispatch["operation_id"]).get().to_dict())
     assert route_results, (route_context, operation)

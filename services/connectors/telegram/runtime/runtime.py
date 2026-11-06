@@ -1095,47 +1095,19 @@ class _CommandExecution(SearchAgentMixin):
             self.decision_status = "ok"
             return
         if self.raw_decision is None and self.chat_conversation_id is not None:
-            ingress_binding = await _offload(
-                runtime.repository.get_ingress_binding, self.context_id, self.operation_id,
-            )
-            bound_draft = None
-            if isinstance(ingress_binding, Mapping) and isinstance(ingress_binding.get("draft_id"), str):
-                bound_draft = await _offload(
-                    runtime.repository.get_draft, self.context_id, ingress_binding["draft_id"],
-                )
+            initial_context, initial_binding = await self._routing_context_metadata()
             try:
-                self.raw_decision = await _offload(
-                    self.route_model.route,
-                    text=self.command.text if self.command is not None else "",
-                    candidates=self.cards,
-                    operation_candidates=tuple(
-                        _safe_save_candidates(self.save_candidates).values()
-                    ),
-                    recent_search_results=self.recent_search_results,
-                    context_metadata={
-                        "active_conversation_id": self.context.active_conversation_id,
-                        "selected_dialog_number": self.context.selected_dialog_number,
-                        "last_doc_id": self.context.last_doc_id,
-                        "selected_conversation_kind": (
-                            self.route_conversation.kind.value if self.route_conversation else None
-                        ),
-                        "selected_draft_id": (
-                            self.route_conversation.draft_id if self.route_conversation else None
-                        ),
-                        "forwarding_context_candidate": isinstance(ingress_binding, Mapping),
-                        "forwarding_source_bound": isinstance(bound_draft, Mapping),
-                        "forwarding_dialog_number": (
-                            bound_draft.get("dialog_number")
-                            if isinstance(bound_draft, Mapping) else None
-                        ),
-                        "selected_search_filters": (
-                            self.route_conversation.search_filters
-                            if self.route_conversation
-                            and self.route_conversation.kind.value == "search" else None
-                        ),
-                    },
-                    history=self.route_history,
-                ) if self.command is not None else {}
+                self.raw_decision = await self._classify_route(initial_context)
+                refreshed_context, refreshed_binding = await self._routing_context_metadata()
+                was_unbound = not self._ingress_source_is_bound(initial_binding)
+                is_now_bound = self._ingress_source_is_bound(refreshed_binding)
+                initial_decision, initial_status = _valid_response(self.raw_decision)
+                needs_source_aware_refresh = (
+                    initial_status == "ok" and isinstance(initial_decision, Mapping)
+                    and initial_decision.get("kind") in {"search", "substantive"}
+                )
+                if was_unbound and is_now_bound and needs_source_aware_refresh:
+                    self.raw_decision = await self._classify_route(refreshed_context)
             except Exception as error:
                 self.raw_decision = {}
                 _LOGGER.warning(
@@ -1145,6 +1117,143 @@ class _CommandExecution(SearchAgentMixin):
                            "exception_class": type(error).__name__},
                 )
         self.decision, self.decision_status = _valid_response(self.raw_decision)
+
+    @staticmethod
+    def _ingress_source_is_bound(binding: Any) -> bool:
+        return bool(
+            isinstance(binding, Mapping)
+            and isinstance(binding.get("draft_id"), str)
+            and binding.get("draft_state") == "collecting"
+        )
+
+    async def _routing_context_metadata(self) -> tuple[dict[str, Any], Any]:
+        """Return safe route context and the verified ingress association snapshot."""
+        ingress_binding = await _offload(
+            self.runtime.repository.get_ingress_binding, self.context_id, self.operation_id,
+        )
+        ingress_draft = None
+        if isinstance(ingress_binding, Mapping):
+            ingress_draft_id = ingress_binding.get("draft_id")
+            if isinstance(ingress_draft_id, str):
+                ingress_draft = await _offload(
+                    self.runtime.repository.get_draft, self.context_id, ingress_draft_id,
+                )
+        association = None
+        if (isinstance(ingress_binding, Mapping) and isinstance(ingress_draft, Mapping)
+                and ingress_draft.get("state") == "collecting"):
+            association = {**dict(ingress_binding),
+                           "draft_state": ingress_draft.get("state"),
+                           "dialog_number": ingress_draft.get("dialog_number")}
+        captured = await self._accepted_collecting_draft()
+        context = {
+            "active_conversation_id": self.context.active_conversation_id,
+            "selected_dialog_number": self.context.selected_dialog_number,
+            "last_doc_id": self.context.last_doc_id,
+            "selected_conversation_kind": (
+                self.route_conversation.kind.value if self.route_conversation else None
+            ),
+            "selected_draft_id": (
+                self.route_conversation.draft_id if self.route_conversation else None
+            ),
+            "forwarding_context_candidate": isinstance(ingress_binding, Mapping),
+            "forwarding_source_bound": association is not None,
+            "forwarding_dialog_number": (
+                association.get("dialog_number") if association else None
+            ),
+            "captured_collecting_draft": captured,
+            "selected_search_filters": (
+                self.route_conversation.search_filters
+                if self.route_conversation
+                and self.route_conversation.kind.value == "search" else None
+            ),
+        }
+        return context, association
+
+    async def _classify_route(self, context_metadata: Mapping[str, Any]) -> dict[str, Any]:
+        """Run one governed structured classification against a metadata snapshot."""
+        from services.connectors.telegram.sessions import _safe_save_candidates
+
+        return await _offload(
+            self.route_model.route,
+            text=self.command.text if self.command is not None else "",
+            candidates=self.cards,
+            operation_candidates=tuple(
+                _safe_save_candidates(self.save_candidates).values()
+            ),
+            recent_search_results=self.recent_search_results,
+            context_metadata=context_metadata,
+            history=self.route_history,
+        ) if self.command is not None else {}
+
+    async def _accepted_collecting_draft(self) -> dict[str, Any] | None:
+        """Verify the accepted command's current collecting draft independently of focus."""
+        input_ref = _value(self.operation, "input_ref")
+        prefix = f"telegram_sessions/{self.context_id}/commands/"
+        if not isinstance(input_ref, str) or not input_ref.startswith(prefix):
+            return None
+        command_id = input_ref[len(prefix):]
+        if not command_id or "/" in command_id:
+            return None
+        command_snapshot = await _offload(
+            self.runtime.repository.client.collection("telegram_sessions")
+            .document(self.context_id).collection("commands").document(command_id).get
+        )
+        command = command_snapshot.to_dict() or {} if command_snapshot.exists else {}
+        if (command.get("context_id") != self.context_id
+                or command.get("operation_id") != self.operation_id):
+            return None
+        binding = await _offload(
+            self.runtime.repository.get_ingress_binding, self.context_id, self.operation_id,
+        )
+        command_draft_id = command.get("draft_id")
+        ingress_draft_id = binding.get("draft_id") if isinstance(binding, Mapping) else None
+        if (isinstance(command_draft_id, str) and isinstance(ingress_draft_id, str)
+                and command_draft_id != ingress_draft_id):
+            return None
+        draft_id = command_draft_id if isinstance(command_draft_id, str) else ingress_draft_id
+        cutoff = command.get("cutoff_message_ids")
+        if (not isinstance(draft_id, str) or not isinstance(cutoff, list) or not cutoff
+                or any(type(item) is not int or item < 1 for item in cutoff)
+                or len(set(cutoff)) != len(cutoff)):
+            return None
+        draft = await _offload(self.runtime.repository.get_draft, self.context_id, draft_id)
+        dialog_number = draft.get("dialog_number") if isinstance(draft, Mapping) else None
+        conversation_id = draft.get("conversation_id") if isinstance(draft, Mapping) else None
+        if (not isinstance(draft, Mapping) or draft.get("draft_id") != draft_id
+                or draft.get("state") != "collecting"
+                or type(dialog_number) is not int or dialog_number < 1
+                or not isinstance(conversation_id, str) or not conversation_id
+                or self.context.active_draft_id != draft_id):
+            return None
+        if (any(message_id not in draft.get("ordered_message_ids", [])
+                for message_id in cutoff)
+                or (isinstance(ingress_draft_id, str)
+                    and (not isinstance(binding, Mapping)
+                         or binding.get("draft_id") != draft_id))):
+            return None
+        context_ref = self.runtime.repository.client.collection("telegram_sessions").document(
+            self.context_id
+        )
+        dialog_snapshot = await _offload(
+            context_ref.collection("dialogs").document(str(dialog_number)).get,
+        )
+        dialog = dialog_snapshot.to_dict() or {} if dialog_snapshot.exists else {}
+        conversation_snapshot = await _offload(
+            context_ref.collection("conversations").document(conversation_id).get,
+        )
+        conversation = conversation_snapshot.to_dict() or {} if conversation_snapshot.exists else {}
+        if (dialog.get("dialog_number") != dialog_number
+                or dialog.get("conversation_id") != conversation_id
+                or dialog.get("draft_id") != draft_id or dialog.get("doc_id") is not None
+                or (conversation_snapshot.exists and (
+                    conversation.get("conversation_id") != conversation_id
+                    or conversation.get("kind") != "draft"
+                    or conversation.get("draft_id") != draft_id
+                    or conversation.get("dialog_number") != dialog_number
+                ))):
+            return None
+        return {"draft_id": draft_id, "dialog_number": dialog_number,
+                "state": "collecting"}
 
     def _load_search_exchange(
         self, reference: Any, *, conversation_id: str, operation_id: str,
@@ -1517,9 +1626,18 @@ class _CommandExecution(SearchAgentMixin):
         """Persist global route control and dispatch its specific command handler."""
         if not await self._persist_global_route():
             return QueueOperationState.FAILED
+        if (isinstance(self.pinned, Mapping)
+                and self.pinned.get("kind") == "annotation"
+                and self.pinned.get("status") == "invalid_route"):
+            self.decision_status = "invalid_route"
+            return await self._invalid_annotation_target_reply()
         if self.decision is None or self.decision_status != "ok":
             if self.decision_status == "uncertain":
                 return await self.finish_reply(_UNCERTAIN_ROUTE_REPLY)
+            if (self.decision_status == "invalid_route"
+                    and isinstance(self.pinned, Mapping)
+                    and self.pinned.get("kind") == "annotation"):
+                return await self._invalid_annotation_target_reply()
             return await self._finish_processing_error()
         cleared = await _offload(
             self.runtime.repository.clear_command_candidate, self.context_id,
@@ -1539,8 +1657,11 @@ class _CommandExecution(SearchAgentMixin):
         return await handler()
 
     async def _persist_global_route(self) -> bool:
-        """Durably pin the selected route and its replay checkpoint before side effects."""
+        """Pin route identity; a valid unbound annotation keeps its bounded continuation."""
         if await self._trusted_legacy_search_pin():
+            return True
+        if (self._has_pinned_decision() and isinstance(self.pinned, Mapping)
+                and self.pinned.get("kind") == "annotation"):
             return True
         decision = self.decision
         if (decision is None and isinstance(self.pinned, Mapping)
@@ -1606,17 +1727,18 @@ class _CommandExecution(SearchAgentMixin):
                         else:
                             record["status"] = "invalid_route"
                     else:
-                        source = await self._captured_draft_source()
-                        source_draft_id = source.get("draft_id") if isinstance(source, Mapping) else None
-                        source_draft = (await _offload(
-                            self.runtime.repository.get_draft, self.context_id, source_draft_id,
-                        ) if isinstance(source_draft_id, str) else None)
-                        if (isinstance(source_draft, Mapping)
-                                and source_draft.get("dialog_number") == requested_number):
-                            record["target_draft_id"] = source_draft_id
+                        captured = await self._accepted_collecting_draft()
+                        if (isinstance(captured, Mapping)
+                                and captured.get("dialog_number") == requested_number):
+                            record["target_draft_id"] = captured["draft_id"]
                             record["dialog_number"] = requested_number
                         else:
                             record["status"] = "invalid_route"
+                else:
+                    captured = await self._accepted_collecting_draft()
+                    if isinstance(captured, Mapping):
+                        record["target_draft_id"] = captured["draft_id"]
+                        record["dialog_number"] = captured["dialog_number"]
             elif self.search_continuation:
                 record["conversation_id"] = self.search_session_id
                 record["search_protocol"] = "agent-v1"
@@ -1640,10 +1762,23 @@ class _CommandExecution(SearchAgentMixin):
         except Exception:
             return False
 
+    async def _invalid_annotation_target_reply(self) -> QueueOperationState:
+        """Deliver the stable refusal for an explicit annotation target mismatch."""
+        return await self.finish_reply(
+            "I could not safely match that context note to a dialog. Please choose the dialog explicitly.",
+            kind="error", failure_final=True,
+        )
+
     async def _handle_annotation(self) -> QueueOperationState:
         """Apply a model-routed note to an exact synced document or stage it with its draft."""
         if self.decision is None:
             return QueueOperationState.FAILED
+        pinned_route = self.pinned if isinstance(self.pinned, Mapping) else {}
+        if pinned_route.get("status") not in {"ok", "success"}:
+            return await self.finish_reply(
+                "I could not safely match that context note to a dialog. Please choose the dialog explicitly.",
+                kind="error", failure_final=True,
+            )
         text = self.decision.get("substantive_text")
         if not isinstance(text, str) or not text.strip():
             return await self.finish_reply(
@@ -1651,7 +1786,7 @@ class _CommandExecution(SearchAgentMixin):
                 kind="error", failure_final=True,
             )
         requested_number = self.decision.get("dialog_number")
-        route = self.pinned if isinstance(self.pinned, Mapping) else {}
+        route = pinned_route
         target_ref = self.decision.get("target_ref")
         target_doc_id = route.get("target_doc_id")
         if isinstance(target_doc_id, str):
@@ -1733,7 +1868,7 @@ class _CommandExecution(SearchAgentMixin):
             draft_id = binding.get("draft_id")
         source = None
         if not isinstance(draft_id, str):
-            source = await self._captured_draft_source()
+            source = await self._accepted_collecting_draft()
             draft_id = source.get("draft_id") if isinstance(source, Mapping) else None
         if not isinstance(draft_id, str):
             deadline = binding.get("max_deadline_at") if isinstance(binding, Mapping) else None

@@ -127,6 +127,36 @@ def test_router_prompt_carries_only_safe_document_and_focus_metadata():
     assert "must not be included" not in repr(prompt)
 
 
+def test_router_prompt_treats_bare_topic_description_as_annotation_and_exposes_verified_draft():
+    import json
+    from services.connectors.telegram.runtime.routing import GeminiCommandRouter
+
+    class Model:
+        def generate(self, **kwargs):
+            self.request = kwargs
+            return {"parts": [{"function_call": {"name": "route_command", "args": _route()}}]}
+
+    model = Model()
+    GeminiCommandRouter(model).route(
+        text="Project Atlas planning", candidates=[],
+        context_metadata={
+            "selected_conversation_kind": "search",
+            "selected_draft_id": "untrusted-selected-draft",
+            "captured_collecting_draft": {
+                "draft_id": "accepted-draft-8", "dialog_number": 8, "state": "collecting",
+            },
+            "unapproved_extra": "must not be included",
+        },
+    )
+    prompt = json.loads(model.request["contents"][0]["parts"][0]["text"])
+    assert prompt["context"].get("captured_collecting_draft") == {
+        "draft_id": "accepted-draft-8", "dialog_number": 8, "state": "collecting",
+    }
+    assert "declarative topic or title" in prompt["instruction"]
+    assert "does not authorize corpus search" in prompt["instruction"]
+    assert "unapproved_extra" not in repr(prompt)
+
+
 def test_router_reads_real_gemini_candidate_envelope_and_governor_replays_it(firestore_fake):
     from google.genai import types
     from core.integrations.firestore.operation_queue import QueueOperationRetryStore
