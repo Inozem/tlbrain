@@ -522,13 +522,9 @@ def _record_add_dialog_provider_rejection(client, operation_id, owner, lease, sa
 
 
 def _publish_add_dialog_index_work(client):
-    """Publish due index outbox records using the configured task target."""
+    """Publish due index outbox records using the public Vector Sync target."""
     target = TaskTargetConfig(
         queue_name=os.environ["VECTOR_SYNC_QUEUE"], url=os.environ["VECTOR_SYNC_URL"],
-        service_account_email=(os.environ.get("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL")
-                               or os.environ.get("TASK_SERVICE_ACCOUNT_EMAIL")),
-        audience=(os.environ.get("CLOUD_TASKS_OIDC_AUDIENCE")
-                  or os.environ.get("TASK_OIDC_AUDIENCE")),
     )
     operation_outbox.publish_due_outbox_records(
         client, {OutboxTargetKind.INDEX_DISPATCH: target},

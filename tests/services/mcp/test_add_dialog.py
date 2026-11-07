@@ -461,6 +461,28 @@ def test_fresh_invalid_explicit_folder_path_does_not_reserve_request(monkeypatch
 def test_explicit_empty_folder_path_selects_root_and_reports_accepted_index_task(
     monkeypatch, sdk_fakes, firestore_fake,
 ):
+    from google.cloud import tasks_v2
+    from tests.fixtures.sdk_fakes import FakeCloudTasksClient
+
+    vector_url = "https://vector-sync.pytest.invalid/"
+    recovery_audience = os.environ["CLOUD_TASKS_OIDC_AUDIENCE"]
+    monkeypatch.setenv("VECTOR_SYNC_URL", vector_url)
+    recovery_service_account = os.environ["CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL"]
+    monkeypatch.setenv("TASK_OIDC_AUDIENCE", "https://legacy-mcp-recovery.pytest.invalid")
+    monkeypatch.setenv("TASK_OIDC_SERVICE_ACCOUNT_EMAIL", "legacy-dialog-invoker@synthetic-project.invalid")
+    monkeypatch.setenv("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL", "malformed legacy service account")
+    monkeypatch.setenv("TASK_SERVICE_ACCOUNT_EMAIL", "conflicting-dialog-invoker@synthetic-project.invalid")
+    task_serializations = []
+    create_task_at_boundary = FakeCloudTasksClient.create_task
+
+    def serialize_task_at_boundary(self, *, parent, task, **kwargs):
+        task_message = task if isinstance(task, tasks_v2.Task) else tasks_v2.Task(task)
+        serialized = tasks_v2.Task.serialize(task_message)
+        parsed = tasks_v2.Task.deserialize(serialized)
+        task_serializations.append((serialized, parsed))
+        return create_task_at_boundary(self, parent=parent, task=parsed, **kwargs)
+
+    monkeypatch.setattr(FakeCloudTasksClient, "create_task", serialize_task_at_boundary)
     files, documents, created_docs = _install_document_boundary(monkeypatch, sdk_fakes)
     tools = _post(_rpc("tools/list", "confirm-add-dialog-tool")).json()["result"]["tools"]
     assert "add_dialog" in {tool["name"] for tool in tools}
@@ -511,18 +533,34 @@ def test_explicit_empty_folder_path_selects_root_and_reports_accepted_index_task
         event for event in sdk_fakes.trace
         if event["boundary"] == "tasks" and event["operation"] == "create_task"
     ]
-    vector_url = os.environ["VECTOR_SYNC_URL"]
     index_tasks = [
         event for event in task_events
-        if event["arguments"]["task"]["http_request"]["url"].startswith(vector_url)
+        if event["arguments"]["task"].http_request.url.startswith(vector_url)
     ]
     assert len(index_tasks) == 1
-    task_body = json.loads(index_tasks[0]["arguments"]["task"]["http_request"]["body"])
+    task = index_tasks[0]["arguments"]["task"]
+    assert len(task_serializations) == 1
+    serialized_task, parsed_task = task_serializations[0]
+    assert serialized_task == tasks_v2.Task.serialize(parsed_task)
+    assert parsed_task.http_request.url == f"{vector_url.rstrip('/')}/sync/doc/{payload['doc_id']}"
+    http_request = task.http_request
+    assert index_tasks[0]["arguments"]["parent"].endswith("/queues/pytest-vector-sync-queue")
+    assert http_request._pb.WhichOneof("authorization_header") is None
+    assert not http_request._pb.HasField("oidc_token")
+    assert recovery_audience != "https://legacy-mcp-recovery.pytest.invalid"
+    assert recovery_service_account != "legacy-dialog-invoker@synthetic-project.invalid"
+    task_body = json.loads(http_request.body)
     assert task_body["schema_version"] == 1
     assert task_body["target_kind"] == "index_dispatch"
     assert task_body["document_id"] == payload["doc_id"]
     assert task_body["operation_id"] == payload["operation_id"]
     assert task_body["save_intent_id"]
+    from core.integrations.firestore.outbox import get_outbox_record
+    from core.integrations.firestore.save_intents import get_save_intent
+    outbox_client = firestore_fake.client_class()
+    save_intent = get_save_intent(outbox_client, task_body["save_intent_id"])
+    delivered_index_work = get_outbox_record(outbox_client, save_intent.index_checkpoint_ref)
+    assert delivered_index_work.state.value == "delivered"
 
     index_record = firestore_fake.client_class().collection("transcript_index").document(payload["doc_id"]).get()
     assert index_record.exists
@@ -915,3 +953,66 @@ def test_add_dialog_missing_operation_after_publish_returns_in_progress(monkeypa
 
     assert response["error"]["code"] == -32010
     assert response["error"]["data"]["operation_id"] == "missing-operation"
+
+
+@pytest.mark.parametrize(
+    "auth_settings",
+    [
+        pytest.param(
+            {
+                "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL": "recovery@synthetic.invalid",
+                "CLOUD_TASKS_OIDC_AUDIENCE": "https://mcp-recovery.synthetic.invalid",
+                "OIDC_SERVICE_ACCOUNT_EMAIL": "recovery@synthetic.invalid",
+                "OIDC_AUDIENCE": "https://mcp-recovery.synthetic.invalid",
+                "TASK_OIDC_SERVICE_ACCOUNT_EMAIL": "conflicting@synthetic.invalid",
+                "TASK_OIDC_AUDIENCE": "https://legacy-recovery.synthetic.invalid",
+                "CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL": "malformed account",
+                "TASK_SERVICE_ACCOUNT_EMAIL": "other@synthetic.invalid",
+            },
+            id="present-and-conflicting",
+        ),
+        pytest.param({}, id="absent"),
+        pytest.param(
+            {
+                "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL": "not-an-email",
+                "CLOUD_TASKS_OIDC_AUDIENCE": "not-a-url",
+                "OIDC_SERVICE_ACCOUNT_EMAIL": "also malformed",
+                "OIDC_AUDIENCE": "bad audience",
+                "TASK_OIDC_SERVICE_ACCOUNT_EMAIL": "different malformed account",
+                "TASK_OIDC_AUDIENCE": "also not a URL",
+                "CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL": "legacy malformed",
+                "TASK_SERVICE_ACCOUNT_EMAIL": "conflicting malformed",
+            },
+            id="malformed-and-conflicting",
+        ),
+    ],
+)
+def test_add_dialog_index_dispatch_ignores_recovery_auth_configuration(monkeypatch, auth_settings):
+    from services.mcp.app.mcp import handler
+
+    auth_names = (
+        "CLOUD_TASKS_OIDC_AUDIENCE", "TASK_OIDC_AUDIENCE", "OIDC_AUDIENCE",
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "TASK_OIDC_SERVICE_ACCOUNT_EMAIL",
+    )
+    auth_names += ("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL", "TASK_SERVICE_ACCOUNT_EMAIL", "OIDC_SERVICE_ACCOUNT_EMAIL")
+    for name in auth_names:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in auth_settings.items():
+        monkeypatch.setenv(name, value)
+    vector_url = "https://vector-service.synthetic.invalid/"
+    monkeypatch.setenv("VECTOR_SYNC_URL", vector_url)
+    monkeypatch.setenv("VECTOR_SYNC_QUEUE", "vector-queue")
+    captured = {}
+
+    def publish(_client, targets, **_kwargs):
+        captured.update(targets)
+
+    monkeypatch.setattr(handler.operation_outbox, "publish_due_outbox_records", publish)
+
+    handler._publish_add_dialog_index_work(object())
+
+    target = next(iter(captured.values()))
+    assert target.queue_name == "vector-queue"
+    assert target.url == vector_url
+    assert target.service_account_email is None
+    assert target.audience is None
