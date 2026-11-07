@@ -8,6 +8,8 @@ all downloads and process discovery are faked and all archives are synthetic.
 
 from __future__ import annotations
 
+import builtins
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -438,6 +440,258 @@ def test_candidate_probe_fails_if_numeric_windows_version_is_unavailable(
 
     with pytest.raises(RuntimeError, match="numeric Windows OS version"):
         runner._probe_interpreter(candidate)
+
+
+@pytest.mark.parametrize(
+    ("platform_tag", "expected_architecture", "accepted"),
+    [("win-amd64", "x86_64", True), ("win32", "x86", False),
+     ("win-arm64", "arm64", False)],
+)
+def test_candidate_probe_uses_windows_build_facts_without_wmi(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    platform_tag: str, expected_architecture: str, accepted: bool,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+    candidate.write_text("synthetic", encoding="utf-8")
+    output = io.StringIO()
+    fake_sys = SimpleNamespace(
+        platform="win32", getwindowsversion=lambda: (10, 0, 26100, 2, ""),
+    )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Windows child probe must not call WMI-backed platform helpers")
+
+    fake_platform = SimpleNamespace(
+        python_version=lambda: "3.12.14", mac_ver=forbidden,
+        win32_ver=forbidden, machine=forbidden, libc_ver=forbidden,
+    )
+    modules = {
+        "json": json,
+        "platform": fake_platform,
+        "sys": fake_sys,
+        "sysconfig": SimpleNamespace(get_platform=lambda: platform_tag),
+        "ssl": SimpleNamespace(),
+        "venv": SimpleNamespace(),
+        "pip": SimpleNamespace(),
+    }
+
+    def execute_probe(args: list[str], **_kwargs: Any) -> Any:
+        code = args[args.index("-c") + 1]
+
+        def imported(name: str, globals_: Any = None, locals_: Any = None,
+                     fromlist: Any = (), level: int = 0) -> Any:
+            del globals_, locals_, fromlist, level
+            if name in modules:
+                return modules[name]
+            return builtins.__import__(name)
+
+        namespace = {"__builtins__": {**vars(builtins), "__import__": imported}}
+        with contextlib.redirect_stdout(output):
+            exec(compile(code, "<candidate-probe>", "exec"), namespace)
+        return SimpleNamespace(returncode=0, stdout=output.getvalue(), stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", execute_probe)
+    facts = runner._probe_interpreter(candidate)
+    assert facts["os_version"] == "10.0.26100"
+    assert facts["architecture"] == expected_architecture
+    assert facts["ssl"] is facts["venv"] is facts["pip"] is True
+    assert runner.check_interpreter(candidate, probe=lambda _path: facts)["python_minor"] == "3.12"
+    assert runner._native_facts_match(facts, _platform()) is accepted
+    if accepted:
+        assert runner._meets_minimums(facts, runner.select_entry(
+            runner.load_lock(LOCK), "windows", "x86_64", "none", "3.14.0",
+        ))
+
+
+@pytest.mark.parametrize(
+    ("system", "expected_os", "expected_version", "expected_libc", "expected_libc_version"),
+    [
+        ("linux", "linux", "", "glibc", "2.39"),
+        ("darwin", "macos", "14.5", "none", ""),
+        ("freebsd14", "freebsd14", "", "none", ""),
+    ],
+)
+def test_candidate_probe_preserves_unix_facts_and_limits_libc_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    system: str,
+    expected_os: str,
+    expected_version: str,
+    expected_libc: str,
+    expected_libc_version: str,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python"
+    calls: list[str] = []
+    output = io.StringIO()
+
+    def forbid() -> Any:
+        raise AssertionError("platform helper must not run for this candidate OS")
+
+    platform_module = SimpleNamespace(
+        python_version=lambda: "3.12.14",
+        machine=lambda: calls.append("machine") or "x86_64",
+        mac_ver=lambda: calls.append("mac_ver") or ("14.5", ("", "", ""), "arm64"),
+        libc_ver=lambda: calls.append("libc_ver") or ("glibc", "2.39"),
+    )
+    if system == "linux":
+        platform_module.mac_ver = forbid
+    elif system == "darwin":
+        platform_module.libc_ver = forbid
+    else:
+        platform_module.mac_ver = forbid
+        platform_module.libc_ver = forbid
+    modules = {
+        "json": json,
+        "platform": platform_module,
+        "sys": SimpleNamespace(platform=system),
+        "sysconfig": SimpleNamespace(),
+        "ssl": SimpleNamespace(),
+        "venv": SimpleNamespace(),
+        "pip": SimpleNamespace(),
+    }
+
+    def execute_probe(args: list[str], **_kwargs: Any) -> Any:
+        code = args[args.index("-c") + 1]
+
+        def imported(name: str, globals_: Any = None, locals_: Any = None,
+                     fromlist: Any = (), level: int = 0) -> Any:
+            del globals_, locals_, fromlist, level
+            return modules[name] if name in modules else builtins.__import__(name)
+
+        namespace = {"__builtins__": {**vars(builtins), "__import__": imported}}
+        with contextlib.redirect_stdout(output):
+            exec(compile(code, "<candidate-probe>", "exec"), namespace)
+        return SimpleNamespace(returncode=0, stdout=output.getvalue(), stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", execute_probe)
+    facts = runner._probe_interpreter(candidate)
+    assert facts["os"] == expected_os
+    assert facts["os_version"] == expected_version
+    assert facts["architecture"] == "x86_64"
+    assert facts["libc"] == expected_libc
+    assert facts["libc_version"] == expected_libc_version
+    assert "libc_ver" in calls if system == "linux" else "libc_ver" not in calls
+    assert "mac_ver" in calls if system == "darwin" else "mac_ver" not in calls
+
+
+def test_candidate_probe_refuses_unknown_windows_build_architecture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+
+    def execute_probe(args: list[str], **_kwargs: Any) -> Any:
+        code = args[args.index("-c") + 1]
+        modules = {
+            "json": json,
+            "platform": SimpleNamespace(python_version=lambda: "3.12.14"),
+            "sys": SimpleNamespace(platform="win32", getwindowsversion=lambda: (10, 0, 26100)),
+            "sysconfig": SimpleNamespace(get_platform=lambda: "win-mips"),
+            "ssl": SimpleNamespace(),
+            "venv": SimpleNamespace(),
+        }
+
+        def imported(name: str, globals_: Any = None, locals_: Any = None,
+                     fromlist: Any = (), level: int = 0) -> Any:
+            del globals_, locals_, fromlist, level
+            return modules[name] if name in modules else builtins.__import__(name)
+
+        with pytest.raises(RuntimeError, match="unsupported Windows interpreter architecture"):
+            exec(code, {"__builtins__": {**vars(builtins), "__import__": imported}})
+        return SimpleNamespace(returncode=1, stderr="unsupported Windows interpreter architecture")
+
+    monkeypatch.setattr(runner.subprocess, "run", execute_probe)
+    with pytest.raises(RuntimeError, match="interpreter probe failed: unsupported Windows interpreter architecture"):
+        runner._probe_interpreter(candidate)
+
+
+def test_candidate_probe_timeout_uses_fixed_secret_free_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+
+    def timeout(*_args: Any, **kwargs: Any) -> Any:
+        assert kwargs["timeout"] == 20
+        raise runner.subprocess.TimeoutExpired(
+            cmd=[str(candidate), "SECRET-COMMAND"], timeout=20,
+            output="SECRET-OUTPUT", stderr="SECRET-TRACEBACK",
+        )
+
+    candidate.write_text("synthetic", encoding="utf-8")
+    monkeypatch.setattr(runner.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match="interpreter probe timed out after 20 seconds") as caught:
+        runner.check_interpreter(candidate)
+    assert caught.value.__suppress_context__ is True
+    assert all(secret not in str(caught.value) for secret in ("SECRET", "python.exe"))
+
+
+def test_native_candidate_probe_timeout_falls_back_to_verified_download(tmp_path: Path) -> None:
+    runner = _runner()
+    native = tmp_path / "native-python.exe"
+    native.write_text("synthetic", encoding="utf-8")
+    cache = tmp_path / "cache"
+    downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+
+    def probe(path: Path) -> dict[str, object]:
+        if path == native:
+            raise RuntimeError("interpreter probe timed out after 20 seconds; candidate runtime was not accepted")
+        return _fixture_probe(path)
+
+    runtime = runner.ensure_runtime(
+        _write_lock(tmp_path), cache, _platform(), native_interpreter=native,
+        downloader=downloader, interpreter_probe=probe,
+    )
+    assert Path(runtime) != native
+    assert len(downloader.calls) == 1
+    assert not list(cache.glob("runner-*"))
+
+
+def test_downloaded_candidate_probe_timeout_cleans_stage_without_publishing(tmp_path: Path) -> None:
+    runner = _runner()
+    cache = tmp_path / "cache"
+    downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+
+    def timeout(_path: Path) -> dict[str, object]:
+        raise RuntimeError("interpreter probe timed out after 20 seconds; candidate runtime was not accepted")
+
+    published: list[Path] = []
+    with pytest.raises(RuntimeError, match="interpreter probe timed out after 20 seconds"):
+        runner.ensure_runtime(
+            _write_lock(tmp_path), cache, _platform(), downloader=downloader,
+            interpreter_probe=timeout, publisher=lambda staged, generation: published.append(generation),
+        )
+
+    assert len(downloader.calls) == 1
+    assert published == []
+    assert not list(cache.glob("runner-*"))
+    assert not list((cache / "generations").glob("windows-x86_64-none-*"))
+
+
+def test_main_reports_timeout_as_concise_preflight_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "candidate.exe"
+    candidate.write_text("synthetic", encoding="utf-8")
+
+    def timeout(*_args: Any, **_kwargs: Any) -> Any:
+        raise runner.subprocess.TimeoutExpired(
+            cmd=[str(candidate), "SECRET-CODE"], timeout=20,
+            output="SECRET-OUTPUT", stderr="SECRET-TRACEBACK",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", timeout)
+    monkeypatch.setattr(runner, "run_preflight", lambda *_args: runner.check_interpreter(candidate))
+    result = runner.main([
+        "--service", "mcp", "--source-root", str(tmp_path), "--output", str(tmp_path / "artifact"),
+    ])
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "preflight: interpreter probe timed out after 20 seconds" in captured.err
+    assert all(secret not in captured.err for secret in ("SECRET", "Traceback", "python.exe"))
 
 
 def _fixture_probe(_path: Path) -> dict[str, object]:

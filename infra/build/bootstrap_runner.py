@@ -314,22 +314,42 @@ def _current_platform() -> dict[str, str]:
 
 
 def _probe_interpreter(path: Path) -> dict[str, Any]:
-    code = (
-        "import json, platform, sys\n"
-        "libc_name, libc_version = platform.libc_ver()\n"
-        "features = {}\n"
-        "import ssl, venv\n"
-        "try:\n import pip; features['pip'] = True\n"
-        "except Exception:\n features['pip'] = False\n"
-        "os_name = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, 'linux' if sys.platform.startswith('linux') else sys.platform)\n"
-        "windows_version = sys.getwindowsversion() if os_name == 'windows' else None\n"
-        "os_version = platform.win32_ver()[0] if os_name == 'windows' else platform.mac_ver()[0] if os_name == 'macos' else ''\n"
-        "print(json.dumps({'version': platform.python_version(), 'ssl': True, 'venv': True, 'pip': features['pip'], 'os': os_name, 'architecture': platform.machine().lower(), 'libc': (libc_name.lower() or 'unknown') if sys.platform.startswith('linux') else 'none', 'libc_version': libc_version, 'os_version': os_version, 'windows_version': windows_version}))"
-    )
-    result = subprocess.run(
-        [str(path), "-I", "-c", code], capture_output=True, text=True,
-        timeout=20, check=False,
-    )
+    code = "\n".join((
+        "import json, platform, sys, sysconfig",
+        "import ssl, venv",
+        "try:",
+        " import pip; has_pip = True",
+        "except Exception:",
+        " has_pip = False",
+        "os_name = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, 'linux' if sys.platform.startswith('linux') else sys.platform)",
+        "windows_version = None",
+        "if os_name == 'windows':",
+        " windows_version = sys.getwindowsversion()",
+        " os_version = '{}.{}.{}'.format(*windows_version[:3])",
+        " architecture = {'win-amd64': 'x86_64', 'win32': 'x86', 'win-arm64': 'arm64'}.get(sysconfig.get_platform().lower())",
+        " if architecture is None: raise RuntimeError('unsupported Windows interpreter architecture')",
+        " libc_name, libc_version = '', ''",
+        "elif os_name == 'macos':",
+        " os_version = platform.mac_ver()[0]",
+        " architecture = platform.machine().lower()",
+        " libc_name, libc_version = '', ''",
+        "elif os_name == 'linux':",
+        " os_version = ''",
+        " architecture = platform.machine().lower()",
+        " libc_name, libc_version = platform.libc_ver()",
+        "else:",
+        " os_version = ''",
+        " architecture = platform.machine().lower()",
+        " libc_name, libc_version = '', ''",
+        "print(json.dumps({'version': platform.python_version(), 'ssl': True, 'venv': True, 'pip': has_pip, 'os': os_name, 'architecture': architecture, 'libc': (libc_name.lower() or 'unknown') if os_name == 'linux' else 'none', 'libc_version': libc_version, 'os_version': os_version, 'windows_version': windows_version}))",
+    ))
+    try:
+        result = subprocess.run(
+            [str(path), "-I", "-c", code], capture_output=True, text=True,
+            timeout=20, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("interpreter probe timed out after 20 seconds; candidate runtime was not accepted") from None
     if result.returncode:
         raise RuntimeError(f"interpreter probe failed: {result.stderr.strip()}")
     try:
