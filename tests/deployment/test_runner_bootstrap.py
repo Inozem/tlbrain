@@ -1056,6 +1056,281 @@ def _write_tar(path: Path, members: list[tuple[str, bytes, str, int]]) -> None:
                 archive.addfile(info)
 
 
+def _source_toolchain_archive(
+    tmp_path: Path, *, cache_directory: bool = False, root_source: bool = False,
+) -> Path:
+    archive = tmp_path / "toolchain-with-source.tar.gz"
+    members = [
+        ("python/bin/python.exe", b"synthetic executable", "file", 0o755),
+        (
+            "synthetic_module.py" if root_source else "python/lib/synthetic_module.py",
+            b"value = 'synthetic'\n", "file", 0o644,
+        ),
+    ]
+    if cache_directory:
+        members.append(("python/lib/__pycache__", b"", "dir", 0o755))
+        members.append(("python/lib/__pycache__/preexisting.cpython-312.pyc", b"recorded-bytecode", "file", 0o644))
+    _write_tar(archive, members)
+    return archive
+
+
+def _install_source_toolchain(
+    tmp_path: Path, *, cache_directory: bool = False, root_source: bool = False,
+) -> tuple[Any, Path, _Downloader, Path]:
+    runner = _runner()
+    archive = _source_toolchain_archive(
+        tmp_path, cache_directory=cache_directory, root_source=root_source,
+    )
+    downloader = _Downloader(archive)
+    executable = runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)),
+        tmp_path / "private-cache", _platform(), downloader=downloader,
+        interpreter_probe=_fixture_probe,
+    )
+    return runner, Path(executable), downloader, archive
+
+
+@pytest.mark.parametrize("cache_directory", [False, True], ids=("new-cache-dir", "recorded-cache-dir"))
+def test_ensure_runtime_removes_only_new_valid_bytecode_and_reuses_generation(
+    tmp_path: Path, cache_directory: bool,
+) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(
+        tmp_path, cache_directory=cache_directory,
+    )
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    generated_cache = Path(py_compile.compile(str(source), doraise=True))
+    assert generated_cache.is_file()
+    recorded_bytecode = source.parent / "__pycache__" / "preexisting.cpython-312.pyc"
+    recorded_bytes = recorded_bytecode.read_bytes() if cache_directory else None
+
+    reused = runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)),
+        tmp_path / "private-cache", _platform(), downloader=downloader,
+        interpreter_probe=_fixture_probe,
+    )
+
+    assert Path(reused) == executable
+    assert len(downloader.calls) == 1
+    assert not list((tmp_path / "private-cache").glob("generations/*.corrupt-*"))
+    assert not generated_cache.exists()
+    assert (source.parent / "__pycache__").is_dir() is cache_directory
+    marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
+    if cache_directory:
+        assert recorded_bytecode.read_bytes() == recorded_bytes == b"recorded-bytecode"
+        relative_recorded = recorded_bytecode.relative_to(generation).as_posix()
+        assert marker["files"][relative_recorded] == runner._tree_manifest(generation)[relative_recorded]
+    assert runner._tree_manifest(generation) == marker["files"]
+
+
+def test_check_runtime_removes_new_valid_bytecode_before_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(tmp_path)
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    generated_cache = Path(py_compile.compile(str(source), doraise=True))
+    assert generated_cache.is_file()
+    monkeypatch.setattr(runner, "_probe_interpreter", lambda _path: pytest.fail("unverified runtime was probed"))
+
+    facts = runner.check_runtime(executable)
+
+    assert facts["python_minor"] == "3.12"
+    assert len(downloader.calls) == 1
+    assert not generated_cache.exists()
+    marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
+    assert runner._tree_manifest(generation) == marker["files"]
+
+
+def test_ensure_runtime_accepts_cache_for_source_at_generation_root(tmp_path: Path) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(tmp_path, root_source=True)
+    generation = executable.parents[2]
+    source = generation / "synthetic_module.py"
+    generated_cache = Path(py_compile.compile(str(source), doraise=True))
+
+    reused = runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)), tmp_path / "private-cache", _platform(),
+        downloader=downloader, interpreter_probe=_fixture_probe,
+    )
+
+    assert Path(reused) == executable
+    assert len(downloader.calls) == 1
+    assert not generated_cache.exists()
+    marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
+    assert runner._tree_manifest(generation) == marker["files"]
+
+
+def test_runtime_manifest_hashing_stays_bounded_for_warm_and_cache_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(tmp_path)
+    original_manifest = runner._tree_manifest
+    calls: list[Path] = []
+
+    def tracked_manifest(root: Path) -> dict[str, str]:
+        calls.append(root)
+        return original_manifest(root)
+
+    monkeypatch.setattr(runner, "_tree_manifest", tracked_manifest)
+    runner.check_runtime(executable)
+    assert len(calls) == 1
+
+    calls.clear()
+    runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)), tmp_path / "private-cache", _platform(),
+        downloader=downloader, interpreter_probe=_fixture_probe,
+    )
+    assert len(calls) == 1
+
+    source = executable.parents[2] / "python" / "lib" / "synthetic_module.py"
+    py_compile.compile(str(source), doraise=True)
+    calls.clear()
+    runner.check_runtime(executable)
+    assert len(calls) == 2
+
+    py_compile.compile(str(source), doraise=True)
+    calls.clear()
+    runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)), tmp_path / "private-cache", _platform(),
+        downloader=downloader, interpreter_probe=_fixture_probe,
+    )
+    assert len(calls) == 2
+    assert len(downloader.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "relative,content",
+    [
+        ("python/lib/extra.py", b"extra = True\n"),
+        ("python/lib/__pycache__/unknown.data", b"unknown"),
+        ("python/lib/__pycache__/orphan.cpython-312.pyc", b"orphan"),
+        ("python/lib/orphan.cpython-312.pyc", b"outside cache"),
+    ],
+    ids=("added-source", "unknown-cache-content", "orphan-bytecode", "outside-cache-bytecode"),
+)
+def test_check_runtime_does_not_clean_unrelated_tree_drift(
+    tmp_path: Path, relative: str, content: bytes,
+) -> None:
+    import py_compile
+
+    runner, executable, _downloader, _archive = _install_source_toolchain(tmp_path)
+    source = executable.parents[2] / "python" / "lib" / "synthetic_module.py"
+    legitimate_cache = Path(py_compile.compile(str(source), doraise=True))
+    legitimate_bytes = legitimate_cache.read_bytes()
+    unexpected = executable.parents[2] / relative
+    unexpected.parent.mkdir(parents=True, exist_ok=True)
+    unexpected.write_bytes(content)
+
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity)"):
+        runner.check_runtime(executable)
+
+    assert unexpected.read_bytes() == content
+    assert legitimate_cache.read_bytes() == legitimate_bytes
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink fixture")
+@pytest.mark.parametrize("link_parent", [False, True], ids=("bytecode-link", "cache-parent-link"))
+def test_check_runtime_does_not_follow_or_remove_symlinked_cache_paths(
+    tmp_path: Path, link_parent: bool,
+) -> None:
+    runner, executable, _downloader, _archive = _install_source_toolchain(tmp_path)
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.pyc"
+    sentinel.write_bytes(b"outside sentinel")
+    cache = source.parent / "__pycache__"
+    cache.mkdir()
+    if link_parent:
+        cache.rmdir()
+        cache.symlink_to(outside, target_is_directory=True)
+    else:
+        cache_name = Path(importlib.util.cache_from_source(str(source))).name
+        (cache / cache_name).symlink_to(sentinel)
+
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity)"):
+        runner.check_runtime(executable)
+
+    assert sentinel.read_bytes() == b"outside sentinel"
+    assert cache.is_symlink() is link_parent
+
+
+def test_generated_bytecode_reparse_metadata_is_not_cleaned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import py_compile
+
+    runner, executable, _downloader, _archive = _install_source_toolchain(tmp_path)
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    generated = Path(py_compile.compile(str(source), doraise=True))
+    actual_reparse_check = runner._is_reparse_point
+    monkeypatch.setattr(runner, "_is_reparse_point", lambda path: path == generated or actual_reparse_check(path))
+
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity)"):
+        runner.check_runtime(executable)
+
+    assert generated.is_file()
+
+
+@pytest.mark.parametrize(
+    "kind", [
+        "source", "recorded-bytecode", "executable", "missing-source", "missing-executable",
+        "source-mode", "executable-mode",
+    ],
+)
+def test_recorded_source_and_bytecode_drift_are_rejected_and_repaired(
+    tmp_path: Path, kind: str,
+) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(tmp_path)
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    if kind == "source":
+        source.write_text("value = 'changed'\n", encoding="utf-8")
+    elif kind == "executable":
+        executable.write_bytes(b"changed executable")
+    elif kind == "missing-source":
+        source.unlink()
+    elif kind == "missing-executable":
+        executable.unlink()
+    elif kind == "source-mode":
+        if os.name == "nt":
+            pytest.skip("POSIX permission bits are not represented by Windows")
+        os.chmod(source, 0o600)
+    elif kind == "executable-mode":
+        if os.name == "nt":
+            pytest.skip("POSIX permission bits are not represented by Windows")
+        os.chmod(executable, 0o600)
+    else:
+        recorded_bytecode = Path(py_compile.compile(str(source), doraise=True))
+        marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
+        marker["files"] = runner._tree_manifest(generation)
+        (generation / ".bootstrap-runtime.json").write_text(json.dumps(marker), encoding="utf-8")
+        recorded_bytecode.write_bytes(b"changed recorded bytecode")
+
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity)"):
+        runner.check_runtime(executable)
+
+    repaired = runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)), tmp_path / "private-cache", _platform(),
+        downloader=downloader, interpreter_probe=_fixture_probe,
+    )
+    assert Path(repaired) == executable
+    assert len(downloader.calls) == 2
+    assert list((tmp_path / "private-cache").glob("generations/*.corrupt-*"))
+
+
 @pytest.mark.parametrize(
     "members",
     [

@@ -395,11 +395,15 @@ def check_runtime(path: os.PathLike[str] | str) -> dict[str, Any]:
             raise RuntimeError("managed runtime generation cannot be a symlink")
         try:
             details = json.loads(marker.read_text(encoding="utf-8"))
-            if _tree_manifest(marker_root) == details.get("files"):
-                facts = dict(details["probe"])
-                if facts.get("python_minor") == "3.12" and all(facts.get(k) is True for k in ("ssl", "venv", "pip")):
-                    facts["host_python_minor"] = details["host_python_minor"]
-                    return facts
+            expected_files = details.get("files")
+            facts = dict(details["probe"])
+            if not (facts.get("python_minor") == "3.12"
+                    and all(facts.get(k) is True for k in ("ssl", "venv", "pip"))):
+                raise RuntimeError("managed runtime generation failed integrity validation")
+            if not _verified_runtime_manifest(marker_root, expected_files):
+                raise RuntimeError("managed runtime generation failed integrity validation")
+            facts["host_python_minor"] = details["host_python_minor"]
+            return facts
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError("managed runtime generation failed integrity validation") from exc
         raise RuntimeError("managed runtime generation failed integrity validation")
@@ -442,6 +446,147 @@ def _tree_manifest(root: Path) -> dict[str, str]:
         else:
             raise ValueError(f"runtime tree contains a special file: {relative}")
     return result
+
+
+def _runtime_tree_inventory(root: Path) -> dict[str, tuple[Path, str, bool]]:
+    """Inventory regular paths without traversing links, reparses, or special files."""
+    observed: dict[str, tuple[Path, str, bool]] = {}
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        _assert_under(directory, root)
+        _reject_reparse_point(directory, "runtime directory")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                item = Path(entry.path)
+                _assert_under(item, root)
+                info = item.lstat()
+                relative = item.relative_to(root).as_posix()
+                reparse = _is_reparse_point(item)
+                if stat.S_ISDIR(info.st_mode):
+                    observed[relative] = (item, "directory", reparse)
+                    if not reparse:
+                        pending.append(item)
+                elif stat.S_ISREG(info.st_mode) or reparse:
+                    kind = "file" if stat.S_ISREG(info.st_mode) else "link"
+                    observed[relative] = (item, kind, reparse)
+                else:
+                    raise ValueError(f"runtime tree contains a special file: {relative}")
+    return observed
+
+
+def _bytecode_cleanup_plan(
+    root: Path,
+    expected: Mapping[str, str],
+    current: Mapping[str, str],
+    observed: Mapping[str, tuple[Path, str, bool]],
+) -> tuple[list[Path], list[Path]] | None:
+    """Plan cache removals only when all extra paths are recognized PEP 3147 output."""
+    bytecode: list[Path] = []
+    cache_directories: list[Path] = []
+    for relative in set(current).difference(expected):
+        record = observed.get(relative)
+        if record is None:
+            return None
+        item, kind, reparse = record
+        if reparse:
+            return None
+        _assert_under(item, root)
+        if kind == "directory" and item.name == "__pycache__":
+            cache_directories.append(item)
+            continue
+        if kind != "file" or item.parent.name != "__pycache__":
+            return None
+        match = re.fullmatch(r"(?P<stem>.+)\.cpython-[0-9]+(?:\.opt-[0-9]+)?\.pyc", item.name)
+        if match is None:
+            return None
+        source = item.parent.parent / f"{match.group('stem')}.py"
+        source_relative = source.relative_to(root).as_posix()
+        source_record = observed.get(source_relative)
+        if (source_record is None or source_record[1] != "file" or source_record[2]
+                or expected.get(source_relative, "").split(":", 2)[0] != "file"
+                or current.get(source_relative) != expected.get(source_relative)):
+            return None
+        parent = item.parent
+        while parent != root:
+            _assert_under(parent, root)
+            _reject_reparse_point(parent, "bytecode cache parent")
+            parent = parent.parent
+        bytecode.append(item)
+
+    bytecode_set = set(bytecode)
+    for directory in cache_directories:
+        parent_relative = directory.parent.relative_to(root).as_posix()
+        parent_record = observed.get(parent_relative)
+        root_parent = directory.parent == root
+        if (parent_record is not None and (parent_record[1] != "directory" or parent_record[2])):
+            return None
+        if not root_parent and (parent_record is None or parent_relative not in expected):
+            return None
+        _assert_under(directory.parent, root)
+        _reject_reparse_point(directory.parent, "bytecode cache parent")
+        _reject_reparse_point(directory, "bytecode cache directory")
+        with os.scandir(directory) as entries:
+            if any(Path(entry.path) not in bytecode_set for entry in entries):
+                return None
+    return bytecode, cache_directories
+
+
+def _verified_runtime_manifest(root: Path, expected: Any) -> bool:
+    """Verify recorded entries and normalize only eligible generated bytecode drift."""
+    try:
+        current = _tree_manifest(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if current == expected:
+        return True
+    return _remove_generated_bytecode(root, expected, current)
+
+
+def _remove_generated_bytecode(root: Path, expected: Any, current: Mapping[str, str]) -> bool:
+    """Remove only new PEP 3147 caches while preserving every recorded entry."""
+    if not isinstance(expected, dict) or not all(
+        isinstance(name, str) and isinstance(value, str) for name, value in expected.items()
+    ):
+        return False
+    root = Path(os.path.abspath(root))
+    try:
+        _assert_under(root, root)
+        _reject_reparse_point(root, "runtime generation")
+        observed = _runtime_tree_inventory(root)
+        if any(reparse and not item.is_symlink() for item, _kind, reparse in observed.values()):
+            return False
+        if any(current.get(name) != value for name, value in expected.items()):
+            return False
+        plan = _bytecode_cleanup_plan(root, expected, current, observed)
+        if plan is None:
+            return False
+        bytecode, cache_directories = plan
+
+        for item in bytecode:
+            _assert_under(item, root)
+            _reject_reparse_point(item, "bytecode cache file")
+            try:
+                info = item.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                return False
+            relative = item.relative_to(root).as_posix()
+            current_value = f"file:{stat.S_IMODE(info.st_mode):04o}:{_sha256_file(item)}"
+            if current.get(relative) != current_value:
+                return False
+            item.unlink(missing_ok=True)
+        for directory in sorted(cache_directories, key=lambda path: len(path.parts), reverse=True):
+            _assert_under(directory, root)
+            _reject_reparse_point(directory, "bytecode cache directory")
+            try:
+                directory.rmdir()
+            except FileNotFoundError:
+                continue
+        return _tree_manifest(root) == expected
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return False
 
 
 def _archive_members(archive: Path) -> list[tarfile.TarInfo]:
@@ -648,15 +793,18 @@ def ensure_runtime(
         try:
             marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
             existing = marker["probe"]
-            complete = (
+            existing_compatible = (
+                existing.get("python_minor") == "3.12"
+                and all(existing.get(k) is True for k in ("ssl", "venv", "pip"))
+                and _native_facts_match(existing, facts)
+                and _meets_minimums(existing, entry)
+            )
+            marker_identity_matches = (
                 marker.get("archive_sha256") == entry["sha256"]
                 and marker.get("platform_key") == platform_key
-                and marker.get("files") == _tree_manifest(generation)
             )
-            if (complete and existing.get("python_minor") == "3.12"
-                    and all(existing.get(k) is True for k in ("ssl", "venv", "pip"))
-                    and _native_facts_match(existing, facts)
-                    and _meets_minimums(existing, entry)):
+            if (marker_identity_matches and existing_compatible
+                    and _verified_runtime_manifest(generation, marker.get("files"))):
                 return generation_executable
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             pass
