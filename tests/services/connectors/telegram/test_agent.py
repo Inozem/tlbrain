@@ -150,7 +150,8 @@ def _real_sdk_client(monkeypatch, handler):
     client = genai.Client(
         api_key="synthetic-gemini-key",
         http_options=types.HttpOptions(
-            base_url="http://127.0.0.1/v1beta",
+            api_version="v1",
+            base_url="http://127.0.0.1",
             httpx_client=http_client,
         ),
     )
@@ -276,6 +277,10 @@ def test_routed_application_result_reaches_real_sdk_as_untrusted_data_without_fa
 
         payload = json.loads(wire_requests[0].content)
         config = payload["generationConfig"]
+        assert "responseFormat" not in config
+        assert "responseMimeType" not in config
+        assert "responseSchema" not in config
+        assert "responseJsonSchema" not in config
         assert wire_requests[0].url.path.endswith(f"models/{MODEL}:generateContent")
         assert config["thinkingConfig"]["thinking_level"] == "MEDIUM"
         assert "temperature" not in config and "topP" not in config
@@ -940,8 +945,11 @@ def test_save_metadata_call_uses_native_json_schema_on_real_sdk_wire(monkeypatch
         assert len(wire_requests) == 1
         request = json.loads(wire_requests[0].content)
         generation = request["generationConfig"]
-        schema = generation["responseJsonSchema"]
-        assert generation["responseMimeType"] == "application/json"
+        assert wire_requests[0].url.path.endswith("/v1/models/gemini-3.5-flash-lite:generateContent")
+        schema = generation["responseFormat"]["text"]["schema"]
+        assert generation["responseFormat"]["text"]["mimeType"] == "APPLICATION_JSON"
+        assert "responseJsonSchema" not in generation
+        assert "responseMimeType" not in generation
         assert schema == {
             "type": "object",
             "properties": {

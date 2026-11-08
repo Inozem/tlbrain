@@ -179,20 +179,28 @@ def test_iter_windows_preserves_centers_payloads_and_generation_configuration(sd
         "cf7c5ab976ef2265f26b254671a6a81421f3448fb2fe91a715156cc7f3e4ab7d",
     ]
     for call, expected_dialogue, expected_prompt_hash in zip(calls, expected_dialogues, expected_prompt_hashes):
-        assert call["model"] == "gemini-2.5-flash"
+        assert call["model"] == "gemini-3.5-flash-lite"
         assert call["contents"].split("Dialogue:\n", 1)[1] == expected_dialogue
         assert hashlib.sha256(call["contents"].encode("utf-8")).hexdigest() == expected_prompt_hash
         assert "Always reply in English regardless of the dialogue language." in call["contents"]
         assert call["config"].temperature == 0
         assert call["config"].top_p == 1
-        assert call["config"].response_mime_type == "application/json"
-        assert call["config"].response_schema == {
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string"},
-                "facts": {"type": "array", "items": {"type": "string"}},
+        assert call["config"].http_options.extra_body == {
+            "generationConfig": {
+                "responseFormat": {
+                    "text": {
+                        "mimeType": "APPLICATION_JSON",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "summary": {"type": "string"},
+                                "facts": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["summary", "facts"],
+                        },
+                    },
+                },
             },
-            "required": ["summary", "facts"],
         }
 
 

@@ -13,7 +13,11 @@ def make_client(*, single_attempt: bool = False) -> genai.Client:
         return genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(
+                api_version="v1",
                 retry_options=types.HttpRetryOptions(attempts=1),
             ),
         )
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1"),
+    )

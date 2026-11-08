@@ -321,7 +321,7 @@ The existing OAuth and `ALLOWED_EMAIL` configuration continues to apply. `GOOGLE
  
 **Conversation-aware retrieval.** Retrieval works with utterance windows, not arbitrary chunks. Summaries cover overlapping ranges; facts are anchored to specific dialogue segments.
  
-**Deterministic pipeline.** `temperature=0` and idempotency keys based on transcript content hash let unchanged content reuse existing index entries.
+**Content-based reuse.** Idempotency keys based on transcript content hash let unchanged content reuse existing index entries. Model-generated summaries and facts can vary between calls.
  
 **No vendor lock-in.** Google Drive, Qdrant Cloud, and Gemini use free or pay-per-use plans. Qdrant Cloud free tier can suit small deployments.
  
@@ -368,9 +368,9 @@ TLBrain is designed to keep infrastructure costs low for small teams using a sha
 - Embeddings only for summaries and facts → ~10–20% of utterance volume
 - Enough for many small deployments
 
-**Gemini (~$0.20 per transcript):**
-- You only pay for Gemini when indexing new transcripts
-- ~$0.20 per transcript — depends on conversation length, number of utterances, and content volume
+**Gemini (pay per use):**
+- Usage includes indexing, automatic folder advisory and optional Telegram agent/audio requests
+- Cost depends on conversation length, the number of windows and generated tokens, including thinking
 - `gemini-embedding-2`, `output_dimensionality=768` → 4× cheaper than 3072
 - One Gemini request per window (summary + facts together)
 - If a file hasn't changed, it's skipped — Gemini is never called again
@@ -437,6 +437,10 @@ During indexing, each document is processed through anchor-based windowing:
 - **Anchor** = every Nth utterance (e.g. every 3rd)
 - **Window** = `[i-2, i-1, i, i+1, i+2]` around the anchor
 - Overlap between adjacent windows happens automatically
+
+Summaries, facts and automatic folder advisory use `gemini-3.5-flash-lite`. The shared client explicitly selects stable Gemini Developer API `v1`; structured responses use its native JSON schema format. Telegram agent calls use the same model, while audio transcription uses `gemini-3.5-transcribe`.
+
+Existing index entries are retained when the model changes. New generation uses the selected model; no migration or automatic full reindex is required.
 
 For each window — one Gemini request returning:
 - **Summary** — brief description of the topic, decisions, and next steps

@@ -27,7 +27,7 @@ def test_trusted_single_attempt_policy_configures_sdk_and_wrapper(sdk_fakes):
     assert client["arguments"]["http_options"].retry_options.attempts == 1
     calls = [event for event in events if event["operation"] == "generate_content"]
     assert len(calls) == 1
-    assert calls[0]["arguments"]["model"] == "gemini-2.5-flash"
+    assert calls[0]["arguments"]["model"] == "gemini-3.5-flash-lite"
 
 
 def test_trusted_single_attempt_does_not_retry_or_log_provider_error(sdk_fakes, caplog):
@@ -56,4 +56,29 @@ def test_legacy_call_keeps_default_client_and_retry_arguments(sdk_fakes):
 
     assert call_gemini_json("legacy") == {"folder_name": "Client", "confidence": 0.9}
     client = next(event for event in sdk_fakes.trace if event["operation"] == "client")
-    assert "http_options" not in client["arguments"]
+    assert client["arguments"]["http_options"].api_version == "v1"
+    assert client["arguments"]["http_options"].retry_options is None
+
+
+def test_structured_response_options_preserve_schema_input():
+    from copy import deepcopy
+
+    from core.integrations.gemini.structured import json_response_options
+
+    schema = {
+        "type": "object",
+        "properties": {"folder_name": {"type": ["string", "null"]}},
+        "required": ["folder_name"],
+    }
+    original = deepcopy(schema)
+
+    options = json_response_options(schema)
+
+    assert options.extra_body == {
+        "generationConfig": {
+            "responseFormat": {
+                "text": {"mimeType": "APPLICATION_JSON", "schema": original},
+            },
+        },
+    }
+    assert schema == original

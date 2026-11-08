@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from google.genai import types
 
 from core.integrations.gemini import client as gemini_client
+from core.integrations.gemini.structured import json_response_options
 
 
 AGENT_MODEL = "gemini-3.5-flash-lite"
@@ -43,8 +44,8 @@ class GeminiAgent:
             tool_config=(types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(mode="ANY")
             ) if mode == "routing" and sdk_tools else None),
-            response_mime_type=("application/json" if response_json_schema is not None else None),
-            response_json_schema=response_json_schema,
+            http_options=(json_response_options(response_json_schema)
+                          if response_json_schema is not None else None),
         )
         return self._client.models.generate_content(
             model=AGENT_MODEL,

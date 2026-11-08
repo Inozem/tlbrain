@@ -6,6 +6,7 @@ from google import genai
 from google.genai import types
 
 from .client import make_client
+from .structured import json_response_options
 from core.utils.retry import RetryPolicy, with_retry
 
 logger = logging.getLogger(__name__)
@@ -15,7 +16,7 @@ class GeminiEmptyResponseError(Exception):
     """Raised when Gemini returns a response with no text content (e.g. safety filter)."""
 
 
-_LLM_MODEL = "gemini-2.5-flash"
+_LLM_MODEL = "gemini-3.5-flash-lite"
 
 _PROMPT = """\
 You are analyzing a fragment of a dialogue. Produce two things:
@@ -57,7 +58,7 @@ _RESPONSE_SCHEMA = {
 _CLIENT_DETECTION_SCHEMA = {
     "type": "object",
     "properties": {
-        "folder_name": {"type": "string", "nullable": True},
+        "folder_name": {"type": ["string", "null"]},
         "confidence": {"type": "number"},
     },
     "required": ["folder_name", "confidence"],
@@ -111,8 +112,7 @@ def _generate_structured(client: genai.Client, prompt: str, schema: dict = _RESP
         config=types.GenerateContentConfig(
             temperature=0,
             top_p=1,
-            response_mime_type="application/json",
-            response_schema=schema,
+            http_options=json_response_options(schema),
         ),
     )
     if response.text is None:
