@@ -123,7 +123,11 @@ def test_gemini_consumers_use_scripted_real_response_models(sdk_fakes):
     )
     assert llm.call_gemini_json("choose") == {"folder_name": "Ada", "confidence": 0.9}
     generated = [e for e in sdk_fakes.trace if e["operation"] == "generate_content"][-1]
-    assert generated["arguments"]["config"].response_mime_type == "application/json"
+    config = generated["arguments"]["config"]
+    assert config.response_mime_type is None
+    assert config.http_options.extra_body["generationConfig"]["responseFormat"]["text"][
+        "mimeType"
+    ] == "APPLICATION_JSON"
 
 
 def test_gemini_sdk_exposes_verbatim_audio_transcription_config():

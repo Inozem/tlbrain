@@ -295,12 +295,21 @@ class FakeDocumentReference:
         return FakeCollectionReference(f"{self.path}/{name}")
 
     def get(self, *, transaction: "FakeTransaction | None" = None, **kwargs: Any) -> FakeDocumentSnapshot:
+        field_paths = kwargs.pop("field_paths", None)
         if kwargs:
             raise TypeError(f"Unsupported get options: {', '.join(kwargs)}")
         if transaction is not None:
-            return transaction._read(self)
-        with _STATE.lock:
-            return FakeDocumentSnapshot(self, _STATE.documents.get(self._key))
+            snapshot = transaction._read(self)
+        else:
+            with _STATE.lock:
+                snapshot = FakeDocumentSnapshot(self, _STATE.documents.get(self._key))
+        if field_paths is None or not snapshot.exists:
+            return snapshot
+        if not isinstance(field_paths, (list, tuple)):
+            raise TypeError("field_paths must be a list or tuple")
+        data = snapshot.to_dict() or {}
+        projected = {field: data[field] for field in field_paths if field in data}
+        return FakeDocumentSnapshot(self, projected)
 
     def set(self, document_data: dict[str, Any], merge: Any = False, **kwargs: Any) -> None:
         if kwargs:

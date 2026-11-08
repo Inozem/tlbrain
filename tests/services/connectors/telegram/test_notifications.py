@@ -250,6 +250,147 @@ def test_slow_sync_reservation_does_not_block_event_loop_heartbeat():
     assert beats == ["alive"]
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_category", "expected_type", "expected_state"),
+    [
+        (TimeoutError("token=secret timeout body=client text"),
+         "unexpected_error", "TimeoutError", "retry"),
+        (TelegramAPIError("transport"), "transport", "TelegramAPIError", "retry"),
+        (TelegramAPIError("authorization"), "permission_denied", "TelegramAPIError", "failed"),
+        (TelegramAPIError("not_found"), "not_found", "TelegramAPIError", "failed"),
+        (TelegramAPIError("secret-bot-token:https://api.telegram.org/botsecret"),
+         "unknown", "TelegramAPIError", "failed"),
+    ],
+)
+def test_send_diagnostics_are_structured_and_exclude_untrusted_error_text(
+    firestore_fake, caplog, failure, expected_category, expected_type, expected_state,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    notification_id = "safe-diagnostic-send"
+    repo.create_notification(
+        notification_id, context_id=accepted.context_id, kind="final",
+        body="private comment source text", operation_id="safe-operation", now=NOW,
+    )
+
+    class FailingTelegram:
+        async def send_message(self, chat_id, text, *, message_thread_id=None):
+            raise failure
+
+    caplog.set_level("WARNING", logger="services.connectors.telegram.notifications")
+    publisher = TelegramNotificationPublisher(repo, FailingTelegram(), clock=_Clock())
+    assert _run(publisher.publish(notification_id)) == expected_state
+
+    records = [
+        record for record in caplog.records
+        if getattr(record, "event", None) == "telegram_notification_delivery"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.getMessage() == "Telegram notification delivery diagnostic"
+    assert record.phase == "send"
+    assert record.category == expected_category
+    assert record.action == "send" and record.known_message is False
+    assert record.reserved_revision == 1
+    assert record.notification_id == notification_id
+    assert record.operation_id == "safe-operation"
+    assert record.exception_type == expected_type
+    from core.utils.logging import _CloudRunFormatter
+    formatted = json.loads(_CloudRunFormatter().format(record))
+    assert formatted["category"] == expected_category
+    structured = {key: value for key, value in record.__dict__.items()
+                  if key not in {"name", "msg", "args", "levelname", "levelno", "pathname",
+                                 "filename", "module", "exc_info", "exc_text", "stack_info",
+                                 "lineno", "funcName", "created", "msecs", "relativeCreated",
+                                 "thread", "threadName", "processName", "process", "message",
+                                 "taskName"}}
+    serialized = json.dumps(structured, ensure_ascii=False, default=str)
+    for forbidden in (
+        "secret", "private comment source text", "-10042", "https://api.telegram.org",
+    ):
+        assert forbidden not in serialized
+
+
+def test_missing_message_id_and_reservation_failure_have_bounded_diagnostics(
+    firestore_fake, caplog,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    repo.create_notification(
+        "missing-id-send", context_id=accepted.context_id, kind="final",
+        body="private source body", operation_id="diagnostic-operation", now=NOW,
+    )
+
+    class MissingIdTelegram:
+        async def send_message(self, *_args, **_kwargs):
+            return {"message_id": "malformed token=secret"}
+
+    caplog.set_level("WARNING", logger="services.connectors.telegram.notifications")
+    publisher = TelegramNotificationPublisher(repo, MissingIdTelegram(), clock=_Clock())
+    assert _run(publisher.publish("missing-id-send")) == "retry"
+    missing = next(
+        record for record in caplog.records
+        if getattr(record, "category", None) == "missing_message_id"
+    )
+    assert missing.phase == "response_validation" and missing.known_message is False
+    assert "malformed" not in missing.getMessage()
+    assert "secret" not in json.dumps(missing.__dict__, default=str)
+
+    class ReservationFailureRepository:
+        def reserve_notification_attempt(self, *_args, **_kwargs):
+            raise RuntimeError("bot token=secret request body=source text")
+
+    with pytest.raises(RuntimeError):
+        _run(TelegramNotificationPublisher(
+            ReservationFailureRepository(), MissingIdTelegram(), clock=_Clock(),
+        ).publish("reservation-error"))
+    reservation = next(
+        record for record in caplog.records
+        if getattr(record, "phase", None) == "reservation"
+    )
+    assert reservation.category == "storage_error"
+    assert reservation.exception_type == "RuntimeError"
+    assert reservation.getMessage() == "Telegram notification delivery diagnostic"
+    assert "secret" not in json.dumps(reservation.__dict__, default=str)
+
+
+def test_settlement_storage_error_reports_known_message_without_leaking_provider_context(
+    firestore_fake, caplog,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = _accepted(repo)
+    repo.create_notification(
+        "settlement-error", context_id=accepted.context_id, kind="final",
+        body="private comment body", operation_id="settlement-operation", now=NOW,
+    )
+    telegram = _Telegram()
+
+    def fail_settlement(*_args, **_kwargs):
+        raise RuntimeError("token=secret provider=https://api.telegram.org/body")
+
+    repo.settle_notification_attempt = fail_settlement
+    caplog.set_level("WARNING", logger="services.connectors.telegram.notifications")
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=_Clock())
+    with pytest.raises(RuntimeError):
+        _run(publisher.publish("settlement-error"))
+
+    assert len(telegram.sent) == 1
+    record = next(
+        record for record in caplog.records
+        if getattr(record, "phase", None) == "settlement"
+    )
+    assert record.category == "storage_error" and record.exception_type == "RuntimeError"
+    assert record.action == "send" and record.known_message is True
+    assert record.operation_id == "settlement-operation"
+    assert record.message_id == 901
+    serialized = json.dumps(record.__dict__, ensure_ascii=False, default=str)
+    for forbidden in ("secret", "private comment body", "https://api.telegram.org", "-10042"):
+        assert forbidden not in serialized
+
+
 def test_ack_is_immutable_and_progress_send_then_edit_adds_no_conversation_turn(firestore_fake):
     client = firestore_fake.client_class()
     repo = TelegramRepository(client)
@@ -901,7 +1042,9 @@ def test_stale_edit_rate_limit_waits_and_reuses_the_same_message(firestore_fake)
     assert [edit[1] for edit in telegram.edited] == [901, 901]
 
 
-def test_canonical_not_modified_edit_replay_settles_known_message_without_resend(firestore_fake):
+def test_canonical_not_modified_edit_replay_settles_known_message_without_resend(
+    firestore_fake, caplog,
+):
     calls = []
 
     def telegram_response(request):
@@ -928,6 +1071,7 @@ def test_canonical_not_modified_edit_replay_settles_known_message_without_resend
     publisher = TelegramNotificationPublisher(
         repo, TelegramClient("synthetic-token", http_client=http), clock=clock,
     )
+    caplog.set_level("WARNING", logger="services.connectors.telegram.notification_diagnostics")
     try:
         assert _run(publisher.publish(notification_id)) == "delivered"
         repo.revise_notification(notification_id, body="Current", now=clock())
@@ -942,6 +1086,38 @@ def test_canonical_not_modified_edit_replay_settles_known_message_without_resend
     assert row["body"] == "Current"
     assert row["state"] == "delivered"
     assert row["edit_attempts_started"] == 1
+    assert not any(
+        getattr(record, "event", None) == "telegram_notification_delivery"
+        for record in caplog.records
+    )
+
+
+def test_recursive_receipt_refresh_does_not_relabel_settlement_error_as_reservation(
+    firestore_fake, caplog,
+):
+    repo = TelegramRepository(firestore_fake.client_class())
+    accepted = _accepted(repo)
+    telegram = _Telegram()
+
+    def fail_settlement(*_args, **_kwargs):
+        raise RuntimeError("token=secret settlement body=private")
+
+    repo.settle_notification_attempt = fail_settlement
+    caplog.set_level("WARNING", logger="services.connectors.telegram.notification_diagnostics")
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=_Clock())
+    with pytest.raises(RuntimeError):
+        _run(publisher.publish(accepted.notification_id))
+
+    diagnostics = [
+        record for record in caplog.records
+        if getattr(record, "event", None) == "telegram_notification_delivery"
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].phase == "settlement"
+    assert diagnostics[0].category == "storage_error"
+    assert diagnostics[0].known_message is True and diagnostics[0].message_id == 901
+    assert all(record.phase != "reservation" for record in diagnostics)
+    assert len(telegram.sent) == 1
 
 
 def test_saved_old_group_closure_refreshes_new_draft_card_after_newer_group_closes(firestore_fake):

@@ -15,6 +15,10 @@ from core.integrations.firestore.outbox import (
     get_outbox_record,
     task_payload,
 )
+from services.connectors.telegram.annotation_notifications import (
+    is_annotation_apply_operation,
+    resolve_annotation_terminal_notification,
+)
 
 
 STATUS_CHECK_OFFSETS = (60, 120, 300)
@@ -118,6 +122,16 @@ class TelegramStatusChecks:
         status = await self._read_current_status(operation_id, queue_operation)
         state = self._status_state(persisted, status)
         if state in {"completed", "failed"}:
+            if self.managed_runtime and is_annotation_apply_operation(queue_operation):
+                annotation_notice = await asyncio.to_thread(
+                    resolve_annotation_terminal_notification,
+                    self.client, record, queue_operation, state,
+                    now=_aware(self.clock(), "clock"),
+                )
+                delivery_state = await self.notification_publisher.publish(annotation_notice)
+                if delivery_state not in {"delivered", "failed", "delivery_unknown"}:
+                    raise RuntimeError("Telegram annotation notification delivery is pending")
+                return str(state)
             if self.managed_runtime:
                 linked_id = await asyncio.to_thread(
                     self._linked_terminal_notification_id, record, persisted, status, queue_operation, state,

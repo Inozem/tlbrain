@@ -13,6 +13,12 @@ from uuid import uuid4
 
 from services.connectors.telegram.client import TelegramAPIError
 from services.connectors.telegram.formatting import delivery_presentation
+from services.connectors.telegram.notification_diagnostics import (
+    log_missing_message_id,
+    log_provider_failure,
+    log_unexpected_failure,
+    storage_call,
+)
 from services.connectors.telegram.repository import TelegramRepository
 
 
@@ -126,10 +132,16 @@ class TelegramNotificationPublisher:
     async def publish(self, notification_id: str, *, _refresh_receipt: bool = True) -> str:
         """Deliver one notification attempt and return its durable disposition."""
         now = self.clock()
+        attempt_id = "tgnotify-" + uuid4().hex
         if _refresh_receipt:
             refresh_receipt = getattr(self.repository, "refresh_receipt_card", None)
             current_card_ids = (
-                await _offload_repository_call(refresh_receipt, notification_id, now=now)
+                await storage_call(
+                    _offload_repository_call, refresh_receipt, notification_id,
+                    diagnostic_notification_id=notification_id,
+                    diagnostic_attempt_id=attempt_id,
+                    phase="refresh", now=now,
+                )
                 if callable(refresh_receipt) else None
             )
             if current_card_ids:
@@ -138,10 +150,11 @@ class TelegramNotificationPublisher:
                     for card_id in current_card_ids
                 ]
                 return next((state for state in dispositions if state != "delivered"), "delivered")
-        attempt_id = "tgnotify-" + uuid4().hex
-        reservation = await _offload_repository_call(
-            self.repository.reserve_notification_attempt,
-            notification_id, attempt_id=attempt_id, now=now,
+        reservation = await storage_call(
+            _offload_repository_call, self.repository.reserve_notification_attempt,
+            notification_id, diagnostic_notification_id=notification_id,
+            diagnostic_attempt_id=attempt_id, phase="reservation",
+            attempt_id=attempt_id, now=now,
         )
         if reservation is None:
             return "not_found"
@@ -149,10 +162,14 @@ class TelegramNotificationPublisher:
             state = reservation.get("state")
             return state if state in {"delivered", "failed", "delivery_unknown", "superseded"} else "busy"
 
+        action = "send" if reservation["is_send"] else "edit"
+        operation_id = reservation.get("operation_id")
+        revision = reservation.get("attempt_revision")
+        known_message = action == "edit"
+        known_message_id = reservation.get("message_id") if known_message else None
         chat_id = reservation["chat_id"]
         thread_id = reservation.get("thread_id")
         body = reservation["body"]
-        revision = reservation["attempt_revision"]
         retry_after = None
         try:
             presentation = delivery_presentation(
@@ -169,8 +186,14 @@ class TelegramNotificationPublisher:
                 message_id = response.get("message_id") if isinstance(response, dict) else None
                 if type(message_id) is not int or message_id < 1:
                     outcome, message_id = "unknown", None
+                    log_missing_message_id(
+                        notification_id=notification_id, attempt_id=attempt_id,
+                        operation_id=operation_id, action=action, revision=revision,
+                    )
                 else:
                     outcome = "sent"
+                    known_message = True
+                    known_message_id = message_id
             else:
                 kwargs = {}
                 if reservation.get("reply_markup") is not None:
@@ -190,15 +213,30 @@ class TelegramNotificationPublisher:
                 outcome = "unknown"
             else:
                 outcome = "rejected"
+            if not (exc.category == "not_modified" and not reservation["is_send"]):
+                log_provider_failure(
+                    notification_id=notification_id, attempt_id=attempt_id,
+                    operation_id=operation_id, action=action, revision=revision,
+                    known_message=known_message, category=exc.category, error=exc,
+                )
             retry_after = exc.retry_after if exc.category == "rate_limited" else None
             message_id = None
-        except Exception:
+        except Exception as exc:
             # A timeout or connection drop does not prove whether Telegram accepted the send.
+            log_unexpected_failure(
+                notification_id=notification_id, attempt_id=attempt_id,
+                operation_id=operation_id, action=action, revision=revision,
+                known_message=known_message, error=exc,
+            )
             outcome, message_id = "unknown", None
 
-        settled = await _offload_repository_call(
-            self.repository.settle_notification_attempt,
-            notification_id, attempt_id=attempt_id, revision=revision,
+        settled = await storage_call(
+            _offload_repository_call, self.repository.settle_notification_attempt,
+            notification_id, diagnostic_notification_id=notification_id,
+            diagnostic_attempt_id=attempt_id, diagnostic_operation_id=operation_id,
+            diagnostic_action=action, diagnostic_revision=revision,
+            diagnostic_known_message=known_message, diagnostic_message_id=known_message_id,
+            phase="settlement", attempt_id=attempt_id, revision=revision,
             outcome=outcome, message_id=message_id, now=self.clock(),
             retry_after=retry_after,
         )

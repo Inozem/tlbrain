@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import os
 import socket
@@ -92,6 +93,82 @@ def _scheduled_rows(client, operation_id="save-op"):
         if record and record.operation_id == operation_id:
             rows.append(record)
     return sorted(rows, key=lambda row: row.schedule_at)
+
+
+def _annotation_lineage(client, *, context_id, draft_id, comment_id, operation_id,
+                        comment_state="applied", queue_state="completed"):
+    """Create a synthetic but validator-complete save/index proof for one note."""
+    doc_id = "saved-dialog"
+    save_operation_id = "save-operation"
+    intent_id = "save-intent"
+    manifest_digest = hashlib.sha256(b"synthetic-manifest").hexdigest()
+    content_hash = hashlib.sha256(b"DATE: 2026-11-08\nPROVIDER: manual\n---\nSpeaker :: Synthetic dialog.").hexdigest()
+    receipt_ref = f"index_completions/{doc_id}/generations/{content_hash}"
+    certificate_ref = f"dialog_save_intents/{intent_id}"
+    origin_binding = {
+        "context_id": context_id, "draft_id": draft_id,
+        "manifest_digest": manifest_digest,
+    }
+    certificate_id = "completion-certificate"
+    cleanup_authorization = {
+        "certificate_id": certificate_id, "save_intent_id": intent_id,
+        "operation_id": save_operation_id, "origin_binding": origin_binding,
+    }
+    shared_certificate = {
+        "certificate_id": certificate_id, "save_intent_id": intent_id,
+        "operation_id": save_operation_id, "doc_id": doc_id,
+        "content_hash": content_hash, "receipt_ref": receipt_ref,
+        "receipt_version": content_hash, "origin_binding": origin_binding,
+    }
+    local_certificate = {
+        **origin_binding, "operation_id": save_operation_id,
+        "save_intent_id": intent_id, "receipt_ref": receipt_ref,
+        "receipt_version": content_hash, "doc_id": doc_id,
+        "origin_binding": origin_binding,
+    }
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    draft_ref = context_ref.collection("drafts").document(draft_id)
+    draft_ref.set({
+        "draft_id": draft_id, "dialog_number": 17,
+        "active_save_operation_id": save_operation_id,
+        "immutable_save_intent_id": intent_id,
+        "completion_certificate_ref": certificate_ref,
+        "manifest_digest": manifest_digest,
+        "completion_certificate": local_certificate,
+    })
+    client.collection("dialog_save_intents").document(intent_id).set({
+        "doc_id": doc_id, "completion_certificate": shared_certificate,
+        "cleanup_authorization": cleanup_authorization,
+    })
+    client.collection("dialog_operations").document(save_operation_id).set({
+        "operation_id": save_operation_id, "state": "completed", "doc_id": doc_id,
+        "save_intent_id": intent_id, "cleanup_authorization": cleanup_authorization,
+    })
+    client.collection("index_completions").document(doc_id).collection(
+        "generations"
+    ).document(content_hash).set({
+        "status": "completed", "doc_id": doc_id, "content_hash": content_hash,
+        "version": content_hash,
+    })
+    comment_ref = draft_ref.collection("annotations").document(comment_id)
+    comment_ref.set({
+        "context_id": context_id, "draft_id": draft_id, "comment_id": comment_id,
+        "application_operation_id": operation_id, "applied_doc_id": doc_id,
+        "completion_certificate_ref": certificate_ref,
+        "completion_receipt_ref": receipt_ref, "state": comment_state,
+        "error_code": "synthetic_failure" if comment_state == "failed" else None,
+        "text": "private synthetic annotation text",
+    })
+    input_ref = f"telegram_sessions/{context_id}/drafts/{draft_id}/annotations/{comment_id}"
+    context_ref.collection("operations").document(operation_id).set({
+        "operation_id": operation_id, "state": queue_state,
+        "context_id": context_id, "input_ref": input_ref,
+        "telegram_internal_kind": "annotation_apply", "draft_id": draft_id,
+        "annotation_id": comment_id, "target_doc_id": doc_id,
+        "completion_certificate_ref": certificate_ref,
+        "completion_receipt_ref": receipt_ref,
+    })
+    return doc_id, input_ref
 
 
 def _request(path, payload, token="valid"):
@@ -672,6 +749,341 @@ def test_terminal_fallback_persists_delivery_and_suppresses_remaining_checks(
     ] == ["no_op", "no_op"]
     assert publisher.calls == [terminal_id]
     assert len(telegram.sent) == 1
+
+
+def test_applied_annotation_status_reuses_one_numbered_notice_across_recreated_checks(firestore_fake):
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id, draft_id, comment_id = "annotation-apply", accepted.draft_id, "comment-17"
+    _, input_ref = _annotation_lineage(
+        client, context_id=accepted.context_id, draft_id=draft_id,
+        comment_id=comment_id, operation_id=operation_id,
+    )
+    assert input_ref.endswith(f"/drafts/{draft_id}/annotations/{comment_id}")
+    clock = _Clock()
+    records = _service(client, reader=lambda _: {"state": "completed"}, clock=clock).schedule_checks(
+        accepted.context_id, operation_id, ACCEPTED_AT,
+    )
+
+    class Telegram:
+        def __init__(self):
+            self.sent = []
+            self.edited = []
+
+        async def send_message(self, chat_id, text, *, message_thread_id=None):
+            self.sent.append((chat_id, text, message_thread_id))
+            return {"message_id": 987}
+
+        async def edit_message_text(self, *_args, **_kwargs):
+            self.edited.append((_args, _kwargs))
+            raise AssertionError("annotation terminal notice is sent once")
+
+    telegram = Telegram()
+    durable_publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+
+    class CountingPublisher:
+        def __init__(self):
+            self.calls = []
+
+        async def publish(self, notification_id):
+            self.calls.append(notification_id)
+            return await durable_publisher.publish(notification_id)
+
+    publisher = CountingPublisher()
+    expected_id = "tgannotation-final-" + hashlib.sha256(comment_id.encode()).hexdigest()
+    for record in records:
+        clock.current = record.schedule_at
+        checks = _service(
+            client, reader=lambda _: {"state": "completed"},
+            publisher=publisher, clock=clock,
+        )
+        checks.managed_runtime = True
+        checks.terminal_notification_updater = lambda _: pytest.fail(
+            "verified annotation completion must bypass the generic terminal fallback"
+        )
+        assert _run(checks.handle_task(task_payload(record))) == "completed"
+
+    notice = repo.get_notification(expected_id)
+    assert notice["body"] == "Dialog #17: Context note added to search."
+    assert notice["kind"] == "final" and notice["dialog_number"] == 17
+    assert notice["operation_id"] == operation_id and notice["state"] == "delivered"
+    assert publisher.calls == [expected_id, expected_id, expected_id]
+    assert len(telegram.sent) == 1
+
+
+def test_completed_failed_annotation_reuses_delivered_canonical_error_without_generic_success(
+    firestore_fake,
+):
+    from services.connectors.telegram.client import TelegramAPIError
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id, draft_id, comment_id = "annotation-failed", accepted.draft_id, "failed-comment"
+    _annotation_lineage(
+        client, context_id=accepted.context_id, draft_id=draft_id,
+        comment_id=comment_id, operation_id=operation_id,
+        comment_state="failed", queue_state="completed",
+    )
+    clock = _Clock()
+    records = _service(client, reader=lambda _: {"state": "completed"}, clock=clock).schedule_checks(
+        accepted.context_id, operation_id, ACCEPTED_AT,
+    )
+    expected_id = "tgannotation-error-" + hashlib.sha256(comment_id.encode()).hexdigest()
+    error_body = (
+        "The dialog was saved and indexed, but its context note could not be added. "
+        "The note remains stored with the dialog."
+    )
+
+    class Telegram:
+        def __init__(self):
+            self.sent = []
+            self.fail = True
+
+        async def send_message(self, chat_id, text, *, message_thread_id=None):
+            self.sent.append((chat_id, text, message_thread_id))
+            if self.fail:
+                self.fail = False
+                raise TelegramAPIError("timeout")
+            return {"message_id": 988}
+
+        async def edit_message_text(self, *_args, **_kwargs):
+            raise AssertionError("canonical error notice has no known message yet")
+
+    telegram = Telegram()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    repo.create_notification(
+        expected_id, context_id=accepted.context_id, kind="error", body=error_body,
+        dialog_number=17, operation_id=operation_id, now=clock(),
+    )
+    assert _run(publisher.publish(expected_id)) == "retry"
+    pending = repo.get_notification(expected_id)
+    assert pending["send_attempts_started"] == 1 and pending["message_id"] is None
+
+    checks = _service(client, reader=lambda _: {"state": "completed"}, publisher=publisher, clock=clock)
+    checks.managed_runtime = True
+    checks.terminal_notification_updater = lambda _: pytest.fail(
+        "failed note must never become a generic success"
+    )
+    clock.current = records[0].schedule_at
+    assert _run(checks.handle_task(task_payload(records[0]))) == "completed"
+
+    delivered = repo.get_notification(expected_id)
+    assert delivered["body"] == error_body and delivered["kind"] == "error"
+    assert delivered["state"] == "delivered" and delivered["send_attempts_started"] == 2
+    assert all(row.to_dict().get("operation_id") != operation_id or row.id == expected_id
+               for row in client.collection("notification_outbox").stream())
+    assert [entry[1] for entry in telegram.sent] == [error_body, error_body]
+
+
+def test_already_delivered_annotation_failure_notice_is_not_sent_again(firestore_fake):
+    import hashlib
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id, draft_id, comment_id = "annotation-error-already-delivered", accepted.draft_id, "comment-done"
+    _annotation_lineage(
+        client, context_id=accepted.context_id, draft_id=draft_id,
+        comment_id=comment_id, operation_id=operation_id,
+        comment_state="failed", queue_state="completed",
+    )
+    expected_id = "tgannotation-error-" + hashlib.sha256(comment_id.encode()).hexdigest()
+    body = (
+        "The dialog was saved and indexed, but its context note could not be added. "
+        "The note remains stored with the dialog."
+    )
+    repo.create_notification(
+        expected_id, context_id=accepted.context_id, kind="error", body=body,
+        dialog_number=17, operation_id=operation_id, now=ACCEPTED_AT,
+    )
+    reservation = repo.reserve_notification_attempt(
+        expected_id, attempt_id="annotation-error-send", now=ACCEPTED_AT,
+    )
+    repo.settle_notification_attempt(
+        expected_id, attempt_id="annotation-error-send",
+        revision=reservation["attempt_revision"], outcome="sent",
+        message_id=989, now=ACCEPTED_AT,
+    )
+    records = _service(client, reader=lambda _: {"state": "completed"}).schedule_checks(
+        accepted.context_id, operation_id, ACCEPTED_AT,
+    )
+
+    class Telegram:
+        def __init__(self):
+            self.sent = []
+            self.edited = []
+
+        async def send_message(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+            return {"message_id": 990}
+
+        async def edit_message_text(self, *args, **kwargs):
+            self.edited.append((args, kwargs))
+            return {"message_id": 989}
+
+    telegram = Telegram()
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=_Clock())
+    checks = _service(
+        client, reader=lambda _: {"state": "completed"}, publisher=publisher,
+    )
+    checks.managed_runtime = True
+    checks.terminal_notification_updater = lambda _: pytest.fail(
+        "delivered note error must not become generic success"
+    )
+    assert _run(checks.handle_task(task_payload(records[0]))) == "completed"
+    assert telegram.sent == [] and telegram.edited == []
+    assert repo.get_notification(expected_id)["send_attempts_started"] == 1
+
+
+@pytest.mark.parametrize("invalidity", ["queued_note", "missing_note", "malformed_input_ref"])
+def test_completed_annotation_operation_without_terminal_note_proof_fails_closed(
+    firestore_fake, invalidity,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id, draft_id, comment_id = "annotation-incomplete", accepted.draft_id, "incomplete-note"
+    _annotation_lineage(
+        client, context_id=accepted.context_id, draft_id=draft_id,
+        comment_id=comment_id, operation_id=operation_id,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    comment_ref = context_ref.collection("drafts").document(draft_id).collection(
+        "annotations"
+    ).document(comment_id)
+    if invalidity == "queued_note":
+        comment_ref.update({"state": "queued_fact"})
+    elif invalidity == "missing_note":
+        comment_ref.delete()
+    else:
+        context_ref.collection("operations").document(operation_id).update({
+            "input_ref": f"telegram_sessions/{accepted.context_id}/drafts/{draft_id}/annotations",
+        })
+    records = _service(client, reader=lambda _: {"state": "completed"}).schedule_checks(
+        accepted.context_id, operation_id, ACCEPTED_AT,
+    )
+    checks = _service(client, reader=lambda _: {"state": "completed"})
+    checks.managed_runtime = True
+    checks.terminal_notification_updater = lambda _: pytest.fail(
+        "incomplete annotation proof must not become generic success"
+    )
+    with pytest.raises(RuntimeError, match="annotation completion proof"):
+        _run(checks.handle_task(task_payload(records[0])))
+    success_id = "tgannotation-final-" + hashlib.sha256(comment_id.encode()).hexdigest()
+    assert repo.get_notification(success_id) is None
+
+
+@pytest.mark.parametrize("mismatch", ["context", "draft", "annotation", "document", "receipt"])
+def test_inconsistent_annotation_completion_proof_never_creates_a_success_notice(
+    firestore_fake, mismatch,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id, draft_id, comment_id = "annotation-proof-mismatch", accepted.draft_id, "proof-comment"
+    _, input_ref = _annotation_lineage(
+        client, context_id=accepted.context_id, draft_id=draft_id,
+        comment_id=comment_id, operation_id=operation_id,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    operation_ref = context_ref.collection("operations").document(operation_id)
+    comment_ref = context_ref.collection("drafts").document(draft_id).collection(
+        "annotations"
+    ).document(comment_id)
+    if mismatch == "context":
+        operation_ref.update({"context_id": "foreign-context"})
+    elif mismatch == "draft":
+        operation_ref.update({"draft_id": "foreign-draft"})
+    elif mismatch == "annotation":
+        comment_ref.update({"application_operation_id": "foreign-operation"})
+    elif mismatch == "document":
+        comment_ref.update({"applied_doc_id": "foreign-document"})
+    else:
+        operation_ref.update({"completion_receipt_ref": "foreign-receipt"})
+
+    clock = _Clock()
+    records = _service(client, reader=lambda _: {"state": "completed"}, clock=clock).schedule_checks(
+        accepted.context_id, operation_id, ACCEPTED_AT,
+    )
+    checks = _service(client, reader=lambda _: {"state": "completed"}, clock=clock)
+    checks.managed_runtime = True
+    checks.terminal_notification_updater = lambda _: pytest.fail(
+        "invalid annotation proof must not fall through to generic success"
+    )
+    with pytest.raises(RuntimeError, match="annotation completion proof"):
+        _run(checks.handle_task(task_payload(records[0])))
+    assert repo.get_notification(
+        "tgannotation-final-" + hashlib.sha256(comment_id.encode()).hexdigest()
+    ) is None
+
+
+def test_delivered_legacy_terminal_fallback_remains_authoritative_for_annotation_replay(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_forward(
+        31, chat_id=-10042, thread_id=5,
+        message={"message_id": 41, "text": "synthetic source"}, now=ACCEPTED_AT,
+    )
+    operation_id, draft_id = "annotation-with-legacy-final", accepted.draft_id
+    _annotation_lineage(
+        client, context_id=accepted.context_id, draft_id=draft_id,
+        comment_id="legacy-comment", operation_id=operation_id,
+    )
+    legacy_id = "tgterminal-" + hashlib.sha256(operation_id.encode()).hexdigest()
+    legacy = repo.create_notification(
+        legacy_id, context_id=accepted.context_id, kind="final",
+        body="Operation completed.", operation_id=operation_id, now=ACCEPTED_AT,
+    )
+    reservation = repo.reserve_notification_attempt(
+        legacy_id, attempt_id="legacy-terminal-send", now=ACCEPTED_AT,
+    )
+    repo.settle_notification_attempt(
+        legacy_id, attempt_id="legacy-terminal-send",
+        revision=reservation["attempt_revision"], outcome="sent",
+        message_id=991, now=ACCEPTED_AT,
+    )
+    records = _service(client, reader=lambda _: {"state": "completed"}).schedule_checks(
+        accepted.context_id, operation_id, ACCEPTED_AT,
+    )
+    publisher = _Publisher()
+    checks = _service(client, reader=lambda _: {"state": "completed"}, publisher=publisher)
+    checks.managed_runtime = True
+    checks.terminal_notification_updater = lambda _: pytest.fail(
+        "already-delivered legacy terminal rows must not be replaced"
+    )
+
+    assert _run(checks.handle_task(task_payload(records[0]))) == "completed"
+    assert publisher.calls == [legacy_id]
+    delivered_legacy = repo.get_notification(legacy_id)
+    assert delivered_legacy["state"] == "delivered"
+    assert delivered_legacy["body"] == "Operation completed."
+    assert not any(
+        row.to_dict().get("notification_id", "").startswith("tgannotation-final-")
+        for row in client.collection("notification_outbox").stream()
+    )
 
 
 def test_failed_terminal_fallback_renders_persisted_error_and_bound_dialog_after_selection_changes(
