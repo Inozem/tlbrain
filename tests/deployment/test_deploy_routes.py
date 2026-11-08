@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryFile
 from pathlib import Path
 
 import pytest
@@ -223,10 +224,98 @@ raise SystemExit("unexpected preflight route: " + repr(args))
 '''
 
 
+_GCLOUD_HANDLER = r'''from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+args = sys.argv[1:]
+events = Path(os.environ["ROUTE_EVENT_LOG"])
+command = " ".join(args)
+
+
+def record(*parts):
+    with events.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(list(parts)) + "\n")
+
+
+def write_legacy_log():
+    with events.open("a", encoding="utf-8") as stream:
+        stream.write("gcloud\t{}\n".format(command))
+
+
+write_legacy_log()
+record("child-env", "gcloud", bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+       bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")))
+record("gcloud-argv", *args)
+
+if "--env-vars-file" in args:
+    env_file = Path(args[args.index("--env-vars-file") + 1])
+    data = json.loads(env_file.read_text(encoding="utf-8"))
+    if "TELEGRAM_ALLOWED_USER_IDS" in data:
+        record("telegram-env-file", data.get("TELEGRAM_ALLOWED_USER_IDS"),
+               bool(data.get("TELEGRAM_BOT_TOKEN")))
+
+if "config get-value account" in command:
+    print("synthetic-deployer@example.invalid")
+elif "firestore indexes composite list" in command:
+    index_file = Path(os.environ["ROUTE_INDEX_FILE"])
+    data = json.loads(index_file.read_text(encoding="utf-8"))
+    project = os.environ["PROJECT_ID"]
+    rows = []
+    for number, index in enumerate(data["indexes"]):
+        item = dict(index)
+        item.update(
+            name="projects/{}/databases/(default)/collectionGroups/{}/indexes/ready-{}".format(
+                project, index["collectionGroup"], number
+            ),
+            fields=index["fields"] + [{"fieldPath": "__name__", "order": "DESCENDING"}],
+            state="READY",
+        )
+        rows.append(item)
+    print(json.dumps(rows))
+elif "firestore indexes fields list" in command:
+    index_file = Path(os.environ["ROUTE_INDEX_FILE"])
+    data = json.loads(index_file.read_text(encoding="utf-8"))
+    group = next(value.split("=", 1)[1] for value in args if value.startswith("--collection-group="))
+    project = os.environ["PROJECT_ID"]
+    rows = []
+    for override in data["fieldOverrides"]:
+        if override["collectionGroup"] == group and override["indexes"] == []:
+            rows.append({
+                "name": "projects/{}/databases/(default)/collectionGroups/{}/fields/{}".format(
+                    project, override["collectionGroup"], override["fieldPath"]
+                ),
+                "indexConfig": {"indexes": []},
+            })
+    print(json.dumps(rows))
+elif "firestore operations list" in command:
+    print("[]")
+elif "projects describe" in command:
+    print("123456789012")
+elif "auth print-identity-token" in command:
+    print("synthetic-deployer-id-token")
+elif "run services describe" in command and "spec.template.spec.serviceAccountName" in command:
+    print("synthetic-runtime@synthetic-project.iam.gserviceaccount.com")
+elif "run services describe" in command and "status.url" in command:
+    service = args[3]
+    url = "https://{}-uc.a.run.app".format(service)
+    print(url)
+    record("gcloud-result", "run-service-url", service, url)
+elif "functions describe" in command:
+    print("https://{}-uc.a.run.app".format(args[2]))
+'''
+
+
 def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     build = root / "infra" / "build"
     helper = build / "route_gate.py"
     helper.write_text(_GATE_HELPER, encoding="utf-8")
+    gcloud_handler = build / "gcloud_fixture.py"
+    gcloud_handler.write_text(_GCLOUD_HANDLER, encoding="utf-8")
     preflight = build / "preflight.sh"
     preflight.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
@@ -251,30 +340,13 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     gcloud = bin_dir / "gcloud"
     gcloud.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
-        "printf 'gcloud\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
-        "\"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"child-env\",\"gcloud\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\"))])+\"\\n\")'\n"
-        "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n"
-        "gcloud_args=(\"$@\"); env_file=\"\"; for ((i=0; i<${#gcloud_args[@]}; i++)); do if [[ \"${gcloud_args[$i]}\" == --env-vars-file ]]; then env_file=\"${gcloud_args[$((i+1))]}\"; break; fi; done\n"
-        "if [[ -n \"${env_file}\" ]]; then \"$ROUTE_PYTHON\" -c 'import json,os,sys; data=json.load(open(sys.argv[1],encoding=\"utf-8\"));\n"
-        "if \"TELEGRAM_ALLOWED_USER_IDS\" in data: open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"telegram-env-file\",data.get(\"TELEGRAM_ALLOWED_USER_IDS\"),bool(data.get(\"TELEGRAM_BOT_TOKEN\"))])+\"\\n\")' \"${env_file}\"; fi\n"
-        "case \"$*\" in *'config get-value account'*) printf 'synthetic-deployer@example.invalid\\n' ;; "
-        "*'firestore indexes composite list'*) \"$ROUTE_PYTHON\" -c 'import json,os; d=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); p=os.environ[\"PROJECT_ID\"]; rows=[];\nfor n,i in enumerate(d[\"indexes\"]): i=dict(i,name=\"projects/{}/databases/(default)/collectionGroups/{}/indexes/ready-{}\".format(p,i[\"collectionGroup\"],n),fields=i[\"fields\"]+[{\"fieldPath\":\"__name__\",\"order\":\"DESCENDING\"}],state=\"READY\"); rows.append(i)\nprint(json.dumps(rows))' ;; "
-        "*'firestore indexes fields list'*) \"$ROUTE_PYTHON\" -c 'import json,os,sys; d=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); g=next(x.split(\"=\",1)[1] for x in sys.argv[1:] if x.startswith(\"--collection-group=\")); p=os.environ[\"PROJECT_ID\"]; rows=[];\nfor x in d[\"fieldOverrides\"]:\n if x[\"collectionGroup\"]==g and x[\"indexes\"]==[]: rows.append(dict(name=\"projects/{}/databases/(default)/collectionGroups/{}/fields/{}\".format(p,x[\"collectionGroup\"],x[\"fieldPath\"]),indexConfig={\"indexes\":[]}))\nprint(json.dumps(rows))' \"$@\" ;; "
-        "*'firestore operations list'*) printf '[]\\n' ;; "
-        "*'projects describe'*) printf '123456789012\\n' ;; "
-        "*'auth print-identity-token'*) printf 'synthetic-deployer-id-token\\n' ;; "
-        "*'run services describe'*'spec.template.spec.serviceAccountName'*) printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\\n' ;; "
-        "*'run services describe'*'status.url'*) "
-        "service=\"$4\"; url=\"https://$service-uc.a.run.app\"; printf '%s\\n' \"$url\"; "
-        "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-result\", \"run-service-url\", sys.argv[1], sys.argv[2]]) + \"\\n\")' \"$service\" \"$url\" ;; "
-        "*'functions describe'*) printf 'https://%s-uc.a.run.app\\n' \"$3\" ;; "
-        "esac\n",
+        "exec \"$ROUTE_PYTHON\" \"$ROUTE_GCLOUD_HANDLER\" \"$@\"\n",
         encoding="utf-8",
     )
     gcloud.chmod(0o755)
     if os.name == "nt":
         (bin_dir / "gcloud.cmd").write_text(
-            f'@echo off\r\n"{_bash()}" "{gcloud}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            '@echo off\r\n"%ROUTE_PYTHON%" "%ROUTE_GCLOUD_HANDLER%" %*\r\nexit /b %ERRORLEVEL%\r\n',
             encoding="utf-8",
         )
     docker = bin_dir / "docker"
@@ -321,6 +393,33 @@ def _read_route_events(log: Path) -> list[list[str]]:
         else:
             events.append(json.loads(line))
     return events
+
+
+def _run_with_file_capture(
+    argv: list[str], *, cwd: Path, env: dict[str, str], input_data: bytes,
+    timeout: int, tmp_path: Path,
+) -> subprocess.CompletedProcess[bytes]:
+    """Capture the route in fixture-local files so child handles cannot stall pipe draining."""
+    with (
+        TemporaryFile(mode="w+b", dir=tmp_path) as stdout_file,
+        TemporaryFile(mode="w+b", dir=tmp_path) as stderr_file,
+    ):
+        try:
+            completed = subprocess.run(
+                argv, cwd=cwd, env=env, input=input_data, stdout=stdout_file,
+                stderr=stderr_file, check=False, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            exc.output = stdout_file.read()
+            exc.stderr = stderr_file.read()
+            raise
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read()
+        stderr = stderr_file.read()
+    return subprocess.CompletedProcess(completed.args, completed.returncode, stdout, stderr)
 
 
 def _run_route(
@@ -375,6 +474,7 @@ def _run_route(
         "TEMP": str(tmp_path),
         "TMP": str(tmp_path),
         "ROUTE_PYTHON": sys.executable,
+        "ROUTE_GCLOUD_HANDLER": str(root / "infra" / "build" / "gcloud_fixture.py"),
         "ROUTE_HELPER_PYTHON": str(tmp_path / "python helper with spaces" / "python"),
         "ROUTE_EVENT_LOG": str(log),
         "ROUTE_GCLOUD_EXECUTABLE": str(bin_dir / "gcloud"),
@@ -420,8 +520,10 @@ def _run_route(
     if stdin_answers is None:
         stdin_answers = "y\ny\n" if command in {"deploy.sh", "local_deploy.sh"} else ""
     answer = stdin_answers.encode("utf-8")
-    completed = subprocess.run([bash, str(script)], cwd=root, env=environment, input=answer,
-                               capture_output=True, check=False, timeout=180)
+    completed = _run_with_file_capture(
+        [bash, str(script)], cwd=root, env=environment, input_data=answer,
+        timeout=180, tmp_path=tmp_path,
+    )
     result = subprocess.CompletedProcess(
         completed.args,
         completed.returncode,
@@ -444,6 +546,76 @@ def test_route_log_reader_normalizes_shell_and_gate_events(tmp_path: Path) -> No
         ["docker", "build --platform linux/amd64 -t synthetic-image ."],
         ["validated-function", "sync_checker", "/synthetic/.build/sync_checker", "checker"],
     ]
+
+
+def test_gcloud_fixture_shell_and_native_launchers_preserve_argv(tmp_path: Path) -> None:
+    bash = _bash()
+    root = tmp_path / "synthetic checkout"
+    (root / "infra" / "build").mkdir(parents=True)
+    bin_dir, _helper = _install_fakes(root, tmp_path)
+    index_file = root / "infra" / "firestore" / "indexes.json"
+    index_file.parent.mkdir(parents=True)
+    index_file.write_text(json.dumps({
+        "indexes": [{
+            "collectionGroup": "documents",
+            "queryScope": "COLLECTION",
+            "fields": [{"fieldPath": "created_at", "order": "DESCENDING"}],
+        }],
+        "fieldOverrides": [],
+    }), encoding="utf-8")
+    env_file = tmp_path / "fixture data with spaces" / "telegram vars.json"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(json.dumps({
+        "TELEGRAM_ALLOWED_USER_IDS": "101,202",
+        "TELEGRAM_BOT_TOKEN": "synthetic-token",
+    }), encoding="utf-8")
+    args = [
+        "firestore", "indexes", "composite", "list", "--project", "synthetic-project",
+        "--database", "(default)", "--format=json", "--env-vars-file", str(env_file),
+    ]
+    common_env = {
+        **{
+            name: os.environ[name]
+            for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")
+            if name in os.environ
+        },
+        "PATH": os.pathsep.join((str(bin_dir), str(Path(sys.executable).parent))),
+        "ROUTE_PYTHON": sys.executable,
+        "ROUTE_GCLOUD_HANDLER": str(root / "infra" / "build" / "gcloud_fixture.py"),
+        "ROUTE_EVENT_LOG": str(tmp_path / "shell-events.jsonl"),
+        "ROUTE_INDEX_FILE": str(index_file),
+        "PROJECT_ID": "synthetic-project",
+    }
+
+    def invoke(argv: list[str], log_path: Path) -> tuple[list[dict[str, object]], list[list[str]]]:
+        env = {**common_env, "ROUTE_EVENT_LOG": str(log_path)}
+        result = subprocess.run(argv, env=env, capture_output=True, text=True, check=False, timeout=20)
+        assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        return json.loads(result.stdout), _read_route_events(log_path)
+
+    shell_json, shell_events = invoke([bash, str(bin_dir / "gcloud"), *args], tmp_path / "shell-events.jsonl")
+    assert shell_json[0]["name"] == (
+        "projects/synthetic-project/databases/(default)/collectionGroups/documents/indexes/ready-0"
+    )
+    assert shell_json[0]["fields"][-1] == {"fieldPath": "__name__", "order": "DESCENDING"}
+    shell_argv = next(event for event in shell_events if event[0] == "gcloud-argv")
+    assert shell_argv == ["gcloud-argv", *args]
+    assert next(event for event in shell_events if event[0] == "telegram-env-file") == [
+        "telegram-env-file", "101,202", True,
+    ]
+    assert next(event for event in shell_events if event[0] == "gcloud")[1] == " ".join(args)
+
+    if os.name == "nt":
+        native = bin_dir / "gcloud.cmd"
+        assert native.is_file()
+        assert "bash" not in native.read_text(encoding="utf-8").lower()
+        native_json, native_events = invoke([str(native), *args], tmp_path / "native-events.jsonl")
+        assert native_json == shell_json
+        assert next(event for event in native_events if event[0] == "gcloud-argv") == shell_argv
+        assert next(event for event in native_events if event[0] == "telegram-env-file") == next(
+            event for event in shell_events if event[0] == "telegram-env-file"
+        )
+        assert next(event for event in native_events if event[0] == "gcloud")[1] == " ".join(args)
 
 
 def test_route_entrypoints_keep_the_ordinary_and_local_operator_commands() -> None:

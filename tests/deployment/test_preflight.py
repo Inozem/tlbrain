@@ -200,7 +200,9 @@ def test_preflight_reuses_dependencies_but_reassembles_and_validates_current_sou
     root, first_output = _checkout(tmp_path)
     second_output = root / ".build" / "second-artifact"
     calls = _mock_boundaries(monkeypatch, module)
-    monkeypatch.setattr(module.tempfile, "tempdir", str(tmp_path / "private-temp"))
+    private_temp = tmp_path / "private-temp"
+    private_temp.mkdir()
+    monkeypatch.setattr(module.tempfile, "tempdir", str(private_temp))
     monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
     monkeypatch.setenv("PIP_NO_INDEX", "1")
     monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
