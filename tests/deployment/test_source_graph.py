@@ -352,6 +352,77 @@ def test_analysis_does_not_execute_synthetic_source(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+def test_module_index_prunes_reserved_directories_before_descending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root, _ = _project(
+        tmp_path,
+        {
+            "build_import.py": "import ordinary.keep\nimport cached_only\n",
+            "tmp_import.py": "import ordinary.keep\nimport tmp_cached_only\n",
+            "ordinary/__init__.py": "",
+            "ordinary/keep.py": "VALUE = 1\n",
+            ".build/toolchain/generations/old/cached_only.py": "VALUE = 2\n",
+            "ordinary/.build/old/nested_cache.py": "VALUE = 3\n",
+            ".tmp/pytest-fixtures/old/tmp_cached_only.py": "VALUE = 4\n",
+            "ordinary/.tmp/old/nested_tmp.py": "VALUE = 5\n",
+        },
+    )
+    manifest = json.loads(
+        (source_root / "infra" / "build" / "service-manifests.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    service = manifest["services"]["mcp"]
+    spec = importlib.util.spec_from_file_location("assemble_prune_test", ASSEMBLER)
+    assert spec is not None and spec.loader is not None
+    assembler_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(assembler_module)
+    original_walk = assembler_module.os.walk
+    reserved_roots = {
+        source_root / ".build",
+        source_root / "ordinary" / ".build",
+        source_root / ".tmp",
+        source_root / "ordinary" / ".tmp",
+    }
+    yielded_directories: list[Path] = []
+    discovered_reserved_branches: set[Path] = set()
+
+    def walk_with_reserved_tree_guard(top: object, *args: object, **kwargs: object):
+        for base, dirs, files in original_walk(top, *args, **kwargs):
+            current = Path(base)
+            if any(current == root or root in current.parents for root in reserved_roots):
+                raise AssertionError(f"os.walk descended into excluded tree: {current}")
+            yielded_directories.append(current)
+            for directory in dirs:
+                if directory in {".build", ".tmp"}:
+                    discovered_reserved_branches.add(current / directory)
+            yield base, dirs, files
+
+    monkeypatch.setattr(assembler_module.os, "walk", walk_with_reserved_tree_guard)
+    for entry_root, missing_module in (
+        ("build_import.py", "cached_only"),
+        ("tmp_import.py", "tmp_cached_only"),
+    ):
+        service["entry_roots"] = [entry_root]
+        assembler = assembler_module.Assembler(source_root, "mcp", service)
+
+        assert "ordinary.keep" in assembler.local_modules
+        assert "cached_only" not in assembler.local_modules
+        assert "tmp_cached_only" not in assembler.local_modules
+        assert "ordinary..build.old.nested_cache" not in assembler.local_modules
+        assert "ordinary..tmp.old.nested_tmp" not in assembler.local_modules
+        with pytest.raises(
+            assembler_module.AssemblyError,
+            match=rf"missing local import '{missing_module}'",
+        ):
+            assembler.build()
+
+    assert discovered_reserved_branches == reserved_roots
+    assert source_root in yielded_directories
+    assert source_root / "ordinary" in yielded_directories
+
+
 def test_resources_are_staged_and_reported_with_hashes(tmp_path: Path) -> None:
     source_root, output = _project(tmp_path, {"main.py": "VALUE = 1\n", "assets/model.bin": "model bytes"})
     _set_resources(source_root, [{"source_path": "assets/model.bin", "runtime_path": "data/model.bin"}])
@@ -375,6 +446,7 @@ def test_resource_directory_inventory_excludes_build_and_test_material(tmp_path:
             "assets/.env.local": "secret",
             "assets/tests/test_data.bin": "test data",
             "assets/.build/stale.bin": "stale build",
+            "assets/.tmp/stale.bin": "temporary fixture data",
         },
     )
     _set_resources(source_root, [{"source_path": "assets", "runtime_path": "data"}])
@@ -385,6 +457,7 @@ def test_resource_directory_inventory_excludes_build_and_test_material(tmp_path:
     assert not (output / "data" / ".env.local").exists()
     assert not (output / "data" / "tests").exists()
     assert not (output / "data" / ".build").exists()
+    assert not (output / "data" / ".tmp").exists()
     assert [item["runtime_path"] for item in report["resources"]] == ["data/keep.bin"]
 
 
@@ -489,7 +562,18 @@ def test_report_and_output_bytes_are_deterministic_and_replacement_is_complete(t
     source_root, output = _project(tmp_path, {"main.py": "import dependency\n", "dependency.py": "VALUE = 2\n"})
     assert _run(source_root, output).returncode == 0
     first = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
-    # Include the generated artifact in the next source analysis; .build remains excluded.
+    irrelevant_build_file = source_root / ".build" / "toolchain" / "generations" / "old" / "stale.py"
+    irrelevant_build_file.parent.mkdir(parents=True)
+    irrelevant_build_file.write_text("UNREACHABLE = True\n", encoding="utf-8")
+    nested_build_file = source_root / "dependency" / ".build" / "old" / "nested.py"
+    nested_build_file.parent.mkdir(parents=True)
+    nested_build_file.write_text("UNREACHABLE = True\n", encoding="utf-8")
+    irrelevant_tmp_file = source_root / ".tmp" / "pytest-fixtures" / "old" / "stale.py"
+    irrelevant_tmp_file.parent.mkdir(parents=True)
+    irrelevant_tmp_file.write_text("UNREACHABLE = True\n", encoding="utf-8")
+    nested_tmp_file = source_root / "dependency" / ".tmp" / "old" / "nested.py"
+    nested_tmp_file.parent.mkdir(parents=True)
+    nested_tmp_file.write_text("UNREACHABLE = True\n", encoding="utf-8")
     assert _run(source_root, output).returncode == 0
     second = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
     assert first == second
