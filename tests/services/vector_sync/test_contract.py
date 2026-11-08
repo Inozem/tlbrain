@@ -112,6 +112,43 @@ def test_legacy_body_extras_are_ignored_but_route_id_is_checked(vector_main, mon
     assert calls == ["doc-1"]
 
 
+def test_managed_route_dispatches_completion_after_index_stage_and_retries_failure(vector_main, monkeypatch):
+    from core.operations.outbox import OutboxDispatchResult, TaskTargetConfig
+
+    events = []
+    reference = {
+        "schema_version": 1, "outbox_id": "index-outbox", "target_kind": "index_dispatch",
+        "generation": 3, "operation_id": "operation-1", "document_id": "doc-1",
+        "save_intent_id": "save-1",
+    }
+    monkeypatch.setattr(vector_main, "load_index", lambda _doc_id: None)
+    monkeypatch.setattr(vector_main, "get_file_parent_folder_id", lambda _doc_id: ("folder-1", False, "sample.docx"))
+    monkeypatch.setattr(vector_main, "get_folder_by_id", lambda _folder_id: {"folder_id": "folder-1"})
+    monkeypatch.setattr(vector_main, "read_google_doc", lambda _doc_id: "synthetic transcript")
+    monkeypatch.setattr(document_operations, "validate_document_format", lambda *_args: True)
+    monkeypatch.setattr(vector_main, "ensure_imported", lambda *_args, **_kwargs: None)
+
+    def process(*_args, **_kwargs):
+        events.append("indexed")
+        return "processed"
+
+    def dispatch(*_args, **kwargs):
+        events.append("dispatched")
+        assert kwargs["target"] == TaskTargetConfig("dialog-ops", "https://mcp.test/internal/dialog-operations")
+        return OutboxDispatchResult("failed")
+
+    monkeypatch.setattr(vector_main, "process_managed_one", process)
+    monkeypatch.setattr(vector_main, "_mcp_completion_target", lambda: TaskTargetConfig(
+        "dialog-ops", "https://mcp.test/internal/dialog-operations",
+    ))
+    monkeypatch.setattr(vector_main, "dispatch_completed_managed_mcp_index", dispatch)
+
+    response = _request(vector_main.app, body=reference)
+    assert response.status_code == 503
+    assert response.json() == {"status": "error", "details": "MCP completion dispatch unavailable"}
+    assert events == ["indexed", "dispatched"]
+
+
 def _drive_missing(_doc_id):
     raise HttpError(type("Response", (), {"status": 404, "reason": "Not Found"})(), b"missing")
 

@@ -40,20 +40,21 @@ if [[ -z "${RUNTIME_SERVICE_ACCOUNT}" ]]; then
   RUNTIME_SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 fi
 TASKS_SERVICE_AGENT="service-${PROJECT_NUMBER}@gcp-sa-cloudtasks.iam.gserviceaccount.com"
+VECTOR_SERVICE_NAME=${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}
 
 if ! gcloud iam service-accounts describe "${TASK_INVOKER_EMAIL}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
   gcloud iam service-accounts create "${TASK_INVOKER_ACCOUNT_ID}" \
     --project "${PROJECT_ID}" \
-    --display-name="TLBrain dialog operations task invoker"
+    --display-name="TLBrain dialog operations task invoker" >/dev/null
 fi
 
 if gcloud tasks queues describe "${QUEUE_NAME}" --project "${PROJECT_ID}" \
   --location "${REGION}" >/dev/null 2>&1; then
   gcloud tasks queues update "${QUEUE_NAME}" --project "${PROJECT_ID}" \
-    --location "${REGION}" --max-concurrent-dispatches=2
+    --location "${REGION}" --max-concurrent-dispatches=2 >/dev/null
 else
   gcloud tasks queues create "${QUEUE_NAME}" --project "${PROJECT_ID}" \
-    --location "${REGION}" --max-concurrent-dispatches=2
+    --location "${REGION}" --max-concurrent-dispatches=2 >/dev/null
 fi
 
 # The task invoker can call only the target MCP service. Cloud Tasks may mint
@@ -61,20 +62,45 @@ fi
 # this queue and act as this identity.
 gcloud run services add-iam-policy-binding "${MCP_SERVICE_NAME}" \
   --project "${PROJECT_ID}" --region "${REGION}" \
-  --member="serviceAccount:${TASK_INVOKER_EMAIL}" --role=roles/run.invoker
+  --member="serviceAccount:${TASK_INVOKER_EMAIL}" --role=roles/run.invoker >/dev/null
 gcloud iam service-accounts add-iam-policy-binding "${TASK_INVOKER_EMAIL}" \
   --project "${PROJECT_ID}" --member="serviceAccount:${TASKS_SERVICE_AGENT}" \
-  --role=roles/iam.serviceAccountTokenCreator
+  --role=roles/iam.serviceAccountTokenCreator >/dev/null
 gcloud tasks queues add-iam-policy-binding "${QUEUE_NAME}" \
   --project "${PROJECT_ID}" --location "${REGION}" \
-  --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" --role=roles/cloudtasks.enqueuer
+  --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" --role=roles/cloudtasks.enqueuer >/dev/null
 gcloud iam service-accounts add-iam-policy-binding "${TASK_INVOKER_EMAIL}" \
   --project "${PROJECT_ID}" --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
-  --role=roles/iam.serviceAccountUser
+  --role=roles/iam.serviceAccountUser >/dev/null
 # Firestore data access only; no project owner/editor or datastore admin role.
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" --role=roles/datastore.user \
-  --condition=None
+  --condition=None >/dev/null
+
+if VECTOR_RUNTIME_SERVICE_ACCOUNT=$(gcloud run services describe "${VECTOR_SERVICE_NAME}" \
+  --project "${PROJECT_ID}" --region "${REGION}" \
+  --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null); then
+  if [[ -z "${VECTOR_RUNTIME_SERVICE_ACCOUNT}" ]]; then
+    VECTOR_RUNTIME_SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+  fi
+  if [[ "${VECTOR_RUNTIME_SERVICE_ACCOUNT}" != "${RUNTIME_SERVICE_ACCOUNT}" ]]; then
+    gcloud tasks queues add-iam-policy-binding "${QUEUE_NAME}" \
+      --project "${PROJECT_ID}" --location "${REGION}" \
+      --member="serviceAccount:${VECTOR_RUNTIME_SERVICE_ACCOUNT}" --role=roles/cloudtasks.enqueuer >/dev/null
+    gcloud iam service-accounts add-iam-policy-binding "${TASK_INVOKER_EMAIL}" \
+      --project "${PROJECT_ID}" --member="serviceAccount:${VECTOR_RUNTIME_SERVICE_ACCOUNT}" \
+      --role=roles/iam.serviceAccountUser >/dev/null
+  fi
+  if [[ "${DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC:-0}" == "1" ]]; then
+    gcloud run services update "${VECTOR_SERVICE_NAME}" \
+      --project "${PROJECT_ID}" --region "${REGION}" \
+      --update-env-vars "^|^INTERNAL_DIALOG_OPERATIONS_URL=${CALLBACK_URL}|DIALOG_OPERATIONS_QUEUE=${QUEUE_NAME}|CLOUD_TASKS_OIDC_AUDIENCE=${OIDC_AUDIENCE}|CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=${TASK_INVOKER_EMAIL}|REGION=${REGION}|GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
+      >/dev/null
+  fi
+elif [[ "${DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC:-0}" == "1" ]]; then
+  echo "Vector Sync must be deployed before dialog recovery configuration" >&2
+  exit 1
+fi
 
 printf 'INTERNAL_DIALOG_OPERATIONS_URL=%s\n' "${CALLBACK_URL}"
 printf 'DIALOG_OPERATIONS_QUEUE=%s\n' "${QUEUE_NAME}"

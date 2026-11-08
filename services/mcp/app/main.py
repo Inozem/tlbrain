@@ -118,7 +118,7 @@ async def dialog_operations_endpoint(request: Request):
         return JSONResponse({"error": "Recovery unavailable"}, status_code=503)
     except Exception:
         return JSONResponse({"error": "Recovery unavailable"}, status_code=503)
-    return JSONResponse({"status": result.status}, status_code=200)
+    return JSONResponse({"status": result.status}, status_code=503 if result.status == "in_progress" else 200)
 
 
 @app.post("/mcp")

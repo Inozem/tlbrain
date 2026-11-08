@@ -110,12 +110,12 @@ def process_dialog_operation(client, payload: object) -> RecoveryResult:
             client, operation.operation_id, owner, lease, now, root_folder_id, folders,
         )
         handler._publish_add_dialog_index_work(client)
-        dialog_completion.finalize_save(
+        finalized = dialog_completion.finalize_save(
             client, operation_id=operation.operation_id,
             save_intent_id=progress.save_intent_id, owner=owner, fence=lease.fence,
             origin_binding=binding, now=datetime.now(timezone.utc),
         )
-        return RecoveryResult("processed")
+        return RecoveryResult("processed" if finalized is not None else "in_progress")
     finally:
         try:
             release_operation(

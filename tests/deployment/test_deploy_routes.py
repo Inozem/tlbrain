@@ -648,6 +648,27 @@ def test_route_entrypoints_keep_the_ordinary_and_local_operator_commands() -> No
     assert "bash infra/deploy/core/local_deploy_mcp.sh" in local
 
 
+def test_vector_dialog_configuration_is_deferred_until_writer_gate() -> None:
+    ordinary = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
+    local = (DEPLOY / "local_deploy.sh").read_text(encoding="utf-8")
+    vector = (DEPLOY / "core" / "deploy_vector_sync.sh").read_text(encoding="utf-8")
+    local_vector = (DEPLOY / "core" / "local_deploy_vector_sync.sh").read_text(encoding="utf-8")
+    helper = (DEPLOY / "core" / "helpers" / "deploy_dialog_operations.sh").read_text(encoding="utf-8")
+
+    assert "DEPLOY_DEFER_DIALOG_READINESS=1 bash infra/deploy/core/deploy_vector_sync.sh" in ordinary
+    assert "DEPLOY_DEFER_DIALOG_READINESS=1 bash infra/deploy/core/local_deploy_vector_sync.sh" in local
+    for script in (vector, local_vector):
+        assert '[[ "${DEPLOY_DEFER_DIALOG_READINESS:-0}" != "1" ]]' in script
+        assert 'MCP_URL=$(gcloud run services describe "${MCP_SERVICE_NAME:-tlbrain-mcp}"' in script
+        assert "DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC=1" in script
+    for script in (ordinary, local):
+        writer_phase = script.index('echo "rollout_phase:writers_enabled"')
+        vector_update = script.index('gcloud run services update "${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}"')
+        assert writer_phase < vector_update
+    assert 'if [[ "${DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC:-0}" == "1" ]]' in helper
+    assert helper.count("printf '") == 6
+
+
 @pytest.mark.parametrize(
     ("route", "local_images"),
     [("deploy.sh", False), ("local_deploy.sh", True)],

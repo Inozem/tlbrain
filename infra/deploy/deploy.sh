@@ -163,7 +163,7 @@ bash infra/deploy/core/helpers/deploy_firestore_indexes.sh
 # =========================
 # Deploy core (except MCP)
 # =========================
-bash infra/deploy/core/deploy_vector_sync.sh
+DEPLOY_DEFER_DIALOG_READINESS=1 bash infra/deploy/core/deploy_vector_sync.sh
 echo "rollout_phase:decoder_compatible"
 
 # =========================
@@ -209,7 +209,13 @@ while IFS= read -r setting; do
         exit 1
       fi
       DIALOG_SETTING_SEEN["${setting_name}"]=1
-      DIALOG_ENV_VARS+=("${setting}") ;;
+      DIALOG_ENV_VARS+=("${setting}")
+      case "${setting}" in
+        INTERNAL_DIALOG_OPERATIONS_URL=*) VECTOR_DIALOG_URL=${setting#*=} ;;
+        DIALOG_OPERATIONS_QUEUE=*) VECTOR_DIALOG_QUEUE=${setting#*=} ;;
+        CLOUD_TASKS_OIDC_AUDIENCE=*) VECTOR_DIALOG_AUDIENCE=${setting#*=} ;;
+        CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=*) VECTOR_DIALOG_INVOKER=${setting#*=} ;;
+      esac ;;
   esac
 done <<< "${DIALOG_SETTINGS_OUTPUT}"
 if [[ ${#DIALOG_ENV_VARS[@]} -ne 6 ]]; then
@@ -220,6 +226,9 @@ DIALOG_ENV_VARS_JOINED=$(IFS='|'; echo "${DIALOG_ENV_VARS[*]}")
 echo "rollout_phase:writers_enabled"
 gcloud run services update "${MCP_SERVICE_NAME}" \
   --region "${REGION}" --update-env-vars "^|^${DIALOG_ENV_VARS_JOINED}"
+VECTOR_DIALOG_ENV="INTERNAL_DIALOG_OPERATIONS_URL=${VECTOR_DIALOG_URL}|DIALOG_OPERATIONS_QUEUE=${VECTOR_DIALOG_QUEUE}|CLOUD_TASKS_OIDC_AUDIENCE=${VECTOR_DIALOG_AUDIENCE}|CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=${VECTOR_DIALOG_INVOKER}|REGION=${REGION}|GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
+gcloud run services update "${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}" \
+  --region "${REGION}" --update-env-vars "^|^${VECTOR_DIALOG_ENV}"
 
 if [[ "${TELEGRAM_ENABLED}" == "1" ]]; then
   TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN_VALUE}" \

@@ -20,7 +20,7 @@ from core.integrations.firestore.outbox import (
     task_payload,
 )
 from core.integrations.firestore.operations import list_stale_operations
-from core.operations.models import OperationOrigin, OperationState
+from core.operations.models import OperationOrigin, OperationRecord, OperationState
 
 
 MCP_RECOVERY_STALE_AGE = timedelta(minutes=5)
@@ -65,6 +65,17 @@ class OutboxSweepResult:
     already_exists: int = 0
     skipped: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxDispatchResult:
+    """Outcome for publishing one durable outbox record."""
+
+    outcome: str
+
+    @property
+    def retryable(self) -> bool:
+        return self.outcome in {_PublicationOutcome.SKIPPED.value, _PublicationOutcome.FAILED.value}
 
 
 class _PublicationOutcome(Enum):
@@ -175,6 +186,17 @@ def _publish_record(
     )
 
 
+def publish_outbox_record(
+    client: object,
+    record: OutboxRecord,
+    target: TaskTargetConfig | None,
+    *,
+    now: datetime,
+) -> OutboxDispatchResult:
+    """Publish one durable record without scanning other outbox work."""
+    return OutboxDispatchResult(_publish_record(client, record, target, now=now).value)
+
+
 def publish_due_outbox_records(
     client: object,
     targets: Mapping[OutboxTargetKind | str, TaskTargetConfig | None],
@@ -241,25 +263,53 @@ def enqueue_stale_mcp_save_recoveries(
         ):
             continue
 
-        generation = max(1, operation.fence + 1)
-        identity = f"{operation.operation_id}\0{operation.save_intent_id}\0{operation.fence}"
-        outbox_id = "mcp-save-recovery-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
         try:
-            create_outbox_record(
-                client,
-                outbox_id,
-                target_kind=OutboxTargetKind.MCP_SAVE_RECOVERY,
-                generation=generation,
-                schedule_at=operation.created_at or operation.updated_at or now,
-                now=now,
-                operation_id=operation.operation_id,
-                save_intent_id=operation.save_intent_id,
-            )
+            create_mcp_save_recovery_record(client, operation, now=now)
         except (TypeError, ValueError):
             # Malformed legacy identifiers are not dispatchable task references.
             continue
         enqueued += 1
     return enqueued
+
+
+def create_mcp_save_recovery_record(
+    client: object, operation: OperationRecord, *, now: datetime,
+    completed_index_dispatch: OutboxRecord | None = None,
+) -> OutboxRecord:
+    """Create a stable MCP recovery record from a fence or completed index dispatch."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    operation_id = operation.operation_id
+    save_intent_id = operation.save_intent_id
+    fence = operation.fence
+    if (not isinstance(operation_id, str) or not _SAFE_TASK_ID.fullmatch(operation_id)
+            or not isinstance(save_intent_id, str) or not _SAFE_TASK_ID.fullmatch(save_intent_id)
+            or isinstance(fence, bool) or not isinstance(fence, int) or fence < 0):
+        raise ValueError("operation is not a valid MCP recovery identity")
+    now = now.astimezone(timezone.utc)
+    source = completed_index_dispatch
+    if source is not None and (
+        source.target_kind is not OutboxTargetKind.INDEX_DISPATCH
+        or source.operation_id != operation_id or source.save_intent_id != save_intent_id
+        or not isinstance(source.generation, int) or source.generation < 1
+    ):
+        raise ValueError("completed index dispatch does not match the operation")
+    identity_suffix = (
+        f"index:{source.outbox_id}:{source.generation}" if source is not None else str(fence)
+    )
+    identity = f"{operation_id}\0{save_intent_id}\0{identity_suffix}"
+    outbox_id = "mcp-save-recovery-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return create_outbox_record(
+        client,
+        outbox_id,
+        target_kind=OutboxTargetKind.MCP_SAVE_RECOVERY,
+        generation=source.generation if source is not None else max(1, fence + 1),
+        schedule_at=(source.schedule_at if source is not None else
+                     getattr(operation, "created_at", None) or getattr(operation, "updated_at", None) or now),
+        now=now,
+        operation_id=operation_id,
+        save_intent_id=save_intent_id,
+    )
 
 
 def enqueue_expired_telegram_queue_recoveries(
@@ -277,10 +327,13 @@ def enqueue_expired_telegram_queue_recoveries(
 
 
 __all__ = [
+    "OutboxDispatchResult",
     "OutboxSweepResult",
     "TaskTargetConfig",
     "TelegramQueueRecoveryStore",
+    "publish_outbox_record",
     "enqueue_expired_telegram_queue_recoveries",
     "enqueue_stale_mcp_save_recoveries",
+    "create_mcp_save_recovery_record",
     "publish_due_outbox_records",
 ]

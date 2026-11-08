@@ -8,11 +8,12 @@ from core.integrations.firestore.outbox import (
     create_outbox_record,
     get_outbox_record,
 )
-from core.integrations.firestore.operations import claim_operation, create_operation
+from core.integrations.firestore.operations import claim_operation, create_operation, get_operation
 from core.operations import outbox as publisher
 from core.operations.models import OperationOrigin
 from core.operations.outbox import (
     TaskTargetConfig,
+    create_mcp_save_recovery_record,
     enqueue_stale_mcp_save_recoveries,
     publish_due_outbox_records,
 )
@@ -354,6 +355,36 @@ def test_stale_mcp_recovery_advances_generation_only_with_fence(firestore_fake):
     assert len(records) == 2
     assert {record["generation"] for record in records} == {1, 2}
     assert first["outbox_id"] != next(record["outbox_id"] for record in records if record["generation"] == 2)
+
+
+def test_direct_and_scheduled_recovery_share_identical_record_identity(firestore_fake):
+    client = firestore_fake.client_class()
+    operation = _create_operation(client, "shared", now=NOW - timedelta(minutes=10))
+    direct = create_mcp_save_recovery_record(client, operation, now=NOW)
+
+    assert enqueue_stale_mcp_save_recoveries(client, now=NOW, limit=10) == 1
+    replay = create_mcp_save_recovery_record(client, get_operation(client, "shared"), now=NOW + timedelta(seconds=30))
+    assert replay == direct
+    assert len([path for path in firestore_fake.documents if path.startswith("task_outbox/")]) == 1
+
+
+def test_completed_index_recovery_identity_survives_later_operation_fence(firestore_fake):
+    client = firestore_fake.client_class()
+    operation = _create_operation(client, "completed-index", now=NOW - timedelta(minutes=10))
+    source = create_outbox_record(
+        client, "index-checkpoint", target_kind=OutboxTargetKind.INDEX_DISPATCH,
+        generation=7, schedule_at=NOW, now=NOW, operation_id=operation.operation_id,
+        document_id="doc-1", save_intent_id=operation.save_intent_id,
+    )
+    first = create_mcp_save_recovery_record(
+        client, operation, now=NOW, completed_index_dispatch=source,
+    )
+    later = claim_operation(client, operation.operation_id, owner="later", now=NOW, lease_seconds=60)
+    assert later is not None
+    replay = create_mcp_save_recovery_record(
+        client, later, now=NOW + timedelta(seconds=30), completed_index_dispatch=source,
+    )
+    assert replay == first
 
 
 def test_target_config_rejects_untrusted_or_malformed_url():

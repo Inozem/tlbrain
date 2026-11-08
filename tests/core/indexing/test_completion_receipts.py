@@ -656,6 +656,220 @@ def test_managed_index_stage_uses_durable_budget_and_completed_replay(
     assert len(calls) == 2
 
 
+def _prepare_mcp_completed_index(client, sdk_fakes, *, monkeypatch):
+    from core.integrations.firestore.operations import release_operation
+    from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record
+    from core.integrations.firestore.save_intents import update_save_intent_checkpoints
+
+    lease, save_intent_id, receipt, content = _save_fixture(client, sdk_fakes)
+    digest = "a" * 64
+    session_hash, request_hash = "b" * 64, "c" * 64
+    origin_ref = f"mcp_sessions/{session_hash}/requests/{request_hash}"
+    operation_ref = client.collection("dialog_operations").document(OPERATION_ID)
+    operation_data = operation_ref.get().to_dict()
+    operation_data.update({
+        "origin": "mcp", "origin_operation_ref": origin_ref,
+        "immutable_input_digest": digest, "doc_id": DOC_ID,
+        "desired_content_hash": receipt["content_hash"],
+        "desired_parent_id_hash": receipt["parent_id_hash"],
+    })
+    operation_ref.set(operation_data)
+    intent_ref = client.collection("dialog_save_intents").document(save_intent_id)
+    intent_data = intent_ref.get().to_dict()
+    intent_data["immutable_input_digest"] = digest
+    intent_ref.set(intent_data)
+    client.collection("mcp_sessions").document(session_hash).collection("requests").document(request_hash).set({
+        "operation_id": OPERATION_ID,
+    })
+
+    index_outbox_id = "mcp-index-dispatch"
+    create_outbox_record(
+        client, index_outbox_id, target_kind=OutboxTargetKind.INDEX_DISPATCH,
+        generation=7, schedule_at=NOW, now=NOW, operation_id=OPERATION_ID,
+        document_id=DOC_ID, save_intent_id=save_intent_id,
+    )
+    assert update_save_intent_checkpoints(
+        client, save_intent_id, operation_id=OPERATION_ID, owner=OWNER,
+        fence=lease.fence, now=NOW, index_checkpoint_ref=index_outbox_id,
+    ) is not None
+    receipt.update({
+        "work_manifest_ref": operation_data["immutable_input_ref"],
+        "checkpoint_refs": [intent_data["fill_checkpoint_ref"], index_outbox_id],
+    })
+    _set_generation(client, DOC_ID, receipt["content_hash"], receipt)
+    client.collection("transcript_index").document(DOC_ID).set({**receipt, "status": "synced"})
+
+    assert release_operation(client, OPERATION_ID, owner=OWNER, fence=lease.fence, now=NOW)
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: client)
+    from core.indexing.processor import process_managed_one
+    assert process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, {
+        "schema_version": 1, "outbox_id": index_outbox_id, "target_kind": "index_dispatch",
+        "generation": 7, "operation_id": OPERATION_ID, "document_id": DOC_ID,
+        "save_intent_id": save_intent_id,
+    }) in {"processed", "skipped"}
+    assert not [event for event in sdk_fakes.trace if event["boundary"] in {"gemini", "qdrant"}]
+    return save_intent_id, content, {
+        "schema_version": 1, "outbox_id": index_outbox_id, "target_kind": "index_dispatch",
+        "generation": 7, "operation_id": OPERATION_ID, "document_id": DOC_ID,
+        "save_intent_id": save_intent_id,
+    }
+
+
+def test_managed_mcp_index_dispatches_stable_task_then_existing_worker_finalizes(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operations import claim_operation, get_operation, release_operation
+    from core.integrations.firestore.outbox import OutboxState, get_outbox_record
+    from core.operations.mcp_completion import dispatch_completed_managed_mcp_index
+    from core.operations.outbox import TaskTargetConfig
+    from services.mcp.app import dialog_worker
+
+    client = firestore_fake.client_class()
+    save_intent_id, content, reference = _prepare_mcp_completed_index(
+        client, sdk_fakes, monkeypatch=monkeypatch,
+    )
+    _synthetic_google_oauth(monkeypatch)
+    enqueue_calls = []
+    accepted_tasks = set()
+
+    def enqueue_with_lost_ack(**kwargs):
+        enqueue_calls.append(kwargs)
+        accepted_tasks.add(kwargs["task_id"])
+        if len(enqueue_calls) == 1:
+            raise TimeoutError("synthetic accepted task acknowledgement lost")
+        return False
+
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_with_lost_ack)
+    target = TaskTargetConfig(
+        "dialog-operations", "https://mcp.example.invalid/internal/dialog-operations",
+        "invoker@example.invalid", "https://mcp.example.invalid",
+    )
+    first = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content, target=target, now=NOW + timedelta(seconds=1),
+    )
+    assert first is not None and first.outcome == "failed"
+    recovery_payload = enqueue_calls[0]["body"]
+    assert get_outbox_record(client, recovery_payload["outbox_id"]).state is OutboxState.RETRY
+
+    later_lease = claim_operation(
+        client, OPERATION_ID, owner="redelivery-fence", now=NOW + timedelta(seconds=2), lease_seconds=30,
+    )
+    assert later_lease is not None
+    assert release_operation(
+        client, OPERATION_ID, owner="redelivery-fence", fence=later_lease.fence,
+        now=NOW + timedelta(seconds=2),
+    )
+    replay = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content, target=target, now=NOW + timedelta(seconds=3),
+    )
+    assert replay is not None and replay.outcome == "already_exists"
+    assert enqueue_calls[0]["task_id"] == enqueue_calls[1]["task_id"]
+    assert accepted_tasks == {enqueue_calls[1]["task_id"]}
+    assert enqueue_calls[0]["body"] == enqueue_calls[1]["body"] == recovery_payload
+    assert get_outbox_record(client, recovery_payload["outbox_id"]).state is OutboxState.DELIVERED
+
+    from services.mcp.app.mcp import handler
+    monkeypatch.setattr(handler, "_advance_add_dialog_save", lambda *_args: SimpleNamespace(save_intent_id=save_intent_id))
+    monkeypatch.setattr(handler, "_publish_add_dialog_index_work", lambda *_args: None)
+    monkeypatch.setattr(dialog_worker.folder_repository, "get_all_folders", lambda *_args: {})
+    monkeypatch.setattr(dialog_worker, "get_root_folder_id", lambda: ROOT_ID)
+
+    assert dialog_worker.process_dialog_operation(client, recovery_payload).status == "processed"
+    operation = get_operation(client, OPERATION_ID)
+    intent = client.collection("dialog_save_intents").document(save_intent_id).get().to_dict()
+    assert operation.state.value == "completed"
+    assert operation.result.document_id == DOC_ID
+    assert intent["completion_certificate"]["doc_id"] == DOC_ID
+    assert intent["completion_certificate"]["save_intent_id"] == save_intent_id
+    operation_data = client.collection("dialog_operations").document(OPERATION_ID).get().to_dict()
+    assert intent["cleanup_authorization"]["certificate_id"] == operation_data["cleanup_authorization"]["certificate_id"]
+
+
+def test_eligible_mcp_completion_without_target_remains_pending_for_retry(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.outbox import OutboxState, get_outbox_record
+    from core.operations.mcp_completion import dispatch_completed_managed_mcp_index
+    from core.operations.outbox import TaskTargetConfig
+
+    client = firestore_fake.client_class()
+    save_intent_id, content, reference = _prepare_mcp_completed_index(
+        client, sdk_fakes, monkeypatch=monkeypatch,
+    )
+    missing = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content, target=None, now=NOW + timedelta(seconds=1),
+    )
+    assert missing is not None and missing.retryable
+    record_path = next(path for path in firestore_fake.documents if path.startswith("task_outbox/mcp-save-recovery-"))
+    assert firestore_fake.documents[record_path]["state"] == OutboxState.PENDING.value
+
+    calls = []
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", lambda **kwargs: calls.append(kwargs) or True)
+    later = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content,
+        target=TaskTargetConfig("dialog-operations", "https://mcp.example.invalid/internal/dialog-operations"),
+        now=NOW + timedelta(seconds=2),
+    )
+    assert later is not None and later.outcome == "published"
+    assert calls[0]["task_id"] == firestore_fake.documents[record_path]["task_name"]
+
+
+@pytest.mark.parametrize(
+    "invalid_proof",
+    ["cross_operation", "non_mcp", "terminal", "intent_operation", "digest", "parent", "no_stage", "no_receipt", "stale_receipt"],
+)
+def test_managed_mcp_completion_rejects_invalid_or_stale_proof(
+    firestore_fake, sdk_fakes, monkeypatch, invalid_proof,
+):
+    from core.operations.mcp_completion import dispatch_completed_managed_mcp_index
+    from core.operations.outbox import TaskTargetConfig
+    from core.integrations.firestore.operations import _stage_id
+
+    client = firestore_fake.client_class()
+    save_intent_id, content, reference = _prepare_mcp_completed_index(
+        client, sdk_fakes, monkeypatch=monkeypatch,
+    )
+    operation_ref = client.collection("dialog_operations").document(OPERATION_ID)
+    intent_ref = client.collection("dialog_save_intents").document(save_intent_id)
+    transcript_ref = client.collection("transcript_index").document(DOC_ID)
+    if invalid_proof == "cross_operation":
+        reference = {**reference, "operation_id": "other-operation"}
+    elif invalid_proof == "non_mcp":
+        operation_ref.update({"origin": "telegram"})
+    elif invalid_proof == "terminal":
+        operation_ref.update({"state": "completed"})
+    elif invalid_proof == "intent_operation":
+        intent_ref.update({"dispatch_operation_id": "other-operation"})
+    elif invalid_proof == "digest":
+        operation_ref.update({"desired_content_hash": "f" * 64})
+    elif invalid_proof == "parent":
+        intent_ref.update({"desired_parent_id_hash": "f" * 64})
+    elif invalid_proof == "no_stage":
+        stage_id = _stage_id(OPERATION_ID, "managed_index")
+        client.collection("dialog_operations").document(OPERATION_ID).collection("stages").document(stage_id).delete()
+    elif invalid_proof == "no_receipt":
+        client.collection("index_completions").document(DOC_ID).collection("generations").document(
+            hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        ).delete()
+    elif invalid_proof == "stale_receipt":
+        transcript_ref.update({"status": "syncing"})
+
+    calls = []
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", lambda **kwargs: calls.append(kwargs) or True)
+    result = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content, target=TaskTargetConfig("dialog-operations", "https://mcp.example.invalid/callback"),
+        now=NOW + timedelta(seconds=1),
+    )
+    assert result is None
+    assert calls == []
+
+
 def test_fresh_managed_claim_with_lower_operation_fence_refreshes_current_generation(
     firestore_fake, sdk_fakes,
 ):

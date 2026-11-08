@@ -48,7 +48,7 @@ EXPECTED_INTEGRATION_REQUIREMENTS = {
         "cloud_tasks", "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
     },
     "vector_sync": {
-        "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
+        "cloud_tasks", "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
     },
     "tldv_import": {
         "cloud_tasks", "firestore", "gemini", "google_auth", "google_docs",

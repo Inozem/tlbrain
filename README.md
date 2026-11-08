@@ -465,6 +465,9 @@ Utterances are always saved. A failure in summary/facts generation does not bloc
 4. Generates summaries, facts, BM25 sparse vectors
 5. Full-document replacement writes the new version before deleting the old version. Incremental replacement deletes affected entries before writing replacements, so continuous availability is not guaranteed.
 6. Updates status: `syncing → synced`
+7. For managed MCP saves, queues the existing completion worker after indexing finishes. The worker verifies the saved document and marks the save operation `completed`.
+
+Completion delivery reuses the durable task outbox and completed indexing checkpoint, so a delivery retry does not recreate the document or repeat model generation. Normal MCP completion does not wait for the scheduled recovery sweep.
 
 Status machine: `queued → downloading → imported → syncing → synced / error`
  

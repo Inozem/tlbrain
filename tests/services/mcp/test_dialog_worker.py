@@ -65,7 +65,13 @@ def test_worker_noops_terminal_and_rejects_missing_completion_binding(monkeypatc
         dialog_worker.process_dialog_operation(object(), TASK)
 
 
-def test_worker_advances_only_matching_operation_through_existing_checkpoints(monkeypatch):
+@pytest.mark.parametrize(
+    ("finalized", "expected_status"),
+    [(SimpleNamespace(document_id="doc-1"), "processed"), (None, "in_progress")],
+)
+def test_worker_advances_only_matching_operation_through_existing_checkpoints(
+    monkeypatch, finalized, expected_status,
+):
     record = SimpleNamespace(
         target_kind=OutboxTargetKind.MCP_SAVE_RECOVERY, generation=2,
         operation_id="operation-1", save_intent_id="save-1", state=OutboxState.DELIVERED,
@@ -94,10 +100,19 @@ def test_worker_advances_only_matching_operation_through_existing_checkpoints(mo
     from services.mcp.app.mcp import handler
     monkeypatch.setattr(handler, "_advance_add_dialog_save", lambda *_args: advanced.append("advance") or SimpleNamespace(save_intent_id="save-1"))
     monkeypatch.setattr(handler, "_publish_add_dialog_index_work", lambda *_: advanced.append("publish"))
-    monkeypatch.setattr(dialog_worker.dialog_completion, "finalize_save", lambda *_args, **kwargs: advanced.append(kwargs["origin_binding"]))
+    monkeypatch.setattr(dialog_worker.dialog_completion, "finalize_save", lambda *_args, **kwargs: advanced.append(kwargs["origin_binding"]) or finalized)
 
-    assert dialog_worker.process_dialog_operation(object(), TASK).status == "processed"
+    assert dialog_worker.process_dialog_operation(object(), TASK).status == expected_status
     assert advanced == ["advance", "publish", recovery_binding]
+
+
+def test_internal_route_retries_when_worker_is_busy_or_not_finalized(monkeypatch):
+    monkeypatch.setattr(main, "verify_google_id_token", lambda _token: SimpleNamespace(authorized=True))
+    monkeypatch.setattr(main, "process_dialog_operation", lambda *_: dialog_worker.RecoveryResult("in_progress"))
+    response = _request("post", "/internal/dialog-operations", json=TASK,
+                        headers={"Authorization": "Bearer synthetic-token"})
+    assert response.status_code == 503
+    assert response.json() == {"status": "in_progress"}
 
 
 def test_internal_route_bypasses_mcp_oauth_and_redacts_recovery_blocker(monkeypatch):

@@ -176,9 +176,17 @@ def test_first_mcp_deploy_waits_for_real_status_url_before_self_url_readiness(
     assert deploys, f"no MCP deploy in command trace: {cloud}"
     initial_deploy = deploys[0]
     initial_text = " ".join(initial_deploy)
-    assert "INTERNAL_DIALOG_OPERATIONS_URL" not in initial_text
-    assert "QUEUE" not in initial_text
-    assert "OIDC" not in initial_text
+    assert "VECTOR_SYNC_QUEUE=synthetic-vector-queue" in initial_text
+    assert "REGION=synthetic-region" in initial_text
+    for setting in (
+        "INTERNAL_DIALOG_OPERATIONS_URL=",
+        "DIALOG_OPERATIONS_QUEUE=",
+        "CLOUD_TASKS_OIDC_AUDIENCE=",
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=",
+        "OIDC_AUDIENCE=",
+        "OIDC_SERVICE_ACCOUNT_EMAIL=",
+    ):
+        assert setting not in initial_text
 
     url_event = next(
         event for event in events
@@ -405,6 +413,7 @@ def _run_deploy_helper(tmp_path: Path, helper: str, *args: str, **overrides: str
         "  *'firestore indexes fields list'*) \"$ROUTE_PYTHON\" -c 'import json,os,sys; log=[json.loads(x) for x in open(os.environ[\"ROUTE_EVENT_LOG\"],encoding=\"utf-8\")]; data=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); group=next(x.split(\"=\",1)[1] for x in sys.argv[1:] if x.startswith(\"--collection-group=\")); done=any(x[:4]==[\"firestore\",\"indexes\",\"fields\",\"update\"] for x in log); rows=[o for o in data[\"fieldOverrides\"] if o[\"collectionGroup\"]==group and o[\"indexes\"]==[]]; print(json.dumps([dict(name=\"projects/example-project/databases/(default)/collectionGroups/\"+o[\"collectionGroup\"]+\"/fields/\"+o[\"fieldPath\"],indexConfig={\"indexes\":[],\"usesAncestorConfig\":False}) for o in rows] if done else []))' \"$@\" ;;\n"
         "  *'firestore operations list'*) \"$ROUTE_PYTHON\" -c 'import json,os; log=[json.loads(x) for x in open(os.environ[\"ROUTE_EVENT_LOG\"],encoding=\"utf-8\")]; done=any(x[:4] in ([\"firestore\",\"indexes\",\"composite\",\"create\"],[\"firestore\",\"indexes\",\"fields\",\"update\"]) for x in log); print(json.dumps([dict(name=\"operations/index-async\",done=True,metadata={\"state\":\"SUCCESSFUL\"})] if done else []))' ;;\n"
         "  *'firestore operations describe'*) echo '{\"name\":\"operations/index-async\",\"done\":true,\"metadata\":{\"state\":\"SUCCESSFUL\"}}' ;;\n"
+        "  *'run services describe tlbrain-vector-sync'*) if [[ \"${FAKE_VECTOR_SERVICE_MISSING:-0}\" == 1 ]]; then exit 1; fi; echo \"${FAKE_VECTOR_RUNTIME_SERVICE_ACCOUNT-${FAKE_RUNTIME_SERVICE_ACCOUNT-mcp-runtime@example-project.iam.gserviceaccount.com}}\" ;;\n"
         "  *'run services describe'*) echo \"${FAKE_RUNTIME_SERVICE_ACCOUNT-mcp-runtime@example-project.iam.gserviceaccount.com}\" ;;\n"
         "  *'projects describe'*) echo '123456789' ;;\n"
         "  *'iam service-accounts describe'*) echo 'NOT_FOUND: service account missing' >&2; exit 1 ;;\n"
@@ -502,6 +511,8 @@ def test_dialog_operations_helper_uses_confirmed_url_and_scoped_iam(tmp_path: Pa
     assert (("iam", "service-accounts", "add-iam-policy-binding"), "roles/iam.serviceAccountUser", f"serviceAccount:{runtime}") in role_bindings
     assert any(event[:3] == ["projects", "add-iam-policy-binding", "example-project"]
                and any(arg.endswith("roles/datastore.user") for arg in event) for event in events)
+    assert sum(event[:3] == ["tasks", "queues", "add-iam-policy-binding"]
+               and f"serviceAccount:{runtime}" in " ".join(event) for event in bindings) == 1
     trace = " ".join(" ".join(event) for event in events)
     assert "roles/owner" not in trace and "roles/editor" not in trace
     assert "roles/cloudtasks.admin" not in trace and "roles/datastore.owner" not in trace
@@ -565,6 +576,44 @@ def test_dialog_operations_uses_default_compute_identity_when_service_account_is
                and any(arg.endswith(f"serviceAccount:{runtime}") for arg in event)
                and "--role=roles/iam.serviceAccountUser" in event
                for event in events)
+
+
+def test_dialog_operations_configures_distinct_vector_runtime_narrowly(tmp_path: Path) -> None:
+    vector_runtime = "vector-runtime@example-project.iam.gserviceaccount.com"
+    result, events = _run_deploy_helper(
+        tmp_path, "deploy_dialog_operations.sh", "https://synthetic-mcp-uc.a.run.app",
+        DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC="1",
+        FAKE_VECTOR_RUNTIME_SERVICE_ACCOUNT=vector_runtime,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    output_lines = [line for line in result.stdout.splitlines() if line]
+    assert len(output_lines) == 6
+    bindings = [event for event in events if "add-iam-policy-binding" in event]
+    assert any(event[:3] == ["tasks", "queues", "add-iam-policy-binding"]
+               and f"serviceAccount:{vector_runtime}" in " ".join(event)
+               and "roles/cloudtasks.enqueuer" in " ".join(event) for event in bindings)
+    invoker = "tlbrain-dialog-ops-invoker@example-project.iam.gserviceaccount.com"
+    assert any(event[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]
+               and event[3] == invoker and f"serviceAccount:{vector_runtime}" in " ".join(event)
+               and "roles/iam.serviceAccountUser" in " ".join(event) for event in bindings)
+    vector_updates = [event for event in events if event[:4] == ["run", "services", "update", "tlbrain-vector-sync"]]
+    assert len(vector_updates) == 1
+    update_text = " ".join(vector_updates[0])
+    assert "INTERNAL_DIALOG_OPERATIONS_URL=https://synthetic-mcp-uc.a.run.app/internal/dialog-operations" in update_text
+    assert "DIALOG_OPERATIONS_QUEUE=tlbrain-dialog-operations" in update_text
+    assert "CLOUD_TASKS_OIDC_AUDIENCE=https://synthetic-mcp-uc.a.run.app" in update_text
+    assert f"CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL={invoker}" in update_text
+    assert "REGION=europe-west1" in update_text and "GOOGLE_CLOUD_PROJECT=example-project" in update_text
+
+
+def test_vector_configuration_fails_when_required_service_is_missing(tmp_path: Path) -> None:
+    result, events = _run_deploy_helper(
+        tmp_path, "deploy_dialog_operations.sh", "https://synthetic-mcp-uc.a.run.app",
+        DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC="1", FAKE_VECTOR_SERVICE_MISSING="1",
+    )
+    assert result.returncode != 0
+    assert "Vector Sync must be deployed" in result.stderr
+    assert not any(event[:3] == ["run", "services", "update"] for event in events)
 
 
 def test_firestore_index_helper_adds_declared_indexes_and_exemptions_idempotently(tmp_path: Path) -> None:

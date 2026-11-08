@@ -37,16 +37,27 @@ def connectors_disabled(monkeypatch):
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-client-id")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-client-secret")
     monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-refresh-token")
+    monkeypatch.setenv(
+        "INTERNAL_DIALOG_OPERATIONS_URL",
+        "https://mcp.test/internal/dialog-operations",
+    )
+    monkeypatch.setenv("DIALOG_OPERATIONS_QUEUE", "dialog-operations")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_AUDIENCE", "https://mcp.test")
+    monkeypatch.setenv("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL", "invoker@example.invalid")
+    monkeypatch.setenv("OIDC_AUDIENCE", "https://mcp.test")
+    monkeypatch.setenv("OIDC_SERVICE_ACCOUNT_EMAIL", "invoker@example.invalid")
+    monkeypatch.setenv("REGION", "us-central1")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "pytest-project")
     monkeypatch.setenv("RETRIEVAL_TOP_K", "15")
     monkeypatch.setenv("RETRIEVAL_SCORE_THRESHOLD", "0.0")
 
 
-def _post_asgi(app, path: str, *, content: bytes = b""):
+def _post_asgi(app, path: str, *, content: bytes = b"", headers: dict | None = None):
     async def request():
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://vector-sync.test"
         ) as client:
-            return await client.post(path, content=content)
+            return await client.post(path, content=content, headers=headers or {})
 
     return asyncio.run(request(), loop_factory=_selector_loop)
 
@@ -289,9 +300,37 @@ def test_add_dialog_offline_workflow_replays_dispatch_and_becomes_queryable(
         for event in sdk_fakes.trace
     )
 
+    callback_events = [
+        event for event in sdk_fakes.trace
+        if event["boundary"] == "tasks" and event["operation"] == "create_task"
+        and event["arguments"]["task"]["http_request"]["url"]
+        == os.environ["INTERNAL_DIALOG_OPERATIONS_URL"]
+    ]
+    assert len(callback_events) == 1
+    callback_task = callback_events[0]["arguments"]["task"]
+    assert callback_events[0]["arguments"]["parent"].endswith("/queues/dialog-operations")
+    assert callback_task["http_request"]["oidc_token"]["audience"] == "https://mcp.test"
+    callback_body = callback_task["http_request"]["body"]
+    if isinstance(callback_body, str):
+        callback_body = callback_body.encode("utf-8")
+    from services.mcp.app import main as mcp_main
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        mcp_main, "verify_google_id_token",
+        lambda token: SimpleNamespace(authorized=token == "pytest-task-token"),
+    )
+    callback_response = _post_asgi(
+        mcp_main.app,
+        "/internal/dialog-operations",
+        content=callback_body,
+        headers={"authorization": "Bearer pytest-task-token"},
+    )
+    assert callback_response.status_code == 200
+    assert callback_response.json() == {"status": "processed"}
+
     completed_operation = firestore_fake.client_class().collection("dialog_operations").document(operation_id).get()
-    assert completed_operation.to_dict()["state"] == "running"
-    assert completed_operation.to_dict()["stage"] == "managed_index"
+    assert completed_operation.to_dict()["state"] == "completed"
 
     aggregate = _payload(_call(session_id, "workflow-aggregate-status", "sync_status", {}))
     assert {key: value for key, value in aggregate.items() if key != "suggestion"} == {

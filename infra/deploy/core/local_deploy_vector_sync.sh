@@ -37,7 +37,7 @@ gcloud run deploy "${VECTOR_SYNC_SERVICE_NAME}" \
   --timeout 3600 \
   --concurrency 1 \
   --max-instances "${VECTOR_SYNC_MAX_INSTANCES}" \
-  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",GEMINI_API_KEY="${GEMINI_API_KEY}",QDRANT_URL="${QDRANT_URL}",QDRANT_API_KEY="${QDRANT_API_KEY}",QDRANT_COLLECTION="${QDRANT_COLLECTION}",GOOGLE_REFRESH_TOKEN="${GOOGLE_REFRESH_TOKEN}",GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}",GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET}"
+  --set-env-vars ROOT_FOLDER_URL="${ROOT_FOLDER_URL}",GEMINI_API_KEY="${GEMINI_API_KEY}",QDRANT_URL="${QDRANT_URL}",QDRANT_API_KEY="${QDRANT_API_KEY}",QDRANT_COLLECTION="${QDRANT_COLLECTION}",GOOGLE_REFRESH_TOKEN="${GOOGLE_REFRESH_TOKEN}",GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}",GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET}",REGION="${REGION}",GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
 
 VECTOR_SYNC_URL=$(gcloud run services describe "${VECTOR_SYNC_SERVICE_NAME}" \
   --region "${REGION}" \
@@ -51,6 +51,14 @@ gcloud tasks queues create "${VECTOR_SYNC_QUEUE}" \
 gcloud tasks queues update "${VECTOR_SYNC_QUEUE}" \
   --location="${REGION}" \
   --max-concurrent-dispatches="${VECTOR_SYNC_MAX_INSTANCES}"
+
+if [[ "${DEPLOY_DEFER_DIALOG_READINESS:-0}" != "1" ]] \
+  && MCP_URL=$(gcloud run services describe "${MCP_SERVICE_NAME:-tlbrain-mcp}" \
+  --project "${PROJECT_ID}" --region "${REGION}" --format='value(status.url)' 2>/dev/null) \
+  && [[ -n "${MCP_URL}" ]]; then
+  DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC=1 \
+    bash "${REPO_ROOT}/infra/deploy/core/helpers/deploy_dialog_operations.sh" "${MCP_URL}" >/dev/null
+fi
 
 echo
 echo "Vector Sync: POST ${VECTOR_SYNC_URL}/sync"
