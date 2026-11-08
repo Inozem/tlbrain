@@ -75,6 +75,18 @@ def _mock_boundaries(monkeypatch: pytest.MonkeyPatch, module: Any, *, fail_at: s
     def fake_run(args: list[str], **kwargs: Any) -> Any:
         argv = [str(item) for item in args]
         calls.append(argv)
+        if args == "ver" or argv == ["v", "e", "r"]:
+            return SimpleNamespace(returncode=0, stdout="Microsoft Windows [Version 10.0.26100.0]", stderr="")
+        if "-c" in argv and "ensurepip.version()" in argv[-1]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "version": "3.14.0 (synthetic)", "implementation": "cpython", "cache_tag": "cpython-314",
+                "abiflags": "", "platform": "win-amd64", "sys_platform": "win32", "machine": "AMD64",
+                "libc": ["", ""], "ensurepip": "25.2",
+            }), stderr="")
+        if "config" in argv:
+            if "debug" in argv:
+                return SimpleNamespace(returncode=0, stdout="env_var:\nenv:\nglobal:\nsite:\nuser:\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         if any(item.endswith("infra\\build\\assemble.py") or item.endswith("infra/build/assemble.py") for item in argv):
             if fail_at == "assemble":
                 return SimpleNamespace(returncode=23)
@@ -88,6 +100,8 @@ def _mock_boundaries(monkeypatch: pytest.MonkeyPatch, module: Any, *, fail_at: s
             executable.write_bytes(b"synthetic verified runtime venv executable")
             return SimpleNamespace(returncode=0)
         if "-m" in argv and "pip" in argv:
+            if "--version" in argv:
+                return SimpleNamespace(returncode=0, stdout="pip 25.2 from synthetic (python 3.14)", stderr="")
             if fail_at == "pip-install" and "install" in argv:
                 return SimpleNamespace(returncode=25)
             if fail_at == "pip-check" and "check" in argv:
@@ -163,6 +177,7 @@ def test_preflight_assembles_once_uses_external_harness_and_gates_on_fingerprint
     assert harness.is_absolute() and not harness.is_relative_to(root) and not harness.is_relative_to(output)
     assert result_path.is_absolute() and not result_path.is_relative_to(root) and not result_path.is_relative_to(output)
     assert result_path.parent == harness.parent.parent
+    assert not harness.parent.parent.exists()
     assert Path(validate[validate.index("--artifact") + 1]) == Path(os.path.abspath(output))
     printed = capsys.readouterr().out
     assert "Native OS:" in printed
@@ -178,6 +193,33 @@ def test_preflight_assembles_once_uses_external_harness_and_gates_on_fingerprint
     assert module._artifact_fingerprint(output) == validator_reference._fingerprint(output)
 
 
+def test_preflight_reuses_dependencies_but_reassembles_and_validates_current_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    root, first_output = _checkout(tmp_path)
+    second_output = root / ".build" / "second-artifact"
+    calls = _mock_boundaries(monkeypatch, module)
+    monkeypatch.setattr(module.tempfile, "tempdir", str(tmp_path / "private-temp"))
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+
+    assert module.run_preflight("mcp", root, first_output) == 0
+    (root / "main.py").write_text("class App:\n    value = 2\napp = App()\n", encoding="utf-8")
+    assert module.run_preflight("mcp", root, second_output) == 0
+
+    assemblers = [call for call in calls if any(item.endswith("assemble.py") for item in call)]
+    creates = [call for call in calls if "venv" in call]
+    installs = [call for call in calls if "install" in call]
+    checks = [call for call in calls if "check" in call]
+    validators = [call for call in calls if any(item.endswith("validate.py") for item in call)]
+    assert (len(assemblers), len(creates), len(installs), len(checks), len(validators)) == (2, 1, 1, 2, 2)
+    assert checks[0][0] == checks[1][0]
+    assert validators[0][validators[0].index("--result") + 1] != validators[1][validators[1].index("--result") + 1]
+    assert all(not Path(call[call.index("--result") + 1]).parent.exists() for call in validators)
+
+
 @pytest.mark.parametrize("fail_at,expected_code", [("assemble", 23), ("venv", 24), ("pip-install", 25), ("pip-check", 26), ("validation", 27)])
 def test_preflight_stops_at_first_failed_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_at: str, expected_code: int
@@ -190,7 +232,7 @@ def test_preflight_stops_at_first_failed_gate(
         assert len(calls) == 1
         assert not output.exists()
     elif fail_at == "venv":
-        assert not any("pip" in call for call in calls)
+        assert not any("install" in call or "check" in call for call in calls)
     elif fail_at == "pip-check":
         assert not any(any(item.endswith("validate.py") for item in call) for call in calls)
     elif fail_at == "pip-install":

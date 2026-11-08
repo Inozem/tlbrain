@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import ntpath
 import os
@@ -34,6 +35,21 @@ _SUPPORTED_PREFLIGHT_SERVICES = {
     "tldv_reconciliation", "telegram",
 }
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_ENVIRONMENT_CACHE: Any = None
+
+
+def _environment_cache() -> Any:
+    """Load the build-only sibling helper without adding checkout imports."""
+    global _ENVIRONMENT_CACHE
+    if _ENVIRONMENT_CACHE is None:
+        helper = Path(__file__).resolve().with_name("environment_cache.py")
+        spec = importlib.util.spec_from_file_location("tlbrain_environment_cache", helper)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("dependency environment cache helper is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _ENVIRONMENT_CACHE = module
+    return _ENVIRONMENT_CACHE
 
 
 def normalize_windows_path(path: os.PathLike[str] | str, root: os.PathLike[str] | str | None = None) -> str:
@@ -978,41 +994,32 @@ def run_preflight(service: str, source_root: os.PathLike[str] | str, output: os.
         shutil.copy2(build_tools / "validate.py", harness / "validate.py")
         shutil.copy2(build_tools / "smoke_support.py", harness / "smoke_support.py")
         result_path = external / "validation-result.json"
-        environment = external / "runtime-venv"
-        created = subprocess.run([str(runtime), "-I", "-m", "venv", str(environment)], cwd=str(external), check=False)
-        if created.returncode:
-            return created.returncode
-        venv_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        if not venv_python.is_file():
-            raise RuntimeError("verified runtime did not create its runtime-only virtual environment")
         requirements = artifact / "requirements.txt"
-        if requirements.is_file() and requirements.read_text(encoding="utf-8").strip():
-            installed = subprocess.run(
-                [str(venv_python), "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "-r", str(requirements)],
+        cache = _environment_cache()
+        with cache.prepared_environment(
+            runtime=runtime, project_root=root, requirements=requirements,
+            fresh_parent=external, process_runner=subprocess.run,
+            tree_manifest=_tree_manifest, verify_manifest=_verified_runtime_manifest,
+        ) as prepared:
+            if prepared.status or prepared.python is None:
+                return prepared.status or 1
+            validation = subprocess.run(
+                [str(prepared.python), "-I", str((harness / "validate.py").resolve()), "--service", service,
+                 "--artifact", str(Path(os.path.abspath(artifact))), "--offline", "--result", str(result_path)],
                 cwd=str(external), check=False,
             )
-            if installed.returncode:
-                return installed.returncode
-        checked = subprocess.run([str(venv_python), "-I", "-m", "pip", "check"], cwd=str(external), check=False)
-        if checked.returncode:
-            return checked.returncode
-        validation = subprocess.run(
-            [str(venv_python), "-I", str((harness / "validate.py").resolve()), "--service", service,
-             "--artifact", str(Path(os.path.abspath(artifact))), "--offline", "--result", str(result_path)],
-            cwd=str(external), check=False,
-        )
-        if validation.returncode:
-            return validation.returncode
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        after = _artifact_fingerprint(artifact)
-        if result.get("status") != "passed" or result.get("artifact_fingerprint") != before or after != before:
-            raise RuntimeError("artifact fingerprint changed or validation did not pass; it cannot be handed to upload")
-        print(f"Preflight passed for {service}")
-        print(f"Native OS: {_native_os_name()}")
-        print(f"Native architecture: {_native_architecture()}")
-        print("Artifact deployment target OS: linux")
-        print(f"Artifact runtime target: {artifact_target}")
-        print(f"Artifact fingerprint: {before}")
+            if validation.returncode:
+                return validation.returncode
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            after = _artifact_fingerprint(artifact)
+            if result.get("status") != "passed" or result.get("artifact_fingerprint") != before or after != before:
+                raise RuntimeError("artifact fingerprint changed or validation did not pass; it cannot be handed to upload")
+            print(f"Preflight passed for {service}")
+            print(f"Native OS: {_native_os_name()}")
+            print(f"Native architecture: {_native_architecture()}")
+            print("Artifact deployment target OS: linux")
+            print(f"Artifact runtime target: {artifact_target}")
+            print(f"Artifact fingerprint: {before}")
     return 0
 
 
@@ -1021,9 +1028,9 @@ def run_managed_helper(
     requirements: os.PathLike[str] | str,
     code: str,
 ) -> int:
-    """Run a project helper with its dependencies in a temporary managed venv."""
+    """Run a project helper in its verified runtime-only dependency environment."""
     root = Path(source_root).resolve()
-    requirements_path = Path(requirements).resolve()
+    requirements_path = Path(os.path.abspath(requirements))
     if not root.is_dir() or not requirements_path.is_file():
         raise ValueError("managed helper source root or requirements file is unavailable")
     if not code.strip():
@@ -1044,49 +1051,23 @@ def run_managed_helper(
         )
         with tempfile.TemporaryDirectory(prefix="tlbrain-helper-") as temporary:
             work = Path(temporary).resolve()
-            venv_python, preparation_status = _prepare_managed_helper_environment(
-                runtime, requirements_path, work,
-            )
-            if preparation_status or venv_python is None:
-                return preparation_status or 1
-            consumer_environment["PYTHONPATH"] = os.pathsep.join(
-                value for value in (str(root), consumer_environment.get("PYTHONPATH", "")) if value
-            )
-            return subprocess.run(
-                [str(venv_python), "-c", code], cwd=str(root), env=consumer_environment, check=False,
-            ).returncode
+            cache = _environment_cache()
+            with cache.prepared_environment(
+                runtime=runtime, project_root=root, requirements=requirements_path,
+                fresh_parent=work, process_runner=subprocess.run,
+                tree_manifest=_tree_manifest, verify_manifest=_verified_runtime_manifest,
+                env=consumer_environment,
+            ) as prepared:
+                if prepared.status or prepared.python is None:
+                    return prepared.status or 1
+                consumer_environment["PYTHONPATH"] = os.pathsep.join(
+                    value for value in (str(root), consumer_environment.get("PYTHONPATH", "")) if value
+                )
+                return subprocess.run(
+                    [str(prepared.python), "-c", code], cwd=str(root), env=consumer_environment, check=False,
+                ).returncode
     finally:
         os.environ.update(saved_credentials)
-
-
-def _prepare_managed_helper_environment(
-    runtime: os.PathLike[str] | str,
-    requirements: Path,
-    work: Path,
-) -> tuple[Path | None, int]:
-    """Create, populate, and validate a temporary helper virtual environment."""
-    environment = work / "venv"
-    created = subprocess.run(
-        [str(runtime), "-I", "-m", "venv", str(environment)], cwd=str(work), check=False,
-    )
-    if created.returncode:
-        return None, created.returncode
-    venv_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if not venv_python.is_file():
-        raise RuntimeError("managed helper runtime did not create its virtual environment")
-    installed = subprocess.run(
-        [str(venv_python), "-I", "-m", "pip", "install", "--disable-pip-version-check",
-         "--no-input", "-r", str(requirements)],
-        cwd=str(work), check=False,
-    )
-    if installed.returncode:
-        return None, installed.returncode
-    checked = subprocess.run(
-        [str(venv_python), "-I", "-m", "pip", "check"], cwd=str(work), check=False,
-    )
-    if checked.returncode:
-        return None, checked.returncode
-    return venv_python, 0
 
 
 def main(argv: list[str] | None = None) -> int:

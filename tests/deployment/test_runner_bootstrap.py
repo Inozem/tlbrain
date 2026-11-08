@@ -88,6 +88,8 @@ def test_managed_helper_uses_isolated_firestore_environment_and_scopes_credentia
     requirements.parent.mkdir(parents=True)
     requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
     private_runtime = tmp_path / "managed runtime" / "python.exe"
+    private_runtime.parent.mkdir(parents=True)
+    private_runtime.write_bytes(b"synthetic managed runtime")
     monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
     calls: list[tuple[list[str], dict[str, str] | None]] = []
     consumers: list[tuple[list[str], dict[str, str]]] = []
@@ -107,7 +109,37 @@ def test_managed_helper_uses_isolated_firestore_environment_and_scopes_credentia
             venv_python.parent.mkdir(parents=True)
             venv_python.write_text("synthetic venv interpreter", encoding="utf-8")
             return SimpleNamespace(returncode=0)
+        if "-c" in argv and "ensurepip.version()" in argv[-1]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "version": "3.14.0 (synthetic)", "implementation": "cpython", "cache_tag": "cpython-314",
+                "abiflags": "", "platform": "win-amd64", "sys_platform": "win32", "machine": "AMD64",
+                "libc": ["", ""], "ensurepip": "25.2",
+            }), stderr="")
+        if "config" in argv:
+            if "debug" in argv:
+                pip_config = kwargs["env"]["PIP_CONFIG_FILE"]
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        f"env_var:\n  PIP_CONFIG_FILE='{pip_config}'\n  PIP_NO_INDEX='1'\n"
+                        "  PIP_DISABLE_PIP_VERSION_CHECK='1'\n"
+                        f"env:\n  global: {pip_config}, exists: True\n"
+                        "global:\n  C:\\ProgramData\\pip\\pip.ini, exists: False\n"
+                        "site:\n  C:\\synthetic\\site\\pip.ini, exists: False\n"
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f":env:.config-file='{kwargs['env']['PIP_CONFIG_FILE']}'\n"
+                    ":env:.no-index='1'\n:env:.disable-pip-version-check='1'\n"
+                ),
+                stderr="",
+            )
         if "pip" in argv:
+            if "--version" in argv:
+                return SimpleNamespace(returncode=0, stdout="pip 25.2 from synthetic (python 3.14)", stderr="")
             assert str(private_runtime) not in argv or argv[0] == str(venv_python)
             return SimpleNamespace(returncode=0)
         consumers.append((argv, kwargs["env"]))
@@ -117,12 +149,16 @@ def test_managed_helper_uses_isolated_firestore_environment_and_scopes_credentia
     monkeypatch.setattr(runner.subprocess, "run", run)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
     code = "import os; assert os.environ['TELEGRAM_BOT_TOKEN'] == 'synthetic-token'"
 
     assert runner.run_managed_helper(root, requirements, code) == 0
+    assert runner.run_managed_helper(root, requirements, code) == 0
     assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
     assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
-    assert len(consumers) == 1
+    assert len(consumers) == 2
     consumer_argv, consumer_env = consumers[0]
     consumer_python = Path(consumer_argv[0])
     assert consumer_python.name == ("python.exe" if os.name == "nt" else "python")
@@ -130,13 +166,17 @@ def test_managed_helper_uses_isolated_firestore_environment_and_scopes_credentia
     assert consumer_argv[1:] == ["-c", code]
     assert consumer_env["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
     assert consumer_env["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    assert consumers[1][0][0] == consumer_argv[0]
     install = next(argv for argv, _env in calls if "install" in argv)
     assert install[0] == consumer_argv[0]
     assert install[install.index("-r") + 1] == str(requirements)
     assert str(private_runtime) not in install
-    assert any("check" in argv for argv, _env in calls)
-    temporary_root = Path(consumer_argv[0]).parents[2]
-    assert not temporary_root.exists()
+    assert len([argv for argv, _env in calls if "check" in argv]) == 2
+    cache_entry = Path(consumer_argv[0]).parents[1]
+    assert cache_entry.exists()
+    assert Path(consumer_argv[0]).parent.name == ("Scripts" if os.name == "nt" else "bin")
+    assert any(cache_entry.parent.glob("*.ready.json"))
+    assert not list(tmp_path.glob("tlbrain-helper-*"))
 
 
 @pytest.mark.parametrize("failed_stage", ["venv", "install", "check"])
@@ -149,15 +189,29 @@ def test_managed_helper_stops_before_consumer_and_cleans_up_on_prepare_failure(
     root.mkdir()
     requirements = root / "requirements.txt"
     requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    managed_runtime = tmp_path / "managed-python"
+    managed_runtime.write_bytes(b"synthetic managed runtime")
     monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
     calls: list[list[str]] = []
 
-    monkeypatch.setattr(runner, "ensure_runtime", lambda *_args, **_kwargs: tmp_path / "managed-python")
+    monkeypatch.setattr(runner, "ensure_runtime", lambda *_args, **_kwargs: managed_runtime)
 
     def run(argv: list[str], **_kwargs: Any) -> Any:
         calls.append(argv)
+        if "-c" in argv and "ensurepip.version()" in argv[-1]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "version": "3.14.0 (synthetic)", "implementation": "cpython", "cache_tag": "cpython-314",
+                "abiflags": "", "platform": "win-amd64", "sys_platform": "win32", "machine": "AMD64",
+                "libc": ["", ""], "ensurepip": "25.2",
+            }), stderr="")
+        if "config" in argv:
+            if "debug" in argv:
+                return SimpleNamespace(returncode=0, stdout="env_var:\nenv:\nglobal:\nsite:\nuser:\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "--version" in argv:
+            return SimpleNamespace(returncode=0, stdout="pip 25.2 synthetic", stderr="")
         if "venv" in argv:
             if failed_stage == "venv":
                 return SimpleNamespace(returncode=17)
@@ -174,9 +228,11 @@ def test_managed_helper_stops_before_consumer_and_cleans_up_on_prepare_failure(
     assert runner.run_managed_helper(root, requirements, "raise AssertionError()") == expected_status
     assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
     assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
-    assert not any("-c" in argv for argv in calls)
-    temporary_root = Path(calls[0][-1]).parents[0]
-    assert not temporary_root.exists()
+    assert not any("-c" in argv and argv[-1] == "raise AssertionError()" for argv in calls)
+    cache_name = "tlbrain-deps" if os.name == "nt" else f"tlbrain-deps-{os.getuid()}"
+    ready_files = list((tmp_path / cache_name).rglob("*.ready.json"))
+    assert not ready_files
+    assert not list(tmp_path.glob("tlbrain-helper-*"))
 
 
 def test_managed_helper_restores_credentials_when_runtime_setup_raises(
@@ -187,6 +243,8 @@ def test_managed_helper_restores_credentials_when_runtime_setup_raises(
     root.mkdir()
     requirements = root / "requirements.txt"
     requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    managed_runtime = tmp_path / "managed-python"
+    managed_runtime.write_bytes(b"synthetic managed runtime")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
 
@@ -210,14 +268,28 @@ def test_managed_helper_cleans_up_and_restores_credentials_after_consumer_failur
     root.mkdir()
     requirements = root / "requirements.txt"
     requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    managed_runtime = tmp_path / "managed-python"
+    managed_runtime.write_bytes(b"synthetic managed runtime")
     monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
-    monkeypatch.setattr(runner, "ensure_runtime", lambda *_args, **_kwargs: tmp_path / "managed-python")
+    monkeypatch.setattr(runner, "ensure_runtime", lambda *_args, **_kwargs: managed_runtime)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
     calls: list[list[str]] = []
 
     def run(argv: list[str], **_kwargs: Any) -> Any:
         calls.append(argv)
+        if "-c" in argv and "ensurepip.version()" in argv[-1]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "version": "3.14.0 (synthetic)", "implementation": "cpython", "cache_tag": "cpython-314",
+                "abiflags": "", "platform": "win-amd64", "sys_platform": "win32", "machine": "AMD64",
+                "libc": ["", ""], "ensurepip": "25.2",
+            }), stderr="")
+        if "config" in argv:
+            if "debug" in argv:
+                return SimpleNamespace(returncode=0, stdout="env_var:\nenv:\nglobal:\nsite:\nuser:\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "--version" in argv:
+            return SimpleNamespace(returncode=0, stdout="pip 25.2 synthetic", stderr="")
         if "venv" in argv:
             venv_python = Path(argv[-1]) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
             venv_python.parent.mkdir(parents=True)
@@ -230,8 +302,9 @@ def test_managed_helper_cleans_up_and_restores_credentials_after_consumer_failur
     assert calls[-1][1:] == ["-c", "pass"]
     assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
     assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
-    temporary_root = Path(calls[-1][0]).parents[2]
-    assert not temporary_root.exists()
+    cache_name = "tlbrain-deps" if os.name == "nt" else f"tlbrain-deps-{os.getuid()}"
+    assert list((tmp_path / cache_name).rglob("*.ready.json"))
+    assert not list(tmp_path.glob("tlbrain-helper-*"))
 
 
 @pytest.mark.parametrize("key", sorted(PINNED_TOOLCHAINS))

@@ -69,6 +69,7 @@ pytest.ini
 
 # Assembler is the only infra/build tool needed in the builder stage.
 infra/build/bootstrap_runner.py
+infra/build/environment_cache.py
 infra/build/image_metadata.py
 infra/build/preflight.sh
 infra/build/runner-toolchain.json
