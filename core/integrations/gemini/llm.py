@@ -6,7 +6,8 @@ from google import genai
 from google.genai import types
 
 from .client import make_client
-from core.utils.retry import with_retry
+from .structured import json_response_options
+from core.utils.retry import RetryPolicy, with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,7 @@ class GeminiEmptyResponseError(Exception):
     """Raised when Gemini returns a response with no text content (e.g. safety filter)."""
 
 
-_LLM_MODEL = "gemini-2.5-flash"
+_LLM_MODEL = "gemini-3.5-flash-lite"
 
 _PROMPT = """\
 You are analyzing a fragment of a dialogue. Produce two things:
@@ -57,16 +58,21 @@ _RESPONSE_SCHEMA = {
 _CLIENT_DETECTION_SCHEMA = {
     "type": "object",
     "properties": {
-        "folder_name": {"type": "string", "nullable": True},
+        "folder_name": {"type": ["string", "null"]},
         "confidence": {"type": "number"},
     },
     "required": ["folder_name", "confidence"],
 }
 
 
-def call_gemini_json(prompt: str) -> dict:
-    client = make_client()
-    return _generate_structured(client, prompt, schema=_CLIENT_DETECTION_SCHEMA)
+def call_gemini_json(prompt: str, *, retry_policy: RetryPolicy | None = None) -> dict:
+    if retry_policy is None:
+        client = make_client()
+        return _generate_structured(client, prompt, schema=_CLIENT_DETECTION_SCHEMA)
+    client = make_client(single_attempt=retry_policy.attempts == 1)
+    return _generate_structured(
+        client, prompt, schema=_CLIENT_DETECTION_SCHEMA, retry_policy=retry_policy,
+    )
 
 
 def generate_summary_and_facts(utterances: list[dict[str, Any]]) -> tuple[str, list[str]]:
@@ -106,8 +112,7 @@ def _generate_structured(client: genai.Client, prompt: str, schema: dict = _RESP
         config=types.GenerateContentConfig(
             temperature=0,
             top_p=1,
-            response_mime_type="application/json",
-            response_schema=schema,
+            http_options=json_response_options(schema),
         ),
     )
     if response.text is None:

@@ -1,4 +1,5 @@
 from copy import deepcopy
+import pytest
 
 from google.genai import types
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, PointStruct, SparseVector
@@ -103,6 +104,21 @@ def test_empty_upserts_do_not_write(sdk_fakes):
     writer.upsert_facts([], [])
     writer.upsert_user_facts([], [])
     assert not [event for event in sdk_fakes.trace if event["operation"] == "upsert"]
+
+
+def test_user_fact_accepts_explicit_uuid_point_id_and_rejects_invalid_ids_before_write(sdk_fakes):
+    fact = {"type": "user_fact", "doc_id": DOC_ID, "text": "Same fact", "root_folder_id": ROOT_ID}
+    writer.upsert_user_facts([fact], [[0.5, 0.75]], point_ids=["6f11649d-013d-4d97-8a71-1dc816cb880f"])
+    point = _event(sdk_fakes, "upsert")["points"][0]
+    assert point.id == "6f11649d-013d-4d97-8a71-1dc816cb880f"
+    assert point.payload == fact
+
+    before = len([event for event in sdk_fakes.trace if event["operation"] == "upsert"])
+    with pytest.raises(ValueError, match="point_ids must contain UUIDs"):
+        writer.upsert_user_facts([fact], [[0.5]], point_ids=["unsafe id"])
+    with pytest.raises(ValueError, match="point_ids must match"):
+        writer.upsert_user_facts([fact], [[0.5]], point_ids=[])
+    assert len([event for event in sdk_fakes.trace if event["operation"] == "upsert"]) == before
 
 
 def test_delete_and_payload_mutation_filters_keep_exact_scope(sdk_fakes):

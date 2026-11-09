@@ -76,6 +76,8 @@ class _State:
     tasks: set[str] = field(default_factory=set)
     anonymous_task_counter: int = 0
     qdrant_collections: dict[str, dict[str, Any]] = field(default_factory=dict)
+    docs_revisions: dict[str, str] = field(default_factory=dict)
+    docs_revision_counter: int = 0
     clients: list[Any] = field(default_factory=list)
 
 
@@ -106,6 +108,8 @@ class _Controls:
         _STATE.tasks.clear()
         _STATE.anonymous_task_counter = 0
         _STATE.qdrant_collections.clear()
+        _STATE.docs_revisions.clear()
+        _STATE.docs_revision_counter = 0
         _STATE.clients.clear()
 
     @property
@@ -176,7 +180,31 @@ class _Request:
         if kwargs:
             raise TypeError(f"Unsupported execute options: {', '.join(kwargs)}")
         _record(self.boundary, self.operation, **self.args)
-        return _script(self.boundary, self.operation)
+        if self.boundary == "docs" and self.operation == "documents.batchUpdate":
+            write_control = self.args.get("body", {}).get("writeControl") or {}
+            required_revision = write_control.get("requiredRevisionId")
+            document_id = self.args["documentId"]
+            current_revision = _STATE.docs_revisions.get(document_id)
+            if required_revision is not None and current_revision is not None and required_revision != current_revision:
+                raise RuntimeError(
+                    f"Stale Docs revision for {document_id}: required {required_revision}, current {current_revision}"
+                )
+            response = _script(self.boundary, self.operation)
+            response_control = response.get("writeControl", {}) if isinstance(response, dict) else {}
+            new_revision = response_control.get("requiredRevisionId")
+            if new_revision is None and isinstance(response, dict):
+                new_revision = response.get("revisionId")
+            if new_revision is None:
+                _STATE.docs_revision_counter += 1
+                new_revision = f"pytest-docs-revision-{_STATE.docs_revision_counter}"
+            _STATE.docs_revisions[document_id] = new_revision
+            return response
+        response = _script(self.boundary, self.operation)
+        if self.boundary == "docs" and self.operation == "documents.get" and isinstance(response, dict):
+            revision = response.get("revisionId")
+            if revision is not None:
+                _STATE.docs_revisions[self.args["documentId"]] = revision
+        return response
 
 
 class _Resource:
@@ -189,6 +217,7 @@ class _Resource:
                 "list": {"q", "fields", "pageSize", "pageToken", "orderBy", "spaces", "includeItemsFromAllDrives", "supportsAllDrives", "corpora", "driveId"},
                 "get": {"fileId", "fields", "supportsAllDrives", "acknowledgeAbuse"},
                 "create": {"body", "fields", "supportsAllDrives", "supportsTeamDrives"},
+                "generateIds": {"count", "space", "type", "fields"},
                 "update": {"fileId", "body", "addParents", "removeParents", "fields", "supportsAllDrives", "supportsTeamDrives"},
             },
             "changes": {
@@ -197,7 +226,7 @@ class _Resource:
             },
             "documents": {
                 "get": {"documentId", "includeTabsContent", "suggestionsViewMode"},
-                "batchUpdate": {"documentId", "body", "writeControl"},
+                "batchUpdate": {"documentId", "body"},
             },
         }
         allowed_options = supported.get(self.name, {}).get(operation)
@@ -224,8 +253,8 @@ class _DiscoveryService:
 def fake_discovery_build(api: str, version: str, **kwargs: Any) -> _DiscoveryService:
     if api not in {"drive", "docs"}:
         raise NotImplementedError(f"Unsupported discovery API: {api}")
-    if kwargs.keys() - {"http", "credentials", "cache_discovery"}:
-        raise TypeError(f"Unsupported discovery options: {', '.join(kwargs.keys() - {'http', 'credentials', 'cache_discovery'})}")
+    if kwargs.keys() - {"http", "credentials", "cache_discovery", "num_retries"}:
+        raise TypeError(f"Unsupported discovery options: {', '.join(kwargs.keys() - {'http', 'credentials', 'cache_discovery', 'num_retries'})}")
     return _DiscoveryService(sdk_fakes, api, version, kwargs)
 
 
@@ -260,19 +289,63 @@ class _GeminiModels:
         return _script("gemini", "generate_content")
 
 
+class _GeminiFiles:
+    def upload(self, **kwargs: Any):
+        extra = kwargs.keys() - {"file", "config"}
+        if extra:
+            raise TypeError(f"Unsupported Gemini files.upload options: {', '.join(sorted(extra))}")
+        _record("gemini", "files.upload", **kwargs)
+        return _script("gemini", "files.upload")
+
+    def delete(self, **kwargs: Any):
+        extra = kwargs.keys() - {"name", "config"}
+        if extra:
+            raise TypeError(f"Unsupported Gemini files.delete options: {', '.join(sorted(extra))}")
+        _record("gemini", "files.delete", **kwargs)
+        return _script("gemini", "files.delete")
+
+
+class _AsyncGeminiModels:
+    """Async facade sharing the existing Gemini response queues and trace."""
+
+    def __init__(self, sync_models: _GeminiModels) -> None:
+        self._sync = sync_models
+
+    async def generate_content(self, **kwargs: Any):
+        return self._sync.generate_content(**kwargs)
+
+
+class _AsyncGeminiFiles:
+    """Async facade sharing the existing Gemini file queues and trace."""
+
+    def __init__(self, sync_files: _GeminiFiles) -> None:
+        self._sync = sync_files
+
+    async def upload(self, **kwargs: Any):
+        return self._sync.upload(**kwargs)
+
+    async def delete(self, **kwargs: Any):
+        return self._sync.delete(**kwargs)
+
+
 class FakeGeminiClient:
     def __init__(self, *, api_key: str, **kwargs: Any) -> None:
-        if kwargs:
+        if kwargs.keys() - {"http_options"}:
             raise TypeError(f"Unsupported Gemini client options: {', '.join(kwargs)}")
-        _record("gemini", "client", api_key=api_key)
+        _record("gemini", "client", api_key=api_key, **kwargs)
         self.models = _GeminiModels()
+        self.files = _GeminiFiles()
+        self.aio = SimpleNamespace(
+            models=_AsyncGeminiModels(self.models),
+            files=_AsyncGeminiFiles(self.files),
+        )
 
 
 class FakeQdrantClient:
     def __init__(self, *, url: str, api_key: str | None = None, **kwargs: Any) -> None:
-        if kwargs:
+        if kwargs.keys() - {"check_compatibility"}:
             raise TypeError(f"Unsupported Qdrant client options: {', '.join(kwargs)}")
-        _record("qdrant", "client", url=url, api_key=api_key)
+        _record("qdrant", "client", url=url, api_key=api_key, **kwargs)
         _STATE.clients.append(self)
 
     def get_collections(self):
@@ -309,7 +382,7 @@ class FakeQdrantClient:
         return _script("qdrant", "create_payload_index")
 
     def __getattr__(self, operation: str):
-        if operation not in {"upsert", "delete", "set_payload", "scroll", "query_points"}:
+        if operation not in {"upsert", "delete", "set_payload", "scroll", "query_points", "retrieve"}:
             raise AttributeError(operation)
         def call(*args: Any, **kwargs: Any):
             if args:
@@ -320,6 +393,7 @@ class FakeQdrantClient:
                 "set_payload": {"collection_name", "payload", "points", "key", "wait", "ordering", "shard_key_selector", "timeout"},
                 "scroll": {"collection_name", "scroll_filter", "limit", "order_by", "offset", "with_payload", "with_vectors", "consistency", "shard_key_selector", "timeout"},
                 "query_points": {"collection_name", "query", "using", "prefetch", "query_filter", "search_params", "limit", "offset", "with_payload", "with_vectors", "score_threshold", "lookup_from", "consistency", "shard_key_selector", "timeout"},
+                "retrieve": {"collection_name", "ids", "with_payload", "with_vectors", "consistency", "shard_key_selector", "timeout"},
             }[operation]
             extra = kwargs.keys() - allowed_options
             if extra:
@@ -375,7 +449,7 @@ class FakeCloudTasksClient:
     def task_path(project: str, location: str, queue: str, task: str) -> str:
         return RealCloudTasksClient.task_path(project, location, queue, task)
 
-    def create_task(self, *, parent: str, task: dict[str, Any], **kwargs: Any):
+    def create_task(self, *, parent: str, task: dict[str, Any] | tasks_v2.Task, **kwargs: Any):
         if kwargs:
             raise TypeError(f"Unsupported create_task options: {', '.join(kwargs)}")
         _record("tasks", "create_task", parent=parent, task=task)
@@ -383,7 +457,7 @@ class FakeCloudTasksClient:
         configured = injected.popleft() if injected else _MISSING
         if isinstance(configured, BaseException):
             raise configured
-        name = task.get("name")
+        name = task.get("name") if isinstance(task, dict) else task.name
         if name and name in _STATE.tasks:
             raise AlreadyExists("Task already exists")
         if name:
@@ -491,7 +565,7 @@ def install() -> dict[str, tuple[Any, str, Any, Any]]:
     originals: dict[str, tuple[Any, str, Any, Any]] = {}
     cache_snapshot: dict[tuple[str, str], tuple[Any, str, Any]] = {}
     cache_symbols = {
-        "core.integrations.qdrant.client": ("_client",),
+        "core.integrations.qdrant.client": ("_client", "_single_attempt_client"),
         "core.integrations.fastembed.bm25": ("_bm25_model",),
     }
     for module_name, attrs in cache_symbols.items():
@@ -605,6 +679,7 @@ def restore(originals: dict[str, tuple[Any, str, Any, Any]] | None) -> None:
         setattr(module, attr, value)
     for module_name, attr, fake_type in (
         ("core.integrations.qdrant.client", "_client", FakeQdrantClient),
+        ("core.integrations.qdrant.client", "_single_attempt_client", FakeQdrantClient),
         ("core.integrations.fastembed.bm25", "_bm25_model", FakeSparseTextEmbedding),
     ):
         module = sys.modules.get(module_name)

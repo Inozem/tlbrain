@@ -1,4 +1,4 @@
-"""Synthetic end-to-end coverage for ordinary and local deployment routes.
+﻿"""Synthetic end-to-end coverage for ordinary and local deployment routes.
 
 The shell scenarios run from an isolated checkout with fake cloud and Docker
 commands. The checkout contains no .env file, and the real source assembler,
@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryFile
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,14 @@ def _bash() -> str:
     if not bash:
         pytest.skip("bash is unavailable")
     return bash
+
+
+def _bash_path(path: Path) -> str:
+    """Convert a Windows path to the POSIX form Git Bash searches."""
+    value = path.resolve().as_posix()
+    if len(value) >= 3 and value[1] == ":":
+        return "/" + value[0].lower() + value[2:]
+    return value
 
 
 def _copy_checkout(root: Path) -> None:
@@ -62,6 +71,9 @@ events = Path(os.environ["ROUTE_EVENT_LOG"])
 def record(*parts):
     with events.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(list(map(str, parts))) + "\n")
+
+record("child-env", "preflight", bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+       bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")))
 
 def run(argv):
     return subprocess.run(argv, cwd=root, text=True, capture_output=True, check=False)
@@ -212,15 +224,112 @@ raise SystemExit("unexpected preflight route: " + repr(args))
 '''
 
 
+_GCLOUD_HANDLER = r'''from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+args = sys.argv[1:]
+events = Path(os.environ["ROUTE_EVENT_LOG"])
+command = " ".join(args)
+
+
+def record(*parts):
+    with events.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(list(parts)) + "\n")
+
+
+def write_legacy_log():
+    with events.open("a", encoding="utf-8") as stream:
+        stream.write("gcloud\t{}\n".format(command))
+
+
+write_legacy_log()
+record("child-env", "gcloud", bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+       bool(os.environ.get("TELEGRAM_ALLOWED_USER_IDS")))
+record("gcloud-argv", *args)
+
+if "--env-vars-file" in args:
+    env_file = Path(args[args.index("--env-vars-file") + 1])
+    data = json.loads(env_file.read_text(encoding="utf-8"))
+    if "TELEGRAM_ALLOWED_USER_IDS" in data:
+        record("telegram-env-file", data.get("TELEGRAM_ALLOWED_USER_IDS"),
+               bool(data.get("TELEGRAM_BOT_TOKEN")))
+
+if "config get-value account" in command:
+    print("synthetic-deployer@example.invalid")
+elif "firestore indexes composite list" in command:
+    index_file = Path(os.environ["ROUTE_INDEX_FILE"])
+    data = json.loads(index_file.read_text(encoding="utf-8"))
+    project = os.environ["PROJECT_ID"]
+    rows = []
+    for number, index in enumerate(data["indexes"]):
+        item = dict(index)
+        item.update(
+            name="projects/{}/databases/(default)/collectionGroups/{}/indexes/ready-{}".format(
+                project, index["collectionGroup"], number
+            ),
+            fields=index["fields"] + [{"fieldPath": "__name__", "order": "DESCENDING"}],
+            state="READY",
+        )
+        rows.append(item)
+    print(json.dumps(rows))
+elif "firestore indexes fields list" in command:
+    index_file = Path(os.environ["ROUTE_INDEX_FILE"])
+    data = json.loads(index_file.read_text(encoding="utf-8"))
+    group = next(value.split("=", 1)[1] for value in args if value.startswith("--collection-group="))
+    project = os.environ["PROJECT_ID"]
+    rows = []
+    for override in data["fieldOverrides"]:
+        if override["collectionGroup"] == group and override["indexes"] == []:
+            rows.append({
+                "name": "projects/{}/databases/(default)/collectionGroups/{}/fields/{}".format(
+                    project, override["collectionGroup"], override["fieldPath"]
+                ),
+                "indexConfig": {"indexes": []},
+            })
+    print(json.dumps(rows))
+elif "firestore operations list" in command:
+    print("[]")
+elif "projects describe" in command:
+    print("123456789012")
+elif "auth print-identity-token" in command:
+    print("synthetic-deployer-id-token")
+elif "run services describe" in command and "spec.template.spec.serviceAccountName" in command:
+    print("synthetic-runtime@synthetic-project.iam.gserviceaccount.com")
+elif "run services describe" in command and "status.url" in command:
+    service = args[3]
+    url = "https://{}-uc.a.run.app".format(service)
+    print(url)
+    record("gcloud-result", "run-service-url", service, url)
+elif "functions describe" in command:
+    print("https://{}-uc.a.run.app".format(args[2]))
+'''
+
+
 def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     build = root / "infra" / "build"
     helper = build / "route_gate.py"
     helper.write_text(_GATE_HELPER, encoding="utf-8")
+    gcloud_handler = build / "gcloud_fixture.py"
+    gcloud_handler.write_text(_GCLOUD_HANDLER, encoding="utf-8")
     preflight = build / "preflight.sh"
     preflight.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "if [[ \"${1:-}\" == '--verify-source' ]]; then\n"
         "  exec \"$ROUTE_PYTHON\" \"${BASH_SOURCE[0]%/*}/bootstrap_runner.py\" \"$@\"\n"
+        "fi\n"
+        "if [[ \"${1:-}\" == '--python-mode' ]]; then\n"
+        "  shift\n"
+        "  if [[ \"${1:-}\" == '-c' && \"${2:-}\" == 'import sys; print(sys.executable)' ]]; then\n"
+        "    \"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"child-env\",\"python-discovery\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\"))])+\"\\n\")'\n"
+        "    printf '%s\\n' \"$ROUTE_HELPER_PYTHON\"\n"
+        "    exit 0\n"
+        "  fi\n"
+        "  exec \"$ROUTE_PYTHON\" \"$@\"\n"
         "fi\n"
         "\"$ROUTE_PYTHON\" \"${BASH_SOURCE[0]%/*}/route_gate.py\" \"$@\"\n",
         encoding="utf-8",
@@ -231,22 +340,45 @@ def _install_fakes(root: Path, tmp_path: Path) -> tuple[Path, Path]:
     gcloud = bin_dir / "gcloud"
     gcloud.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
-        "printf 'gcloud\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
-        "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"gcloud-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n"
-        "case \"$*\" in *'services describe'*) printf 'https://synthetic.example/service\\n' ;; "
-        "*'functions describe'*) printf 'https://synthetic.example/function\\n' ;; "
-        "esac\n",
+        "exec \"$ROUTE_PYTHON\" \"$ROUTE_GCLOUD_HANDLER\" \"$@\"\n",
         encoding="utf-8",
     )
     gcloud.chmod(0o755)
+    if os.name == "nt":
+        (bin_dir / "gcloud.cmd").write_text(
+            '@echo off\r\n"%ROUTE_PYTHON%" "%ROUTE_GCLOUD_HANDLER%" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="utf-8",
+        )
     docker = bin_dir / "docker"
     docker.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf 'docker\\t%s\\n' \"$*\" >> \"$ROUTE_EVENT_LOG\"\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"child-env\",\"docker\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\"))])+\"\\n\")'\n"
         "\"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"docker-argv\", *sys.argv[1:]]) + \"\\n\")' \"$@\"\n",
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    python3 = bin_dir / "python3"
+    python3.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os,sys; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"python3-child\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\")),sys.argv[1:]])+\"\\n\")' \"$@\"\n"
+        "if [[ -n \"${TELEGRAM_DISABLE_URL:-}\" ]]; then \"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"telegram-disable\",os.environ.get(\"TELEGRAM_DISABLE_URL\")])+\"\\n\")'; exit 0; fi\n"
+        "case \"$*\" in *register_telegram_webhook*) echo 'Telegram webhook registration succeeded'; exit 0 ;; esac\n"
+        "exec \"$ROUTE_PYTHON\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    python3.chmod(0o755)
+    helper_python = tmp_path / "python helper with spaces" / "python"
+    helper_python.parent.mkdir(parents=True)
+    helper_python.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os,sys; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"python-helper-launch\",bool(os.environ.get(\"TELEGRAM_BOT_TOKEN\")),bool(os.environ.get(\"TELEGRAM_ALLOWED_USER_IDS\")),sys.argv[1:]])+\"\\n\")' \"$@\"\n"
+        "if [[ -n \"${TELEGRAM_DISABLE_URL:-}\" ]]; then \"$ROUTE_PYTHON\" -c 'import json,os; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps([\"telegram-disable\",os.environ.get(\"TELEGRAM_DISABLE_URL\")])+\"\\n\")'; exit 0; fi\n"
+        "case \"$*\" in *'bootstrap_runner.py --run-helper'*) printf 'Telegram webhook registration succeeded\\n'; exit 0 ;; esac\n"
+        "exec \"$ROUTE_PYTHON\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    helper_python.chmod(0o755)
     return bin_dir, helper
 
 
@@ -263,26 +395,93 @@ def _read_route_events(log: Path) -> list[list[str]]:
     return events
 
 
+def _run_with_file_capture(
+    argv: list[str], *, cwd: Path, env: dict[str, str], input_data: bytes,
+    timeout: int, tmp_path: Path,
+) -> subprocess.CompletedProcess[bytes]:
+    """Capture the route in fixture-local files so child handles cannot stall pipe draining."""
+    with (
+        TemporaryFile(mode="w+b", dir=tmp_path) as stdout_file,
+        TemporaryFile(mode="w+b", dir=tmp_path) as stderr_file,
+    ):
+        try:
+            completed = subprocess.run(
+                argv, cwd=cwd, env=env, input=input_data, stdout=stdout_file,
+                stderr=stderr_file, check=False, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            exc.output = stdout_file.read()
+            exc.stderr = stderr_file.read()
+            raise
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read()
+        stderr = stderr_file.read()
+    return subprocess.CompletedProcess(completed.args, completed.returncode, stdout, stderr)
+
+
 def _run_route(
     tmp_path: Path, command: str, *, fail_service: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+    env_file: dict[str, str] | None = None,
+    stdin_answers: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], Path]:
     bash = _bash()
     root = tmp_path / "synthetic checkout"
     _copy_checkout(root)
+    if env_file:
+        (root / ".env").write_text(
+            "\n".join(f"{key}={value}" for key, value in env_file.items()) + "\n",
+            encoding="utf-8",
+        )
     bin_dir, _helper = _install_fakes(root, tmp_path)
     log = tmp_path / "route-events.jsonl"
+    marker_hook = tmp_path / "route-marker-hook.sh"
+    marker_hook.write_text(
+        "if [[ -z \"${ROUTE_GCLOUD_GUARD_CHECKED:-}\" ]]; then\n"
+        "  route_gcloud_resolved=\"$(PATH=\"${ROUTE_GCLOUD_BASH_PATH}:/usr/bin:/bin\" command -v gcloud)\"\n"
+        "  case \"$route_gcloud_resolved\" in */gcloud|*/gcloud.cmd) ;; *) exit 96 ;; esac\n"
+        "  export ROUTE_GCLOUD_GUARD_CHECKED=1\n"
+        "fi\n"
+        "gcloud() { \"$ROUTE_GCLOUD_EXECUTABLE\" \"$@\"; }\n"
+        "_route_record_marker() {\n"
+        "  case \"$*\" in\n"
+        "    *rollout_phase:decoder_compatible*|*rollout_phase:guards_compatible*|"
+        "*rollout_gate:old_workers_drained*|*rollout_phase:writers_enabled*)\n"
+        "      \"$ROUTE_PYTHON\" -c 'import json, os, sys; open(os.environ[\"ROUTE_EVENT_LOG\"], \"a\", encoding=\"utf-8\").write(json.dumps([\"rollout-marker\", sys.argv[1]]) + \"\\n\")' \"$*\" ;;\n"
+        "  esac\n"
+        "}\n"
+        "echo() { _route_record_marker \"$*\"; builtin echo \"$@\"; }\n"
+        "printf() { _route_record_marker \"$*\"; builtin printf \"$@\"; }\n",
+        encoding="utf-8",
+    )
     python_dir = str(Path(sys.executable).parent)
+    safe_path = (
+        (str(bin_dir), python_dir, "C:/Program Files/Git/bin", "C:/Program Files/Git/usr/bin",
+         str(Path(os.environ.get("SYSTEMROOT", "C:/Windows")) / "System32"))
+        if os.name == "nt" else
+        (str(bin_dir), python_dir, "/usr/bin", "/bin")
+    )
     environment = {
         **{
             name: os.environ[name]
             for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")
             if name in os.environ
         },
-        "PATH": os.pathsep.join((str(bin_dir), python_dir, os.environ.get("PATH", ""))),
+        "PATH": os.pathsep.join(safe_path),
         "TEMP": str(tmp_path),
         "TMP": str(tmp_path),
         "ROUTE_PYTHON": sys.executable,
+        "ROUTE_GCLOUD_HANDLER": str(root / "infra" / "build" / "gcloud_fixture.py"),
+        "ROUTE_HELPER_PYTHON": str(tmp_path / "python helper with spaces" / "python"),
         "ROUTE_EVENT_LOG": str(log),
+        "ROUTE_GCLOUD_EXECUTABLE": str(bin_dir / "gcloud"),
+        "ROUTE_GCLOUD_BASH_PATH": _bash_path(bin_dir),
+        "CLOUDSDK_CONFIG": str(tmp_path / "cloudsdk-config"),
+        "ROUTE_INDEX_FILE": str(root / "infra" / "firestore" / "indexes.json"),
+        "BASH_ENV": str(marker_hook),
         "ROUTE_FAIL_SERVICE": fail_service or "",
         "PROJECT_ID": "synthetic-project",
         "REGION": "synthetic-region",
@@ -314,10 +513,17 @@ def _run_route(
         "TLDV_RECONCILIATION_SCHEDULE": "0 3 * * *",
         "DOCKER_CONFIG": str(tmp_path / "docker-config"),
     }
+    expected_gcloud = bin_dir / ("gcloud.cmd" if os.name == "nt" else "gcloud")
+    assert Path(shutil.which("gcloud", path=environment["PATH"]) or "").resolve() == expected_gcloud.resolve()
+    environment.update(env_overrides or {})
     script = root / "infra" / "deploy" / command
-    answer = b"y\n" if command in {"deploy.sh", "local_deploy.sh"} else b""
-    completed = subprocess.run([bash, str(script)], cwd=root, env=environment, input=answer,
-                               capture_output=True, check=False, timeout=180)
+    if stdin_answers is None:
+        stdin_answers = "y\ny\n" if command in {"deploy.sh", "local_deploy.sh"} else ""
+    answer = stdin_answers.encode("utf-8")
+    completed = _run_with_file_capture(
+        [bash, str(script)], cwd=root, env=environment, input_data=answer,
+        timeout=180, tmp_path=tmp_path,
+    )
     result = subprocess.CompletedProcess(
         completed.args,
         completed.returncode,
@@ -342,6 +548,76 @@ def test_route_log_reader_normalizes_shell_and_gate_events(tmp_path: Path) -> No
     ]
 
 
+def test_gcloud_fixture_shell_and_native_launchers_preserve_argv(tmp_path: Path) -> None:
+    bash = _bash()
+    root = tmp_path / "synthetic checkout"
+    (root / "infra" / "build").mkdir(parents=True)
+    bin_dir, _helper = _install_fakes(root, tmp_path)
+    index_file = root / "infra" / "firestore" / "indexes.json"
+    index_file.parent.mkdir(parents=True)
+    index_file.write_text(json.dumps({
+        "indexes": [{
+            "collectionGroup": "documents",
+            "queryScope": "COLLECTION",
+            "fields": [{"fieldPath": "created_at", "order": "DESCENDING"}],
+        }],
+        "fieldOverrides": [],
+    }), encoding="utf-8")
+    env_file = tmp_path / "fixture data with spaces" / "telegram vars.json"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(json.dumps({
+        "TELEGRAM_ALLOWED_USER_IDS": "101,202",
+        "TELEGRAM_BOT_TOKEN": "synthetic-token",
+    }), encoding="utf-8")
+    args = [
+        "firestore", "indexes", "composite", "list", "--project", "synthetic-project",
+        "--database", "(default)", "--format=json", "--env-vars-file", str(env_file),
+    ]
+    common_env = {
+        **{
+            name: os.environ[name]
+            for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")
+            if name in os.environ
+        },
+        "PATH": os.pathsep.join((str(bin_dir), str(Path(sys.executable).parent))),
+        "ROUTE_PYTHON": sys.executable,
+        "ROUTE_GCLOUD_HANDLER": str(root / "infra" / "build" / "gcloud_fixture.py"),
+        "ROUTE_EVENT_LOG": str(tmp_path / "shell-events.jsonl"),
+        "ROUTE_INDEX_FILE": str(index_file),
+        "PROJECT_ID": "synthetic-project",
+    }
+
+    def invoke(argv: list[str], log_path: Path) -> tuple[list[dict[str, object]], list[list[str]]]:
+        env = {**common_env, "ROUTE_EVENT_LOG": str(log_path)}
+        result = subprocess.run(argv, env=env, capture_output=True, text=True, check=False, timeout=20)
+        assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        return json.loads(result.stdout), _read_route_events(log_path)
+
+    shell_json, shell_events = invoke([bash, str(bin_dir / "gcloud"), *args], tmp_path / "shell-events.jsonl")
+    assert shell_json[0]["name"] == (
+        "projects/synthetic-project/databases/(default)/collectionGroups/documents/indexes/ready-0"
+    )
+    assert shell_json[0]["fields"][-1] == {"fieldPath": "__name__", "order": "DESCENDING"}
+    shell_argv = next(event for event in shell_events if event[0] == "gcloud-argv")
+    assert shell_argv == ["gcloud-argv", *args]
+    assert next(event for event in shell_events if event[0] == "telegram-env-file") == [
+        "telegram-env-file", "101,202", True,
+    ]
+    assert next(event for event in shell_events if event[0] == "gcloud")[1] == " ".join(args)
+
+    if os.name == "nt":
+        native = bin_dir / "gcloud.cmd"
+        assert native.is_file()
+        assert "bash" not in native.read_text(encoding="utf-8").lower()
+        native_json, native_events = invoke([str(native), *args], tmp_path / "native-events.jsonl")
+        assert native_json == shell_json
+        assert next(event for event in native_events if event[0] == "gcloud-argv") == shell_argv
+        assert next(event for event in native_events if event[0] == "telegram-env-file") == next(
+            event for event in shell_events if event[0] == "telegram-env-file"
+        )
+        assert next(event for event in native_events if event[0] == "gcloud")[1] == " ".join(args)
+
+
 def test_route_entrypoints_keep_the_ordinary_and_local_operator_commands() -> None:
     assert (DEPLOY / "deploy.sh").is_file()
     assert (DEPLOY / "local_deploy.sh").is_file()
@@ -351,13 +627,46 @@ def test_route_entrypoints_keep_the_ordinary_and_local_operator_commands() -> No
     ordinary = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
     local = (DEPLOY / "local_deploy.sh").read_text(encoding="utf-8")
     assert "bash infra/deploy/core/deploy_vector_sync.sh" in ordinary
+    assert 'if [[ "${TLDV_ENABLED}" == "1" ]]' in ordinary
     assert "bash infra/deploy/connectors/deploy_tldv.sh" in ordinary
     assert "bash infra/deploy/core/deploy_sync_checker.sh" in ordinary
     assert "bash infra/deploy/core/deploy_mcp.sh" in ordinary
     assert "bash infra/deploy/core/local_deploy_vector_sync.sh" in local
+    assert 'if [[ "${TLDV_ENABLED}" == "1" ]]' in local
     assert "bash infra/deploy/connectors/local_deploy_tldv.sh" in local
+    assert 'if [[ "${TELEGRAM_ENABLED}" == "1" ]]' in ordinary
+    assert 'if [[ "${TELEGRAM_ENABLED}" == "1" ]]' in local
+    assert "rollout_gate:old_workers_drained" in ordinary
+    assert "rollout_gate:old_workers_drained" in local
+    oauth_setup = (DEPLOY / "setup_tokens.sh").read_text(encoding="utf-8")
+    env_load = oauth_setup.index('set -a; source "$ENV_FILE"; set +a')
+    telegram_unexport = oauth_setup.index(
+        "export -n TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USER_IDS 2>/dev/null || true"
+    )
+    assert env_load < telegram_unexport < oauth_setup.index("if command -v powershell.exe")
     assert "bash infra/deploy/core/deploy_sync_checker.sh" in local
     assert "bash infra/deploy/core/local_deploy_mcp.sh" in local
+
+
+def test_vector_dialog_configuration_is_deferred_until_writer_gate() -> None:
+    ordinary = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
+    local = (DEPLOY / "local_deploy.sh").read_text(encoding="utf-8")
+    vector = (DEPLOY / "core" / "deploy_vector_sync.sh").read_text(encoding="utf-8")
+    local_vector = (DEPLOY / "core" / "local_deploy_vector_sync.sh").read_text(encoding="utf-8")
+    helper = (DEPLOY / "core" / "helpers" / "deploy_dialog_operations.sh").read_text(encoding="utf-8")
+
+    assert "DEPLOY_DEFER_DIALOG_READINESS=1 bash infra/deploy/core/deploy_vector_sync.sh" in ordinary
+    assert "DEPLOY_DEFER_DIALOG_READINESS=1 bash infra/deploy/core/local_deploy_vector_sync.sh" in local
+    for script in (vector, local_vector):
+        assert '[[ "${DEPLOY_DEFER_DIALOG_READINESS:-0}" != "1" ]]' in script
+        assert 'MCP_URL=$(gcloud run services describe "${MCP_SERVICE_NAME:-tlbrain-mcp}"' in script
+        assert "DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC=1" in script
+    for script in (ordinary, local):
+        writer_phase = script.index('echo "rollout_phase:writers_enabled"')
+        vector_update = script.index('gcloud run services update "${VECTOR_SYNC_SERVICE_NAME:-tlbrain-vector-sync}"')
+        assert writer_phase < vector_update
+    assert 'if [[ "${DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC:-0}" == "1" ]]' in helper
+    assert helper.count("printf '") == 6
 
 
 @pytest.mark.parametrize(
@@ -371,6 +680,9 @@ def test_top_level_route_hands_only_validated_sources_and_images_forward(
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert "Cancelled." not in result.stdout
     assert not list(root.rglob(".env"))
+    disable = next(event for event in events if event[0] == "telegram-disable")
+    removal = next(event for event in events if event[0] == "gcloud" and "--remove-env-vars" in event[1])
+    assert events.index(disable) < events.index(removal)
 
     validated_functions = [event for event in events if event[0] == "validated-function"]
     assert {(event[1], Path(event[2]).name) for event in validated_functions} == {
@@ -473,8 +785,21 @@ def test_top_level_route_hands_only_validated_sources_and_images_forward(
                           if command.startswith("functions deploy synthetic-sync-checker "))
     mcp_deploy = next(i for i, command in enumerate(cloud_text)
                       if command.startswith("run deploy synthetic-mcp "))
-    assert vector_deploy < import_deploy
-    assert checker_deploy < mcp_deploy
+    assert vector_deploy < import_deploy < checker_deploy < mcp_deploy
+
+
+@pytest.mark.parametrize("route", ["deploy.sh", "local_deploy.sh"])
+def test_top_level_enabled_telegram_uses_managed_helper_handoff_offline(tmp_path: Path, route: str) -> None:
+    result, events, _root = _run_route(tmp_path, route, env_overrides={
+        "TELEGRAM_BOT_TOKEN": "synthetic-telegram-token",
+        "TELEGRAM_ALLOWED_USER_IDS": "101,202",
+    })
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    helper = next(event for event in events if event[0] == "python-helper-launch"
+                  and any("bootstrap_runner.py" in str(arg) for arg in event[3]))
+    assert helper[1:3] == [True, False]
+    assert not any(event[0] == "telegram-disable" for event in events)
+    assert not any("synthetic-telegram-token" in str(value) for event in events for value in event)
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import grpc
@@ -122,7 +123,19 @@ def test_gemini_consumers_use_scripted_real_response_models(sdk_fakes):
     )
     assert llm.call_gemini_json("choose") == {"folder_name": "Ada", "confidence": 0.9}
     generated = [e for e in sdk_fakes.trace if e["operation"] == "generate_content"][-1]
-    assert generated["arguments"]["config"].response_mime_type == "application/json"
+    config = generated["arguments"]["config"]
+    assert config.response_mime_type is None
+    assert config.http_options.extra_body["generationConfig"]["responseFormat"]["text"][
+        "mimeType"
+    ] == "APPLICATION_JSON"
+
+
+def test_gemini_sdk_exposes_verbatim_audio_transcription_config():
+    audio_config = types.AudioTranscriptionConfig(mode="VERBATIM", language_codes=[])
+    config = types.GenerateContentConfig(audio_transcription_config=audio_config)
+
+    assert config.audio_transcription_config.mode == "VERBATIM"
+    assert config.audio_transcription_config.language_codes == []
 
 
 def test_gemini_empty_and_error_responses_remain_observable(sdk_fakes):
@@ -221,6 +234,158 @@ def test_google_auth_default_and_tasks_errors_are_scriptable(sdk_fakes, monkeypa
         enqueue_task("queue", "https://worker.invalid/task")
 
 
+def test_drive_app_properties_marker_lookup_is_traced(sdk_fakes):
+    from tests.fixtures.sdk_fakes import fake_discovery_build
+
+    query = "appProperties has { key='tlbrain_save_id' and value='save-42' }"
+    expected = {"files": [{"id": "file-1", "appProperties": {"tlbrain_save_id": "save-42"}}]}
+    sdk_fakes.drive.queue("files.list", response=expected)
+
+    result = fake_discovery_build("drive", "v3").files().list(
+        q=query, fields="files(id,appProperties)", pageSize=1
+    ).execute()
+
+    assert result == expected
+    lookup = next(event for event in sdk_fakes.trace if event["operation"] == "files.list")
+    assert lookup["arguments"]["q"] == query
+    assert lookup["arguments"]["fields"] == "files(id,appProperties)"
+
+
+def test_docs_required_revision_control_is_traced_and_stale_revision_fails(sdk_fakes):
+    from tests.fixtures.sdk_fakes import fake_discovery_build
+
+    documents = fake_discovery_build("docs", "v1").documents()
+    sdk_fakes.docs.queue("documents.get", response={"revisionId": "rev-1"})
+    assert documents.get(documentId="doc-1").execute()["revisionId"] == "rev-1"
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"writeControl": {"requiredRevisionId": "rev-2"}})
+    documents.batchUpdate(
+        documentId="doc-1", body={
+            "requests": [], "writeControl": {"requiredRevisionId": "rev-1"},
+        },
+    ).execute()
+
+    sdk_fakes.docs.queue("documents.batchUpdate", response={"ok": True})
+    with pytest.raises(RuntimeError, match="Stale Docs revision"):
+        documents.batchUpdate(
+            documentId="doc-1", body={
+                "requests": [], "writeControl": {"requiredRevisionId": "rev-1"},
+            },
+        ).execute()
+    update = [event for event in sdk_fakes.trace if event["operation"] == "documents.batchUpdate"]
+    assert "writeControl" not in update[0]["arguments"]
+    assert update[0]["arguments"]["body"]["writeControl"] == {"requiredRevisionId": "rev-1"}
+    assert update[1]["arguments"]["body"]["writeControl"] == {"requiredRevisionId": "rev-1"}
+    with pytest.raises(TypeError, match="Unsupported documents.batchUpdate options: writeControl"):
+        documents.batchUpdate(documentId="doc-1", body={"requests": []}, writeControl={})
+
+
+def test_gemini_audio_files_and_function_call_signatures_are_preserved(sdk_fakes):
+    from google.genai import types
+    from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+    client = FakeGeminiClient(api_key="pytest-synthetic-gemini-key")
+    sdk_fakes.gemini.queue("files.upload", response={"name": "files/synthetic-audio"})
+    sdk_fakes.gemini.queue("files.delete", response={"name": "files/synthetic-audio"})
+    upload = client.files.upload(
+        file="synthetic-audio.wav",
+        config=types.UploadFileConfig(mime_type="audio/wav", display_name="synthetic-audio"),
+    )
+    deleted = client.files.delete(name=upload["name"])
+    assert deleted["name"] == "files/synthetic-audio"
+
+    audio = types.Part(inline_data=types.Blob(mime_type="audio/wav", data=b"synthetic-audio"))
+    function_call = types.Part(
+        function_call=types.FunctionCall(id="call-synthetic-1", name="lookup", args={"key": "synthetic"}),
+        thought_signature=b"synthetic-thought-signature",
+    )
+    function_response = types.Part(function_response=types.FunctionResponse(
+        id="call-synthetic-1", name="lookup", response={"value": "synthetic-result"}
+    ))
+    contents = [types.Content(role="user", parts=[audio]), types.Content(role="model", parts=[function_call]),
+                types.Content(role="user", parts=[function_response])]
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse())
+    client.models.generate_content(model="gemini-test", contents=contents, config=types.GenerateContentConfig())
+
+    upload_trace = next(event for event in sdk_fakes.trace if event["operation"] == "files.upload")
+    assert upload_trace["arguments"]["file"] == "synthetic-audio.wav"
+    assert upload_trace["arguments"]["config"].mime_type == "audio/wav"
+    generated = next(event for event in sdk_fakes.trace if event["operation"] == "generate_content")
+    traced_contents = generated["arguments"]["contents"]
+    assert traced_contents[0].parts[0].inline_data.data == b"synthetic-audio"
+    assert traced_contents[1].parts[0].function_call.id == "call-synthetic-1"
+    assert traced_contents[1].parts[0].thought_signature == b"synthetic-thought-signature"
+    assert traced_contents[2].parts[0].function_response.id == "call-synthetic-1"
+
+
+def test_fake_gemini_async_boundary_shares_sync_queues_and_trace(sdk_fakes):
+    async def run():
+        from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+        client = FakeGeminiClient(api_key="pytest-synthetic-gemini-key")
+        upload = await client.aio.files.upload(
+            file="synthetic-audio.wav",
+            config=types.UploadFileConfig(mime_type="audio/wav"),
+        )
+        result = await client.aio.models.generate_content(
+            model="gemini-3.5-transcribe", contents=[],
+            config=types.GenerateContentConfig(),
+        )
+        deleted = await client.aio.files.delete(name=upload["name"])
+        return upload, result, deleted
+
+    sdk_fakes.gemini.queue("files.upload", response={"name": "files/audio", "uri": "https://files.invalid/audio"})
+    response = types.GenerateContentResponse(candidates=[types.Candidate(
+        content=types.Content(parts=[types.Part(text="Здравствуйте / hello")]),
+    )])
+    sdk_fakes.gemini.queue("generate_content", response=response)
+    sdk_fakes.gemini.queue("files.delete", response={"name": "files/audio"})
+    upload, generated, deleted = __import__("asyncio").run(run())
+
+    assert upload["name"] == deleted["name"] == "files/audio"
+    assert generated.candidates[0].content.parts[0].text == "Здравствуйте / hello"
+    assert [event["operation"] for event in sdk_fakes.trace if event["boundary"] == "gemini"] == [
+        "client", "files.upload", "generate_content", "files.delete",
+    ]
+
+
+def test_google_genai_232_sdk_capabilities_are_available():
+    from google.genai import types
+
+    assert "thinking_level" in types.ThinkingConfig.model_fields
+    assert "id" in types.FunctionResponse.model_fields
+    assert "retry_options" in types.HttpOptions.model_fields
+    assert "attempts" in types.HttpRetryOptions.model_fields
+    assert {"mode", "language_codes"} <= types.AudioTranscriptionConfig.model_fields.keys()
+    assert "audio_transcription_config" in types.GenerateContentConfig.model_fields
+
+
+def test_cloud_tasks_task_schedule_deadline_and_oidc_fields_are_traced(sdk_fakes):
+    from datetime import datetime, timedelta, timezone
+    from google.cloud import tasks_v2
+    from tests.fixtures.sdk_fakes import FakeCloudTasksClient
+
+    schedule_time = datetime(2026, 2, 3, 4, 5, tzinfo=timezone.utc)
+    task = tasks_v2.Task(
+        schedule_time=schedule_time,
+        dispatch_deadline=timedelta(seconds=45),
+        http_request=tasks_v2.HttpRequest(
+            url="https://worker.pytest.invalid/task",
+            oidc_token=tasks_v2.OidcToken(
+                service_account_email="pytest-task@synthetic-project.invalid",
+                audience="https://worker.pytest.invalid",
+            ),
+        ),
+    )
+    response = FakeCloudTasksClient().create_task(parent="projects/p/locations/l/queues/q", task=task)
+
+    assert response.name == "projects/p/locations/l/queues/q/tasks/fake-anonymous-1"
+    traced = next(event for event in sdk_fakes.trace if event["operation"] == "create_task")["arguments"]["task"]
+    assert traced.schedule_time == schedule_time
+    assert traced.dispatch_deadline == timedelta(seconds=45)
+    assert traced.http_request.oidc_token.service_account_email == "pytest-task@synthetic-project.invalid"
+    assert traced.http_request.oidc_token.audience == "https://worker.pytest.invalid"
+
+
 def test_http_boundary_allows_mock_transport_and_blocks_external_session(sdk_fakes):
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
     with httpx.Client(transport=transport) as client:
@@ -258,6 +423,75 @@ def test_http_boundary_allows_mock_transport_and_blocks_external_session(sdk_fak
         requests.Session().get("https://example.invalid/path?private=synthetic")
     assert "example.invalid" not in str(blocked.value)
     assert "private" not in str(blocked.value)
+
+
+def test_synthetic_environment_replaces_external_and_derived_settings(monkeypatch):
+    from tests import conftest
+
+    inherited = {
+        "TELEGRAM_BOT_TOKEN": "real-looking-token-must-not-survive",
+        "TELEGRAM_ALLOWED_USER_IDS": "123456",
+        "VECTOR_SYNC_URL": "https://production.example/sync",
+        "VECTOR_SYNC_QUEUE": "production-vector-queue",
+        "TLDV_IMPORT_SERVICE_URL": "https://production.example/import",
+        "TLDV_IMPORT_QUEUE": "production-import-queue",
+        "TLDV_RECONCILIATION_URL": "https://production.example/reconcile",
+        "SYNC_CHECKER_URL": "https://production.example/check",
+        "OIDC_AUDIENCE": "https://production.example",
+        "OIDC_SERVICE_ACCOUNT_EMAIL": "prod@production.example",
+        "TASK_OIDC_AUDIENCE": "https://production.example/task",
+        "TASK_OIDC_SERVICE_ACCOUNT_EMAIL": "prod-task@production.example",
+        "CLOUD_TASKS_OIDC_AUDIENCE": "https://production.example/task",
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL": "prod-cloud-task@production.example",
+        "INTERNAL_DIALOG_OPERATIONS_URL": "https://production.example/dialog-operations",
+        "DIALOG_OPERATIONS_QUEUE": "production-dialog-operations-queue",
+        "TELEGRAM_CONTROL_QUEUE": "production-telegram-control-queue",
+        "CLOUD_TASKS_QUEUE": "production-cloud-tasks-queue",
+        "TASK_SERVICE_ACCOUNT_EMAIL": "prod-task@production.example",
+        "INTERNAL_FUTURE_URI": "https://production.example/future",
+        "FUTURE_AUDIENCE": "https://production.example/future-audience",
+        "FUTURE_SERVICE_ACCOUNT": "prod-future@production.example",
+        "FUTURE_SERVICE_ACCOUNT_EMAIL": "prod-email@production.example",
+        "FUTURE_QUEUE_NAME": "production-future-queue",
+        "TZ": "Pacific/Honolulu",
+    }
+    for name, value in inherited.items():
+        monkeypatch.setenv(name, value)
+
+    conftest._apply_synthetic_environment()
+
+    # Telegram stays disabled unless an individual test opts in.
+    assert "TELEGRAM_BOT_TOKEN" not in os.environ
+    assert "TELEGRAM_ALLOWED_USER_IDS" not in os.environ
+    assert "TLDV_RECONCILIATION_URL" not in os.environ
+    assert all(os.environ[name] == value for name, value in conftest._SYNTHETIC_ENV.items())
+    assert os.environ["TZ"] == "UTC"
+    assert os.environ["INTERNAL_DIALOG_OPERATIONS_URL"] == "https://dialog-operations.pytest.invalid/internal/dialog-operations"
+    assert os.environ["DIALOG_OPERATIONS_QUEUE"] == "pytest-dialog-operations-queue"
+    assert os.environ["TELEGRAM_CONTROL_QUEUE"] == "pytest-telegram-control-queue"
+    assert os.environ["CLOUD_TASKS_QUEUE"] == "pytest-cloud-tasks-queue"
+    assert os.environ["TASK_SERVICE_ACCOUNT_EMAIL"] == "pytest-task-worker@synthetic-project.invalid"
+    assert "INTERNAL_FUTURE_URI" not in os.environ
+    assert "FUTURE_AUDIENCE" not in os.environ
+    assert "FUTURE_SERVICE_ACCOUNT" not in os.environ
+    assert "FUTURE_SERVICE_ACCOUNT_EMAIL" not in os.environ
+    assert "FUTURE_QUEUE_NAME" not in os.environ
+    assert "production" not in repr(conftest._SYNTHETIC_ENV)
+    assert conftest._SYNTHETIC_ENV["VECTOR_SYNC_URL"].endswith(".invalid")
+    assert conftest._SYNTHETIC_ENV["OIDC_AUDIENCE"].endswith(".invalid")
+    assert conftest._SYNTHETIC_ENV["OIDC_SERVICE_ACCOUNT_EMAIL"].endswith(".invalid")
+
+
+def test_fake_clock_is_utc_aware_and_advances_exactly(fake_clock):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert fake_clock() == start
+    assert fake_clock.now() == start
+    assert fake_clock.current_time == start
+    advanced = fake_clock.advance(seconds=12.5)
+    assert advanced == start + timedelta(seconds=12.5)
+    assert fake_clock.now() == advanced
+    assert advanced.tzinfo is not None
+    assert advanced.utcoffset().total_seconds() == 0
 
 
 async def _async_mock_response(request):

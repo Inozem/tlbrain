@@ -143,7 +143,7 @@ def _validate_final_evidence(evidence: Any, config: dict[str, Any]) -> dict[str,
         raise ValueError("validation evidence fields do not match schema v1")
     if evidence["schema_version"] != 1:
         raise ValueError("validation evidence schema version is unsupported")
-    if evidence["service"] not in {"mcp", "vector_sync", "tldv_import"}:
+    if evidence["service"] not in {"mcp", "vector_sync", "tldv_import", "telegram"}:
         raise ValueError("validation evidence service is invalid")
     if not isinstance(evidence["target"], str) or not evidence["target"]:
         raise ValueError("validation evidence target is invalid")
@@ -286,6 +286,7 @@ _SERVICE_CMDS = {
     "mcp": ["python", "-m", "uvicorn", "services.mcp.app.main:app", "--host", "0.0.0.0", "--port", "8080"],
     "vector_sync": ["python", "-m", "uvicorn", "services.vector_sync.app.main:app", "--host", "0.0.0.0", "--port", "8080"],
     "tldv_import": ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"],
+    "telegram": ["python", "-m", "uvicorn", "services.connectors.telegram.app.main:app", "--host", "0.0.0.0", "--port", "8080"],
 }
 
 
@@ -391,8 +392,8 @@ def run_image_preflight(
     build_tools: Path | None = None,
 ) -> dict[str, Any]:
     """Run validation in the final image, then attach evidence as the last step."""
-    if service not in {"mcp", "vector_sync", "tldv_import"}:
-        raise ValueError("image validation supports mcp, vector_sync, and tldv_import")
+    if service not in {"mcp", "vector_sync", "tldv_import", "telegram"}:
+        raise ValueError("image validation supports mcp, vector_sync, tldv_import, and telegram")
     before = docker.inspect_image(image)
     image_id = before.get("image_id")
     if not isinstance(image_id, str) or not image_id:
@@ -725,7 +726,7 @@ def _cli() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     image = subparsers.add_parser("image-preflight", help="run offline checks in a final Linux image and attach evidence")
     image.add_argument("--image", required=True)
-    image.add_argument("--service", required=True, choices=("mcp", "vector_sync", "tldv_import"))
+    image.add_argument("--service", required=True, choices=("mcp", "vector_sync", "tldv_import", "telegram"))
     image.add_argument("--platform", default="linux/amd64")
     image.add_argument("--artifact-path", default="/app")
     image.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", "local"))

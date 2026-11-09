@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
-import pytest
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
+import pytest
+from googleapiclient.errors import HttpError
+
+from core.integrations.firestore.effects import get_effect_allocation
+from core.integrations.firestore.operations import claim_operation, create_operation
 from core.integrations.google_drive import folder_service
+from core.integrations.firestore import folders as folder_repository
+from core.operations.effects import allocate_folder_id
+from core.operations.models import OperationOrigin
+from tests.fixtures.sdk_fakes import fake_discovery_build
 
 
 class _Request:
@@ -177,6 +187,249 @@ def test_create_folder_preserves_drive_id_and_effect_order(monkeypatch):
         ("drive", "New", "parent-id"),
         ("firestore", "stable-drive-id", "New", "parent-id"),
     ]
+
+
+@pytest.mark.offline
+def test_stable_folder_creation_excludes_its_own_registry_record_and_registers_after_drive(monkeypatch):
+    events = []
+    monkeypatch.setattr(folder_service, "_resolve", lambda path, role: "parent-id")
+    monkeypatch.setattr(
+        folder_service.folder_repository, "folder_name_exists",
+        lambda name, parent, *, exclude_id=None: events.append(("conflict", name, parent, exclude_id)) or False,
+    )
+    monkeypatch.setattr(
+        folder_service.drive_client, "create_folder",
+        lambda name, parent, *, folder_id, intent_marker: events.append(
+            ("drive", name, parent, folder_id, intent_marker)
+        ) or folder_id,
+    )
+    monkeypatch.setattr(
+        folder_service.folder_repository, "upsert_folder",
+        lambda *args: events.append(("register", *args)),
+    )
+
+    result = folder_service.create_folder(
+        "New", ["Parent"], folder_id="planned-folder-id", intent_marker="v1:" + "a" * 64,
+    )
+
+    assert result == "planned-folder-id"
+    assert events == [
+        ("conflict", "New", "parent-id", "planned-folder-id"),
+        ("drive", "New", "parent-id", "planned-folder-id", "v1:" + "a" * 64),
+        ("register", "planned-folder-id", "New", "parent-id"),
+    ]
+
+
+@pytest.mark.offline
+def test_repository_exclusion_ignores_only_own_folder_and_keeps_sibling_conflicts(firestore_fake):
+    client = firestore_fake.client_class()
+    client.collection("folders").document("own-folder").set({
+        "folder_id": "own-folder", "name": "Same", "parent_id": "parent",
+    })
+
+    assert folder_repository.folder_name_exists("Same", "parent", client, exclude_id="own-folder") is False
+    client.collection("folders").document("other-folder").set({
+        "folder_id": "other-folder", "name": "Same", "parent_id": "parent",
+    })
+    assert folder_repository.folder_name_exists("Same", "parent", client, exclude_id="own-folder") is True
+
+
+@pytest.mark.offline
+def test_stable_folder_replay_still_rejects_another_registered_sibling(firestore_fake, monkeypatch):
+    client = firestore_fake.client_class()
+    client.collection("folders").document("own-folder").set({
+        "folder_id": "own-folder", "name": "Same", "parent_id": "root-id",
+    })
+    client.collection("folders").document("other-folder").set({
+        "folder_id": "other-folder", "name": "Same", "parent_id": "root-id",
+    })
+    drive_calls = []
+    monkeypatch.setattr(folder_service, "get_root_folder_id", lambda: "root-id")
+    monkeypatch.setattr(folder_service.drive_client, "create_folder", lambda *args, **kwargs: drive_calls.append(True))
+
+    with pytest.raises(folder_service.FolderNameConflict):
+        folder_service.create_folder("Same", folder_id="own-folder", intent_marker="v1:" + "a" * 64)
+    assert drive_calls == []
+
+
+@pytest.mark.offline
+def test_stable_folder_replay_recovers_same_id_after_lost_create_response_and_repairs_registry(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    client = firestore_fake.client_class()
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    create_operation(
+        client, operation_id="folder-recovery-op", origin=OperationOrigin.MCP,
+        caller_binding="caller", immutable_input_digest="sha256:" + "a" * 64,
+        immutable_input_ref="input-ref", now=now,
+    )
+    lease = claim_operation(client, "folder-recovery-op", owner="worker", now=now, lease_seconds=60)
+    allocation = allocate_folder_id(
+        client, operation_id="folder-recovery-op", effect_id="folder-effect",
+        intent_digest="sha256:" + "b" * 64, owner="worker", fence=lease.fence, now=now,
+        id_factory=lambda: "planned-folder-id",
+    )
+    marker = allocation["intent_marker"]
+    accepted_folder = {
+        "id": "planned-folder-id", "mimeType": "application/vnd.google-apps.folder", "name": "Recovered",
+        "parents": ["root-id"], "trashed": False,
+        "appProperties": {"tlbrain_effect_intent": marker},
+    }
+    sdk_fakes.drive.queue("files.create", error=TimeoutError("private timeout detail"))
+    sdk_fakes.drive.queue("files.create", error=HttpError(SimpleNamespace(status=409, reason="Conflict"), b"conflict"))
+    sdk_fakes.drive.queue("files.get", response=accepted_folder)
+    monkeypatch.setattr(folder_service, "get_root_folder_id", lambda: "root-id")
+    monkeypatch.setattr(folder_service.drive_client, "build_drive_service_rw", lambda: fake_discovery_build("drive", "v3"))
+
+    real_create = folder_service.drive_client.create_folder
+    def check_allocation_before_remote_create(*args, **kwargs):
+        persisted = get_effect_allocation(client, "folder-recovery-op", "folder-effect")
+        assert persisted["resource_id"] == kwargs["folder_id"]
+        return real_create(*args, **kwargs)
+    monkeypatch.setattr(folder_service.drive_client, "create_folder", check_allocation_before_remote_create)
+
+    with pytest.raises(RuntimeError, match="Drive folder creation outcome is unresolved") as first_error:
+        folder_service.create_folder("Recovered", folder_id=allocation["resource_id"], intent_marker=marker)
+    assert "private timeout detail" not in str(first_error.value)
+    assert folder_repository.get_folder_by_id("planned-folder-id", client) is None
+
+    replay = allocate_folder_id(
+        client, operation_id="folder-recovery-op", effect_id="folder-effect",
+        intent_digest="sha256:" + "b" * 64, owner="worker", fence=lease.fence, now=now,
+        id_factory=lambda: pytest.fail("replay must reuse the persisted folder ID"),
+    )
+    assert replay == allocation
+    assert folder_service.create_folder(
+        "Recovered", folder_id=replay["resource_id"], intent_marker=replay["intent_marker"],
+    ) == "planned-folder-id"
+    assert folder_repository.get_folder_by_id("planned-folder-id", client)["name"] == "Recovered"
+    events = [event["operation"] for event in sdk_fakes.trace if event["boundary"] == "drive"]
+    assert events.count("files.create") == 2
+    assert events.count("files.get") == 1
+    assert "files.generateIds" not in events
+    assert "files.list" not in events
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("readback", [
+    {"id": "wrong-id"},
+    {"mimeType": "application/vnd.google-apps.document"},
+    {"name": "Different"},
+    {"parents": ["wrong-parent"]},
+    {"parents": "root-id"},
+    {"parents": ["root-id", "other-parent"]},
+    {"trashed": True},
+    {"appProperties": {"tlbrain_effect_intent": "v1:" + "0" * 64}},
+    {"appProperties": "malformed"},
+    None,
+])
+def test_stable_folder_mismatching_or_malformed_readback_never_registers(
+    sdk_fakes, monkeypatch, readback,
+):
+    marker = "v1:" + "a" * 64
+    accepted = {
+        "id": "planned-folder-id", "mimeType": "application/vnd.google-apps.folder", "name": "Recovered",
+        "parents": ["root-id"], "trashed": False,
+        "appProperties": {"tlbrain_effect_intent": marker},
+    }
+    if readback is None:
+        accepted = None
+    else:
+        accepted.update(readback)
+    sdk_fakes.drive.queue("files.create", error=HttpError(SimpleNamespace(status=409, reason="Conflict"), b"conflict"))
+    sdk_fakes.drive.queue("files.get", response=accepted)
+    registrations = []
+    monkeypatch.setattr(folder_service, "get_root_folder_id", lambda: "root-id")
+    monkeypatch.setattr(folder_service.drive_client, "build_drive_service_rw", lambda: fake_discovery_build("drive", "v3"))
+    monkeypatch.setattr(folder_service.folder_repository, "folder_name_exists", lambda *args, **kwargs: False)
+    monkeypatch.setattr(folder_service.folder_repository, "upsert_folder", lambda *args: registrations.append(args))
+
+    with pytest.raises(RuntimeError):
+        folder_service.create_folder("Recovered", folder_id="planned-folder-id", intent_marker=marker)
+    assert registrations == []
+    operations = [event["operation"] for event in sdk_fakes.trace if event["boundary"] == "drive"]
+    assert operations.count("files.create") == 1
+    assert operations.count("files.get") == 1
+
+
+@pytest.mark.offline
+def test_stable_folder_unreadable_readback_never_registers(sdk_fakes, monkeypatch):
+    marker = "v1:" + "a" * 64
+    sdk_fakes.drive.queue("files.create", error=HttpError(SimpleNamespace(status=409, reason="Conflict"), b"conflict"))
+    sdk_fakes.drive.queue("files.get", error=RuntimeError("private provider detail"))
+    registrations = []
+    monkeypatch.setattr(folder_service, "get_root_folder_id", lambda: "root-id")
+    monkeypatch.setattr(folder_service.drive_client, "build_drive_service_rw", lambda: fake_discovery_build("drive", "v3"))
+    monkeypatch.setattr(folder_service.folder_repository, "folder_name_exists", lambda *args, **kwargs: False)
+    monkeypatch.setattr(folder_service.folder_repository, "upsert_folder", lambda *args: registrations.append(args))
+
+    with pytest.raises(RuntimeError, match="Drive folder creation outcome is unresolved") as error:
+        folder_service.create_folder("Recovered", folder_id="planned-folder-id", intent_marker=marker)
+    assert "private provider detail" not in str(error.value)
+    assert registrations == []
+
+
+@pytest.mark.offline
+def test_after_commit_registry_failure_replays_own_folder_and_repairs_safely(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    client = firestore_fake.client_class()
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    create_operation(
+        client, operation_id="folder-register-replay-op", origin=OperationOrigin.MCP,
+        caller_binding="caller", immutable_input_digest="sha256:" + "a" * 64,
+        immutable_input_ref="input-ref", now=now,
+    )
+    lease = claim_operation(client, "folder-register-replay-op", owner="worker", now=now, lease_seconds=60)
+    allocation = allocate_folder_id(
+        client, operation_id="folder-register-replay-op", effect_id="folder-effect",
+        intent_digest="sha256:" + "b" * 64, owner="worker", fence=lease.fence, now=now,
+        id_factory=lambda: "registered-after-commit-id",
+    )
+    response = {"id": allocation["resource_id"]}
+    readback = {
+        "id": allocation["resource_id"], "mimeType": "application/vnd.google-apps.folder", "name": "Recovered",
+        "parents": ["root-id"], "trashed": False,
+        "appProperties": {"tlbrain_effect_intent": allocation["intent_marker"]},
+    }
+    sdk_fakes.drive.queue("files.create", response=response)
+    sdk_fakes.drive.queue("files.create", error=HttpError(SimpleNamespace(status=409, reason="Conflict"), b"conflict"))
+    sdk_fakes.drive.queue("files.get", response=readback)
+    monkeypatch.setattr(folder_service, "get_root_folder_id", lambda: "root-id")
+    monkeypatch.setattr(folder_service.drive_client, "build_drive_service_rw", lambda: fake_discovery_build("drive", "v3"))
+
+    row_path = f"folders/{allocation['resource_id']}"
+    firestore_fake.fail_next(
+        "set", path=row_path, phase="after", exception=RuntimeError("private Firestore detail"),
+    )
+    real_create = folder_service.drive_client.create_folder
+    def check_allocation_before_remote_create(*args, **kwargs):
+        stored = get_effect_allocation(client, "folder-register-replay-op", "folder-effect")
+        assert stored["resource_id"] == kwargs["folder_id"]
+        return real_create(*args, **kwargs)
+    monkeypatch.setattr(folder_service.drive_client, "create_folder", check_allocation_before_remote_create)
+
+    with pytest.raises(RuntimeError, match="Drive folder registration outcome is unresolved") as first_error:
+        folder_service.create_folder(
+            "Recovered", folder_id=allocation["resource_id"], intent_marker=allocation["intent_marker"],
+        )
+    assert "private Firestore detail" not in str(first_error.value)
+    assert folder_repository.get_folder_by_id(allocation["resource_id"], client)["name"] == "Recovered"
+
+    replay = allocate_folder_id(
+        client, operation_id="folder-register-replay-op", effect_id="folder-effect",
+        intent_digest="sha256:" + "b" * 64, owner="worker", fence=lease.fence, now=now,
+        id_factory=lambda: pytest.fail("replay must reuse the persisted folder ID"),
+    )
+    assert folder_service.create_folder(
+        "Recovered", folder_id=replay["resource_id"], intent_marker=replay["intent_marker"],
+    ) == allocation["resource_id"]
+    assert folder_repository.get_folder_by_id(allocation["resource_id"], client)["name"] == "Recovered"
+    drive_ops = [event["operation"] for event in sdk_fakes.trace if event["boundary"] == "drive"]
+    assert drive_ops.count("files.create") == 2
+    assert drive_ops.count("files.get") == 1
+    assert "files.generateIds" not in drive_ops
+    assert "files.list" not in drive_ops
 
 
 @pytest.mark.offline

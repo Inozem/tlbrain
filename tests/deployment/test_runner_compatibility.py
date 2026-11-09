@@ -265,6 +265,35 @@ def test_sync_checker_route_uses_gcloud_bootstrap_fallback_before_cloud_send(
         assert not uploads
 
 
+def test_preflight_python_mode_uses_gcloud_interpreter_fallback(tmp_path: Path) -> None:
+    """The Python mode passes helper argv through the same interpreter discovery path."""
+    bash = _bash()
+    checkout = _copy_route(tmp_path)
+    events, isolated_path = _write_fakes(checkout, tmp_path, runner_status=0)
+    alias_dir = tmp_path / "WindowsApps"
+    alias_dir.mkdir()
+    alias = alias_dir / "python3"
+    alias.write_text("#!/usr/bin/env bash\necho alias-used >> \"$RUNNER_COMPAT_EVENTS\"\nexit 92\n", encoding="utf-8")
+    alias.chmod(0o755)
+    environment = {
+        **{name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT") if name in os.environ},
+        "PATH": os.pathsep.join((str(alias_dir), str(isolated_path))),
+        "RUNNER_COMPAT_EVENTS": str(events),
+        "RUNNER_COMPAT_INTERPRETER": _path_for_bash(tmp_path / "Build Area" / "bootstrap python"),
+        "RUNNER_COMPAT_STATUS": "0",
+    }
+    completed = subprocess.run(
+        [bash, str(checkout / "infra" / "build" / "preflight.sh"), "--python-mode",
+         str(tmp_path / "Build Area" / "bootstrap python"), "argument with spaces"],
+        cwd=checkout, env=environment, text=True, capture_output=True, check=False, timeout=30,
+    )
+    assert completed.returncode == 0, f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    log = events.read_text(encoding="utf-8").splitlines()
+    assert any(line == "gcloud\tinfo --format=value(basic.python_location)" for line in log)
+    assert any(line.startswith("bootstrap\t") and "argument with spaces" in line for line in log)
+    assert "alias-used" not in "\n".join(log)
+
+
 def test_runner_cold_warm_and_corrupt_cache_states_stay_in_private_cache(tmp_path: Path) -> None:
     """Exercise the ordinary runner API across all cache states with its synthetic archive."""
     helper_path = Path(__file__).with_name("test_runner_bootstrap.py")
@@ -315,11 +344,42 @@ def test_successful_host_preflight_report_keeps_host_facts_separate_from_linux_t
 
     def use_synthetic_runtime(lock_path: Path, cache_path: Path, **_kwargs: object) -> Path:
         runtime_calls.append((lock_path, cache_path))
-        return tmp_path / "synthetic-python312"
+        runtime = tmp_path / "synthetic-python312"
+        runtime.write_bytes(b"synthetic Python 3.12 runtime")
+        return runtime
 
     def run(argv: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "-c" in argv and "ensurepip.version()" in argv[-1]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "version": "3.12.14 (synthetic)", "implementation": "cpython", "cache_tag": "cpython-312",
+                "abiflags": "", "platform": "win-amd64", "sys_platform": "win32", "machine": "AMD64",
+                "os_release": ["Windows", "synthetic-release", "synthetic-build"],
+                "libc": ["", ""], "ensurepip": "23.2.1", "pip": "23.2.1",
+            }), stderr="")
+        if "config" in argv:
+            if "debug" in argv:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        f"env_var:\n  PIP_CONFIG_FILE='{os.devnull}'\n  PIP_NO_INDEX='1'\n"
+                        "  PIP_DISABLE_PIP_VERSION_CHECK='1'\n"
+                        f"env:\n  {os.devnull}, exists: True\n"
+                        "global:\n  C:\\ProgramData\\pip\\pip.ini, exists: False\n"
+                        "site:\n  C:\\synthetic\\site\\pip.ini, exists: False\n"
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f":env:.config-file='{os.devnull}'\n:env:.no-index='1'\n"
+                    ":env:.disable-pip-version-check='1'\n"
+                ),
+                stderr="",
+            )
         if "assemble.py" in str(argv):
             artifact.mkdir(parents=True)
+            (artifact / "requirements.txt").write_text("# synthetic runtime requirements\n", encoding="utf-8")
             (artifact / "assembly-report.json").write_text(
                 json.dumps({"runtime_target": "checker"}), encoding="utf-8"
             )
@@ -338,6 +398,12 @@ def test_successful_host_preflight_report_keeps_host_facts_separate_from_linux_t
 
     monkeypatch.setattr(runner, "ensure_runtime", use_synthetic_runtime)
     monkeypatch.setattr(runner, "subprocess", SimpleNamespace(run=run))
+    for name in tuple(os.environ):
+        if name.startswith("PIP_"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
 
     assert runner.run_preflight("sync_checker", root, artifact) == 0
     output = capsys.readouterr().out

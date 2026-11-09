@@ -11,6 +11,7 @@ from core.integrations.google_drive.folders import (
 from core.integrations.qdrant import reader
 from core.retrieval.pipeline import dedup_and_sort
 from core.retrieval.segments import build_segments
+from core.utils.retry import RetryPolicy
 
 
 def get_transcripts(
@@ -19,12 +20,21 @@ def get_transcripts(
     date_from: str | None = None,
     date_to: str | None = None,
     limit: int = 1,
+    *,
+    retry_policy: RetryPolicy | None = None,
+    single_attempt: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     resolve_path = None
+    single_attempt = single_attempt or (retry_policy is not None and retry_policy.attempts == 1)
     if doc_id is not None:
-        utterances, resolve_path = _load_doc_transcripts(doc_id)
+        utterances, resolve_path = _load_doc_transcripts(
+            doc_id, **({"single_attempt": True} if single_attempt else {}),
+        )
     elif folder_path is not None:
-        folder_result = _load_folder_transcripts(folder_path, date_from, date_to)
+        folder_result = _load_folder_transcripts(
+            folder_path, date_from, date_to,
+            **({"single_attempt": True} if single_attempt else {}),
+        )
         if folder_result is None:
             return [], _empty_metadata(f"Folder not found: {'/'.join(folder_path)}")
         utterances, resolve_path = folder_result
@@ -46,15 +56,18 @@ def get_transcripts(
 
 def _load_doc_transcripts(
     doc_id: str,
+    *,
+    single_attempt: bool = False,
 ) -> tuple[list[dict[str, Any]], Callable[[str], str] | None]:
-    utterances = _scroll_by_doc_id(doc_id)
+    utterances = (_scroll_by_doc_id(doc_id, single_attempt=True) if single_attempt
+                  else _scroll_by_doc_id(doc_id))
     if not utterances:
         return utterances, None
-    return utterances, _load_doc_path_resolver()
+    return utterances, _load_doc_path_resolver(single_attempt=single_attempt)
 
 
-def _load_doc_path_resolver() -> Callable[[str], str]:
-    all_folders = get_all_folders()
+def _load_doc_path_resolver(*, single_attempt: bool = False) -> Callable[[str], str]:
+    all_folders = (get_all_folders(single_attempt=True) if single_attempt else get_all_folders())
     return make_folder_path_resolver(all_folders, get_root_folder_id())
 
 
@@ -62,11 +75,13 @@ def _load_folder_transcripts(
     folder_path: list[str],
     date_from: str | None,
     date_to: str | None,
+    *,
+    single_attempt: bool = False,
 ) -> tuple[list[dict[str, Any]], Callable[[str], str]] | None:
     if not folder_path:
         return None
 
-    all_folders = get_all_folders()
+    all_folders = (get_all_folders(single_attempt=True) if single_attempt else get_all_folders())
     root_folder_id = get_root_folder_id()
     terminal_ids = resolve_folder_path(folder_path, all_folders, root_folder_id)
     if not terminal_ids:
@@ -78,7 +93,9 @@ def _load_folder_transcripts(
         for folder_id in expand_subtree(terminal_id, all_folders)
     ]
     resolve_path = make_folder_path_resolver(all_folders, root_folder_id)
-    utterances = _scroll_by_folder(folder_ids, date_from, date_to)
+    utterances = (_scroll_by_folder(
+        folder_ids, date_from, date_to, single_attempt=True,
+    ) if single_attempt else _scroll_by_folder(folder_ids, date_from, date_to))
     return utterances, resolve_path
 
 
@@ -133,13 +150,20 @@ def _build_metadata(total_docs: int, returned_segments: int, truncated: bool) ->
     return meta
 
 
-def _scroll_by_doc_id(doc_id: str) -> list[dict[str, Any]]:
-    return reader.fetch_utterances_by_doc_id(doc_id)
+def _scroll_by_doc_id(doc_id: str, *, single_attempt: bool = False) -> list[dict[str, Any]]:
+    return reader.fetch_utterances_by_doc_id(
+        doc_id, **({"single_attempt": True} if single_attempt else {}),
+    )
 
 
 def _scroll_by_folder(
     folder_ids: list[str],
     date_from: str | None,
     date_to: str | None,
+    *,
+    single_attempt: bool = False,
 ) -> list[dict[str, Any]]:
-    return reader.fetch_utterances_by_folder(folder_ids, date_from, date_to)
+    return reader.fetch_utterances_by_folder(
+        folder_ids, date_from, date_to,
+        **({"single_attempt": True} if single_attempt else {}),
+    )

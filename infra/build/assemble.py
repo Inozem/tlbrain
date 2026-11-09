@@ -24,7 +24,7 @@ class AssemblyError(Exception):
 EXCLUDED_PARTS = {
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".tox", ".venv", "venv", "tests", "test", "fixtures", "fixture",
-    "dist", "build", "cache", ".cache",
+    "dist", "build", "cache", ".cache", ".build", ".tmp",
 }
 
 _REQUIREMENT_INCLUDE = re.compile(

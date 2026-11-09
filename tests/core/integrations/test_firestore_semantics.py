@@ -8,10 +8,35 @@ import pytest
 from core.integrations.firestore import folders as folder_repository
 from core.integrations.firestore import sync_state as sync_state_repository
 from core.integrations.firestore import transcripts as transcript_repository
+from core.integrations.firestore.operation_queue import validate_context_queue_lease
 
 
 INDEX = "transcript_index"
 FOLDERS = "folders"
+
+
+def test_context_queue_lease_validator_checks_owner_fence_and_expiry():
+    now = datetime(2026, 8, 9, tzinfo=timezone.utc)
+    context = {
+        "reserved_operation_id": "op-1", "active_operation_id": "op-1",
+        "lock_owner": "worker", "fence": 3,
+    }
+    assert validate_context_queue_lease(
+        context, "op-1", owner="worker", fence=3,
+        now=now, expiry=now + timedelta(minutes=1),
+    )
+    assert not validate_context_queue_lease(
+        context, "op-1", owner="stale", fence=3,
+        now=now, expiry=now + timedelta(minutes=1),
+    )
+    assert not validate_context_queue_lease(
+        context, "op-1", owner="worker", fence=2,
+        now=now, expiry=now + timedelta(minutes=1),
+    )
+    assert not validate_context_queue_lease(
+        context, "op-1", owner="worker", fence=3,
+        now=now, expiry=now,
+    )
 
 
 def _client(firestore_fake):
@@ -269,6 +294,24 @@ def test_transcript_repository_queries_by_meeting_id(firestore_fake):
     ]
 
 
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ({"meeting_id": " meeting-a "}, True),
+        ({"meeting_id": "meeting-a", "provider": "tldv"}, True),
+        ({"meeting_id": "meeting-a", "provider": None}, False),
+        ({"meeting_id": "meeting-a", "provider": ""}, False),
+        ({"meeting_id": "meeting-a", "provider": "telegram"}, False),
+        ({"meeting_id": "meeting-a", "provider": "unknown"}, False),
+        ({"meeting_id": "  "}, False),
+        ({"meeting_id": 12}, False),
+        ({"provider": "tldv"}, False),
+    ],
+)
+def test_tldv_record_predicate_accepts_only_explicit_or_valid_legacy_records(record, expected):
+    assert transcript_repository.is_tldv_transcript_record(record) is expected
+
+
 def test_transcript_repository_lists_filters_and_aggregates(firestore_fake):
     db = _client(firestore_fake)
     records = {
@@ -394,7 +437,7 @@ def test_tldv_placeholder_stage_fields_and_delete(firestore_fake):
     assert transcript_repository.write_queued("meeting-a") is True
     placeholder_path = f"{INDEX}/tldv-meeting-a"
     assert firestore_fake.documents[placeholder_path] == {
-        "meeting_id": "meeting-a", "status": "queued", "status_changed_at": now,
+        "meeting_id": "meeting-a", "provider": "tldv", "status": "queued", "status_changed_at": now,
     }
     before_repeat_snapshot = firestore_fake.documents[placeholder_path]
     before_repeat_trace = firestore_fake.trace()
@@ -404,22 +447,40 @@ def test_tldv_placeholder_stage_fields_and_delete(firestore_fake):
 
     transcript_repository.mark_downloading("meeting-a")
     assert firestore_fake.documents[placeholder_path] == {
-        "meeting_id": "meeting-a", "status": "downloading", "status_changed_at": now,
+        "meeting_id": "meeting-a", "provider": "tldv", "status": "downloading", "status_changed_at": now,
     }
     transcript_repository.mark_download_error("meeting-a", "synthetic download failure")
     assert firestore_fake.documents[placeholder_path] == {
-        "meeting_id": "meeting-a", "status": "error", "error": "synthetic download failure",
+        "meeting_id": "meeting-a", "provider": "tldv", "status": "error", "error": "synthetic download failure",
         "error_stage": "import", "status_changed_at": now,
     }
     assert transcript_repository.write_queued("meeting-a") is True
     assert firestore_fake.documents[placeholder_path] == {
-        "meeting_id": "meeting-a", "status": "queued", "error": None, "error_stage": None,
+        "meeting_id": "meeting-a", "provider": "tldv", "status": "queued", "error": None, "error_stage": None,
         "status_changed_at": now,
     }
     transcript_repository.delete_queued_placeholder("meeting-a")
     assert placeholder_path not in firestore_fake.documents
     relevant = _writes(firestore_fake, placeholder_path)
     assert [event["operation"] for event in relevant] == ["commit", "update", "update", "commit", "delete"]
+
+
+def test_tldv_placeholder_helpers_preserve_foreign_reserved_id(firestore_fake):
+    meeting_id = "foreign-collision"
+    path = f"{INDEX}/tldv-{meeting_id}"
+    foreign = {
+        "meeting_id": meeting_id, "provider": "telegram", "status": "imported",
+        "error": "keep", "nested": {"value": 7},
+    }
+    _client(firestore_fake).collection(INDEX).document(f"tldv-{meeting_id}").set(foreign)
+    before = firestore_fake.documents[path].copy()
+
+    assert transcript_repository.write_queued(meeting_id) is False
+    transcript_repository.mark_downloading(meeting_id)
+    transcript_repository.mark_download_error(meeting_id, "synthetic import failure")
+    transcript_repository.delete_queued_placeholder(meeting_id)
+
+    assert firestore_fake.documents[path] == before
 
 
 def test_sync_error_and_move_writers_preserve_or_clear_fields_explicitly(firestore_fake):

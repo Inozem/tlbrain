@@ -8,6 +8,7 @@ import logging
 import pytest
 
 from core.utils.logging import configure_logging
+from core.retrieval import run as retrieval_run
 
 
 def _read_json_lines(captured: str) -> list[dict]:
@@ -68,34 +69,47 @@ def test_json_records_preserve_safe_correlation_and_status_fields(capsys):
     logger = logging.getLogger("logging.safe_extras")
     secret = "synthetic-secret-marker"
 
-    logger.warning(
-        "stage completed",
-        extra={
-            "stage": "index",
-            "result": "success",
-            "doc_id": "synthetic-doc-safe",
-            "meeting_id": "synthetic-meeting-safe",
-            "request_id": "synthetic-request-safe",
-            "response_status": 207,
-            "token_count": 4,
-            "processing_state": "complete",
-            "access_token": secret,
-            "client_secret": secret,
-        },
-    )
+    url = "https://synthetic.example/private/path?api_key=synthetic-url-secret"
+    try:
+        raise RuntimeError(f"request failed for {url}")
+    except RuntimeError:
+        logger.exception(
+            "stage completed at %s",
+            url,
+            extra={
+                "stage": "index",
+                "result": "success",
+                "doc_id": "synthetic-doc-safe",
+                "operation_id": "synthetic-operation-safe",
+                "meeting_id": "synthetic-meeting-safe",
+                "request_id": "synthetic-request-safe",
+                "endpoint": url,
+                "response_status": 207,
+                "token_count": 4,
+                "processing_state": "complete",
+                "access_token": secret,
+                "client_secret": secret,
+            },
+        )
 
     [event] = _read_json_lines(capsys.readouterr().err)
+    assert event["severity"] == "ERROR"
+    assert event["message"] == "stage completed at [REDACTED_URL]"
     assert event["stage"] == "index"
     assert event["result"] == "success"
     assert event["doc_id"] == "synthetic-doc-safe"
+    assert event["operation_id"] == "synthetic-operation-safe"
     assert event["meeting_id"] == "synthetic-meeting-safe"
     assert event["request_id"] == "synthetic-request-safe"
     assert event["response_status"] == 207
     assert event["token_count"] == 4
     assert event["processing_state"] == "complete"
+    assert event["endpoint"] == "[REDACTED_URL]"
+    assert "[REDACTED_URL]" in event["exception"]
     assert "access_token" not in event
     assert "client_secret" not in event
     assert secret not in json.dumps(event)
+    assert url not in json.dumps(event)
 
 
 def test_nested_sensitive_extra_key_is_omitted_and_safe_siblings_survive(capsys):
@@ -120,3 +134,19 @@ def test_nested_sensitive_extra_key_is_omitted_and_safe_siblings_survive(capsys)
     assert "access_token" not in event["proxy"]
     assert event["proxy"]["request_id"] == request_id
     assert event["proxy"]["status"] == 502
+
+
+def test_retrieval_diagnostics_omit_raw_query_text(caplog, monkeypatch):
+    query_marker = "synthetic-private-retrieval-query"
+    monkeypatch.setattr(retrieval_run, "_resolve_folder_context", lambda _path: (None, lambda _doc: ""))
+    monkeypatch.setattr(retrieval_run, "_search_in_parallel", lambda *_args: ([], []))
+    monkeypatch.setattr(retrieval_run, "_find_pinned_summaries", lambda *_args: [])
+    monkeypatch.setattr(retrieval_run, "get_retrieval_score_threshold", lambda: 0.0)
+    caplog.set_level(logging.INFO, logger=retrieval_run.__name__)
+
+    retrieval_run.run_retrieval(query_marker)
+
+    retrieval_logs = [record for record in caplog.records if record.name == retrieval_run.__name__]
+    assert len(retrieval_logs) == 1
+    assert "retrieval semantic_hits=0 keyword_hits=0" == retrieval_logs[0].getMessage()
+    assert query_marker not in json.dumps(retrieval_logs[0].__dict__, default=str)

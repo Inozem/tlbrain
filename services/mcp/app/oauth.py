@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import time
+from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -39,6 +40,51 @@ class OAuthError(Exception):
         self.error = error
         self.description = description
         self.status = status
+
+
+@dataclass(frozen=True)
+class RequestIdentity:
+    """Identity derived from an open installation or a verified OAuth record."""
+
+    caller_binding: str
+    email: str | None = None
+    client_id: str | None = None
+    resource: str | None = None
+
+
+def _caller_binding(email: str, client_id: str, resource: str) -> str:
+    fields = (email.casefold(), client_id, resource)
+    encoded = "\0".join(fields).encode("utf-8")
+    return "oauth:" + hashlib.sha256(encoded).hexdigest()
+
+
+def request_identity(request: Request) -> RequestIdentity | None:
+    """Return the trusted caller identity after applying the normal MCP checks."""
+    if not enabled():
+        return RequestIdentity(caller_binding="anonymous:installation")
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    value = store.load("access", token)
+    if not (
+        value and _allowed(value.get("email"))
+        and value.get("issuer") == base_url(request)
+        and value.get("resource") == f"{base_url(request)}/mcp"
+        and isinstance(value.get("scope"), str) and value["scope"].split()
+        and set(value["scope"].split()).issubset(SCOPES)
+        and isinstance(value.get("client_id"), str) and value["client_id"]
+    ):
+        return None
+    email = value["email"]
+    client_id = value["client_id"]
+    resource = value["resource"]
+    return RequestIdentity(
+        caller_binding=_caller_binding(email, client_id, resource),
+        email=email,
+        client_id=client_id,
+        resource=resource,
+    )
 
 
 async def error_response(request: Request, exc: OAuthError):
@@ -458,13 +504,4 @@ async def token(request: Request):
 
 
 def authorized(request: Request) -> bool:
-    if not enabled():
-        return True
-    authorization = request.headers.get("authorization", "")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        return False
-    value = store.load("access", token)
-    return bool(value and _allowed(value["email"]) and value["issuer"] == base_url(request)
-                and value["resource"] == f"{base_url(request)}/mcp" and value["scope"].split()
-                and set(value["scope"].split()).issubset(SCOPES))
+    return request_identity(request) is not None

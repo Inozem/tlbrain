@@ -51,23 +51,34 @@ def get_folder_by_id(folder_id: str, db: firestore.Client | None = None) -> dict
     return doc.to_dict() if doc.exists else None
 
 
-def get_all_folders(db: firestore.Client | None = None) -> dict[str, dict]:
+def get_all_folders(db: firestore.Client | None = None, *, single_attempt: bool = False) -> dict[str, dict]:
     """Return all folder records keyed by their stable Drive IDs."""
-    client = _db_or_client(db)
-    return {doc.id: (doc.to_dict() or {}) for doc in client.collection(FOLDERS_COLLECTION).stream()}
+    def read() -> dict[str, dict]:
+        client = _db_or_client(db)
+        query = client.collection(FOLDERS_COLLECTION)
+        rows = query.stream(retry=None) if single_attempt else query.stream()
+        return {doc.id: (doc.to_dict() or {}) for doc in rows}
+
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        return single_attempt_read(read)
+    return read()
 
 
-def folder_name_exists(name: str, parent_id: str | None, db: firestore.Client | None = None) -> bool:
+def folder_name_exists(
+    name: str, parent_id: str | None, db: firestore.Client | None = None, *, exclude_id: str | None = None,
+) -> bool:
     """Return True when this name exists under the supplied nullable parent ID."""
     client = _db_or_client(db)
-    docs = (
+    query = (
         client.collection(FOLDERS_COLLECTION)
         .where("name", "==", name)
         .where("parent_id", "==", parent_id)
-        .limit(1)
-        .stream()
     )
-    return any(True for _ in docs)
+    if exclude_id is None:
+        return next(iter(query.limit(1).stream()), None) is not None
+    docs = query.limit(2).stream()
+    return any(doc.id != exclude_id for doc in docs)
 
 
 def get_folder_id_by_name(name: str, db: firestore.Client | None = None) -> str | None:
@@ -99,12 +110,21 @@ def delete_folder(folder_id: str, db: firestore.Client | None = None) -> None:
     logger.info("Deleted folder record: %s", folder_id)
 
 
-def get_folders_by_speaker(speaker: str, db: firestore.Client | None = None):
+def get_folders_by_speaker(speaker: str, db: firestore.Client | None = None, *,
+                           single_attempt: bool = False):
     """Query folder snapshots whose indexed count for speaker is positive."""
-    client = _db_or_client(db)
-    return client.collection(FOLDERS_COLLECTION).where(
-        filter=firestore.FieldFilter(f"speakers.{speaker_key(speaker)}", ">", 0)
-    ).stream()
+    def read():
+        client = _db_or_client(db)
+        query = client.collection(FOLDERS_COLLECTION).where(
+            filter=firestore.FieldFilter(f"speakers.{speaker_key(speaker)}", ">", 0)
+        )
+        rows = query.stream(retry=None) if single_attempt else query.stream()
+        return list(rows) if single_attempt else rows
+
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        return single_attempt_read(read)
+    return read()
 
 
 def increment_folder_speakers(

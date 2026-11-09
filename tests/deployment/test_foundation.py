@@ -34,13 +34,21 @@ EXPECTED_ENTRIES = {
     "tldv_webhook": "main.py",
     "tldv_reconciliation": "main.py",
 }
+FOUNDATION_ARTIFACT_EXCLUSIONS = (
+    "services/connectors/telegram/",
+)
+MCP_SHARED_OPERATIONS = {
+    "core/operations/read.py",
+    "core/operations/write.py",
+    "core/operations/sync.py",
+}
 IMAGE_SERVICES = {"mcp", "vector_sync", "tldv_import"}
 EXPECTED_INTEGRATION_REQUIREMENTS = {
     "mcp": {
-        "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
+        "cloud_tasks", "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
     },
     "vector_sync": {
-        "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
+        "cloud_tasks", "fastembed", "firestore", "gemini", "google_auth", "google_docs", "qdrant",
     },
     "tldv_import": {
         "cloud_tasks", "firestore", "gemini", "google_auth", "google_docs",
@@ -148,7 +156,7 @@ def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
         "google_docs": "google-api-python-client",
         "firestore": "google-cloud-firestore",
         "qdrant": "qdrant-client>=1.9",
-        "gemini": "google-genai>=1.0",
+        "gemini": "google-genai>=2.32.0",
         "fastembed": "fastembed",
         "cloud_tasks": "google-cloud-tasks>=2.0.0",
     }
@@ -184,15 +192,33 @@ def test_integration_packages_are_passive_and_own_existing_sdk_bounds() -> None:
     assert actual_providers == expected_providers
     assert all(not prefix == "google" for prefix in actual_providers)
     assert not (APP_ROOT / "core" / "utils" / "requirements.txt").exists()
+    assert "tzdata" in (APP_ROOT / "requirements-common.txt").read_text(encoding="utf-8").splitlines()
     assert (APP_ROOT / "core" / "integrations" / "cloud_tasks" / "requirements.txt").read_text(
         encoding="utf-8"
     ).strip() == "google-cloud-tasks>=2.0.0"
 
 
+def test_dialog_and_telegram_package_boundaries_are_passive() -> None:
+    package_initializers = (
+        APP_ROOT / "core" / "dialogs" / "__init__.py",
+        APP_ROOT / "core" / "operations" / "__init__.py",
+        APP_ROOT / "services" / "connectors" / "telegram" / "__init__.py",
+        APP_ROOT / "services" / "connectors" / "telegram" / "app" / "__init__.py",
+    )
+    for path in package_initializers:
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        assert all(
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+            for statement in module.body
+        ), path.relative_to(APP_ROOT)
+
+
 def test_all_six_current_service_sources_assemble_to_isolated_runtime_artifacts() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     services = manifest["services"]
-    assert set(services) == set(EXPECTED_SERVICES)
+    assert set(services) == set(EXPECTED_SERVICES) | {"telegram"}
 
     build_root = APP_ROOT / ".build"
     build_root.mkdir(exist_ok=True)
@@ -230,6 +256,14 @@ def test_all_six_current_service_sources_assemble_to_isolated_runtime_artifacts(
             assert report["runtime_target"] == runtime_target
             assert report["source_files"]
             assert report["import_edges"]
+            source_paths = {entry["runtime_path"] for entry in report["source_files"]}
+            for excluded in FOUNDATION_ARTIFACT_EXCLUSIONS:
+                assert not any(
+                    path == excluded.rstrip("/") or path.startswith(excluded)
+                    for path in source_paths
+                ), f"{service} unexpectedly includes {excluded}"
+            if service == "mcp":
+                assert MCP_SHARED_OPERATIONS <= source_paths
             selected_integrations = {
                 PurePosixPath(item["runtime_path"]).parent.name
                 for item in report["requirements_graph"]["files"]

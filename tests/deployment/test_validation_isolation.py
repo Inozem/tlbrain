@@ -27,6 +27,7 @@ _ENTRY_PATHS = {
     "mcp": "app/main.py",
     "vector_sync": "app/main.py",
     "tldv_import": "app/main.py",
+    "telegram": "app/main.py",
     "sync_checker": "main.py",
     "tldv_webhook": "main.py",
     "tldv_reconciliation": "main.py",
@@ -35,6 +36,7 @@ _RUNTIME_TARGETS = {
     "mcp": "app.main:app",
     "vector_sync": "app.main:app",
     "tldv_import": "app.main:app",
+    "telegram": "app.main:app",
     "sync_checker": "main:checker",
     "tldv_webhook": "main:tldv_webhook",
     "tldv_reconciliation": "main:tldv_reconciliation",
@@ -43,6 +45,7 @@ _ASSEMBLED_RUNTIME_TARGETS = {
     "mcp": "services.mcp.app.main:app",
     "vector_sync": "services.vector_sync.app.main:app",
     "tldv_import": "app.main:app",
+    "telegram": "services.connectors.telegram.app.main:app",
     "sync_checker": "checker",
     "tldv_webhook": "tldv_webhook",
     "tldv_reconciliation": "tldv_reconciliation",
@@ -51,6 +54,7 @@ _RUNTIME_KINDS = {
     "mcp": "asgi",
     "vector_sync": "asgi",
     "tldv_import": "asgi",
+    "telegram": "asgi",
     "sync_checker": "function",
     "tldv_webhook": "function",
     "tldv_reconciliation": "function",
@@ -160,7 +164,7 @@ def _success_entry_source(service: str) -> str:
         "assert app_internal.qualified.VALUE == 3\n"
         "assert deferred_import() == 2\n"
     )
-    if service in {"mcp", "vector_sync", "tldv_import"}:
+    if service in {"mcp", "vector_sync", "tldv_import", "telegram"}:
         source += (
             "async def app(scope, receive, send):\n"
             "    await receive()\n"
@@ -492,6 +496,16 @@ def test_smoke_support_runs_offline_startup_and_benign_route(
     """Exercise component smokes separately via ``-k smoke_support``."""
     marker = (tmp_path / f"{service}-route-ran.txt").resolve()
     entry_source = "from app_internal import VALUE\nassert VALUE == 4\n"
+    if service == "telegram":
+        entry_source += (
+            "from pathlib import Path\n"
+            "async def app(scope, receive, send):\n"
+            "    assert scope['method'] == 'GET' and scope['path'] == '/'\n"
+            "    await receive()\n"
+            f"    Path({str(marker)!r}).write_text('route ran', encoding='utf-8')\n"
+            "    await send({'type': 'http.response.start', 'status': 200, 'headers': [(b'content-type', b'application/json')]})\n"
+            "    await send({'type': 'http.response.body', 'body': b'{\"status\":\"ok\"}', 'more_body': False})\n"
+        )
     if service == "vector_sync":
         entry_source = (
             "from qdrant_client import QdrantClient\n"
@@ -509,12 +523,13 @@ def test_smoke_support_runs_offline_startup_and_benign_route(
             "assert firestore.Client().collection('smoke').stream() == []\n"
             + entry_source
         )
-    entry_source += (
-        "from pathlib import Path\n"
-        "def health():\n"
-        f"    Path({str(marker)!r}).write_text('route ran', encoding='utf-8')\n"
-        "    return {'status': 'ok'}\n"
-    )
+    if service != "telegram":
+        entry_source += (
+            "from pathlib import Path\n"
+            "def health():\n"
+            f"    Path({str(marker)!r}).write_text('route ran', encoding='utf-8')\n"
+            "    return {'status': 'ok'}\n"
+        )
     artifact = _artifact(
         tmp_path,
         service,

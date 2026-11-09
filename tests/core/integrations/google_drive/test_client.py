@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pytest
+from googleapiclient.errors import HttpError
+from types import SimpleNamespace
 
 from core.integrations.google_drive import client
 from core.integrations.google_drive import changes, files, scanner
@@ -19,14 +21,27 @@ class _Request:
 class _Files:
     def __init__(self):
         self.calls = []
+        self.create_error = None
+        self.create_result = {"id": "stable-drive-id"}
+        self.get_result = {}
+        self.generate_result = {"ids": ["preallocated-id"]}
+        self.generate_error = None
 
     def create(self, **kwargs):
         self.calls.append(("create", kwargs))
-        return _Request({"id": "stable-drive-id"})
+        if self.create_error:
+            raise self.create_error
+        return _Request(self.create_result)
 
     def get(self, **kwargs):
         self.calls.append(("get", kwargs))
-        return _Request({"parents": ["old-parent", "shared-parent"]})
+        return _Request(self.get_result or {"parents": ["old-parent", "shared-parent"]})
+
+    def generateIds(self, **kwargs):
+        self.calls.append(("generateIds", kwargs))
+        if self.generate_error:
+            raise self.generate_error
+        return _Request(self.generate_result)
 
     def update(self, **kwargs):
         self.calls.append(("update", kwargs))
@@ -55,6 +70,112 @@ def test_create_folder_uses_requested_parent_and_returns_stable_id(monkeypatch):
         },
         "fields": "id",
     })]
+
+
+@pytest.mark.offline
+def test_stable_folder_uses_preallocated_id_and_intent_marker(monkeypatch):
+    service = _Service()
+    service.api.create_result = {"id": "preallocated-id"}
+    monkeypatch.setattr(client, "build_drive_service_rw", lambda: service)
+
+    assert client.generate_folder_id() == "preallocated-id"
+    assert client.create_folder(
+        "New", "parent-id", folder_id="preallocated-id", intent_marker="v1:" + "a" * 64,
+    ) == "preallocated-id"
+    assert service.api.calls == [
+        ("generateIds", {"count": 1, "space": "drive", "type": "files", "fields": "ids"}),
+        ("create", {"body": {
+            "name": "New", "mimeType": "application/vnd.google-apps.folder", "parents": ["parent-id"],
+            "id": "preallocated-id", "appProperties": {"tlbrain_effect_intent": "v1:" + "a" * 64},
+        }, "fields": "id"}),
+    ]
+
+
+@pytest.mark.offline
+def test_stable_folder_409_readback_accepts_only_matching_intent(monkeypatch):
+    service = _Service()
+    service.api.create_error = HttpError(SimpleNamespace(status=409, reason="Conflict"), b"conflict")
+    service.api.get_result = {
+        "id": "preallocated-id", "mimeType": "application/vnd.google-apps.folder", "name": "New",
+        "parents": ["parent-id"], "trashed": False,
+        "appProperties": {"tlbrain_effect_intent": "v1:" + "a" * 64},
+    }
+    monkeypatch.setattr(client, "build_drive_service_rw", lambda: service)
+
+    marker = "v1:" + "a" * 64
+    assert client.create_folder("New", "parent-id", folder_id="preallocated-id", intent_marker=marker) == "preallocated-id"
+    assert service.api.calls[-1] == (
+        "get", {"fileId": "preallocated-id", "fields": "id,mimeType,name,parents,trashed,appProperties"},
+    )
+
+    service.api.get_result["name"] = "Different"
+    with pytest.raises(RuntimeError, match="conflicts with the persisted intent"):
+        client.create_folder("New", "parent-id", folder_id="preallocated-id", intent_marker=marker)
+
+
+@pytest.mark.offline
+def test_stable_folder_validation_precedes_service_build(monkeypatch):
+    builds = []
+    monkeypatch.setattr(client, "build_drive_service_rw", lambda: builds.append(True))
+    with pytest.raises(ValueError, match="invalid stable folder creation identity"):
+        client.create_folder("New", "parent", folder_id="unsafe/ID", intent_marker="v1:" + "a" * 64)
+    with pytest.raises(ValueError, match="stable folder creation requires both"):
+        client.create_folder("New", "parent", folder_id="planned-id")
+    assert builds == []
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("response", [{}, {"ids": None}, {"ids": []}, {"ids": ["one", "two"]}, {"ids": ["wide Ａ"]}, None])
+def test_generate_folder_id_rejects_malformed_responses_safely(monkeypatch, response):
+    service = _Service()
+    service.api.generate_result = response
+    monkeypatch.setattr(client, "build_drive_service_rw", lambda: service)
+    with pytest.raises(RuntimeError, match="Drive folder ID allocation failed"):
+        client.generate_folder_id()
+
+
+@pytest.mark.offline
+def test_generate_folder_id_hides_provider_errors(monkeypatch):
+    service = _Service()
+    service.api.generate_error = RuntimeError("private Drive detail")
+    monkeypatch.setattr(client, "build_drive_service_rw", lambda: service)
+    with pytest.raises(RuntimeError, match="Drive folder ID allocation failed") as error:
+        client.generate_folder_id()
+    assert "private Drive detail" not in str(error.value)
+
+
+@pytest.mark.offline
+def test_stable_create_rejects_response_with_another_id(monkeypatch):
+    service = _Service()
+    service.api.create_result = {"id": "different-id"}
+    monkeypatch.setattr(client, "build_drive_service_rw", lambda: service)
+    with pytest.raises(RuntimeError, match="Drive folder creation outcome is unresolved"):
+        client.create_folder("New", "parent", folder_id="planned-id", intent_marker="v1:" + "a" * 64)
+
+
+@pytest.mark.offline
+def test_planned_folder_match_is_strict_for_all_readback_fields():
+    marker = "v1:" + "a" * 64
+    baseline = {
+        "id": "planned-id", "mimeType": "application/vnd.google-apps.folder", "name": "New",
+        "parents": ["parent"], "trashed": False,
+        "appProperties": {"tlbrain_effect_intent": marker},
+    }
+    assert client._matches_planned_folder(baseline, "planned-id", "New", "parent", marker)
+    malformed = [
+        None,
+        {**baseline, "id": "other"},
+        {**baseline, "mimeType": "application/vnd.google-apps.document"},
+        {**baseline, "name": "Other"},
+        {**baseline, "parents": "parent"},
+        {**baseline, "parents": ["parent", "other"]},
+        {**baseline, "parents": None},
+        {**baseline, "trashed": True},
+        {**baseline, "appProperties": None},
+        {**baseline, "appProperties": "malformed"},
+        {**baseline, "appProperties": {"tlbrain_effect_intent": "wrong"}},
+    ]
+    assert all(not client._matches_planned_folder(item, "planned-id", "New", "parent", marker) for item in malformed)
 
 
 @pytest.mark.offline

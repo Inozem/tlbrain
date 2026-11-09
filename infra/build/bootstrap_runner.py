@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import ntpath
 import os
@@ -29,7 +30,26 @@ from urllib.parse import urlsplit
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORMS = {"windows", "macos", "linux"}
 _ARCHITECTURES = {"x86_64"}
+_SUPPORTED_PREFLIGHT_SERVICES = {
+    "mcp", "vector_sync", "tldv_import", "sync_checker", "tldv_webhook",
+    "tldv_reconciliation", "telegram",
+}
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_ENVIRONMENT_CACHE: Any = None
+
+
+def _environment_cache() -> Any:
+    """Load the build-only sibling helper without adding checkout imports."""
+    global _ENVIRONMENT_CACHE
+    if _ENVIRONMENT_CACHE is None:
+        helper = Path(__file__).resolve().with_name("environment_cache.py")
+        spec = importlib.util.spec_from_file_location("tlbrain_environment_cache", helper)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("dependency environment cache helper is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _ENVIRONMENT_CACHE = module
+    return _ENVIRONMENT_CACHE
 
 
 def normalize_windows_path(path: os.PathLike[str] | str, root: os.PathLike[str] | str | None = None) -> str:
@@ -310,22 +330,42 @@ def _current_platform() -> dict[str, str]:
 
 
 def _probe_interpreter(path: Path) -> dict[str, Any]:
-    code = (
-        "import json, platform, sys\n"
-        "libc_name, libc_version = platform.libc_ver()\n"
-        "features = {}\n"
-        "import ssl, venv\n"
-        "try:\n import pip; features['pip'] = True\n"
-        "except Exception:\n features['pip'] = False\n"
-        "os_name = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, 'linux' if sys.platform.startswith('linux') else sys.platform)\n"
-        "windows_version = sys.getwindowsversion() if os_name == 'windows' else None\n"
-        "os_version = platform.win32_ver()[0] if os_name == 'windows' else platform.mac_ver()[0] if os_name == 'macos' else ''\n"
-        "print(json.dumps({'version': platform.python_version(), 'ssl': True, 'venv': True, 'pip': features['pip'], 'os': os_name, 'architecture': platform.machine().lower(), 'libc': (libc_name.lower() or 'unknown') if sys.platform.startswith('linux') else 'none', 'libc_version': libc_version, 'os_version': os_version, 'windows_version': windows_version}))"
-    )
-    result = subprocess.run(
-        [str(path), "-I", "-c", code], capture_output=True, text=True,
-        timeout=20, check=False,
-    )
+    code = "\n".join((
+        "import json, platform, sys, sysconfig",
+        "import ssl, venv",
+        "try:",
+        " import pip; has_pip = True",
+        "except Exception:",
+        " has_pip = False",
+        "os_name = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, 'linux' if sys.platform.startswith('linux') else sys.platform)",
+        "windows_version = None",
+        "if os_name == 'windows':",
+        " windows_version = sys.getwindowsversion()",
+        " os_version = '{}.{}.{}'.format(*windows_version[:3])",
+        " architecture = {'win-amd64': 'x86_64', 'win32': 'x86', 'win-arm64': 'arm64'}.get(sysconfig.get_platform().lower())",
+        " if architecture is None: raise RuntimeError('unsupported Windows interpreter architecture')",
+        " libc_name, libc_version = '', ''",
+        "elif os_name == 'macos':",
+        " os_version = platform.mac_ver()[0]",
+        " architecture = platform.machine().lower()",
+        " libc_name, libc_version = '', ''",
+        "elif os_name == 'linux':",
+        " os_version = ''",
+        " architecture = platform.machine().lower()",
+        " libc_name, libc_version = platform.libc_ver()",
+        "else:",
+        " os_version = ''",
+        " architecture = platform.machine().lower()",
+        " libc_name, libc_version = '', ''",
+        "print(json.dumps({'version': platform.python_version(), 'ssl': True, 'venv': True, 'pip': has_pip, 'os': os_name, 'architecture': architecture, 'libc': (libc_name.lower() or 'unknown') if os_name == 'linux' else 'none', 'libc_version': libc_version, 'os_version': os_version, 'windows_version': windows_version}))",
+    ))
+    try:
+        result = subprocess.run(
+            [str(path), "-I", "-c", code], capture_output=True, text=True,
+            timeout=20, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("interpreter probe timed out after 20 seconds; candidate runtime was not accepted") from None
     if result.returncode:
         raise RuntimeError(f"interpreter probe failed: {result.stderr.strip()}")
     try:
@@ -371,11 +411,15 @@ def check_runtime(path: os.PathLike[str] | str) -> dict[str, Any]:
             raise RuntimeError("managed runtime generation cannot be a symlink")
         try:
             details = json.loads(marker.read_text(encoding="utf-8"))
-            if _tree_manifest(marker_root) == details.get("files"):
-                facts = dict(details["probe"])
-                if facts.get("python_minor") == "3.12" and all(facts.get(k) is True for k in ("ssl", "venv", "pip")):
-                    facts["host_python_minor"] = details["host_python_minor"]
-                    return facts
+            expected_files = details.get("files")
+            facts = dict(details["probe"])
+            if not (facts.get("python_minor") == "3.12"
+                    and all(facts.get(k) is True for k in ("ssl", "venv", "pip"))):
+                raise RuntimeError("managed runtime generation failed integrity validation")
+            if not _verified_runtime_manifest(marker_root, expected_files):
+                raise RuntimeError("managed runtime generation failed integrity validation")
+            facts["host_python_minor"] = details["host_python_minor"]
+            return facts
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError("managed runtime generation failed integrity validation") from exc
         raise RuntimeError("managed runtime generation failed integrity validation")
@@ -418,6 +462,147 @@ def _tree_manifest(root: Path) -> dict[str, str]:
         else:
             raise ValueError(f"runtime tree contains a special file: {relative}")
     return result
+
+
+def _runtime_tree_inventory(root: Path) -> dict[str, tuple[Path, str, bool]]:
+    """Inventory regular paths without traversing links, reparses, or special files."""
+    observed: dict[str, tuple[Path, str, bool]] = {}
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        _assert_under(directory, root)
+        _reject_reparse_point(directory, "runtime directory")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                item = Path(entry.path)
+                _assert_under(item, root)
+                info = item.lstat()
+                relative = item.relative_to(root).as_posix()
+                reparse = _is_reparse_point(item)
+                if stat.S_ISDIR(info.st_mode):
+                    observed[relative] = (item, "directory", reparse)
+                    if not reparse:
+                        pending.append(item)
+                elif stat.S_ISREG(info.st_mode) or reparse:
+                    kind = "file" if stat.S_ISREG(info.st_mode) else "link"
+                    observed[relative] = (item, kind, reparse)
+                else:
+                    raise ValueError(f"runtime tree contains a special file: {relative}")
+    return observed
+
+
+def _bytecode_cleanup_plan(
+    root: Path,
+    expected: Mapping[str, str],
+    current: Mapping[str, str],
+    observed: Mapping[str, tuple[Path, str, bool]],
+) -> tuple[list[Path], list[Path]] | None:
+    """Plan cache removals only when all extra paths are recognized PEP 3147 output."""
+    bytecode: list[Path] = []
+    cache_directories: list[Path] = []
+    for relative in set(current).difference(expected):
+        record = observed.get(relative)
+        if record is None:
+            return None
+        item, kind, reparse = record
+        if reparse:
+            return None
+        _assert_under(item, root)
+        if kind == "directory" and item.name == "__pycache__":
+            cache_directories.append(item)
+            continue
+        if kind != "file" or item.parent.name != "__pycache__":
+            return None
+        match = re.fullmatch(r"(?P<stem>.+)\.cpython-[0-9]+(?:\.opt-[0-9]+)?\.pyc", item.name)
+        if match is None:
+            return None
+        source = item.parent.parent / f"{match.group('stem')}.py"
+        source_relative = source.relative_to(root).as_posix()
+        source_record = observed.get(source_relative)
+        if (source_record is None or source_record[1] != "file" or source_record[2]
+                or expected.get(source_relative, "").split(":", 2)[0] != "file"
+                or current.get(source_relative) != expected.get(source_relative)):
+            return None
+        parent = item.parent
+        while parent != root:
+            _assert_under(parent, root)
+            _reject_reparse_point(parent, "bytecode cache parent")
+            parent = parent.parent
+        bytecode.append(item)
+
+    bytecode_set = set(bytecode)
+    for directory in cache_directories:
+        parent_relative = directory.parent.relative_to(root).as_posix()
+        parent_record = observed.get(parent_relative)
+        root_parent = directory.parent == root
+        if (parent_record is not None and (parent_record[1] != "directory" or parent_record[2])):
+            return None
+        if not root_parent and (parent_record is None or parent_relative not in expected):
+            return None
+        _assert_under(directory.parent, root)
+        _reject_reparse_point(directory.parent, "bytecode cache parent")
+        _reject_reparse_point(directory, "bytecode cache directory")
+        with os.scandir(directory) as entries:
+            if any(Path(entry.path) not in bytecode_set for entry in entries):
+                return None
+    return bytecode, cache_directories
+
+
+def _verified_runtime_manifest(root: Path, expected: Any) -> bool:
+    """Verify recorded entries and normalize only eligible generated bytecode drift."""
+    try:
+        current = _tree_manifest(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if current == expected:
+        return True
+    return _remove_generated_bytecode(root, expected, current)
+
+
+def _remove_generated_bytecode(root: Path, expected: Any, current: Mapping[str, str]) -> bool:
+    """Remove only new PEP 3147 caches while preserving every recorded entry."""
+    if not isinstance(expected, dict) or not all(
+        isinstance(name, str) and isinstance(value, str) for name, value in expected.items()
+    ):
+        return False
+    root = Path(os.path.abspath(root))
+    try:
+        _assert_under(root, root)
+        _reject_reparse_point(root, "runtime generation")
+        observed = _runtime_tree_inventory(root)
+        if any(reparse and not item.is_symlink() for item, _kind, reparse in observed.values()):
+            return False
+        if any(current.get(name) != value for name, value in expected.items()):
+            return False
+        plan = _bytecode_cleanup_plan(root, expected, current, observed)
+        if plan is None:
+            return False
+        bytecode, cache_directories = plan
+
+        for item in bytecode:
+            _assert_under(item, root)
+            _reject_reparse_point(item, "bytecode cache file")
+            try:
+                info = item.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                return False
+            relative = item.relative_to(root).as_posix()
+            current_value = f"file:{stat.S_IMODE(info.st_mode):04o}:{_sha256_file(item)}"
+            if current.get(relative) != current_value:
+                return False
+            item.unlink(missing_ok=True)
+        for directory in sorted(cache_directories, key=lambda path: len(path.parts), reverse=True):
+            _assert_under(directory, root)
+            _reject_reparse_point(directory, "bytecode cache directory")
+            try:
+                directory.rmdir()
+            except FileNotFoundError:
+                continue
+        return _tree_manifest(root) == expected
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return False
 
 
 def _archive_members(archive: Path) -> list[tarfile.TarInfo]:
@@ -624,15 +809,18 @@ def ensure_runtime(
         try:
             marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
             existing = marker["probe"]
-            complete = (
+            existing_compatible = (
+                existing.get("python_minor") == "3.12"
+                and all(existing.get(k) is True for k in ("ssl", "venv", "pip"))
+                and _native_facts_match(existing, facts)
+                and _meets_minimums(existing, entry)
+            )
+            marker_identity_matches = (
                 marker.get("archive_sha256") == entry["sha256"]
                 and marker.get("platform_key") == platform_key
-                and marker.get("files") == _tree_manifest(generation)
             )
-            if (complete and existing.get("python_minor") == "3.12"
-                    and all(existing.get(k) is True for k in ("ssl", "venv", "pip"))
-                    and _native_facts_match(existing, facts)
-                    and _meets_minimums(existing, entry)):
+            if (marker_identity_matches and existing_compatible
+                    and _verified_runtime_manifest(generation, marker.get("files"))):
                 return generation_executable
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             pass
@@ -773,8 +961,7 @@ def _native_architecture() -> str:
 
 def run_preflight(service: str, source_root: os.PathLike[str] | str, output: os.PathLike[str] | str) -> int:
     """Assemble once, check dependencies, and validate without publishing."""
-    supported = {"mcp", "vector_sync", "tldv_import", "sync_checker", "tldv_webhook", "tldv_reconciliation"}
-    if service not in supported:
+    if service not in _SUPPORTED_PREFLIGHT_SERVICES:
         raise ValueError(f"unsupported service: {service}")
     root, artifact = _validate_preflight_paths(Path(source_root), Path(output))
     build_tools = Path(__file__).resolve().parent
@@ -807,42 +994,80 @@ def run_preflight(service: str, source_root: os.PathLike[str] | str, output: os.
         shutil.copy2(build_tools / "validate.py", harness / "validate.py")
         shutil.copy2(build_tools / "smoke_support.py", harness / "smoke_support.py")
         result_path = external / "validation-result.json"
-        environment = external / "runtime-venv"
-        created = subprocess.run([str(runtime), "-I", "-m", "venv", str(environment)], cwd=str(external), check=False)
-        if created.returncode:
-            return created.returncode
-        venv_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        if not venv_python.is_file():
-            raise RuntimeError("verified runtime did not create its runtime-only virtual environment")
         requirements = artifact / "requirements.txt"
-        if requirements.is_file() and requirements.read_text(encoding="utf-8").strip():
-            installed = subprocess.run(
-                [str(venv_python), "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "-r", str(requirements)],
+        cache = _environment_cache()
+        with cache.prepared_environment(
+            runtime=runtime, project_root=root, requirements=requirements,
+            fresh_parent=external, process_runner=subprocess.run,
+            tree_manifest=_tree_manifest, verify_manifest=_verified_runtime_manifest,
+        ) as prepared:
+            if prepared.status or prepared.python is None:
+                return prepared.status or 1
+            validation = subprocess.run(
+                [str(prepared.python), "-I", str((harness / "validate.py").resolve()), "--service", service,
+                 "--artifact", str(Path(os.path.abspath(artifact))), "--offline", "--result", str(result_path)],
                 cwd=str(external), check=False,
             )
-            if installed.returncode:
-                return installed.returncode
-        checked = subprocess.run([str(venv_python), "-I", "-m", "pip", "check"], cwd=str(external), check=False)
-        if checked.returncode:
-            return checked.returncode
-        validation = subprocess.run(
-            [str(venv_python), "-I", str((harness / "validate.py").resolve()), "--service", service,
-             "--artifact", str(Path(os.path.abspath(artifact))), "--offline", "--result", str(result_path)],
-            cwd=str(external), check=False,
-        )
-        if validation.returncode:
-            return validation.returncode
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        after = _artifact_fingerprint(artifact)
-        if result.get("status") != "passed" or result.get("artifact_fingerprint") != before or after != before:
-            raise RuntimeError("artifact fingerprint changed or validation did not pass; it cannot be handed to upload")
-        print(f"Preflight passed for {service}")
-        print(f"Native OS: {_native_os_name()}")
-        print(f"Native architecture: {_native_architecture()}")
-        print("Artifact deployment target OS: linux")
-        print(f"Artifact runtime target: {artifact_target}")
-        print(f"Artifact fingerprint: {before}")
+            if validation.returncode:
+                return validation.returncode
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            after = _artifact_fingerprint(artifact)
+            if result.get("status") != "passed" or result.get("artifact_fingerprint") != before or after != before:
+                raise RuntimeError("artifact fingerprint changed or validation did not pass; it cannot be handed to upload")
+            print(f"Preflight passed for {service}")
+            print(f"Native OS: {_native_os_name()}")
+            print(f"Native architecture: {_native_architecture()}")
+            print("Artifact deployment target OS: linux")
+            print(f"Artifact runtime target: {artifact_target}")
+            print(f"Artifact fingerprint: {before}")
     return 0
+
+
+def run_managed_helper(
+    source_root: os.PathLike[str] | str,
+    requirements: os.PathLike[str] | str,
+    code: str,
+) -> int:
+    """Run a project helper in its verified runtime-only dependency environment."""
+    root = Path(source_root).resolve()
+    requirements_path = Path(os.path.abspath(requirements))
+    if not root.is_dir() or not requirements_path.is_file():
+        raise ValueError("managed helper source root or requirements file is unavailable")
+    if not code.strip():
+        raise ValueError("managed helper code is empty")
+
+    build_tools = Path(__file__).resolve().parent
+    saved_credentials = {
+        name: os.environ.pop(name)
+        for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USER_IDS")
+        if name in os.environ
+    }
+    consumer_environment = os.environ.copy()
+    consumer_environment.update(saved_credentials)
+    try:
+        runtime = ensure_runtime(
+            build_tools / "runner-toolchain.json", root / ".build" / "toolchain",
+            native_interpreter=Path(sys.executable) if sys.version_info[:2] == (3, 12) else None,
+        )
+        with tempfile.TemporaryDirectory(prefix="tlbrain-helper-") as temporary:
+            work = Path(temporary).resolve()
+            cache = _environment_cache()
+            with cache.prepared_environment(
+                runtime=runtime, project_root=root, requirements=requirements_path,
+                fresh_parent=work, process_runner=subprocess.run,
+                tree_manifest=_tree_manifest, verify_manifest=_verified_runtime_manifest,
+                env=consumer_environment,
+            ) as prepared:
+                if prepared.status or prepared.python is None:
+                    return prepared.status or 1
+                consumer_environment["PYTHONPATH"] = os.pathsep.join(
+                    value for value in (str(root), consumer_environment.get("PYTHONPATH", "")) if value
+                )
+                return subprocess.run(
+                    [str(prepared.python), "-c", code], cwd=str(root), env=consumer_environment, check=False,
+                ).returncode
+    finally:
+        os.environ.update(saved_credentials)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -853,6 +1078,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--service")
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--run-helper", action="store_true", help="run a helper in a temporary managed venv")
+    parser.add_argument("--requirements", type=Path)
+    parser.add_argument("--helper-code")
     args = parser.parse_args(argv)
     try:
         if args.verify_source:
@@ -861,6 +1089,10 @@ def main(argv: list[str] | None = None) -> int:
             verified = verify_source_artifact(args.artifact, args.fingerprint)
             print(f"Source artifact fingerprint verified: {verified}")
             return 0
+        if args.run_helper:
+            if args.source_root is None or args.requirements is None or args.helper_code is None:
+                parser.error("--run-helper requires --source-root, --requirements, and --helper-code")
+            return run_managed_helper(args.source_root, args.requirements, args.helper_code)
         if args.service is None or args.source_root is None or args.output is None:
             parser.error("preflight requires --service, --source-root, and --output")
         return run_preflight(args.service, args.source_root, args.output)

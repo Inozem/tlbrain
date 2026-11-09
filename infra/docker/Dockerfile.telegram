@@ -1,0 +1,20 @@
+FROM python:3.12-slim AS builder
+
+WORKDIR /src
+
+COPY . /src
+
+RUN python infra/build/assemble.py --service telegram --source-root /src --output /src/.build/telegram
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY --from=builder /src/.build/telegram/ /app/
+
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8080
+
+CMD ["python", "-m", "uvicorn", "services.connectors.telegram.app.main:app", "--host", "0.0.0.0", "--port", "8080"]

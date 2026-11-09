@@ -36,6 +36,28 @@ def test_add_user_fact_builds_versionless_payload_and_embeds_before_upsert(monke
     assert "version" not in events[1][1][0]
 
 
+def test_add_user_fact_forwards_only_explicit_point_id(monkeypatch):
+    events = []
+    monkeypatch.setattr(user_facts, "get_transcript_record", lambda _doc_id: {"status": "synced"})
+    monkeypatch.setattr(user_facts, "get_root_folder_id", lambda: "root")
+    monkeypatch.setattr(user_facts, "embed", lambda texts: events.append(("embed", texts)) or [[1.0]])
+    monkeypatch.setattr(
+        user_facts, "upsert_user_facts",
+        lambda payloads, vectors, **kwargs: events.append(("upsert", kwargs)),
+    )
+
+    user_facts.add_user_fact(DOC_ID, "Fact", point_id="6f11649d-013d-4d97-8a71-1dc816cb880f")
+    assert events == [
+        ("embed", ["Fact"]),
+        ("upsert", {"point_ids": ["6f11649d-013d-4d97-8a71-1dc816cb880f"]}),
+    ]
+
+    events.clear()
+    with pytest.raises(user_facts.AddFactInputError, match="point_id must be a UUID"):
+        user_facts.add_user_fact(DOC_ID, "Fact", point_id="bad")
+    assert events == []
+
+
 @pytest.mark.parametrize("doc_id,text", [(" ", "fact"), ("doc", " ")])
 def test_add_user_fact_rejects_empty_trimmed_inputs(doc_id, text):
     with pytest.raises(user_facts.AddFactInputError, match="doc_id and text are required"):
@@ -95,3 +117,19 @@ def test_add_user_fact_defaults_missing_payload_fields_to_empty_strings(monkeypa
     assert captured[0]["dialog_date"] == ""
     assert captured[0]["parent_id"] == ""
     assert captured[0]["dialog_date_num"] == 0
+
+
+def test_single_attempt_fact_embedding_has_one_physical_sdk_call(sdk_fakes):
+    from core.operations.mutations import MutationNotSent
+
+    sdk_fakes.gemini.queue("embed_content", error=ConnectionError("synthetic embed failure"))
+    payload = {"type": "user_fact", "doc_id": DOC_ID, "text": "Fact",
+               "root_folder_id": "pytest-synthetic-root", "parent_id": "folder"}
+
+    with pytest.raises(MutationNotSent):
+        user_facts.apply_user_fact_payload(
+            payload, point_id="6f11649d-013d-4d97-8a71-1dc816cb880f", single_attempt=True,
+        )
+    calls = [event for event in sdk_fakes.trace
+             if event["boundary"] == "gemini" and event["operation"] == "embed_content"]
+    assert len(calls) == 1, sdk_fakes.trace

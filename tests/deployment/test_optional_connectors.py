@@ -1,0 +1,640 @@
+"""Offline deployment contract for optional Telegram and TL;DV connectors.
+
+These routes run in synthetic checkouts with fake gcloud and Docker commands;
+no credentials or provider calls are used.
+"""
+
+from __future__ import annotations
+
+import re
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_deploy_routes import _bash, _bash_path, _run_route
+
+
+TOP_ROUTES = ("deploy.sh", "local_deploy.sh")
+DIRECT_MCP_ROUTES = ("core/deploy_mcp.sh", "core/local_deploy_mcp.sh")
+ROUTES = TOP_ROUTES + DIRECT_MCP_ROUTES
+
+
+def _connector_environment(telegram: bool, tldv: bool) -> dict[str, str]:
+    return {
+        "TELEGRAM_BOT_TOKEN": "synthetic-telegram-token" if telegram else "",
+        "TELEGRAM_ALLOWED_USER_IDS": "101,202" if telegram else "",
+        "TLDV_API_KEY": "synthetic-tldv-key" if tldv else "",
+    }
+
+
+def _cloud_commands(events: list[list[str]]) -> list[str]:
+    return [event[1] for event in events if event[0] == "gcloud"]
+
+
+def _cloud_argv_events(events: list[list[str]]) -> list[list[str]]:
+    return [event for event in events if event[0] == "gcloud-argv"]
+
+
+def _is_mcp_deploy(event: list[str]) -> bool:
+    return len(event) > 3 and event[1:4] == ["run", "deploy", "synthetic-mcp"]
+
+
+def _is_telegram_service_deploy(event: list[str]) -> bool:
+    return len(event) > 3 and event[1:3] == ["run", "deploy"] and "telegram" in event[3].lower()
+
+
+def _is_service_config(event: list[str], service: str) -> bool:
+    return len(event) > 3 and event[1] == "run" and (
+        (event[2] == "deploy" and event[3] == service)
+        or (event[2:4] == ["services", "update"] and len(event) > 4 and event[4] == service)
+    )
+
+
+def _deploy_mcp_command(commands: list[str]) -> str:
+    return next(command for command in commands if command.startswith("run deploy synthetic-mcp "))
+
+
+def _assert_telegram_secret_absent(result, events: list[list[str]]) -> None:
+    token = "synthetic-telegram-token"
+    deployment_argv = [
+        " ".join(event) for event in events
+        if event[0] in {"gcloud-argv", "docker-argv"}
+    ]
+    assert all(token not in argv for argv in deployment_argv)
+    assert token not in result.stdout
+    assert token not in result.stderr
+
+
+def _false_event_value(value: object) -> bool:
+    return value is False or value == "False"
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("telegram,tldv", [(False, False), (False, True), (True, False), (True, True)])
+def test_optional_connector_capabilities_are_selected_by_nonblank_configuration(
+    tmp_path: Path, route: str, telegram: bool, tldv: bool,
+) -> None:
+    result, events, _root = _run_route(
+        tmp_path, route, env_overrides=_connector_environment(telegram, tldv),
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    _assert_telegram_secret_absent(result, events)
+    provider_env = [event for event in events if event[0] == "child-env"]
+    assert provider_env
+    assert all(_false_event_value(event[2]) and _false_event_value(event[3]) for event in provider_env)
+
+    commands = _cloud_commands(events)
+    mcp_command = _deploy_mcp_command(commands)
+    telegram_deploys = [event for event in _cloud_argv_events(events) if _is_telegram_service_deploy(event)]
+    if route in TOP_ROUTES and telegram:
+        assert telegram_deploys
+        # The allowlist is configuration, while the bot token remains in Firestore.
+        telegram_env_files = [event for event in events if event[0] == "telegram-env-file"]
+        assert telegram_env_files
+        assert all(event[1] == "101,202" and event[2] for event in telegram_env_files)
+    else:
+        assert not telegram_deploys
+    assert "TELEGRAM_BOT_TOKEN=synthetic-telegram-token" not in mcp_command
+
+    tldv_lookups = [command for command in commands if "functions describe" in command and "tldv" in command]
+    tldv_deploys = [command for command in commands if "functions deploy" in command and "tldv" in command]
+    tldv_urls = [line for line in result.stdout.splitlines() if "https://synthetic.example/" in line and "tldv" in line]
+    if tldv:
+        assert tldv_lookups or tldv_deploys
+        assert "TLDV_RECONCILIATION_URL=" in " ".join(next(
+            event for event in _cloud_argv_events(events) if _is_mcp_deploy(event)
+        ))
+        if route in TOP_ROUTES:
+            assert len(tldv_deploys) == 2
+    else:
+        assert not tldv_lookups
+        assert not tldv_deploys
+        assert not tldv_urls
+        assert "TLDV_RECONCILIATION_URL" not in " ".join(next(
+            event for event in _cloud_argv_events(events) if _is_mcp_deploy(event)
+        ))
+
+    if route in TOP_ROUTES:
+        assert any(command.startswith("run deploy synthetic-vector-sync ") for command in commands)
+        assert any(command.startswith("functions deploy synthetic-sync-checker ") for command in commands)
+        assert mcp_command
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_both_optional_connectors_off_keeps_core_services_available(tmp_path: Path, route: str) -> None:
+    result, events, _root = _run_route(tmp_path, route, env_overrides=_connector_environment(False, False))
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    _assert_telegram_secret_absent(result, events)
+    if route in TOP_ROUTES:
+        assert "TL;DV Webhook" not in result.stdout
+        assert "https://synthetic.example/synthetic-tldv-webhook" not in result.stdout
+    commands = _cloud_commands(events)
+    assert any(command.startswith("run deploy synthetic-mcp ") for command in commands)
+    if route in TOP_ROUTES:
+        assert any(command.startswith("run deploy synthetic-vector-sync ") for command in commands)
+        assert any(command.startswith("functions deploy synthetic-sync-checker ") for command in commands)
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_whitespace_connector_values_are_treated_as_unset(tmp_path: Path, route: str) -> None:
+    environment = {
+        "TELEGRAM_BOT_TOKEN": "   ",
+        "TELEGRAM_ALLOWED_USER_IDS": " \t ",
+        "TLDV_API_KEY": "   ",
+    }
+    result, events, _root = _run_route(tmp_path, route, env_overrides=environment)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    _assert_telegram_secret_absent(result, events)
+    commands = _cloud_commands(events)
+    mcp_command = _deploy_mcp_command(commands)
+    assert "TELEGRAM_BOT_TOKEN" not in mcp_command
+    assert "TELEGRAM_ALLOWED_USER_IDS" not in mcp_command
+    mcp_argv = next(event for event in _cloud_argv_events(events) if _is_mcp_deploy(event))
+    assert "TLDV_RECONCILIATION_URL" not in " ".join(mcp_argv)
+    assert not any("functions describe" in command and "tldv" in command for command in commands)
+    assert not any("functions deploy" in command and "tldv" in command for command in commands)
+
+
+@pytest.mark.parametrize("route", DIRECT_MCP_ROUTES)
+def test_first_mcp_deploy_waits_for_real_status_url_before_self_url_readiness(
+    tmp_path: Path, route: str,
+) -> None:
+    result, events, _root = _run_route(
+        tmp_path, route, env_overrides=_connector_environment(False, False),
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    _assert_telegram_secret_absent(result, events)
+
+    cloud = _cloud_argv_events(events)
+    deploys = [event for event in cloud if _is_mcp_deploy(event)]
+    assert deploys, f"no MCP deploy in command trace: {cloud}"
+    initial_deploy = deploys[0]
+    initial_text = " ".join(initial_deploy)
+    assert "VECTOR_SYNC_QUEUE=synthetic-vector-queue" in initial_text
+    assert "REGION=synthetic-region" in initial_text
+    for setting in (
+        "INTERNAL_DIALOG_OPERATIONS_URL=",
+        "DIALOG_OPERATIONS_QUEUE=",
+        "CLOUD_TASKS_OIDC_AUDIENCE=",
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=",
+        "OIDC_AUDIENCE=",
+        "OIDC_SERVICE_ACCOUNT_EMAIL=",
+    ):
+        assert setting not in initial_text
+
+    url_event = next(
+        event for event in events
+        if event[:2] == ["gcloud-result", "run-service-url"] and event[2] == "synthetic-mcp"
+    )
+    real_url = url_event[3]
+    assert real_url == "https://synthetic-mcp-uc.a.run.app"
+    url_position = events.index(url_event)
+    initial_position = events.index(initial_deploy)
+    assert initial_position < url_position
+    describe_position = next(
+        index for index, event in enumerate(events)
+        if event[0] == "gcloud-argv" and event[1:4] == ["run", "services", "describe"]
+        and len(event) > 4 and event[4] == "synthetic-mcp"
+    )
+    assert initial_position < describe_position < url_position
+
+    readiness = next(
+        event for event in cloud
+        if _is_service_config(event, "synthetic-mcp")
+        and any("INTERNAL_DIALOG_OPERATIONS_URL=" in arg for arg in event)
+    )
+    readiness_position = events.index(readiness)
+    readiness_text = " ".join(readiness)
+    assert readiness_position > url_position
+    assert f"INTERNAL_DIALOG_OPERATIONS_URL={real_url}/internal/dialog-operations" in readiness_text
+    assert "QUEUE" in readiness_text
+    assert "OIDC" in readiness_text
+    for setting in (
+        "DIALOG_OPERATIONS_QUEUE=",
+        "CLOUD_TASKS_OIDC_AUDIENCE=",
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL=",
+        "OIDC_AUDIENCE=",
+        "OIDC_SERVICE_ACCOUNT_EMAIL=",
+    ):
+        assert setting in readiness_text
+    assert "synthetic-mcp.run.app" not in readiness_text
+
+
+@pytest.mark.parametrize("route", DIRECT_MCP_ROUTES)
+@pytest.mark.parametrize("allowed_email", ["first@example.invalid,second@example.invalid", ""])
+def test_direct_mcp_routes_preserve_allowlist_list_and_open_mode(
+    tmp_path: Path, route: str, allowed_email: str,
+) -> None:
+    result, events, _root = _run_route(
+        tmp_path, route,
+        env_overrides={**_connector_environment(False, False), "ALLOWED_EMAIL": allowed_email},
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    initial = next(event for event in _cloud_argv_events(events) if _is_mcp_deploy(event))
+    env_arg = next(arg for arg in initial if arg.startswith("^|^"))
+    assert f"ALLOWED_EMAIL={allowed_email}" in env_arg
+
+
+def _marker_position(events: list[list[str]], marker: str) -> int:
+    return next(
+        index for index, event in enumerate(events)
+        if event[0] == "rollout-marker" and marker in event[1]
+    )
+
+
+def _assert_drain_confirmation_prompt(result) -> None:
+    prompt = (result.stdout + "\n" + result.stderr).lower()
+    assert "confirm" in prompt
+    assert "old workers" in prompt
+    assert "external" in prompt and ("i/o" in prompt or "io" in prompt)
+    assert re.search(r"old workers.{0,120}(drain|terminat)", prompt, re.DOTALL)
+    assert re.search(r"external.{0,120}(drain|terminat)", prompt, re.DOTALL)
+
+
+def _rollout_config_events(events: list[list[str]], service: str) -> list[int]:
+    return [index for index, event in enumerate(events)
+            if event[0] == "gcloud-argv" and _is_service_config(event, service)]
+
+
+@pytest.mark.parametrize("route", TOP_ROUTES)
+def test_rollout_orders_compatible_readers_consumers_drain_then_writers(tmp_path: Path, route: str) -> None:
+    result, events, _root = _run_route(
+        tmp_path,
+        route,
+        env_overrides=_connector_environment(True, False),
+        stdin_answers="y\ny\n",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    _assert_drain_confirmation_prompt(result)
+
+    decoder = _marker_position(events, "rollout_phase:decoder_compatible")
+    guards = _marker_position(events, "rollout_phase:guards_compatible")
+    drained = _marker_position(events, "rollout_gate:old_workers_drained")
+    writers = _marker_position(events, "rollout_phase:writers_enabled")
+    assert decoder < guards < drained < writers
+
+    mcp_configs = _rollout_config_events(events, "synthetic-mcp")
+    vector_configs = _rollout_config_events(events, "synthetic-vector-sync")
+    assert len(mcp_configs) >= 2
+    assert vector_configs
+    checker_deploy = next(
+        index for index, event in enumerate(events)
+        if event[0] == "gcloud-argv" and event[1:4] == ["functions", "deploy", "synthetic-sync-checker"]
+    )
+    assert vector_configs[0] < decoder < checker_deploy < guards
+    assert guards < mcp_configs[0] < drained < writers
+    assert writers < mcp_configs[1]
+
+    writer_commands = [
+        index for index, event in enumerate(events)
+        if event[0] == "gcloud-argv" and _is_service_config(event, "synthetic-mcp")
+        and "INTERNAL_DIALOG_OPERATIONS_URL=" in " ".join(event)
+    ]
+    telegram_commands = [
+        index for index, event in enumerate(events)
+        if event[0] == "gcloud-argv" and _is_telegram_service_deploy(event)
+    ]
+    assert writer_commands and telegram_commands
+    assert writers < min(writer_commands)
+    assert writers < min(telegram_commands)
+
+
+@pytest.mark.parametrize("route", TOP_ROUTES)
+@pytest.mark.parametrize("answers", ["y\nn\n", "y\n"], ids=["operator-declines", "missing-confirmation"])
+def test_rollout_without_drain_confirmation_stops_before_writer_activation(
+    tmp_path: Path, route: str, answers: str,
+) -> None:
+    result, events, _root = _run_route(
+        tmp_path,
+        route,
+        env_overrides=_connector_environment(True, False),
+        stdin_answers=answers,
+    )
+    assert result.returncode != 0
+    _assert_drain_confirmation_prompt(result)
+    _assert_telegram_secret_absent(result, events)
+    decoder = _marker_position(events, "rollout_phase:decoder_compatible")
+    guards = _marker_position(events, "rollout_phase:guards_compatible")
+    assert decoder < guards
+    assert not any(event[0] == "rollout-marker" and "rollout_gate:old_workers_drained" in event[1]
+                   for event in events)
+    assert not any(event[0] == "rollout-marker" and "rollout_phase:writers_enabled" in event[1]
+                   for event in events)
+    assert not any(
+        event[0] == "gcloud-argv" and _is_service_config(event, "synthetic-mcp")
+        and "INTERNAL_DIALOG_OPERATIONS_URL=" in " ".join(event)
+        for event in events
+    )
+    assert not any(
+        event[0] == "gcloud-argv" and _is_telegram_service_deploy(event)
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"TELEGRAM_BOT_TOKEN": "synthetic-telegram-token", "TELEGRAM_ALLOWED_USER_IDS": ""},
+        {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_ALLOWED_USER_IDS": "101,202"},
+    ],
+)
+def test_partial_telegram_configuration_fails_before_cloud_or_docker_mutation(
+    tmp_path: Path, route: str, values: dict[str, str],
+) -> None:
+    environment = {**_connector_environment(False, False), **values}
+    result, events, _root = _run_route(tmp_path, route, env_overrides=environment)
+    assert result.returncode != 0
+    _assert_telegram_secret_absent(result, events)
+    assert "TELEGRAM_BOT_TOKEN" in result.stdout + result.stderr
+    assert "TELEGRAM_ALLOWED_USER_IDS" in result.stdout + result.stderr
+    assert not any(event[0] in {"gcloud", "gcloud-argv", "docker", "docker-argv"} for event in events)
+
+
+@pytest.mark.parametrize("route", TOP_ROUTES)
+@pytest.mark.parametrize("allowed_ids", ["0", "000, 00", "10,abc", "10,,20"])
+def test_invalid_telegram_allowlist_fails_before_cloud_or_docker_mutation(
+    tmp_path: Path, route: str, allowed_ids: str,
+) -> None:
+    result, events, _root = _run_route(
+        tmp_path,
+        route,
+        env_overrides={
+            "TELEGRAM_BOT_TOKEN": "synthetic-telegram-token",
+            "TELEGRAM_ALLOWED_USER_IDS": allowed_ids,
+            "TLDV_API_KEY": "",
+        },
+    )
+    assert result.returncode != 0
+    assert "positive decimal IDs" in result.stdout + result.stderr
+    _assert_telegram_secret_absent(result, events)
+    assert not any(event[0] in {"gcloud", "gcloud-argv", "docker", "docker-argv"} for event in events)
+
+
+@pytest.mark.parametrize("route", TOP_ROUTES)
+def test_telegram_values_from_env_file_do_not_reach_provider_children(
+    tmp_path: Path, route: str,
+) -> None:
+    result, events, root = _run_route(
+        tmp_path,
+        route,
+        env_file={
+            "TELEGRAM_BOT_TOKEN": "synthetic-telegram-token",
+            "TELEGRAM_ALLOWED_USER_IDS": "101,202",
+            "TLDV_API_KEY": "",
+        },
+        stdin_answers="y\ny\n",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert (root / ".env").is_file()
+    _assert_telegram_secret_absent(result, events)
+    provider_env = [event for event in events if event[0] == "child-env"]
+    assert provider_env
+    assert all(_false_event_value(event[2]) and _false_event_value(event[3]) for event in provider_env)
+
+
+def _run_deploy_helper(tmp_path: Path, helper: str, *args: str, **overrides: str):
+    bash = _bash()
+    bin_dir = tmp_path / "helper-bin"
+    bin_dir.mkdir()
+    log = tmp_path / "helper-events.jsonl"
+    fake_gcloud = bin_dir / "gcloud"
+    fake_gcloud.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "\"$ROUTE_PYTHON\" -c 'import json,os,sys; open(os.environ[\"ROUTE_EVENT_LOG\"],\"a\",encoding=\"utf-8\").write(json.dumps(sys.argv[1:])+\"\\n\")' \"$@\"\n"
+        "case \"$*\" in\n"
+        "  *'firestore indexes composite list'*) \"$ROUTE_PYTHON\" -c 'import json,os; log=[json.loads(x) for x in open(os.environ[\"ROUTE_EVENT_LOG\"],encoding=\"utf-8\")]; data=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); done=any(x[:4]==[\"firestore\",\"indexes\",\"composite\",\"create\"] for x in log); print(json.dumps([dict(i,name=\"projects/example-project/databases/(default)/collectionGroups/\"+i[\"collectionGroup\"]+\"/indexes/fake\",state=\"READY\") for i in data[\"indexes\"]] if done else []))' ;;\n"
+        "  *'firestore indexes fields list'*) \"$ROUTE_PYTHON\" -c 'import json,os,sys; log=[json.loads(x) for x in open(os.environ[\"ROUTE_EVENT_LOG\"],encoding=\"utf-8\")]; data=json.load(open(os.environ[\"ROUTE_INDEX_FILE\"],encoding=\"utf-8\")); group=next(x.split(\"=\",1)[1] for x in sys.argv[1:] if x.startswith(\"--collection-group=\")); done=any(x[:4]==[\"firestore\",\"indexes\",\"fields\",\"update\"] for x in log); rows=[o for o in data[\"fieldOverrides\"] if o[\"collectionGroup\"]==group and o[\"indexes\"]==[]]; print(json.dumps([dict(name=\"projects/example-project/databases/(default)/collectionGroups/\"+o[\"collectionGroup\"]+\"/fields/\"+o[\"fieldPath\"],indexConfig={\"indexes\":[],\"usesAncestorConfig\":False}) for o in rows] if done else []))' \"$@\" ;;\n"
+        "  *'firestore operations list'*) \"$ROUTE_PYTHON\" -c 'import json,os; log=[json.loads(x) for x in open(os.environ[\"ROUTE_EVENT_LOG\"],encoding=\"utf-8\")]; done=any(x[:4] in ([\"firestore\",\"indexes\",\"composite\",\"create\"],[\"firestore\",\"indexes\",\"fields\",\"update\"]) for x in log); print(json.dumps([dict(name=\"operations/index-async\",done=True,metadata={\"state\":\"SUCCESSFUL\"})] if done else []))' ;;\n"
+        "  *'firestore operations describe'*) echo '{\"name\":\"operations/index-async\",\"done\":true,\"metadata\":{\"state\":\"SUCCESSFUL\"}}' ;;\n"
+        "  *'run services describe tlbrain-vector-sync'*) if [[ \"${FAKE_VECTOR_SERVICE_MISSING:-0}\" == 1 ]]; then exit 1; fi; echo \"${FAKE_VECTOR_RUNTIME_SERVICE_ACCOUNT-${FAKE_RUNTIME_SERVICE_ACCOUNT-mcp-runtime@example-project.iam.gserviceaccount.com}}\" ;;\n"
+        "  *'run services describe'*) echo \"${FAKE_RUNTIME_SERVICE_ACCOUNT-mcp-runtime@example-project.iam.gserviceaccount.com}\" ;;\n"
+        "  *'projects describe'*) echo '123456789' ;;\n"
+        "  *'iam service-accounts describe'*) echo 'NOT_FOUND: service account missing' >&2; exit 1 ;;\n"
+        "  *'tasks queues describe'*) if [[ \"${FAKE_QUEUE_EXISTS:-0}\" == 1 ]]; then exit 0; else echo 'NOT_FOUND: queue missing' >&2; exit 1; fi ;;\n"
+        "  *'firestore indexes composite create'*'FAKE_INDEX_ERROR=1'*) echo 'PERMISSION_DENIED' >&2; exit 1 ;;\n"
+        "  *'firestore indexes composite create'*) echo '{\"name\":\"operations/index-async\"}' ;;\n"
+        "  *'firestore indexes fields update'*) echo '{\"name\":\"operations/index-async\"}' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_gcloud.chmod(0o755)
+    fake_gcloud_executable = fake_gcloud
+    if os.name == "nt":
+        cmd_shim = bin_dir / "gcloud.cmd"
+        cmd_shim.write_text(
+            f'@echo off\r\n"{_bash()}" "{fake_gcloud}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="utf-8",
+        )
+    safe_path = (
+        (str(bin_dir), str(Path(sys.executable).parent), "C:/Program Files/Git/bin",
+         "C:/Program Files/Git/usr/bin", str(Path(os.environ.get("SYSTEMROOT", "C:/Windows")) / "System32"))
+        if os.name == "nt" else
+        (str(bin_dir), str(Path(sys.executable).parent), "/usr/bin", "/bin")
+    )
+    environment = {
+        **{name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT") if name in os.environ},
+        "PATH": os.pathsep.join(safe_path),
+        "ROUTE_PYTHON": sys.executable,
+        "PYTHON": sys.executable,
+        "ROUTE_EVENT_LOG": str(log),
+        "ROUTE_GCLOUD_EXECUTABLE": str(fake_gcloud_executable),
+        "BASH_ENV": str(bin_dir / "fake-gcloud-hook.sh"),
+        "CLOUDSDK_CONFIG": str(tmp_path / "cloudsdk-config"),
+        "ROUTE_INDEX_FILE": str(Path(__file__).resolve().parents[2] / "infra" / "firestore" / "indexes.json"),
+        "PROJECT_ID": "example-project",
+        "REGION": "europe-west1",
+        **overrides,
+    }
+    (bin_dir / "fake-gcloud-hook.sh").write_text(
+        "if [[ -z \"${ROUTE_GCLOUD_GUARD_CHECKED:-}\" ]]; then\n"
+        "  resolved=\"$(PATH=\"${ROUTE_GCLOUD_BASH_PATH}:/usr/bin:/bin\" command -v gcloud)\"\n"
+        "  case \"$resolved\" in */gcloud|*/gcloud.cmd) ;; *) exit 96 ;; esac\n"
+        "  export ROUTE_GCLOUD_GUARD_CHECKED=1\n"
+        "fi\n"
+        "gcloud() { \"$ROUTE_GCLOUD_EXECUTABLE\" \"$@\"; }\n",
+        encoding="utf-8",
+    )
+    environment["ROUTE_GCLOUD_BASH_PATH"] = _bash_path(bin_dir)
+    expected_gcloud = bin_dir / ("gcloud.cmd" if os.name == "nt" else "gcloud")
+    assert Path(shutil.which("gcloud", path=environment["PATH"]) or "").resolve() == expected_gcloud.resolve()
+    script = Path(__file__).resolve().parents[2] / "infra" / "deploy" / "core" / "helpers" / helper
+    result = subprocess.run([bash, str(script), *args], cwd=script.parents[4], env=environment,
+                            text=True, capture_output=True, check=False, timeout=30)
+    events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+    return result, events
+
+
+def test_dialog_operations_helper_uses_confirmed_url_and_scoped_iam(tmp_path: Path) -> None:
+    base_url = "https://synthetic-mcp-uc.a.run.app"
+    result, events = _run_deploy_helper(tmp_path, "deploy_dialog_operations.sh", base_url)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    output = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    task_invoker_account_id = "tlbrain-dialog-ops-invoker"
+    task_invoker = f"{task_invoker_account_id}@example-project.iam.gserviceaccount.com"
+    runtime = "mcp-runtime@example-project.iam.gserviceaccount.com"
+    assert output == {
+        "INTERNAL_DIALOG_OPERATIONS_URL": base_url + "/internal/dialog-operations",
+        "DIALOG_OPERATIONS_QUEUE": "tlbrain-dialog-operations",
+        "CLOUD_TASKS_OIDC_AUDIENCE": base_url,
+        "CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL": task_invoker,
+        "OIDC_AUDIENCE": base_url,
+        "OIDC_SERVICE_ACCOUNT_EMAIL": task_invoker,
+    }
+    queue = next(event for event in events if event[:4] == ["tasks", "queues", "create", "tlbrain-dialog-operations"])
+    assert "--max-concurrent-dispatches=2" in queue
+    assert "--location" in queue and queue[queue.index("--location") + 1] == "europe-west1"
+    assert any(event[:3] == ["tasks", "queues", "describe"] for event in events)
+    created_accounts = [
+        event[3] for event in events
+        if event[:3] == ["iam", "service-accounts", "create"]
+    ]
+    assert created_accounts == [task_invoker_account_id]
+    assert all(6 <= len(account_id) <= 30 for account_id in created_accounts)
+    assert all(re.fullmatch(r"[a-z][a-z0-9-]*[a-z0-9]", account_id) for account_id in created_accounts)
+
+    bindings = [event for event in events if "add-iam-policy-binding" in event]
+    role_bindings = {
+        (tuple(event[0:3]), next(arg.split("=", 1)[1] for arg in event if arg.startswith("--role=")),
+         next(arg.split("=", 1)[1] for arg in event if arg.startswith("--member=")))
+        for event in bindings
+    }
+    assert (("run", "services", "add-iam-policy-binding"), "roles/run.invoker", f"serviceAccount:{task_invoker}") in role_bindings
+    assert (("iam", "service-accounts", "add-iam-policy-binding"), "roles/iam.serviceAccountTokenCreator", "serviceAccount:service-123456789@gcp-sa-cloudtasks.iam.gserviceaccount.com") in role_bindings
+    assert (("tasks", "queues", "add-iam-policy-binding"), "roles/cloudtasks.enqueuer", f"serviceAccount:{runtime}") in role_bindings
+    assert (("iam", "service-accounts", "add-iam-policy-binding"), "roles/iam.serviceAccountUser", f"serviceAccount:{runtime}") in role_bindings
+    assert any(event[:3] == ["projects", "add-iam-policy-binding", "example-project"]
+               and any(arg.endswith("roles/datastore.user") for arg in event) for event in events)
+    assert sum(event[:3] == ["tasks", "queues", "add-iam-policy-binding"]
+               and f"serviceAccount:{runtime}" in " ".join(event) for event in bindings) == 1
+    trace = " ".join(" ".join(event) for event in events)
+    assert "roles/owner" not in trace and "roles/editor" not in trace
+    assert "roles/cloudtasks.admin" not in trace and "roles/datastore.owner" not in trace
+    assert not any("remove-iam-policy-binding" in event or "set-iam-policy" in event for event in events)
+
+
+def test_dialog_operations_task_invoker_account_id_override_is_used_consistently(tmp_path: Path) -> None:
+    account_id = "custom-dialog-ops-7"
+    email = f"{account_id}@example-project.iam.gserviceaccount.com"
+    result, events = _run_deploy_helper(
+        tmp_path,
+        "deploy_dialog_operations.sh",
+        "https://synthetic-mcp-uc.a.run.app",
+        DIALOG_OPERATIONS_TASK_INVOKER_ACCOUNT_ID=account_id,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    output = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    assert output["CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL"] == email
+    assert output["OIDC_SERVICE_ACCOUNT_EMAIL"] == email
+
+    created_accounts = [
+        event[3] for event in events
+        if event[:3] == ["iam", "service-accounts", "create"]
+    ]
+    assert created_accounts == [account_id]
+    bindings = [event for event in events if "add-iam-policy-binding" in event]
+    assert any(
+        event[:3] == ["run", "services", "add-iam-policy-binding"]
+        and f"--member=serviceAccount:{email}" in event
+        for event in bindings
+    )
+    assert sum(
+        event[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]
+        and len(event) > 3 and event[3] == email
+        for event in bindings
+    ) == 2
+
+
+def test_dialog_operations_rejects_unconfirmed_or_non_base_urls_before_cloud_calls(tmp_path: Path) -> None:
+    result, events = _run_deploy_helper(
+        tmp_path, "deploy_dialog_operations.sh", "https://untrusted.invalid/internal/dialog-operations",
+    )
+    assert result.returncode != 0
+    assert events == []
+
+
+def test_dialog_operations_uses_default_compute_identity_when_service_account_is_empty(tmp_path: Path) -> None:
+    result, events = _run_deploy_helper(
+        tmp_path, "deploy_dialog_operations.sh", "https://synthetic-mcp-uc.a.run.app",
+        FAKE_RUNTIME_SERVICE_ACCOUNT="",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    runtime = "123456789-compute@developer.gserviceaccount.com"
+    assert any(event[:3] == ["tasks", "queues", "add-iam-policy-binding"]
+               and any(arg.endswith(f"serviceAccount:{runtime}") for arg in event) for event in events)
+    assert any(event[:3] == ["projects", "add-iam-policy-binding", "example-project"]
+               and any(arg.endswith(f"serviceAccount:{runtime}") for arg in event)
+               and "--role=roles/datastore.user" in event
+               for event in events)
+    assert any(event[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]
+               and any(arg.endswith(f"serviceAccount:{runtime}") for arg in event)
+               and "--role=roles/iam.serviceAccountUser" in event
+               for event in events)
+
+
+def test_dialog_operations_configures_distinct_vector_runtime_narrowly(tmp_path: Path) -> None:
+    vector_runtime = "vector-runtime@example-project.iam.gserviceaccount.com"
+    result, events = _run_deploy_helper(
+        tmp_path, "deploy_dialog_operations.sh", "https://synthetic-mcp-uc.a.run.app",
+        DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC="1",
+        FAKE_VECTOR_RUNTIME_SERVICE_ACCOUNT=vector_runtime,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    output_lines = [line for line in result.stdout.splitlines() if line]
+    assert len(output_lines) == 6
+    bindings = [event for event in events if "add-iam-policy-binding" in event]
+    assert any(event[:3] == ["tasks", "queues", "add-iam-policy-binding"]
+               and f"serviceAccount:{vector_runtime}" in " ".join(event)
+               and "roles/cloudtasks.enqueuer" in " ".join(event) for event in bindings)
+    invoker = "tlbrain-dialog-ops-invoker@example-project.iam.gserviceaccount.com"
+    assert any(event[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]
+               and event[3] == invoker and f"serviceAccount:{vector_runtime}" in " ".join(event)
+               and "roles/iam.serviceAccountUser" in " ".join(event) for event in bindings)
+    vector_updates = [event for event in events if event[:4] == ["run", "services", "update", "tlbrain-vector-sync"]]
+    assert len(vector_updates) == 1
+    update_text = " ".join(vector_updates[0])
+    assert "INTERNAL_DIALOG_OPERATIONS_URL=https://synthetic-mcp-uc.a.run.app/internal/dialog-operations" in update_text
+    assert "DIALOG_OPERATIONS_QUEUE=tlbrain-dialog-operations" in update_text
+    assert "CLOUD_TASKS_OIDC_AUDIENCE=https://synthetic-mcp-uc.a.run.app" in update_text
+    assert f"CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL={invoker}" in update_text
+    assert "REGION=europe-west1" in update_text and "GOOGLE_CLOUD_PROJECT=example-project" in update_text
+
+
+def test_vector_configuration_fails_when_required_service_is_missing(tmp_path: Path) -> None:
+    result, events = _run_deploy_helper(
+        tmp_path, "deploy_dialog_operations.sh", "https://synthetic-mcp-uc.a.run.app",
+        DIALOG_OPERATIONS_CONFIGURE_VECTOR_SYNC="1", FAKE_VECTOR_SERVICE_MISSING="1",
+    )
+    assert result.returncode != 0
+    assert "Vector Sync must be deployed" in result.stderr
+    assert not any(event[:3] == ["run", "services", "update"] for event in events)
+
+
+def test_firestore_index_helper_adds_declared_indexes_and_exemptions_idempotently(tmp_path: Path) -> None:
+    result, events = _run_deploy_helper(tmp_path, "deploy_firestore_indexes.sh")
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    composites = [event for event in events if event[:5] == ["firestore", "indexes", "composite", "create", "--project"]]
+    assert len(composites) == 6
+    as_text = [" ".join(event) for event in composites]
+    assert any("--collection-group telegram_sessions" in text and "reserved_operation_id" in text and "lock_expires_at" in text for text in as_text)
+    assert any("--collection-group task_outbox" in text and "target_kind" in text and "schedule_at" in text for text in as_text)
+    assert any("--collection-group dialog_operations" in text and "origin" in text and "updated_at" in text for text in as_text)
+    assert any("--collection-group drafts" in text and "cleanup_state" in text and "updated_at" in text for text in as_text)
+    # input_cleanup_state is a single-field equality query and uses Firestore's default index.
+    assert not any("--collection-group dialog_operations" in text and "input_cleanup_state" in text for text in as_text)
+    exemptions = [event for event in events if event[:4] == ["firestore", "indexes", "fields", "update"]]
+    assert len(exemptions) == 9
+    assert {event[4] for event in exemptions} == {
+        "text", "caption", "transcription_text", "parts", "raw_command_envelope", "body", "payload",
+    }
+    assert all("--disable-indexes" in event and "--collection-group" in " ".join(event) for event in exemptions)
+    assert all("--project example-project" in " ".join(event) for event in events)
+    trace = " ".join(" ".join(event) for event in events)
+    assert "delete" not in trace and "clear" not in trace and "indexes import" not in trace
+    assert "ALREADY_EXISTS" not in result.stderr

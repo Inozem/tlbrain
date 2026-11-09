@@ -9,16 +9,18 @@ from googleapiclient.discovery import build
 
 from core.config import get_root_folder_id
 from core.integrations.firestore.folders import increment_folder_speakers, speaker_key
-from core.integrations.firestore.transcripts import get_index_records_by_meeting_id, save_index
+from core.integrations.firestore.transcripts import (
+    delete_queued_placeholder,
+    get_index_records_by_meeting_id,
+    is_tldv_transcript_record,
+    mark_download_error,
+    mark_downloading,
+    save_index,
+)
 from core.integrations.gemini.llm import call_gemini_json
 from core.integrations.google_auth.credentials import credentials
 from core.integrations.google_docs.client import build_docs_service
 from core.integrations.google_docs.writer import create_google_doc
-from core.integrations.firestore.transcripts import (
-    delete_queued_placeholder,
-    mark_download_error,
-    mark_downloading,
-)
 from core.utils.logging import configure_logging
 from core.integrations.cloud_tasks.client import enqueue_task
 from tldv_client import tldv_get
@@ -53,59 +55,51 @@ def _create_google_doc(drive, folder_id: str, title: str, text: str, speaker_ran
     return create_google_doc(drive, docs, folder_id, title, text, speaker_ranges)
 
 
-@app.get("/")
-async def health():
-    return {"status": "ok"}
+def _existing_import_skip(meeting_id: str, db):
+    for record in get_index_records_by_meeting_id(meeting_id, db):
+        data = record.to_dict() or {}
+        if is_tldv_transcript_record(data) and data.get("status") != "queued":
+            logger.info("Already imported: %s", meeting_id)
+            return {"ok": True, "skipped": True}
+    return None
 
 
-@app.post("/import")
-async def import_meeting(request: Request):
-    body = await request.json()
-    meeting_id = body.get("meeting_id")
-    if not meeting_id:
-        return JSONResponse({"error": "missing meeting_id"}, status_code=400)
-
-    logger.info("Importing meeting_id=%s", meeting_id)
-
-    db = firestore.Client()
-    existing = get_index_records_by_meeting_id(meeting_id, db)
-    if any(d.to_dict().get("status") != "queued" for d in existing):
-        logger.info("Already imported: %s", meeting_id)
-        return {"ok": True, "skipped": True}
-
-    mark_downloading(meeting_id)
-
+def _fetch_meeting(meeting_id: str, db):
     try:
-        meeting = tldv_get(f"/meetings/{meeting_id}")
+        return tldv_get(f"/meetings/{meeting_id}"), None
     except http_requests.exceptions.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 404:
             logger.warning("Meeting not found in TL;DV API, deleting placeholder: %s", meeting_id)
-            delete_queued_placeholder(meeting_id)
-            return {"ok": True, "skipped": True, "reason": "meeting_not_found"}
+            delete_queued_placeholder(meeting_id, db=db)
+            return None, {"ok": True, "skipped": True, "reason": "meeting_not_found"}
         if exc.response is not None and exc.response.status_code == 403:
             logger.warning("Meeting forbidden in TL;DV API (403), marking error: %s", meeting_id)
-            mark_download_error(meeting_id, "HTTP 403 fetching meeting")
-            return {"ok": True, "skipped": True, "reason": "meeting_http_403"}
+            mark_download_error(meeting_id, "HTTP 403 fetching meeting", db=db)
+            return None, {"ok": True, "skipped": True, "reason": "meeting_http_403"}
         raise
-    logger.info("Meeting: %r", meeting.get("name"))
 
+
+def _fetch_utterances(meeting_id: str, db):
     try:
         transcript_resp = tldv_get(f"/meetings/{meeting_id}/transcript")
     except http_requests.exceptions.HTTPError as exc:
         if exc.response is not None and exc.response.status_code in (403, 404):
             status_code = exc.response.status_code
             logger.warning("Transcript HTTP %s for meeting_id=%s, marking error", status_code, meeting_id)
-            mark_download_error(meeting_id, f"HTTP {status_code} fetching transcript")
-            return {"ok": True, "skipped": True, "reason": f"transcript_http_{status_code}"}
+            mark_download_error(meeting_id, f"HTTP {status_code} fetching transcript", db=db)
+            return None, {"ok": True, "skipped": True, "reason": f"transcript_http_{status_code}"}
         raise
+
     utterances = transcript_resp.get("results", transcript_resp.get("data", []))
     logger.info("Utterances: %d", len(utterances))
-
     if not utterances:
         logger.warning("Empty transcript for meeting_id=%s, marking error", meeting_id)
-        mark_download_error(meeting_id, "empty transcript")
-        return {"ok": True, "skipped": True, "reason": "empty_transcript"}
+        mark_download_error(meeting_id, "empty transcript", db=db)
+        return None, {"ok": True, "skipped": True, "reason": "empty_transcript"}
+    return utterances, None
 
+
+def _persist_imported_document(meeting_id: str, meeting, utterances, db) -> str:
     title = meeting.get("name") or f"TL;DV {meeting_id}"
     text, speaker_ranges = _format_transcript(meeting, utterances)
     dialog_date, _ = _parse_happened_at(meeting.get("happenedAt", ""))
@@ -138,8 +132,11 @@ async def import_meeting(request: Request):
     if speakers:
         increment_folder_speakers(target_folder_id, speakers, db=db)
 
-    delete_queued_placeholder(meeting_id)
+    delete_queued_placeholder(meeting_id, db=db)
+    return doc_id
 
+
+def _enqueue_vector_sync(doc_id: str) -> None:
     vector_sync_url = os.environ.get("VECTOR_SYNC_URL", "")
     vector_sync_queue = os.environ.get("VECTOR_SYNC_QUEUE", "")
 
@@ -152,5 +149,39 @@ async def import_meeting(request: Request):
         logger.info("Queued vector sync: doc_id=%s", doc_id)
     else:
         logger.warning("VECTOR_SYNC_URL or VECTOR_SYNC_QUEUE not set, skipping sync queue")
+
+
+@app.get("/")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/import")
+async def import_meeting(request: Request):
+    body = await request.json()
+    meeting_id = body.get("meeting_id")
+    if not meeting_id:
+        return JSONResponse({"error": "missing meeting_id"}, status_code=400)
+
+    logger.info("Importing meeting_id=%s", meeting_id)
+
+    db = firestore.Client()
+    skip_response = _existing_import_skip(meeting_id, db)
+    if skip_response is not None:
+        return skip_response
+
+    mark_downloading(meeting_id, db=db)
+
+    meeting, skip_response = _fetch_meeting(meeting_id, db)
+    if skip_response is not None:
+        return skip_response
+    logger.info("Meeting: %r", meeting.get("name"))
+
+    utterances, skip_response = _fetch_utterances(meeting_id, db)
+    if skip_response is not None:
+        return skip_response
+
+    doc_id = _persist_imported_document(meeting_id, meeting, utterances, db)
+    _enqueue_vector_sync(doc_id)
 
     return {"ok": True, "doc_id": doc_id, "meeting_id": meeting_id}

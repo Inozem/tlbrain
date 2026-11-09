@@ -21,23 +21,26 @@ REQUIRED_PATHS = {
     "pytest.ini",
     ".github/workflows/**",
 }
-SOURCE_SERVICES = {
+SOURCE_SERVICES = [
     "mcp",
     "vector_sync",
     "tldv_import",
     "sync_checker",
     "tldv_webhook",
     "tldv_reconciliation",
-}
+    "telegram",
+]
 IMAGE_DOCKERFILES = {
     "mcp": "infra/docker/Dockerfile.mcp",
     "vector_sync": "infra/docker/Dockerfile.vector_sync",
     "tldv_import": "infra/docker/Dockerfile.tldv_import",
+    "telegram": "infra/docker/Dockerfile.telegram",
 }
 PUBLISH_JOBS = {
     "build-mcp": ("mcp", "inozem/tlbrain-mcp"),
     "build-vector-sync": ("vector_sync", "inozem/tlbrain-vector-sync"),
     "build-tldv-import": ("tldv_import", "inozem/tlbrain-tldv-import"),
+    "build-telegram": ("telegram", "inozem/tlbrain-telegram"),
 }
 GATES = {
     "offline-regression",
@@ -93,7 +96,7 @@ def test_workflow_keeps_on_as_a_mapping_and_validates_relevant_changes() -> None
 def test_source_validation_matrix_covers_every_supported_service() -> None:
     job = _workflow()["jobs"]["source-validation"]
     assert job["runs-on"] == "ubuntu-latest"
-    assert job["strategy"]["matrix"]["service"] == sorted(SOURCE_SERVICES, key=("mcp", "vector_sync", "tldv_import", "sync_checker", "tldv_webhook", "tldv_reconciliation").index)
+    assert job["strategy"]["matrix"]["service"] == SOURCE_SERVICES
     assert any(step.get("with", {}).get("python-version") == "3.12" for step in _steps(job))
     invocation = " ".join(str(step.get("run", "")) for step in _steps(job))
     assert "infra/build/preflight.sh" in invocation
@@ -184,6 +187,12 @@ def test_dev_requirements_include_all_service_and_provider_roots() -> None:
         for path in provider["requirements_files"]
     )
     assert required <= included, sorted(path.relative_to(APP_ROOT).as_posix() for path in required - included)
+
+    telegram_requirements = APP_ROOT / "services" / "connectors" / "telegram" / "requirements.txt"
+    telegram_closure = _requirement_include_closure(telegram_requirements)
+    assert telegram_requirements.resolve() in included
+    assert (APP_ROOT / "requirements-common.txt").resolve() in telegram_closure
+    assert "httpx>=0.27" in telegram_requirements.read_text(encoding="utf-8").splitlines()
 
 
 def test_native_smoke_uses_only_synthetic_bootstrap_checks_and_one_function_preflight() -> None:

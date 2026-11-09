@@ -1,0 +1,603 @@
+"""Durable, one-callback-per-attempt stage execution governor."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from inspect import isawaitable
+from typing import Any, Callable, Mapping
+from uuid import uuid4
+
+from core.integrations.firestore.operations import (
+    claim_operation,
+    complete_stage_attempt,
+    fail_operation,
+    fail_stage_attempt,
+    get_stage as repository_get_stage,
+    release_operation,
+    release_stage_attempt,
+    renew_operation_lease,
+    reserve_stage_attempt,
+    validate_operation_lease,
+)
+from core.operations.models import OperationError, OperationStageRecord, StageState
+
+
+DEFAULT_LEASE_SECONDS = 300
+
+
+class RetryBudgetExceeded(RuntimeError):
+    """Raised when a stage has exhausted its durable failure allowance."""
+
+
+class UnknownOutcome(RuntimeError):
+    """Raised when a provider attempt may have committed but is not confirmed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedStageSuccess:
+    """Explicitly confirm a reconciled stage result, including ``None``."""
+
+    result: Any
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedStageFailure:
+    """Explicitly confirm failure of a reconciled attempt with safe details."""
+
+    error: OperationError
+
+
+class ReconciledStageFailure(RuntimeError):
+    """Raised after a reconciled failure has been durably recorded."""
+
+    def __init__(self, error: OperationError) -> None:
+        super().__init__(error.message)
+        self.error = error
+
+
+_BILLING_REASONS = frozenset({
+    "billing_disabled", "billing_not_active", "no_billing_account",
+    "billing_account_not_found", "payment_required", "insufficient_funds",
+})
+_QUOTA_REASONS = frozenset({
+    "quota_exceeded", "insufficient_quota", "daily_limit_exceeded",
+})
+
+
+def _error_reason_codes(error: BaseException) -> set[str]:
+    """Read only bounded machine reason fields, never provider message text."""
+    values: set[str] = set()
+    source_error = getattr(error, "original_error", error)
+    pending = [getattr(source_error, "response_json", None),
+               getattr(source_error, "error", None),
+               getattr(source_error, "details", None)]
+    visited = 0
+    while pending and visited < 32:
+        source = pending.pop()
+        visited += 1
+        if isinstance(source, Mapping):
+            for key in ("reason", "status"):
+                value = source.get(key)
+                if isinstance(value, str) and len(value) <= 80:
+                    values.add(value.lower())
+            # Provider SDKs expose ErrorInfo either as ``error.details`` or
+            # directly through ``exception.details``. Codes are HTTP/RPC
+            # status evidence, not billing/quota evidence.
+            code = source.get("code")
+            if isinstance(code, str) and len(code) <= 80:
+                values.add(code.lower())
+            for key in ("error", "details"):
+                nested = source.get(key)
+                if isinstance(nested, Mapping):
+                    pending.append(nested)
+                elif isinstance(nested, (list, tuple)):
+                    pending.extend(nested[:10])
+        elif isinstance(source, (list, tuple)):
+            pending.extend(source[:10])
+        else:
+            reason = getattr(source, "reason", None)
+            if isinstance(reason, str) and len(reason) <= 80:
+                values.add(reason.lower())
+            detail = getattr(source, "metadata", None)
+            if isinstance(detail, Mapping):
+                pending.append(detail)
+    content = getattr(error, "content", None)
+    if isinstance(content, bytes) and len(content) <= 65536:
+        try:
+            payload = json.loads(content)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, Mapping):
+            err = payload.get("error")
+            if isinstance(err, Mapping):
+                for key in ("status", "reason"):
+                    value = err.get(key)
+                    if isinstance(value, str) and len(value) <= 80:
+                        values.add(value.lower())
+                rows = err.get("errors")
+                if isinstance(rows, list):
+                    for row in rows[:10]:
+                        if isinstance(row, Mapping):
+                            reason = row.get("reason")
+                            if isinstance(reason, str) and len(reason) <= 80:
+                                values.add(reason.lower())
+    return values
+
+
+def _provider_error_category(error: BaseException, *, service: str | None = None) -> str:
+    reasons = _error_reason_codes(error)
+    if reasons & _BILLING_REASONS:
+        return "billing"
+    if reasons & _QUOTA_REASONS:
+        return "quota"
+    error = getattr(error, "original_error", error)
+    status = getattr(error, "code", None) or getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "resp", None), "status", None)
+    if status == 402 and service == "gemini":
+        return "billing"
+    return "rate_limited" if status == 429 else "execution"
+
+
+ErrorClassifier = Callable[[BaseException, str], tuple[str, str | None]]
+
+
+class RetryGovernor:
+    """Persist stage attempts before invoking callbacks and retain their outcomes."""
+
+    def __init__(
+        self,
+        client: Any | None = None,
+        *,
+        clock: Any | None = None,
+        max_failures: int = 3,
+        lease_seconds: int | float = DEFAULT_LEASE_SECONDS,
+        retry_store: Any | None = None,
+        error_classifier: ErrorClassifier | None = None,
+    ) -> None:
+        if max_failures < 1 or max_failures > 3:
+            raise ValueError("max_failures must be between 1 and 3")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        self.client = client
+        self.clock = clock
+        self.max_failures = max_failures
+        self.lease_seconds = lease_seconds
+        self.retry_store = retry_store
+        self.error_classifier = error_classifier
+
+    def _classified_error(self, error: BaseException, stage_key: str) -> tuple[str, str | None]:
+        if self.error_classifier is None:
+            return "execution", None
+        category, service = self.error_classifier(error, stage_key)
+        if category not in {"execution", "rate_limited", "billing", "quota"}:
+            raise ValueError("error classifier returned an unsupported category")
+        if service is not None and service not in {
+            "gemini", "qdrant", "google_docs", "google_drive", "firestore", "telegram", "core",
+        }:
+            raise ValueError("error classifier returned an unsupported service")
+        return category, service
+
+    def _store_call(self, name: str, fallback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        method = getattr(self.retry_store, name, None) if self.retry_store is not None else None
+        return (method or fallback)(*args, **kwargs)
+
+    async def _run_blocking(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run a synchronous store operation without blocking the event loop."""
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+    def _now(self, supplied: datetime | None = None) -> datetime:
+        value = supplied
+        if value is None:
+            value = self.clock.now() if self.clock is not None else datetime.now(timezone.utc)
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
+    def get_stage(self, operation_id: str, stage_key: str) -> OperationStageRecord:
+        return self._store_call("get_stage", lambda **kw: repository_get_stage(self.client, **kw),
+                                operation_id=operation_id, stage_key=stage_key) or OperationStageRecord(
+            stage_key=stage_key, state=StageState.PENDING,
+        )
+
+    def _fail_operation_if_terminal(
+        self,
+        operation_id: str,
+        stage_key: str,
+        *,
+        owner: str,
+        fence: int,
+        error: OperationError,
+        now: datetime,
+    ) -> None:
+        stage = self.get_stage(operation_id, stage_key)
+        if error.retryable and stage.failures < self.max_failures:
+            return
+        if not self._store_call("fail_operation", lambda **kw: fail_operation(self.client, **kw),
+                                operation_id=operation_id, owner=owner, fence=fence,
+                                error=error, now=now):
+            raise RuntimeError("could not persist terminal operation failure")
+
+    def run_stage(
+        self,
+        operation_id: str,
+        stage_key: str,
+        callback: Callable[[], Any],
+        *,
+        now: datetime | None = None,
+        retryable: Callable[[BaseException], bool] | None = None,
+        reconcile: Callable[[], Any] | None = None,
+        save_intent_id: str | None = None,
+        checkpoint_refs: tuple[str, ...] = (),
+        checkpoint_success: bool = True,
+        owner: str | None = None,
+        fence: int | None = None,
+    ) -> Any:
+        """Run one reserved callback or reconcile its durable attempt.
+
+        ``save_intent_id`` remains accepted for compatibility; immutable save intent
+        belongs to the operation record.
+        """
+        del save_intent_id
+        if (owner is None) != (fence is None):
+            raise ValueError("owner and fence must be provided together")
+        now = self._now(now)
+        externally_owned = owner is not None
+        if externally_owned:
+            if not self._store_call("validate_lease",
+                                    lambda **kw: validate_operation_lease(self.client, **kw),
+                                    operation_id=operation_id, owner=owner, fence=fence, now=now):
+                raise RuntimeError("operation lease is unavailable")
+        stage = self.get_stage(operation_id, stage_key)
+        if stage.state == StageState.COMPLETED:
+            return stage.result
+        if self._is_terminal_stage(stage):
+            self._repair_terminal_stage(
+                operation_id, stage_key, stage, owner=owner, fence=fence,
+                externally_owned=externally_owned, now=now,
+            )
+        self._check_retry_eligibility(stage, stage_key, now)
+
+        if externally_owned:
+            assert owner is not None and fence is not None
+        else:
+            owner = f"retry-governor-{uuid4().hex}"
+            lease = claim_operation(
+                self.client, operation_id, owner=owner, now=now, lease_seconds=self.lease_seconds,
+            )
+            if lease is None:
+                raise RuntimeError("operation lease is unavailable")
+            fence = lease.fence
+        attempt_id = stage.in_flight_attempt_id
+        try:
+            if attempt_id is not None:
+                return self._reconcile_attempt(
+                    operation_id, stage_key, attempt_id, reconcile,
+                    owner=owner, fence=fence, checkpoint_refs=checkpoint_refs,
+                    checkpoint_success=checkpoint_success,
+                )
+            reserved, attempt_id_or_result = self._reserve_attempt(
+                operation_id, stage_key, owner, fence, now,
+            )
+            if not reserved:
+                return attempt_id_or_result
+            return self._execute_attempt(
+                operation_id, stage_key, attempt_id_or_result, callback, retryable,
+                owner=owner, fence=fence, checkpoint_refs=checkpoint_refs,
+                checkpoint_success=checkpoint_success,
+            )
+        finally:
+            if not externally_owned:
+                release_operation(self.client, operation_id, owner=owner, fence=fence, now=self._now())
+
+    async def run_stage_async(
+        self,
+        operation_id: str,
+        stage_key: str,
+        callback: Callable[[], Any],
+        *,
+        owner: str,
+        fence: int,
+        now: datetime | None = None,
+        retryable: Callable[[BaseException], bool] | None = None,
+        reconcile: Callable[[], Any] | None = None,
+        checkpoint_refs: tuple[str, ...] = (),
+    ) -> Any:
+        """Async counterpart; reserves once and awaits exactly one callback."""
+        now = self._now(now)
+        valid = await self._run_blocking(
+            self._store_call, "validate_lease",
+            lambda **kw: validate_operation_lease(self.client, **kw),
+            operation_id=operation_id, owner=owner, fence=fence, now=now,
+        )
+        if not valid:
+            raise RuntimeError("operation lease is unavailable")
+        stage = await self._run_blocking(self.get_stage, operation_id, stage_key)
+        if stage.state == StageState.COMPLETED:
+            return stage.result
+        if self._is_terminal_stage(stage):
+            await self._run_blocking(
+                self._fail_operation_if_terminal, operation_id, stage_key,
+                owner=owner, fence=fence, error=stage.last_error, now=now,
+            )
+        self._check_retry_eligibility(stage, stage_key, now)
+        if stage.in_flight_attempt_id:
+            return await self._reconcile_attempt_async(
+                operation_id, stage_key, stage.in_flight_attempt_id, reconcile,
+                owner=owner, fence=fence, checkpoint_refs=checkpoint_refs,
+            )
+        reserved, attempt_id = await self._run_blocking(
+            self._reserve_attempt, operation_id, stage_key, owner, fence, now,
+        )
+        if not reserved:
+            return attempt_id
+        return await self._execute_attempt_async(
+            operation_id, stage_key, attempt_id, callback, retryable,
+            owner=owner, fence=fence, checkpoint_refs=checkpoint_refs,
+        )
+
+    async def _reconcile_attempt_async(
+        self, operation_id: str, stage_key: str, attempt_id: str,
+        reconcile: Callable[[], Any] | None, *, owner: str, fence: int,
+        checkpoint_refs: tuple[str, ...],
+    ) -> Any:
+        """Resolve an in-flight async attempt before any new provider call."""
+        if reconcile is None:
+            raise UnknownOutcome("stage has an unresolved provider outcome")
+        try:
+            reconciled = reconcile()
+            if isawaitable(reconciled):
+                reconciled = await reconciled
+        except BaseException as error:
+            raise UnknownOutcome("stage outcome remains unresolved") from error
+        if reconciled is None:
+            raise UnknownOutcome("stage outcome remains unresolved")
+        if isinstance(reconciled, ConfirmedStageFailure):
+            await self._run_blocking(
+                self._record_reconciled_failure,
+                operation_id, stage_key, attempt_id, reconciled.error, owner=owner, fence=fence,
+            )
+            raise ReconciledStageFailure(reconciled.error) from None
+        result = reconciled.result if isinstance(reconciled, ConfirmedStageSuccess) else reconciled
+        await self._run_blocking(
+            self._complete_attempt, operation_id, stage_key, attempt_id, result,
+            owner=owner, fence=fence, checkpoint_refs=checkpoint_refs, reconciled=True,
+        )
+        return result
+
+    async def _execute_attempt_async(
+        self, operation_id: str, stage_key: str, attempt_id: str,
+        callback: Callable[[], Any], retryable: Callable[[BaseException], bool] | None,
+        *, owner: str, fence: int, checkpoint_refs: tuple[str, ...],
+    ) -> Any:
+        """Invoke and persist the outcome of one newly reserved async attempt."""
+        try:
+            result = callback()
+            if isawaitable(result):
+                result = await result
+        except UnknownOutcome:
+            raise
+        except Exception as error:
+            category, service = self._classified_error(error, stage_key)
+            safe_error = OperationError(
+                code=type(error).__name__.lower(), category=category,
+                message=f"Stage execution failed ({type(error).__name__})",
+                retryable=bool(retryable(error) if retryable is not None else True),
+                service=service, stage=stage_key,
+            )
+            await self._run_blocking(
+                self._record_execution_failure, operation_id, stage_key, attempt_id, safe_error,
+                owner=owner, fence=fence, original_error=error,
+            )
+            raise
+        await self._run_blocking(
+            self._complete_attempt, operation_id, stage_key, attempt_id, result, owner=owner,
+            fence=fence, checkpoint_refs=checkpoint_refs, reconciled=False,
+        )
+        return result
+
+    def _check_retry_eligibility(
+        self, stage: OperationStageRecord, stage_key: str, now: datetime,
+    ) -> None:
+        if stage.in_flight_attempt_id is not None:
+            return
+        if stage.failures >= self.max_failures:
+            raise RetryBudgetExceeded(f"stage {stage_key!r} exhausted its retry budget")
+        if stage.last_error is not None and not stage.last_error.retryable:
+            raise RetryBudgetExceeded(f"stage {stage_key!r} has a permanent failure")
+        if stage.retry_not_before is not None and stage.retry_not_before > now:
+            raise RetryBudgetExceeded(f"stage {stage_key!r} is waiting for its retry time")
+
+    def _is_terminal_stage(self, stage: OperationStageRecord) -> bool:
+        return (stage.in_flight_attempt_id is None and stage.last_error is not None
+                and (not stage.last_error.retryable or stage.failures >= self.max_failures))
+
+    def _repair_terminal_stage(
+        self, operation_id: str, stage_key: str, stage: OperationStageRecord, *,
+        owner: str | None, fence: int | None, externally_owned: bool, now: datetime,
+    ) -> None:
+        """Settle a persisted terminal stage before returning its budget error."""
+        if externally_owned:
+            assert owner is not None and fence is not None and stage.last_error is not None
+            self._fail_operation_if_terminal(
+                operation_id, stage_key, owner=owner, fence=fence,
+                error=stage.last_error, now=now,
+            )
+            return
+
+        recovery_owner = f"retry-governor-{uuid4().hex}"
+        lease = claim_operation(
+            self.client, operation_id, owner=recovery_owner, now=now,
+            lease_seconds=self.lease_seconds,
+        )
+        if lease is None:
+            return
+        try:
+            assert stage.last_error is not None
+            self._fail_operation_if_terminal(
+                operation_id, stage_key, owner=recovery_owner, fence=lease.fence,
+                error=stage.last_error, now=now,
+            )
+        finally:
+            release_operation(
+                self.client, operation_id, owner=recovery_owner, fence=lease.fence,
+                now=self._now(),
+            )
+
+    def _reserve_attempt(
+        self, operation_id: str, stage_key: str, owner: str, fence: int, now: datetime,
+    ) -> tuple[bool, Any]:
+        """Return reservation status and its attempt ID or completed result."""
+        attempt_id = uuid4().hex
+        reserved = self._store_call("reserve_attempt",
+            lambda **kw: reserve_stage_attempt(self.client, kw.pop("operation_id"), kw.pop("stage_key"), **kw),
+            operation_id=operation_id, stage_key=stage_key, owner=owner, fence=fence,
+            attempt_id=attempt_id, now=now)
+        if reserved is not None:
+            return True, attempt_id
+        current = self.get_stage(operation_id, stage_key)
+        if current.in_flight_attempt_id is not None:
+            raise UnknownOutcome("stage has an unresolved provider outcome")
+        if current.state == StageState.COMPLETED:
+            return False, current.result
+        if current.failures >= self.max_failures:
+            raise RetryBudgetExceeded(f"stage {stage_key!r} exhausted its retry budget")
+        raise RuntimeError("could not reserve stage attempt")
+
+    def _reconcile_attempt(
+        self, operation_id: str, stage_key: str, attempt_id: str,
+        reconcile: Callable[[], Any] | None, *, owner: str, fence: int,
+        checkpoint_refs: tuple[str, ...],
+        checkpoint_success: bool = True,
+    ) -> Any:
+        if reconcile is None:
+            raise UnknownOutcome("stage has an unresolved provider outcome")
+        try:
+            reconciled = reconcile()
+        except BaseException as error:
+            raise UnknownOutcome("stage outcome remains unresolved") from error
+        if reconciled is None:
+            raise UnknownOutcome("stage outcome remains unresolved")
+        if isinstance(reconciled, ConfirmedStageFailure):
+            self._record_reconciled_failure(
+                operation_id, stage_key, attempt_id, reconciled.error, owner=owner, fence=fence,
+            )
+            raise ReconciledStageFailure(reconciled.error) from None
+        result = reconciled.result if isinstance(reconciled, ConfirmedStageSuccess) else reconciled
+        if checkpoint_success:
+            self._complete_attempt(
+                operation_id, stage_key, attempt_id, result, owner=owner, fence=fence,
+                checkpoint_refs=checkpoint_refs, reconciled=True,
+            )
+        else:
+            self._release_attempt(operation_id, stage_key, attempt_id, owner=owner, fence=fence)
+        return result
+
+    def _record_reconciled_failure(
+        self, operation_id: str, stage_key: str, attempt_id: str, error: OperationError,
+        *, owner: str, fence: int,
+    ) -> None:
+        if not self._store_call("fail_attempt",
+            lambda **kw: fail_stage_attempt(self.client, kw.pop("operation_id"), kw.pop("stage_key"), **kw),
+            operation_id=operation_id, stage_key=stage_key, owner=owner, fence=fence,
+            attempt_id=attempt_id, error=error, now=self._now()):
+            raise RuntimeError("could not persist reconciled stage failure")
+        self._fail_operation_if_terminal(
+            operation_id, stage_key, owner=owner, fence=fence, error=error, now=self._now(),
+        )
+
+    def _execute_attempt(
+        self, operation_id: str, stage_key: str, attempt_id: str,
+        callback: Callable[[], Any], retryable: Callable[[BaseException], bool] | None,
+        *, owner: str, fence: int, checkpoint_refs: tuple[str, ...],
+        checkpoint_success: bool = True,
+    ) -> Any:
+        try:
+            result = callback()
+        except UnknownOutcome:
+            raise
+        except Exception as error:
+            should_retry = retryable(error) if retryable is not None else True
+            category, service = self._classified_error(error, stage_key)
+            safe_error = OperationError(
+                code=type(error).__name__.lower(), category=category,
+                message=f"Stage execution failed ({type(error).__name__})",
+                retryable=bool(should_retry), service=service,
+                stage=stage_key,
+            )
+            self._record_execution_failure(
+                operation_id, stage_key, attempt_id, safe_error, owner=owner, fence=fence,
+                original_error=error,
+            )
+            raise
+        if checkpoint_success:
+            self._complete_attempt(
+                operation_id, stage_key, attempt_id, result, owner=owner, fence=fence,
+                checkpoint_refs=checkpoint_refs, reconciled=False,
+            )
+        else:
+            self._release_attempt(operation_id, stage_key, attempt_id, owner=owner, fence=fence)
+        return result
+
+    def _release_attempt(self, operation_id: str, stage_key: str, attempt_id: str,
+                         *, owner: str, fence: int) -> None:
+        if not self._store_call(
+            "release_attempt", lambda **kw: release_stage_attempt(self.client, **kw),
+            operation_id=operation_id, stage_key=stage_key, owner=owner, fence=fence,
+            attempt_id=attempt_id, now=self._now(),
+        ):
+            raise RuntimeError("could not release volatile stage observation")
+
+    def _record_execution_failure(
+        self, operation_id: str, stage_key: str, attempt_id: str, error: OperationError,
+        *, owner: str, fence: int, original_error: Exception,
+    ) -> None:
+        if not self._store_call("fail_attempt",
+            lambda **kw: fail_stage_attempt(self.client, kw.pop("operation_id"), kw.pop("stage_key"), **kw),
+            operation_id=operation_id, stage_key=stage_key, owner=owner, fence=fence,
+            attempt_id=attempt_id, error=error, now=self._now()):
+            raise RuntimeError("could not persist stage failure") from original_error
+        self._fail_operation_if_terminal(
+            operation_id, stage_key, owner=owner, fence=fence, error=error, now=self._now(),
+        )
+
+    def _complete_attempt(
+        self, operation_id: str, stage_key: str, attempt_id: str, result: Any,
+        *, owner: str, fence: int, checkpoint_refs: tuple[str, ...], reconciled: bool,
+    ) -> None:
+        if not self._store_call("complete_attempt",
+            lambda **kw: complete_stage_attempt(self.client, kw.pop("operation_id"), kw.pop("stage_key"), **kw),
+            operation_id=operation_id, stage_key=stage_key, owner=owner, fence=fence,
+            attempt_id=attempt_id, result=result, now=self._now(), checkpoint_refs=checkpoint_refs):
+            label = "reconciled stage result" if reconciled else "stage result"
+            raise RuntimeError(f"could not persist {label}")
+
+    def record_wait(self, operation_id: str, stage_key: str, *, until: datetime) -> None:
+        """Record a scheduler wait in memory only; it is not a failed execution."""
+        del operation_id, stage_key, until
+
+    def record_yield(self, operation_id: str, stage_key: str, *, reason: str) -> None:
+        """Yielding execution does not reserve or fail a provider attempt."""
+        del operation_id, stage_key, reason
+
+    def record_status(self, operation_id: str, stage_key: str, *, status: str) -> OperationStageRecord:
+        """Read the durable stage without changing its execution budget."""
+        del status
+        return self.get_stage(operation_id, stage_key)
+
+    def record_lease_renewal(
+        self,
+        operation_id: str,
+        *,
+        owner: str,
+        fence: int,
+        now: datetime | None = None,
+    ) -> bool:
+        renewed = renew_operation_lease(
+            self.client, operation_id, owner=owner, fence=fence, now=self._now(now),
+            lease_seconds=self.lease_seconds,
+        )
+        return renewed is not None

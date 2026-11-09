@@ -30,12 +30,16 @@ def merge_ranges(hits: list[dict[str, Any]]) -> dict[str, list[list[int]]]:
     return merged
 
 
-def fetch_utterances(doc_id: str, merged_ranges: list[list[int]]) -> list[dict[str, Any]]:
+def fetch_utterances(doc_id: str, merged_ranges: list[list[int]], *,
+                    single_attempt: bool = False) -> list[dict[str, Any]]:
     """
     Fetches utterance payloads from Qdrant for all merged ranges of a single doc_id.
     Uses scroll without vectors; filters by type=utterance and order_index range.
     """
-    return fetch_utterances_in_ranges(doc_id, merged_ranges)
+    return fetch_utterances_in_ranges(
+        doc_id, merged_ranges,
+        **({"single_attempt": True} if single_attempt else {}),
+    )
 
 
 def dedup_and_sort(utterances: list[dict[str, Any]]) -> list[dict[str, Any]]:

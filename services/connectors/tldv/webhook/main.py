@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 
@@ -15,11 +14,10 @@ logger = logging.getLogger(__name__)
 @functions_framework.http
 def tldv_webhook(request):
     payload = request.get_json(silent=True) or {}
-    logger.info("TL;DV webhook payload: %s", json.dumps(payload))
 
     meeting_id = payload.get("data", {}).get("meetingId")
     if not meeting_id:
-        logger.warning("No meetingId in payload: %s", payload)
+        logger.warning("TL;DV webhook missing meeting_id")
         return {"error": "missing meetingId"}, 400
 
     import_service_url = os.environ.get("TLDV_IMPORT_SERVICE_URL", "")

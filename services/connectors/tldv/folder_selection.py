@@ -3,7 +3,9 @@
 import logging
 import re
 
-from core.integrations.firestore.folders import get_all_folders, get_folders_by_speaker, speaker_key
+from core.dialogs.classification import FolderSelectionRequest, classify_dialog_folder
+from core.dialogs.models import DialogUtterance
+from core.integrations.firestore.folders import get_all_folders, get_folders_by_speaker
 from core.integrations.gemini.llm import call_gemini_json
 from core.integrations.google_drive.folder_service import get_unassigned_folder_id
 from services.connectors.tldv.formatting import _get_speakers
@@ -93,79 +95,72 @@ def _detect_target_folder_id(
     gemini_json = gemini_json or call_gemini_json
     meeting_name = meeting.get("name", "")
     all_folders = get_all_folders(db)
-
     speakers = _get_speakers(utterances)
 
-    if all(_is_placeholder_speaker(speaker) for speaker in speakers):
-        logger.info("Stage 1: all speakers are placeholders (%s), skipping", speakers)
-        candidates, all_candidates = [], []
-    else:
-        logger.info("Stage 1: speakers from TL;DV: %s", {s: speaker_key(s) for s in speakers})
-        candidates, all_candidates = _get_folders_by_speakers(db, speakers)
+    def speaker_lookup(speaker: str) -> list[str]:
+        docs = get_folders_by_speaker(speaker, db)
+        folder_ids: list[str] = []
+        seen: set[str] = set()
+        for doc in docs:
+            data = doc.to_dict() or {}
+            if data.get("name") != "_unassigned" and doc.id not in seen:
+                seen.add(doc.id)
+                folder_ids.append(doc.id)
+            if len(folder_ids) >= 5:
+                break
+        return folder_ids
 
-    if len(candidates) == 1:
-        logger.info("Folder detected via speakers: %s", candidates[0])
-        return candidates[0]
-    elif len(candidates) >= 2:
-        logger.info("Stage 1: %d speaker candidates: %s", len(candidates), candidates)
-    else:
-        logger.info("Stage 1: no speaker candidates found")
+    def suggest(stage, candidate_ids, _title, _excerpt, _topic_hint):
+        folder_names = [all_folders.get(folder_id, {}).get("name", folder_id) for folder_id in candidate_ids]
+        folders_str = "\n".join(f"{index + 1}. {name}" for index, name in enumerate(folder_names))
+        if stage == "title":
+            prompt = _DETECT_PROMPT_STAGE1.format(meeting_name=meeting_name, folders=folders_str)
+        else:
+            excerpt = "\n".join(
+                f"{utterance.get('speaker', '')}: {utterance.get('text', '')}"
+                for utterance in utterances[:15]
+                if utterance.get("text")
+            )
+            prompt = _DETECT_PROMPT_STAGE2.format(
+                meeting_name=meeting_name,
+                transcript=excerpt,
+                folders=folders_str,
+            )
+        try:
+            result = gemini_json(prompt)
+            folder_name = result.get("folder_name")
+            confidence = result.get("confidence", 0)
+            logger.info(
+                "Stage %s: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)",
+                "2" if stage == "title" else "3",
+                folder_name,
+                confidence,
+                _CONFIDENCE_THRESHOLD,
+            )
+            return folder_name, confidence
+        except Exception as exc:
+            logger.warning("Stage %s folder detection failed: %s", "2" if stage == "title" else "3", exc)
+            raise
 
-    if not all_candidates:
-        all_candidates = [
-            folder_id for folder_id, data in all_folders.items()
-            if data.get("name") != "_unassigned"
-        ]
-
-    if not all_candidates:
-        logger.info("No known folders, falling back to _unassigned")
-        return get_unassigned_folder_id(drive, root_folder_id)
-
-    ids_to_check = candidates if candidates else all_candidates
-    if not candidates:
-        logger.info("Stage 1: falling back to all %d folders", len(ids_to_check))
-
-    folder_names = [all_folders.get(folder_id, {}).get("name", folder_id) for folder_id in ids_to_check]
-    folders_str = "\n".join(f"{index + 1}. {name}" for index, name in enumerate(folder_names))
-    name_to_ids: dict[str, list[str]] = {}
-    for folder_id, name in zip(ids_to_check, folder_names):
-        name_to_ids.setdefault(name, []).append(folder_id)
-
-    try:
-        result = gemini_json(_DETECT_PROMPT_STAGE1.format(
-            meeting_name=meeting_name,
-            folders=folders_str,
-        ))
-        folder_name = result.get("folder_name")
-        confidence = result.get("confidence", 0)
-        logger.info("Stage 2: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)", folder_name, confidence, _CONFIDENCE_THRESHOLD)
-        if folder_name and folder_name in name_to_ids and confidence >= _CONFIDENCE_THRESHOLD:
-            folder_id = name_to_ids[folder_name][0]
-            logger.info("Folder detected via meeting name: %s (%s)", folder_name, folder_id)
-            return folder_id
-    except Exception as exc:
-        logger.warning("Stage 2 folder detection failed: %s", exc)
-
-    excerpt = "\n".join(
-        f"{utterance.get('speaker', '')}: {utterance.get('text', '')}"
-        for utterance in utterances[:15]
-        if utterance.get("text")
+    normalized_utterances = tuple(
+        DialogUtterance(
+            speaker=str(utterance.get("speaker", "")),
+            text=str(utterance.get("text", "")),
+        )
+        for utterance in utterances
     )
-    try:
-        result = gemini_json(_DETECT_PROMPT_STAGE2.format(
-            meeting_name=meeting_name,
-            transcript=excerpt,
-            folders=folders_str,
-        ))
-        folder_name = result.get("folder_name")
-        confidence = result.get("confidence", 0)
-        logger.info("Stage 3: Gemini returned folder=%r confidence=%.2f (threshold=%.1f)", folder_name, confidence, _CONFIDENCE_THRESHOLD)
-        if folder_name and folder_name in name_to_ids and confidence >= _CONFIDENCE_THRESHOLD:
-            folder_id = name_to_ids[folder_name][0]
-            logger.info("Folder detected via transcript: %s (%s)", folder_name, folder_id)
-            return folder_id
-    except Exception as exc:
-        logger.warning("Stage 3 folder detection failed: %s", exc)
-
+    result = classify_dialog_folder(
+        FolderSelectionRequest(
+            title=meeting_name,
+            utterances=normalized_utterances,
+            reliable_speakers=tuple(speakers),
+        ),
+        all_folders,
+        root_folder_id,
+        speaker_index_lookup=speaker_lookup,
+        suggestion=suggest,
+    )
+    if result.folder_id is not None:
+        return result.folder_id
     logger.info("Folder not detected, falling back to _unassigned")
     return get_unassigned_folder_id(drive, root_folder_id)

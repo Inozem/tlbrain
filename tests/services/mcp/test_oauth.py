@@ -135,7 +135,7 @@ def test_codex_registration_browser_login_pkce_and_refresh(connection, firestore
         "grant_type": "refresh_token", "client_id": client_id, "refresh_token": tokens["refresh_token"],
     }).json()["error"] == "invalid_grant"
     docs = firestore_fake.documents
-    assert all(path.startswith("mcp_oauth/") for path in docs)
+    assert all(path.startswith(("mcp_oauth/", "mcp_sessions/")) for path in docs)
     serialized = repr(docs)
     assert tokens["access_token"] not in serialized
     assert tokens["refresh_token"] not in serialized

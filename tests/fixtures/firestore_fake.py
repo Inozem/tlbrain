@@ -289,13 +289,27 @@ class FakeDocumentReference:
     def path(self) -> str:
         return _doc_path(self._key)
 
+    def collection(self, name: str) -> "FakeCollectionReference":
+        if not isinstance(name, str) or not name or "/" in name:
+            raise ValueError("collection name must be one non-empty path segment")
+        return FakeCollectionReference(f"{self.path}/{name}")
+
     def get(self, *, transaction: "FakeTransaction | None" = None, **kwargs: Any) -> FakeDocumentSnapshot:
+        field_paths = kwargs.pop("field_paths", None)
         if kwargs:
             raise TypeError(f"Unsupported get options: {', '.join(kwargs)}")
         if transaction is not None:
-            return transaction._read(self)
-        with _STATE.lock:
-            return FakeDocumentSnapshot(self, _STATE.documents.get(self._key))
+            snapshot = transaction._read(self)
+        else:
+            with _STATE.lock:
+                snapshot = FakeDocumentSnapshot(self, _STATE.documents.get(self._key))
+        if field_paths is None or not snapshot.exists:
+            return snapshot
+        if not isinstance(field_paths, (list, tuple)):
+            raise TypeError("field_paths must be a list or tuple")
+        data = snapshot.to_dict() or {}
+        projected = {field: data[field] for field in field_paths if field in data}
+        return FakeDocumentSnapshot(self, projected)
 
     def set(self, document_data: dict[str, Any], merge: Any = False, **kwargs: Any) -> None:
         if kwargs:
@@ -380,7 +394,8 @@ class FakeQuery:
         return FakeQuery(self.collection, self.filters, self.projection, count)
 
     def stream(self, **kwargs: Any) -> list[FakeDocumentSnapshot]:
-        if kwargs:
+        retry = kwargs.pop("retry", None) if "retry" in kwargs else None
+        if kwargs or retry is not None:
             raise TypeError(f"Unsupported query options: {', '.join(kwargs)}")
         if self.max_results == 0:
             return []

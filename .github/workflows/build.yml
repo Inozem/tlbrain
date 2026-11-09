@@ -55,6 +55,7 @@ jobs:
           - sync_checker
           - tldv_webhook
           - tldv_reconciliation
+          - telegram
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -79,6 +80,8 @@ jobs:
             dockerfile: infra/docker/Dockerfile.vector_sync
           - service: tldv_import
             dockerfile: infra/docker/Dockerfile.tldv_import
+          - service: telegram
+            dockerfile: infra/docker/Dockerfile.telegram
     steps:
       - uses: actions/checkout@v4
       - name: Build final Linux amd64 image
@@ -258,5 +261,48 @@ jobs:
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             docker tag "tlbrain-gated:vector_sync" "$tag"
+            docker push "$tag"
+          done <<< "$TAGS"
+
+  build-telegram:
+    needs:
+      - offline-regression
+      - source-validation
+      - image-validation
+      - native-bootstrap-smoke
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: inozem/tlbrain-telegram
+          tags: |
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+
+      - name: Download gated image
+        uses: actions/download-artifact@v4
+        with:
+          name: gated-image-telegram
+          path: ${{ runner.temp }}/gated-image
+      - name: Load, tag, and push gated image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          docker load --input "${{ runner.temp }}/gated-image/telegram.tar"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag "tlbrain-gated:telegram" "$tag"
             docker push "$tag"
           done <<< "$TAGS"

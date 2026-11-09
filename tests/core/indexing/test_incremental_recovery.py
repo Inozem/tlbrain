@@ -117,12 +117,13 @@ def _qdrant_events(sdk_fakes, operation: str):
 def _install_failure(monkeypatch, firestore_fake, boundary: str):
     targets = {
         "metadata": ("update_index", lambda fields: fields == {"dialog_date": "2026-01-12", "provider": "tldv"}, 1),
+        "marker_reserve": ("update_index", lambda fields: "pending_window_centers" in fields and isinstance(fields["pending_window_centers"], list), 1),
+        "marker_cleanup": ("update_index", lambda fields: "pending_window_centers" in fields and not isinstance(fields["pending_window_centers"], list), 1),
         "changed_hash_1": ("update_index", lambda fields: any(k.startswith("utterance_hashes.") for k in fields), 1),
         "changed_hash_2": ("update_index", lambda fields: any(k.startswith("utterance_hashes.") for k in fields), 2),
         "content": ("update_index", lambda fields: "content_hash" in fields, 1),
         "full_hash_map": ("update_index", lambda fields: "utterance_hashes" in fields, 1),
         "speakers": ("update_index", lambda fields: "speakers" in fields, 1),
-        "mark_synced": ("mark_synced", lambda _fields: True, 1),
         "skipped": ("update_skipped_utterances", lambda _fields: True, 1),
         "utterance_delete": ("delete_utterances_by_order_indexes", lambda _fields: True, 1),
         "summary_delete": ("delete_summaries_by_center_indexes", lambda _fields: True, 1),
@@ -134,6 +135,11 @@ def _install_failure(monkeypatch, firestore_fake, boundary: str):
     original = getattr(processor, name)
     calls = 0
     error = ValueError(f"synthetic {boundary} failure")
+    # This injector raises before invoking the Qdrant writer, so it proves no
+    # request was dispatched and may safely release the batch reservation.
+    if name in {"delete_utterances_by_order_indexes", "delete_summaries_by_center_indexes",
+                "upsert_utterances", "upsert_summaries", "upsert_facts"}:
+        error.outcome = "rejected"
 
     def injected(*args, **kwargs):
         nonlocal calls
@@ -163,7 +169,7 @@ def test_incremental_diff_scopes_checkpoints_and_write_order(app_root, sdk_fakes
     effects: list[tuple[str, object]] = []
     dotted_snapshots: list[dict] = []
     names = ("update_index", "delete_utterances_by_order_indexes", "delete_summaries_by_center_indexes",
-             "upsert_utterances", "upsert_summaries", "upsert_facts", "update_skipped_utterances", "mark_synced")
+              "upsert_utterances", "upsert_summaries", "upsert_facts", "update_skipped_utterances")
     for name in names:
         original = getattr(processor, name)
         def wrap(*args, _name=name, _original=original, **kwargs):
@@ -212,30 +218,33 @@ def test_incremental_diff_scopes_checkpoints_and_write_order(app_root, sdk_fakes
     assert index["parent_id"] == PARENT_ID
     assert index["speakers"] == ["Fixture Speaker A", "Fixture Speaker B"]
     assert [name for name, _ in effects] == [
-        "update_index", "delete_utterances_by_order_indexes", "delete_summaries_by_center_indexes",
+        "update_index", "update_index", "delete_utterances_by_order_indexes", "delete_summaries_by_center_indexes",
         "upsert_utterances", "update_index", "update_index", "upsert_summaries", "upsert_facts",
-        "update_skipped_utterances", "update_index", "mark_synced", "update_index", "update_index",
+        "update_skipped_utterances", "update_index", "update_index", "update_index", "update_index",
     ]
-    assert set(effects[1][1]) == {7, 8, 9}
-    assert set(effects[2][1]) == {5, 6, 7, 8, 9, 10, 11}
-    assert effects[4][1] == {"utterance_hashes.7": new_hashes["7"]}
-    assert effects[5][1] == {"utterance_hashes.8": new_hashes["8"]}
+    assert effects[0][1] == {"pending_window_centers": [5, 6, 7, 8, 9, 10, 11]}
+    assert set(effects[2][1]) == {7, 8, 9}
+    assert set(effects[3][1]) == {5, 6, 7, 8, 9, 10, 11}
+    assert effects[5][1] == {"utterance_hashes.7": new_hashes["7"]}
+    assert effects[6][1] == {"utterance_hashes.8": new_hashes["8"]}
     assert len(dotted_snapshots) == 2
     assert dotted_snapshots[0]["0"] == sha256_utterance(0, "Fixture Speaker A", "We will review the sample schedule.")
     assert dotted_snapshots[0]["8"] != new_hashes["8"]
     assert dotted_snapshots[1]["0"] == dotted_snapshots[0]["0"]
     assert dotted_snapshots[1]["7"] == new_hashes["7"]
-    assert effects[-5][1] == [0]
-    assert effects[-4][1]["content_hash"] == index["content_hash"]
-    assert effects[-3][0] == "mark_synced"
-    assert effects[-1][1] == {"speakers": index["speakers"]}
+    assert effects[9][1] == [0]
+    assert effects[10][1]["content_hash"] == index["content_hash"]
+    assert effects[12][1] == {"speakers": index["speakers"]}
+    assert "pending_window_centers" in effects[-1][1]
+    assert "pending_window_centers" not in index
 
 
 @pytest.mark.parametrize("boundary", [
-    "metadata", "utterance_delete", "summary_delete", "utterance_upsert", "changed_hash_1", "changed_hash_2",
-    "summary_upsert", "fact_upsert", "skipped", "content", "mark_synced", "full_hash_map", "speakers",
+    "marker_reserve", "metadata", "utterance_delete", "summary_delete", "utterance_upsert", "changed_hash_1", "changed_hash_2",
+    "summary_upsert", "fact_upsert", "skipped", "content", "full_hash_map", "speakers",
+    "marker_cleanup",
 ])
-def test_incremental_faults_restart_at_the_current_checkpoint_frontier(
+def test_incremental_faults_recover_all_pending_windows_and_checkpoints(
     app_root, sdk_fakes, firestore_fake, monkeypatch, boundary,
 ):
     _old, new, _new_hashes = _inputs(app_root, sdk_fakes, firestore_fake)
@@ -251,32 +260,18 @@ def test_incremental_faults_restart_at_the_current_checkpoint_frontier(
     _queue_generation(sdk_fakes)
     result = processor.process_one(DOC_ID, PARENT_ID, ROOT_ID, new)
     retry_events = sdk_fakes.trace[trace_before_retry:]
-    # Per-utterance checkpoints precede summaries. Once both have committed, a retry
-    # sees no changed utterances and currently skips window regeneration.
-    # A deleted trailing key remains in the old map until the final full-map write,
-    # so most retries still detect it and rebuild. After the map checkpoint, speakers
-    # failure has no remaining diff and the retry skips.
-    content_checkpoint_written = boundary in {"mark_synced", "full_hash_map", "speakers"}
-    if content_checkpoint_written:
-        assert result == "skipped"
-        assert not any(event["boundary"] == "qdrant" and event["operation"] in {"delete", "upsert"}
-                       for event in retry_events)
-    else:
-        assert result == "processed"
-        assert any(event["boundary"] == "qdrant" and event["operation"] == "delete"
-                   for event in retry_events)
+    assert result == "processed"
+    assert any(event["boundary"] == "qdrant" and event["operation"] == "upsert"
+               for event in retry_events)
     assert firestore_fake.documents[INDEX_PATH]["status"] == "synced"
-    if boundary in {"mark_synced", "full_hash_map", "speakers"}:
-        # The content checkpoint precedes these writes. The early in-sync path skips
-        # them on retry, leaving the current partial map/speaker state observable.
-        if boundary in {"mark_synced", "full_hash_map"}:
-            assert "9" in firestore_fake.documents[INDEX_PATH]["utterance_hashes"]
-        else:
-            assert "9" not in firestore_fake.documents[INDEX_PATH]["utterance_hashes"]
-        assert firestore_fake.documents[INDEX_PATH]["speakers"] == ["Previous synthetic speaker label"]
+    recovered = firestore_fake.documents[INDEX_PATH]
+    assert recovered["utterance_hashes"] == _new_hashes
+    assert recovered["speakers"] == ["Fixture Speaker A", "Fixture Speaker B"]
+    assert recovered["skipped_utterances"] == [0]
+    assert "pending_window_centers" not in recovered
 
 
-def test_dotted_hash_before_window_failure_can_make_retry_skip_that_window(
+def test_dotted_hash_before_window_failure_rebuilds_pending_window_on_retry(
     app_root, sdk_fakes, firestore_fake, monkeypatch,
 ):
     _old, new, new_hashes = _inputs(app_root, sdk_fakes, firestore_fake, insertion_and_deletion=False)
@@ -289,12 +284,14 @@ def test_dotted_hash_before_window_failure_can_make_retry_skip_that_window(
 
     monkeypatch.setattr(processor, name, original)
     trace_before_retry = len(sdk_fakes.trace)
-    assert processor.process_one(DOC_ID, PARENT_ID, ROOT_ID, new) == "skipped"
+    _queue_generation(sdk_fakes)
+    assert processor.process_one(DOC_ID, PARENT_ID, ROOT_ID, new) == "processed"
     retry_events = sdk_fakes.trace[trace_before_retry:]
-    assert not any(event["boundary"] == "qdrant" and event["operation"] in {"delete", "upsert"}
-                   for event in retry_events)
-    # This records only the attempted selector/write trace. The fake does not model
-    # which summary points Qdrant persisted before the injected failure.
+    assert any(event["boundary"] == "qdrant" and event["operation"] == "upsert"
+               for event in retry_events)
+    assert firestore_fake.documents[INDEX_PATH]["utterance_hashes"] == new_hashes
+    assert firestore_fake.documents[INDEX_PATH]["speakers"] == ["Fixture Speaker A", "Fixture Speaker B"]
+    assert "pending_window_centers" not in firestore_fake.documents[INDEX_PATH]
 
 
 def test_incremental_merge_keeps_outside_skips_and_adds_empty_window_indices(

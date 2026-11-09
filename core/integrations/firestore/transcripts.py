@@ -15,6 +15,16 @@ STALE_SYNCING_MINUTES = 15
 _NO_RETRY_STAGES = {"import", "invalid_format"}
 
 
+def is_tldv_transcript_record(data: dict[str, Any] | None) -> bool:
+    """Return whether a record belongs to TL;DV or is a valid legacy record."""
+    if not isinstance(data, dict):
+        return False
+    meeting_id = data.get("meeting_id")
+    if not isinstance(meeting_id, str) or not meeting_id.strip():
+        return False
+    return "provider" not in data or data.get("provider") == "tldv"
+
+
 def get_transcript_record(doc_id: str, db: firestore.Client | None = None) -> dict | None:
     """Return a transcript_index record for a document, or None if absent."""
     client = db if db is not None else get_client()
@@ -94,10 +104,18 @@ def list_transcripts(
     date_to: str | None = None,
     limit: int = 20,
     offset: int = 0,
+    *,
+    single_attempt: bool = False,
 ) -> dict:
     """Return paginated, date-descending transcripts, excluding placeholders."""
     transcripts = []
-    for doc in get_client().collection(COLLECTION_NAME).stream():
+    query = get_client().collection(COLLECTION_NAME)
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        stream = single_attempt_read(lambda: list(query.stream(retry=None)))
+    else:
+        stream = query.stream()
+    for doc in stream:
         data = doc.to_dict() or {}
         if data.get("status") in ("queued", "downloading"):
             continue
@@ -150,12 +168,18 @@ def get_doc_ids_by_client(client_name: str) -> list[str]:
     return [doc.id for doc in docs]
 
 
-def aggregate_transcripts_by_folder() -> dict[str, dict]:
+def aggregate_transcripts_by_folder(*, single_attempt: bool = False) -> dict[str, dict]:
     """Return synced transcript counts and latest dates grouped by parent folder."""
     agg: dict[str, dict] = {}
-    for doc in get_client().collection(COLLECTION_NAME).where(
+    query = get_client().collection(COLLECTION_NAME).where(
         filter=firestore.FieldFilter("status", "==", "synced")
-    ).stream():
+    )
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        stream = single_attempt_read(lambda: list(query.stream(retry=None)))
+    else:
+        stream = query.stream()
+    for doc in stream:
         data = doc.to_dict() or {}
         parent_id = data.get("parent_id")
         if not parent_id:
@@ -222,12 +246,27 @@ def ensure_imported(doc_id: str, parent_id: str, source_file: str = "") -> bool:
     return result
 
 
-def mark_synced(doc_id: str) -> None:
-    get_client().collection(COLLECTION_NAME).document(doc_id).update({
-        "status": "synced",
-        "error": None,
-        "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
+def mark_synced(doc_id: str, index_fence: int | None = None) -> None:
+    client = get_client()
+    ref = client.collection(COLLECTION_NAME).document(doc_id)
+    if index_fence is None:
+        ref.update({
+            "status": "synced", "error": None,
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
+        })
+    else:
+        @firestore.transactional
+        def _txn(transaction: firestore.Transaction) -> bool:
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists or (snapshot.to_dict() or {}).get("index_fence") != index_fence:
+                return False
+            transaction.update(ref, {
+                "status": "synced", "error": None,
+                "status_changed_at": firestore.SERVER_TIMESTAMP,
+            })
+            return True
+        if not _txn(client.transaction()):
+            return
     logger.info("Marked synced: %s", doc_id)
 
 
@@ -241,6 +280,26 @@ def mark_error(doc_id: str, error: str, error_stage: str = "vector_sync") -> Non
     logger.info("Marked error: %s — %s (stage=%s)", doc_id, error, error_stage)
 
 
+def mark_error_if_index_fence(doc_id: str, error: str, index_fence: int,
+                              db: firestore.Client | None = None) -> bool:
+    """Record a sync error only if the transcript still belongs to this index worker."""
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(doc_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        snapshot = ref.get(transaction=transaction)
+        if not snapshot.exists or (snapshot.to_dict() or {}).get("index_fence") != index_fence:
+            return False
+        transaction.update(ref, {
+            "status": "error", "error": error, "error_stage": "vector_sync",
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
+        })
+        return True
+
+    return _txn(client.transaction())
+
+
 def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
     """Create a queued placeholder or reset one with an import error."""
     db = db if db is not None else get_client()
@@ -251,6 +310,8 @@ def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
         snapshot = ref.get(transaction=transaction)
         if snapshot.exists:
             data = snapshot.to_dict() or {}
+            if not is_tldv_transcript_record(data):
+                return False
             if data.get("status") == "error" and data.get("error_stage") == "import":
                 transaction.update(ref, {
                     "status": "queued",
@@ -262,6 +323,7 @@ def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
             return False
         transaction.set(ref, {
             "meeting_id": meeting_id,
+            "provider": "tldv",
             "status": "queued",
             "status_changed_at": firestore.SERVER_TIMESTAMP,
         })
@@ -273,8 +335,13 @@ def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
     return result
 
 
-def mark_downloading(meeting_id: str) -> None:
-    get_client().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
+def mark_downloading(meeting_id: str, db: firestore.Client | None = None) -> None:
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
+    snapshot = ref.get()
+    if snapshot.exists and not is_tldv_transcript_record(snapshot.to_dict() or {}):
+        return
+    ref.update({
         "status": "downloading",
         "status_changed_at": firestore.SERVER_TIMESTAMP,
     })
@@ -287,7 +354,11 @@ def mark_download_error(
     db: firestore.Client | None = None,
 ) -> None:
     client = db if db is not None else get_client()
-    client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").update({
+    ref = client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
+    snapshot = ref.get()
+    if snapshot.exists and not is_tldv_transcript_record(snapshot.to_dict() or {}):
+        return
+    ref.update({
         "status": "error",
         "error": error,
         "error_stage": "import",
@@ -296,8 +367,22 @@ def mark_download_error(
     logger.info("Marked download error: %s — %s", meeting_id, error)
 
 
-def delete_queued_placeholder(meeting_id: str) -> None:
-    get_client().collection(COLLECTION_NAME).document(f"tldv-{meeting_id}").delete()
+def delete_queued_placeholder(meeting_id: str, db: firestore.Client | None = None) -> None:
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
+    snapshot = ref.get()
+    if not snapshot.exists:
+        return
+    data = snapshot.to_dict() or {}
+    if not is_tldv_transcript_record(data):
+        return
+    is_placeholder = (
+        data.get("status") in ("queued", "downloading")
+        or (data.get("status") == "error" and data.get("error_stage") == "import")
+    )
+    if not is_placeholder:
+        return
+    ref.delete()
     logger.info("Deleted queued placeholder: %s", meeting_id)
 
 
@@ -385,14 +470,20 @@ def get_error_docs(db: firestore.Client | None = None) -> list[str]:
     return result
 
 
-def get_sync_status() -> dict:
+def get_sync_status(*, single_attempt: bool = False) -> dict:
     """Aggregate transcript_index counts by status in a single scan."""
     counts: dict[str, int] = {
         "queued": 0, "downloading": 0, "imported": 0,
         "syncing": 0, "synced": 0, "error": 0,
     }
     unassigned = 0
-    for doc in get_client().collection(COLLECTION_NAME).stream():
+    query = get_client().collection(COLLECTION_NAME)
+    if single_attempt:
+        from core.integrations.firestore._single_attempt import single_attempt_read
+        stream = single_attempt_read(lambda: list(query.stream(retry=None)))
+    else:
+        stream = query.stream()
+    for doc in stream:
         data = doc.to_dict()
         status = data.get("status", "")
         if status in counts:

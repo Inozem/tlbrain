@@ -8,6 +8,8 @@ all downloads and process discovery are faked and all archives are synthetic.
 
 from __future__ import annotations
 
+import builtins
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -74,6 +76,235 @@ def test_pinned_toolchain_schema_covers_only_supported_baselines() -> None:
     assert lock["schema_version"] == 1
     assert lock["python_minor"] == "3.12"
     assert set(lock["entries"]) == set(PINNED_TOOLCHAINS)
+
+
+def test_managed_helper_uses_isolated_firestore_environment_and_scopes_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    root = tmp_path / "source checkout"
+    root.mkdir()
+    requirements = root / "core" / "integrations" / "firestore" / "requirements.txt"
+    requirements.parent.mkdir(parents=True)
+    requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    private_runtime = tmp_path / "managed runtime" / "python.exe"
+    private_runtime.parent.mkdir(parents=True)
+    private_runtime.write_bytes(b"synthetic managed runtime")
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+    consumers: list[tuple[list[str], dict[str, str]]] = []
+
+    def ensure_runtime(*_args: Any, **_kwargs: Any) -> Path:
+        assert "TELEGRAM_BOT_TOKEN" not in os.environ
+        assert "TELEGRAM_ALLOWED_USER_IDS" not in os.environ
+        return private_runtime
+
+    def run(argv: list[str], **kwargs: Any) -> Any:
+        calls.append((argv, kwargs.get("env")))
+        assert "TELEGRAM_BOT_TOKEN" not in os.environ
+        assert "TELEGRAM_ALLOWED_USER_IDS" not in os.environ
+        if "venv" in argv:
+            environment = Path(argv[-1])
+            venv_python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("synthetic venv interpreter", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+        if "-c" in argv and "ensurepip.version()" in argv[-1]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "version": "3.14.0 (synthetic)", "implementation": "cpython", "cache_tag": "cpython-314",
+                "abiflags": "", "platform": "win-amd64", "sys_platform": "win32", "machine": "AMD64",
+                "libc": ["", ""], "ensurepip": "25.2",
+            }), stderr="")
+        if "config" in argv:
+            if "debug" in argv:
+                pip_config = kwargs["env"]["PIP_CONFIG_FILE"]
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        f"env_var:\n  PIP_CONFIG_FILE='{pip_config}'\n  PIP_NO_INDEX='1'\n"
+                        "  PIP_DISABLE_PIP_VERSION_CHECK='1'\n"
+                        f"env:\n  global: {pip_config}, exists: True\n"
+                        "global:\n  C:\\ProgramData\\pip\\pip.ini, exists: False\n"
+                        "site:\n  C:\\synthetic\\site\\pip.ini, exists: False\n"
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f":env:.config-file='{kwargs['env']['PIP_CONFIG_FILE']}'\n"
+                    ":env:.no-index='1'\n:env:.disable-pip-version-check='1'\n"
+                ),
+                stderr="",
+            )
+        if "pip" in argv:
+            if "--version" in argv:
+                return SimpleNamespace(returncode=0, stdout="pip 25.2 from synthetic (python 3.14)", stderr="")
+            assert str(private_runtime) not in argv or argv[0] == str(venv_python)
+            return SimpleNamespace(returncode=0)
+        consumers.append((argv, kwargs["env"]))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runner, "ensure_runtime", ensure_runtime)
+    monkeypatch.setattr(runner.subprocess, "run", run)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    code = "import os; assert os.environ['TELEGRAM_BOT_TOKEN'] == 'synthetic-token'"
+
+    assert runner.run_managed_helper(root, requirements, code) == 0
+    assert runner.run_managed_helper(root, requirements, code) == 0
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    assert len(consumers) == 2
+    consumer_argv, consumer_env = consumers[0]
+    consumer_python = Path(consumer_argv[0])
+    assert consumer_python.name == ("python.exe" if os.name == "nt" else "python")
+    assert consumer_python.parent.name == ("Scripts" if os.name == "nt" else "bin")
+    assert consumer_argv[1:] == ["-c", code]
+    assert consumer_env["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert consumer_env["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    assert consumers[1][0][0] == consumer_argv[0]
+    install = next(argv for argv, _env in calls if "install" in argv)
+    assert install[0] == consumer_argv[0]
+    assert install[install.index("-r") + 1] == str(requirements)
+    assert str(private_runtime) not in install
+    assert len([argv for argv, _env in calls if "check" in argv]) == 2
+    cache_entry = Path(consumer_argv[0]).parents[1]
+    assert cache_entry.exists()
+    assert Path(consumer_argv[0]).parent.name == ("Scripts" if os.name == "nt" else "bin")
+    assert any(cache_entry.parent.glob("*.ready.json"))
+    assert not list(tmp_path.glob("tlbrain-helper-*"))
+
+
+@pytest.mark.parametrize("failed_stage", ["venv", "install", "check"])
+def test_managed_helper_stops_before_consumer_and_cleans_up_on_prepare_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    failed_stage: str,
+) -> None:
+    runner = _runner()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    requirements = root / "requirements.txt"
+    requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    managed_runtime = tmp_path / "managed-python"
+    managed_runtime.write_bytes(b"synthetic managed runtime")
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(runner, "ensure_runtime", lambda *_args, **_kwargs: managed_runtime)
+
+    def run(argv: list[str], **_kwargs: Any) -> Any:
+        calls.append(argv)
+        if "-c" in argv and "ensurepip.version()" in argv[-1]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "version": "3.14.0 (synthetic)", "implementation": "cpython", "cache_tag": "cpython-314",
+                "abiflags": "", "platform": "win-amd64", "sys_platform": "win32", "machine": "AMD64",
+                "libc": ["", ""], "ensurepip": "25.2",
+            }), stderr="")
+        if "config" in argv:
+            if "debug" in argv:
+                return SimpleNamespace(returncode=0, stdout="env_var:\nenv:\nglobal:\nsite:\nuser:\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "--version" in argv:
+            return SimpleNamespace(returncode=0, stdout="pip 25.2 synthetic", stderr="")
+        if "venv" in argv:
+            if failed_stage == "venv":
+                return SimpleNamespace(returncode=17)
+            venv_python = Path(argv[-1]) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("synthetic venv interpreter", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+        if "install" in argv:
+            return SimpleNamespace(returncode=19 if failed_stage == "install" else 0)
+        return SimpleNamespace(returncode=23 if failed_stage == "check" else 0)
+
+    monkeypatch.setattr(runner.subprocess, "run", run)
+    expected_status = {"venv": 17, "install": 19, "check": 23}[failed_stage]
+    assert runner.run_managed_helper(root, requirements, "raise AssertionError()") == expected_status
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    assert not any("-c" in argv and argv[-1] == "raise AssertionError()" for argv in calls)
+    cache_name = "tlbrain-deps" if os.name == "nt" else f"tlbrain-deps-{os.getuid()}"
+    ready_files = list((tmp_path / cache_name).rglob("*.ready.json"))
+    assert not ready_files
+    assert not list(tmp_path.glob("tlbrain-helper-*"))
+
+
+def test_managed_helper_restores_credentials_when_runtime_setup_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    requirements = root / "requirements.txt"
+    requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    managed_runtime = tmp_path / "managed-python"
+    managed_runtime.write_bytes(b"synthetic managed runtime")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+
+    def fail_runtime(*_args: Any, **_kwargs: Any) -> Path:
+        assert "TELEGRAM_BOT_TOKEN" not in os.environ
+        assert "TELEGRAM_ALLOWED_USER_IDS" not in os.environ
+        raise RuntimeError("synthetic runtime setup failure")
+
+    monkeypatch.setattr(runner, "ensure_runtime", fail_runtime)
+    with pytest.raises(RuntimeError, match="synthetic runtime setup failure"):
+        runner.run_managed_helper(root, requirements, "pass")
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+
+
+def test_managed_helper_cleans_up_and_restores_credentials_after_consumer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    requirements = root / "requirements.txt"
+    requirements.write_text("google-cloud-firestore\n", encoding="utf-8")
+    managed_runtime = tmp_path / "managed-python"
+    managed_runtime.write_bytes(b"synthetic managed runtime")
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(runner, "ensure_runtime", lambda *_args, **_kwargs: managed_runtime)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "101,202")
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **_kwargs: Any) -> Any:
+        calls.append(argv)
+        if "-c" in argv and "ensurepip.version()" in argv[-1]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "version": "3.14.0 (synthetic)", "implementation": "cpython", "cache_tag": "cpython-314",
+                "abiflags": "", "platform": "win-amd64", "sys_platform": "win32", "machine": "AMD64",
+                "libc": ["", ""], "ensurepip": "25.2",
+            }), stderr="")
+        if "config" in argv:
+            if "debug" in argv:
+                return SimpleNamespace(returncode=0, stdout="env_var:\nenv:\nglobal:\nsite:\nuser:\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "--version" in argv:
+            return SimpleNamespace(returncode=0, stdout="pip 25.2 synthetic", stderr="")
+        if "venv" in argv:
+            venv_python = Path(argv[-1]) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("synthetic venv interpreter", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=31 if "-c" in argv else 0)
+
+    monkeypatch.setattr(runner.subprocess, "run", run)
+    assert runner.run_managed_helper(root, requirements, "pass") == 31
+    assert calls[-1][1:] == ["-c", "pass"]
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "synthetic-token"
+    assert os.environ["TELEGRAM_ALLOWED_USER_IDS"] == "101,202"
+    cache_name = "tlbrain-deps" if os.name == "nt" else f"tlbrain-deps-{os.getuid()}"
+    assert list((tmp_path / cache_name).rglob("*.ready.json"))
+    assert not list(tmp_path.glob("tlbrain-helper-*"))
 
 
 @pytest.mark.parametrize("key", sorted(PINNED_TOOLCHAINS))
@@ -282,6 +513,258 @@ def test_candidate_probe_fails_if_numeric_windows_version_is_unavailable(
 
     with pytest.raises(RuntimeError, match="numeric Windows OS version"):
         runner._probe_interpreter(candidate)
+
+
+@pytest.mark.parametrize(
+    ("platform_tag", "expected_architecture", "accepted"),
+    [("win-amd64", "x86_64", True), ("win32", "x86", False),
+     ("win-arm64", "arm64", False)],
+)
+def test_candidate_probe_uses_windows_build_facts_without_wmi(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    platform_tag: str, expected_architecture: str, accepted: bool,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+    candidate.write_text("synthetic", encoding="utf-8")
+    output = io.StringIO()
+    fake_sys = SimpleNamespace(
+        platform="win32", getwindowsversion=lambda: (10, 0, 26100, 2, ""),
+    )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Windows child probe must not call WMI-backed platform helpers")
+
+    fake_platform = SimpleNamespace(
+        python_version=lambda: "3.12.14", mac_ver=forbidden,
+        win32_ver=forbidden, machine=forbidden, libc_ver=forbidden,
+    )
+    modules = {
+        "json": json,
+        "platform": fake_platform,
+        "sys": fake_sys,
+        "sysconfig": SimpleNamespace(get_platform=lambda: platform_tag),
+        "ssl": SimpleNamespace(),
+        "venv": SimpleNamespace(),
+        "pip": SimpleNamespace(),
+    }
+
+    def execute_probe(args: list[str], **_kwargs: Any) -> Any:
+        code = args[args.index("-c") + 1]
+
+        def imported(name: str, globals_: Any = None, locals_: Any = None,
+                     fromlist: Any = (), level: int = 0) -> Any:
+            del globals_, locals_, fromlist, level
+            if name in modules:
+                return modules[name]
+            return builtins.__import__(name)
+
+        namespace = {"__builtins__": {**vars(builtins), "__import__": imported}}
+        with contextlib.redirect_stdout(output):
+            exec(compile(code, "<candidate-probe>", "exec"), namespace)
+        return SimpleNamespace(returncode=0, stdout=output.getvalue(), stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", execute_probe)
+    facts = runner._probe_interpreter(candidate)
+    assert facts["os_version"] == "10.0.26100"
+    assert facts["architecture"] == expected_architecture
+    assert facts["ssl"] is facts["venv"] is facts["pip"] is True
+    assert runner.check_interpreter(candidate, probe=lambda _path: facts)["python_minor"] == "3.12"
+    assert runner._native_facts_match(facts, _platform()) is accepted
+    if accepted:
+        assert runner._meets_minimums(facts, runner.select_entry(
+            runner.load_lock(LOCK), "windows", "x86_64", "none", "3.14.0",
+        ))
+
+
+@pytest.mark.parametrize(
+    ("system", "expected_os", "expected_version", "expected_libc", "expected_libc_version"),
+    [
+        ("linux", "linux", "", "glibc", "2.39"),
+        ("darwin", "macos", "14.5", "none", ""),
+        ("freebsd14", "freebsd14", "", "none", ""),
+    ],
+)
+def test_candidate_probe_preserves_unix_facts_and_limits_libc_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    system: str,
+    expected_os: str,
+    expected_version: str,
+    expected_libc: str,
+    expected_libc_version: str,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python"
+    calls: list[str] = []
+    output = io.StringIO()
+
+    def forbid() -> Any:
+        raise AssertionError("platform helper must not run for this candidate OS")
+
+    platform_module = SimpleNamespace(
+        python_version=lambda: "3.12.14",
+        machine=lambda: calls.append("machine") or "x86_64",
+        mac_ver=lambda: calls.append("mac_ver") or ("14.5", ("", "", ""), "arm64"),
+        libc_ver=lambda: calls.append("libc_ver") or ("glibc", "2.39"),
+    )
+    if system == "linux":
+        platform_module.mac_ver = forbid
+    elif system == "darwin":
+        platform_module.libc_ver = forbid
+    else:
+        platform_module.mac_ver = forbid
+        platform_module.libc_ver = forbid
+    modules = {
+        "json": json,
+        "platform": platform_module,
+        "sys": SimpleNamespace(platform=system),
+        "sysconfig": SimpleNamespace(),
+        "ssl": SimpleNamespace(),
+        "venv": SimpleNamespace(),
+        "pip": SimpleNamespace(),
+    }
+
+    def execute_probe(args: list[str], **_kwargs: Any) -> Any:
+        code = args[args.index("-c") + 1]
+
+        def imported(name: str, globals_: Any = None, locals_: Any = None,
+                     fromlist: Any = (), level: int = 0) -> Any:
+            del globals_, locals_, fromlist, level
+            return modules[name] if name in modules else builtins.__import__(name)
+
+        namespace = {"__builtins__": {**vars(builtins), "__import__": imported}}
+        with contextlib.redirect_stdout(output):
+            exec(compile(code, "<candidate-probe>", "exec"), namespace)
+        return SimpleNamespace(returncode=0, stdout=output.getvalue(), stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", execute_probe)
+    facts = runner._probe_interpreter(candidate)
+    assert facts["os"] == expected_os
+    assert facts["os_version"] == expected_version
+    assert facts["architecture"] == "x86_64"
+    assert facts["libc"] == expected_libc
+    assert facts["libc_version"] == expected_libc_version
+    assert "libc_ver" in calls if system == "linux" else "libc_ver" not in calls
+    assert "mac_ver" in calls if system == "darwin" else "mac_ver" not in calls
+
+
+def test_candidate_probe_refuses_unknown_windows_build_architecture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+
+    def execute_probe(args: list[str], **_kwargs: Any) -> Any:
+        code = args[args.index("-c") + 1]
+        modules = {
+            "json": json,
+            "platform": SimpleNamespace(python_version=lambda: "3.12.14"),
+            "sys": SimpleNamespace(platform="win32", getwindowsversion=lambda: (10, 0, 26100)),
+            "sysconfig": SimpleNamespace(get_platform=lambda: "win-mips"),
+            "ssl": SimpleNamespace(),
+            "venv": SimpleNamespace(),
+        }
+
+        def imported(name: str, globals_: Any = None, locals_: Any = None,
+                     fromlist: Any = (), level: int = 0) -> Any:
+            del globals_, locals_, fromlist, level
+            return modules[name] if name in modules else builtins.__import__(name)
+
+        with pytest.raises(RuntimeError, match="unsupported Windows interpreter architecture"):
+            exec(code, {"__builtins__": {**vars(builtins), "__import__": imported}})
+        return SimpleNamespace(returncode=1, stderr="unsupported Windows interpreter architecture")
+
+    monkeypatch.setattr(runner.subprocess, "run", execute_probe)
+    with pytest.raises(RuntimeError, match="interpreter probe failed: unsupported Windows interpreter architecture"):
+        runner._probe_interpreter(candidate)
+
+
+def test_candidate_probe_timeout_uses_fixed_secret_free_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "python.exe"
+
+    def timeout(*_args: Any, **kwargs: Any) -> Any:
+        assert kwargs["timeout"] == 20
+        raise runner.subprocess.TimeoutExpired(
+            cmd=[str(candidate), "SECRET-COMMAND"], timeout=20,
+            output="SECRET-OUTPUT", stderr="SECRET-TRACEBACK",
+        )
+
+    candidate.write_text("synthetic", encoding="utf-8")
+    monkeypatch.setattr(runner.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match="interpreter probe timed out after 20 seconds") as caught:
+        runner.check_interpreter(candidate)
+    assert caught.value.__suppress_context__ is True
+    assert all(secret not in str(caught.value) for secret in ("SECRET", "python.exe"))
+
+
+def test_native_candidate_probe_timeout_falls_back_to_verified_download(tmp_path: Path) -> None:
+    runner = _runner()
+    native = tmp_path / "native-python.exe"
+    native.write_text("synthetic", encoding="utf-8")
+    cache = tmp_path / "cache"
+    downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+
+    def probe(path: Path) -> dict[str, object]:
+        if path == native:
+            raise RuntimeError("interpreter probe timed out after 20 seconds; candidate runtime was not accepted")
+        return _fixture_probe(path)
+
+    runtime = runner.ensure_runtime(
+        _write_lock(tmp_path), cache, _platform(), native_interpreter=native,
+        downloader=downloader, interpreter_probe=probe,
+    )
+    assert Path(runtime) != native
+    assert len(downloader.calls) == 1
+    assert not list(cache.glob("runner-*"))
+
+
+def test_downloaded_candidate_probe_timeout_cleans_stage_without_publishing(tmp_path: Path) -> None:
+    runner = _runner()
+    cache = tmp_path / "cache"
+    downloader = _Downloader(_fixture_archive("valid-toolchain.tar.gz"))
+
+    def timeout(_path: Path) -> dict[str, object]:
+        raise RuntimeError("interpreter probe timed out after 20 seconds; candidate runtime was not accepted")
+
+    published: list[Path] = []
+    with pytest.raises(RuntimeError, match="interpreter probe timed out after 20 seconds"):
+        runner.ensure_runtime(
+            _write_lock(tmp_path), cache, _platform(), downloader=downloader,
+            interpreter_probe=timeout, publisher=lambda staged, generation: published.append(generation),
+        )
+
+    assert len(downloader.calls) == 1
+    assert published == []
+    assert not list(cache.glob("runner-*"))
+    assert not list((cache / "generations").glob("windows-x86_64-none-*"))
+
+
+def test_main_reports_timeout_as_concise_preflight_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "candidate.exe"
+    candidate.write_text("synthetic", encoding="utf-8")
+
+    def timeout(*_args: Any, **_kwargs: Any) -> Any:
+        raise runner.subprocess.TimeoutExpired(
+            cmd=[str(candidate), "SECRET-CODE"], timeout=20,
+            output="SECRET-OUTPUT", stderr="SECRET-TRACEBACK",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", timeout)
+    monkeypatch.setattr(runner, "run_preflight", lambda *_args: runner.check_interpreter(candidate))
+    result = runner.main([
+        "--service", "mcp", "--source-root", str(tmp_path), "--output", str(tmp_path / "artifact"),
+    ])
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "preflight: interpreter probe timed out after 20 seconds" in captured.err
+    assert all(secret not in captured.err for secret in ("SECRET", "Traceback", "python.exe"))
 
 
 def _fixture_probe(_path: Path) -> dict[str, object]:
@@ -644,6 +1127,281 @@ def _write_tar(path: Path, members: list[tuple[str, bytes, str, int]]) -> None:
             elif kind == "fifo":
                 info.type = tarfile.FIFOTYPE
                 archive.addfile(info)
+
+
+def _source_toolchain_archive(
+    tmp_path: Path, *, cache_directory: bool = False, root_source: bool = False,
+) -> Path:
+    archive = tmp_path / "toolchain-with-source.tar.gz"
+    members = [
+        ("python/bin/python.exe", b"synthetic executable", "file", 0o755),
+        (
+            "synthetic_module.py" if root_source else "python/lib/synthetic_module.py",
+            b"value = 'synthetic'\n", "file", 0o644,
+        ),
+    ]
+    if cache_directory:
+        members.append(("python/lib/__pycache__", b"", "dir", 0o755))
+        members.append(("python/lib/__pycache__/preexisting.cpython-312.pyc", b"recorded-bytecode", "file", 0o644))
+    _write_tar(archive, members)
+    return archive
+
+
+def _install_source_toolchain(
+    tmp_path: Path, *, cache_directory: bool = False, root_source: bool = False,
+) -> tuple[Any, Path, _Downloader, Path]:
+    runner = _runner()
+    archive = _source_toolchain_archive(
+        tmp_path, cache_directory=cache_directory, root_source=root_source,
+    )
+    downloader = _Downloader(archive)
+    executable = runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)),
+        tmp_path / "private-cache", _platform(), downloader=downloader,
+        interpreter_probe=_fixture_probe,
+    )
+    return runner, Path(executable), downloader, archive
+
+
+@pytest.mark.parametrize("cache_directory", [False, True], ids=("new-cache-dir", "recorded-cache-dir"))
+def test_ensure_runtime_removes_only_new_valid_bytecode_and_reuses_generation(
+    tmp_path: Path, cache_directory: bool,
+) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(
+        tmp_path, cache_directory=cache_directory,
+    )
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    generated_cache = Path(py_compile.compile(str(source), doraise=True))
+    assert generated_cache.is_file()
+    recorded_bytecode = source.parent / "__pycache__" / "preexisting.cpython-312.pyc"
+    recorded_bytes = recorded_bytecode.read_bytes() if cache_directory else None
+
+    reused = runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)),
+        tmp_path / "private-cache", _platform(), downloader=downloader,
+        interpreter_probe=_fixture_probe,
+    )
+
+    assert Path(reused) == executable
+    assert len(downloader.calls) == 1
+    assert not list((tmp_path / "private-cache").glob("generations/*.corrupt-*"))
+    assert not generated_cache.exists()
+    assert (source.parent / "__pycache__").is_dir() is cache_directory
+    marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
+    if cache_directory:
+        assert recorded_bytecode.read_bytes() == recorded_bytes == b"recorded-bytecode"
+        relative_recorded = recorded_bytecode.relative_to(generation).as_posix()
+        assert marker["files"][relative_recorded] == runner._tree_manifest(generation)[relative_recorded]
+    assert runner._tree_manifest(generation) == marker["files"]
+
+
+def test_check_runtime_removes_new_valid_bytecode_before_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(tmp_path)
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    generated_cache = Path(py_compile.compile(str(source), doraise=True))
+    assert generated_cache.is_file()
+    monkeypatch.setattr(runner, "_probe_interpreter", lambda _path: pytest.fail("unverified runtime was probed"))
+
+    facts = runner.check_runtime(executable)
+
+    assert facts["python_minor"] == "3.12"
+    assert len(downloader.calls) == 1
+    assert not generated_cache.exists()
+    marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
+    assert runner._tree_manifest(generation) == marker["files"]
+
+
+def test_ensure_runtime_accepts_cache_for_source_at_generation_root(tmp_path: Path) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(tmp_path, root_source=True)
+    generation = executable.parents[2]
+    source = generation / "synthetic_module.py"
+    generated_cache = Path(py_compile.compile(str(source), doraise=True))
+
+    reused = runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)), tmp_path / "private-cache", _platform(),
+        downloader=downloader, interpreter_probe=_fixture_probe,
+    )
+
+    assert Path(reused) == executable
+    assert len(downloader.calls) == 1
+    assert not generated_cache.exists()
+    marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
+    assert runner._tree_manifest(generation) == marker["files"]
+
+
+def test_runtime_manifest_hashing_stays_bounded_for_warm_and_cache_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(tmp_path)
+    original_manifest = runner._tree_manifest
+    calls: list[Path] = []
+
+    def tracked_manifest(root: Path) -> dict[str, str]:
+        calls.append(root)
+        return original_manifest(root)
+
+    monkeypatch.setattr(runner, "_tree_manifest", tracked_manifest)
+    runner.check_runtime(executable)
+    assert len(calls) == 1
+
+    calls.clear()
+    runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)), tmp_path / "private-cache", _platform(),
+        downloader=downloader, interpreter_probe=_fixture_probe,
+    )
+    assert len(calls) == 1
+
+    source = executable.parents[2] / "python" / "lib" / "synthetic_module.py"
+    py_compile.compile(str(source), doraise=True)
+    calls.clear()
+    runner.check_runtime(executable)
+    assert len(calls) == 2
+
+    py_compile.compile(str(source), doraise=True)
+    calls.clear()
+    runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)), tmp_path / "private-cache", _platform(),
+        downloader=downloader, interpreter_probe=_fixture_probe,
+    )
+    assert len(calls) == 2
+    assert len(downloader.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "relative,content",
+    [
+        ("python/lib/extra.py", b"extra = True\n"),
+        ("python/lib/__pycache__/unknown.data", b"unknown"),
+        ("python/lib/__pycache__/orphan.cpython-312.pyc", b"orphan"),
+        ("python/lib/orphan.cpython-312.pyc", b"outside cache"),
+    ],
+    ids=("added-source", "unknown-cache-content", "orphan-bytecode", "outside-cache-bytecode"),
+)
+def test_check_runtime_does_not_clean_unrelated_tree_drift(
+    tmp_path: Path, relative: str, content: bytes,
+) -> None:
+    import py_compile
+
+    runner, executable, _downloader, _archive = _install_source_toolchain(tmp_path)
+    source = executable.parents[2] / "python" / "lib" / "synthetic_module.py"
+    legitimate_cache = Path(py_compile.compile(str(source), doraise=True))
+    legitimate_bytes = legitimate_cache.read_bytes()
+    unexpected = executable.parents[2] / relative
+    unexpected.parent.mkdir(parents=True, exist_ok=True)
+    unexpected.write_bytes(content)
+
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity)"):
+        runner.check_runtime(executable)
+
+    assert unexpected.read_bytes() == content
+    assert legitimate_cache.read_bytes() == legitimate_bytes
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink fixture")
+@pytest.mark.parametrize("link_parent", [False, True], ids=("bytecode-link", "cache-parent-link"))
+def test_check_runtime_does_not_follow_or_remove_symlinked_cache_paths(
+    tmp_path: Path, link_parent: bool,
+) -> None:
+    runner, executable, _downloader, _archive = _install_source_toolchain(tmp_path)
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.pyc"
+    sentinel.write_bytes(b"outside sentinel")
+    cache = source.parent / "__pycache__"
+    cache.mkdir()
+    if link_parent:
+        cache.rmdir()
+        cache.symlink_to(outside, target_is_directory=True)
+    else:
+        cache_name = Path(importlib.util.cache_from_source(str(source))).name
+        (cache / cache_name).symlink_to(sentinel)
+
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity)"):
+        runner.check_runtime(executable)
+
+    assert sentinel.read_bytes() == b"outside sentinel"
+    assert cache.is_symlink() is link_parent
+
+
+def test_generated_bytecode_reparse_metadata_is_not_cleaned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import py_compile
+
+    runner, executable, _downloader, _archive = _install_source_toolchain(tmp_path)
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    generated = Path(py_compile.compile(str(source), doraise=True))
+    actual_reparse_check = runner._is_reparse_point
+    monkeypatch.setattr(runner, "_is_reparse_point", lambda path: path == generated or actual_reparse_check(path))
+
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity)"):
+        runner.check_runtime(executable)
+
+    assert generated.is_file()
+
+
+@pytest.mark.parametrize(
+    "kind", [
+        "source", "recorded-bytecode", "executable", "missing-source", "missing-executable",
+        "source-mode", "executable-mode",
+    ],
+)
+def test_recorded_source_and_bytecode_drift_are_rejected_and_repaired(
+    tmp_path: Path, kind: str,
+) -> None:
+    import py_compile
+
+    runner, executable, downloader, archive = _install_source_toolchain(tmp_path)
+    generation = executable.parents[2]
+    source = generation / "python" / "lib" / "synthetic_module.py"
+    if kind == "source":
+        source.write_text("value = 'changed'\n", encoding="utf-8")
+    elif kind == "executable":
+        executable.write_bytes(b"changed executable")
+    elif kind == "missing-source":
+        source.unlink()
+    elif kind == "missing-executable":
+        executable.unlink()
+    elif kind == "source-mode":
+        if os.name == "nt":
+            pytest.skip("POSIX permission bits are not represented by Windows")
+        os.chmod(source, 0o600)
+    elif kind == "executable-mode":
+        if os.name == "nt":
+            pytest.skip("POSIX permission bits are not represented by Windows")
+        os.chmod(executable, 0o600)
+    else:
+        recorded_bytecode = Path(py_compile.compile(str(source), doraise=True))
+        marker = json.loads((generation / ".bootstrap-runtime.json").read_text(encoding="utf-8"))
+        marker["files"] = runner._tree_manifest(generation)
+        (generation / ".bootstrap-runtime.json").write_text(json.dumps(marker), encoding="utf-8")
+        recorded_bytecode.write_bytes(b"changed recorded bytecode")
+
+    with pytest.raises(RuntimeError, match="(?i)(managed|integrity)"):
+        runner.check_runtime(executable)
+
+    repaired = runner.ensure_runtime(
+        _write_lock(tmp_path, _lock_document(archive)), tmp_path / "private-cache", _platform(),
+        downloader=downloader, interpreter_probe=_fixture_probe,
+    )
+    assert Path(repaired) == executable
+    assert len(downloader.calls) == 2
+    assert list((tmp_path / "private-cache").glob("generations/*.corrupt-*"))
 
 
 @pytest.mark.parametrize(

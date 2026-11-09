@@ -1,0 +1,1690 @@
+"""Offline contracts for generation receipts and guarded document completion."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+
+DOC_ID = "completion-doc"
+PARENT_ID = "completion-parent"
+ROOT_ID = "completion-root"
+OPERATION_ID = "completion-operation"
+OWNER = "completion-worker"
+NOW = datetime(2026, 3, 4, tzinfo=timezone.utc)
+RESOURCE = f"document:{DOC_ID}"
+
+
+def _lease(client, *, operation_id=OPERATION_ID, now=NOW, lease_seconds=30, owner=OWNER):
+    from core.integrations.firestore.operations import claim_operation, create_operation
+    from core.operations.models import OperationOrigin
+
+    create_operation(
+        client,
+        operation_id=operation_id,
+        origin=OperationOrigin.MCP,
+        caller_binding="synthetic-caller",
+        immutable_input_digest="sha256:synthetic-input",
+        immutable_input_ref="synthetic-input-ref",
+        now=now,
+    )
+    lease = claim_operation(
+        client, operation_id, owner=owner, now=now, lease_seconds=lease_seconds,
+    )
+    assert lease is not None
+    return lease
+
+
+def _completion_module():
+    # Function-local so this test module still collects before T042 adds the seam.
+    from core.dialogs import completion
+
+    return completion
+
+
+def _stored_generation(firestore_fake, doc_id: str, content_hash: str):
+    path = f"index_completions/{doc_id}/generations/{content_hash}"
+    return firestore_fake.documents.get(path)
+
+
+def _set_generation(client, doc_id: str, content_hash: str, receipt: dict):
+    (client.collection("index_completions").document(doc_id)
+     .collection("generations").document(content_hash).set(receipt))
+
+
+def _assert_user_fact_excluded(delete_events):
+    from qdrant_client.models import Filter, MatchAny
+
+    assert delete_events
+    for event in delete_events:
+        selector = event["points_selector"]
+        assert isinstance(selector, Filter)
+        type_condition = next(condition for condition in selector.must if condition.key == "type")
+        match = type_condition.match
+        selected_types = set(match.any) if isinstance(match, MatchAny) else {match.value}
+        assert selected_types <= {"utterance", "summary", "fact"}
+        assert "user_fact" not in selected_types
+
+
+def _save_fixture(
+    client, sdk_fakes, *, operation_id=OPERATION_ID, owner=OWNER, now=NOW,
+    lease_seconds=30, skipped_utterances=(),
+):
+    from core.integrations.firestore.operations import claim_operation, create_operation
+    from core.integrations.firestore.save_intents import (
+        create_save_intent,
+        dispatch_save_intent,
+        update_save_intent_checkpoints,
+    )
+    from core.operations.models import OperationOrigin, OperationResult
+
+    save_intent_id = f"{operation_id}-save"
+    content = "DATE: 2026-03-04\nPROVIDER: tldv\n---\nSpeaker A :: Completed synthetic transcript."
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    parent_hash = hashlib.sha256(PARENT_ID.encode("utf-8")).hexdigest()
+    create_operation(
+        client, operation_id=operation_id, origin=OperationOrigin.TELEGRAM,
+        origin_operation_ref="synthetic-context", caller_binding="synthetic-caller",
+        immutable_input_digest="sha256:synthetic-manifest",
+        immutable_input_ref="synthetic-dialog-input-ref", provider="tldv",
+        title="Synthetic transcript", explicit_folder_id=PARENT_ID,
+        save_intent_id=save_intent_id, now=now,
+    )
+    create_save_intent(
+        client, save_intent_id, operation_id=operation_id,
+        desired_content_hash=content_hash, desired_parent_id_hash=parent_hash, now=now,
+    )
+    lease = claim_operation(client, operation_id, owner=owner, now=now, lease_seconds=lease_seconds)
+    assert lease is not None
+    result = OperationResult(document_id=DOC_ID, title="Synthetic transcript")
+    assert dispatch_save_intent(
+        client, save_intent_id, operation_id=operation_id, owner=owner, fence=lease.fence,
+        now=now, create_callback=lambda: result,
+    ) == result
+    assert update_save_intent_checkpoints(
+        client, save_intent_id, operation_id=operation_id, owner=owner, fence=lease.fence,
+        now=now, fill_checkpoint_ref="synthetic-fill-checkpoint",
+        index_checkpoint_ref="synthetic-index-checkpoint",
+    ) is not None
+
+    sdk_fakes.docs.queue("documents.get", response={
+        "revisionId": "synthetic-revision",
+        "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
+            for line in content.splitlines()
+        ]},
+    })
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document", "parents": [PARENT_ID], "trashed": False,
+    })
+    receipt = {
+        "doc_id": DOC_ID, "content_hash": content_hash, "version": content_hash,
+        "provider": "tldv", "parent_id": PARENT_ID, "parent_id_hash": parent_hash,
+        "root_folder_id": ROOT_ID, "status": "completed",
+        "skipped_utterances": list(skipped_utterances),
+        "completed_at": now, "error": None, "owner": owner, "fence": lease.fence,
+        "index_fence": 1, "resource_epoch": 0,
+        "work_manifest_ref": "synthetic-work-manifest",
+        "checkpoint_refs": ["synthetic-fill-checkpoint", "synthetic-index-checkpoint"],
+    }
+    _set_generation(client, DOC_ID, content_hash, receipt)
+    client.collection("transcript_index").document(DOC_ID).set({
+        **receipt, "status": "synced", "synced_at": now,
+    })
+    return lease, save_intent_id, receipt, content
+
+
+def _finalize(client, *, operation_id=OPERATION_ID, save_intent_id=None, owner=OWNER,
+              fence=1, now=NOW, clock=None):
+    clock = clock or (lambda: now)
+    return _completion_module().finalize_save(
+        client, operation_id=operation_id,
+        save_intent_id=save_intent_id or f"{operation_id}-save",
+        owner=owner, fence=fence,
+        origin_binding={
+            "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+            "manifest_digest": "sha256:synthetic-manifest",
+        },
+        now=now,
+        clock=clock,
+    )
+
+
+def test_telegram_finalizer_read_failure_counts_and_reloads_projection_under_queue_budget(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.integrations.firestore.operations import get_operation
+    from core.operations.retries import RetryGovernor
+    from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
+    from services.connectors.telegram.runtime.save_fencing import (
+        _ParentBoundRetryGovernor, telegram_error_classifier,
+    )
+
+    client = firestore_fake.client_class()
+    save_lease, intent_id, receipt, content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    context_id, queue_id, queue_owner, queue_fence = (
+        "synthetic-context", "telegram-finalizer-queue-op", "telegram-worker", 7,
+    )
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.set({
+        "active_operation_id": queue_id, "reserved_operation_id": queue_id,
+        "lock_owner": queue_owner, "fence": queue_fence,
+        "lock_expires_at": NOW + timedelta(minutes=2),
+    })
+    context_ref.collection("operations").document(queue_id).set({
+        "operation_id": queue_id, "state": "running", "sequence": 1,
+    })
+    source = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: NOW),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+        error_classifier=telegram_error_classifier,
+    )
+    bound = _ParentBoundRetryGovernor(
+        source, clock=lambda: NOW,
+        assert_current=lambda: None,
+    )
+
+    def read_boundary(boundary, callback):
+        return bound.run_stage(
+            queue_id, f"telegram.finalize.{OPERATION_ID}.{boundary}", callback,
+            now=NOW, owner=queue_owner, fence=queue_fence,
+            reconcile=callback, checkpoint_success=False,
+        )
+
+    sdk_fakes.reset()
+    sdk_fakes.docs.queue(
+        "documents.get", error=ConnectionError("synthetic docs read outage"),
+    )
+    with pytest.raises(ConnectionError):
+        _completion_module().finalize_save(
+            client, operation_id=OPERATION_ID, save_intent_id=intent_id,
+            owner=OWNER, fence=save_lease.fence,
+            origin_binding={
+                "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+                "manifest_digest": "sha256:synthetic-manifest",
+            },
+            now=NOW, clock=lambda: NOW,
+            retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+            read_boundary=read_boundary,
+        )
+
+    docs_stage_key = f"telegram.finalize.{OPERATION_ID}.docs"
+    docs_stage = source.get_stage(queue_id, docs_stage_key)
+    assert docs_stage.failures == 1 and docs_stage.attempts_started == 1
+    assert docs_stage.last_error.service == "google_docs"
+    assert docs_stage.result is None
+    assert get_operation(client, OPERATION_ID).state.value == "running"
+
+    # A manual edit does not change resource_epoch. The next attempt must read
+    # it again and remain pending while the index still names the old version.
+    edited_content = (
+        "DATE: 2026-03-04\nPROVIDER: tldv\n---\n"
+        "Speaker A :: Externally revised synthetic transcript."
+    )
+    def document_projection(value, revision):
+        return {
+            "revisionId": revision,
+            "body": {"content": [
+                {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
+                for line in value.splitlines()
+            ]},
+        }
+
+    sdk_fakes.docs.queue("documents.get", response=document_projection(
+        edited_content, "edited-revision",
+    ))
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": [PARENT_ID], "trashed": False,
+    })
+    pending = _completion_module().finalize_save(
+        client, operation_id=OPERATION_ID, save_intent_id=intent_id,
+        owner=OWNER, fence=save_lease.fence,
+        origin_binding={
+            "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+            "manifest_digest": "sha256:synthetic-manifest",
+        },
+        now=NOW, clock=lambda: NOW,
+        retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+        read_boundary=read_boundary,
+    )
+    assert pending is None
+    assert get_operation(client, OPERATION_ID).state.value == "running"
+    assert client.collection("dialog_save_intents").document(intent_id).get().to_dict().get(
+        "completion_certificate"
+    ) is None
+
+    # Restoring the source projection under the same grant and epoch permits
+    # completion with the original immutable intent and the same Doc.
+    sdk_fakes.docs.queue("documents.get", response=document_projection(
+        content, "restored-revision",
+    ))
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": [PARENT_ID], "trashed": False,
+    })
+    result = _completion_module().finalize_save(
+        client, operation_id=OPERATION_ID, save_intent_id=intent_id,
+        owner=OWNER, fence=save_lease.fence,
+        origin_binding={
+            "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+            "manifest_digest": "sha256:synthetic-manifest",
+        },
+        now=NOW, clock=lambda: NOW,
+        retry_policy=SINGLE_ATTEMPT_RETRY_POLICY,
+        read_boundary=read_boundary,
+    )
+
+    assert result is not None and result.document_id == DOC_ID
+    certificate = client.collection("dialog_save_intents").document(intent_id).get().to_dict()[
+        "completion_certificate"
+    ]
+    assert certificate["content_hash"] == receipt["content_hash"]
+    docs_stage = source.get_stage(queue_id, docs_stage_key)
+    assert docs_stage.failures == 1 and docs_stage.attempts_started == 3
+    assert docs_stage.state.value == "pending" and docs_stage.result is None
+    assert docs_stage.last_error.service == "google_docs"
+    assert docs_stage.last_error.category == "execution"
+    drive_stage = source.get_stage(queue_id, f"telegram.finalize.{OPERATION_ID}.drive")
+    assert drive_stage.attempts_started == 2 and drive_stage.result is None
+    assert receipt["resource_epoch"] == 0
+    docs_calls = [event for event in sdk_fakes.trace
+                  if event["boundary"] == "docs"
+                  and event["operation"] == "documents.get"]
+    assert len(docs_calls) == 3
+    assert all(event["arguments"]["documentId"] == DOC_ID for event in docs_calls)
+    serialized_stages = repr([
+        client.collection("telegram_sessions").document(context_id)
+        .collection("operations").document(queue_id).collection("stages").document(key)
+        .get().to_dict()
+        for key in (docs_stage_key, f"telegram.finalize.{OPERATION_ID}.drive")
+    ])
+    assert edited_content not in serialized_stages
+    assert "synthetic docs read outage" not in serialized_stages
+
+
+def test_inflight_finalizer_reconciles_fresh_docs_read_and_charges_only_three_attempts(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryGovernor, UnknownOutcome, ReconciledStageFailure, RetryBudgetExceeded
+    from core.utils.retry import SINGLE_ATTEMPT_RETRY_POLICY
+    from services.connectors.telegram.runtime.save_core import _reconcile_finalization_read
+    from services.connectors.telegram.runtime.save_fencing import (
+        _ParentBoundRetryGovernor, telegram_error_classifier,
+    )
+
+    client = firestore_fake.client_class()
+    _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    context_id, queue_id = "reconcile-context", "telegram-reconcile-queue"
+    old_owner, new_owner, old_fence, new_fence = "old-worker", "current-worker", 4, 5
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.set({
+        "active_operation_id": queue_id, "reserved_operation_id": queue_id,
+        "lock_owner": old_owner, "fence": old_fence,
+        "lock_expires_at": NOW + timedelta(minutes=2),
+    })
+    context_ref.collection("operations").document(queue_id).set({
+        "operation_id": queue_id, "state": "running", "sequence": 1,
+    })
+    source = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: NOW),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+        error_classifier=telegram_error_classifier,
+    )
+    stage_key = f"telegram.finalize.{OPERATION_ID}.docs"
+    with pytest.raises(UnknownOutcome):
+        source.run_stage(
+            queue_id, stage_key,
+            lambda: (_ for _ in ()).throw(UnknownOutcome("unresolved first read")),
+            now=NOW, owner=old_owner, fence=old_fence,
+        )
+    assert source.get_stage(queue_id, stage_key).in_flight_attempt_id is not None
+    context_ref.update({
+        "lock_owner": new_owner, "fence": new_fence,
+        "lock_expires_at": NOW + timedelta(minutes=2),
+    })
+    current = lambda: (
+        context_ref.get().to_dict().get("lock_owner") == new_owner
+        and context_ref.get().to_dict().get("fence") == new_fence
+    )
+    bound = _ParentBoundRetryGovernor(
+        source, clock=lambda: NOW, assert_current=lambda: (
+            None if current() else (_ for _ in ()).throw(RuntimeError("stale queue owner"))
+        ),
+    )
+    sdk_fakes.reset()
+
+    def read_document():
+        from core.integrations.google_docs.reader import read_google_doc
+        return read_google_doc(DOC_ID, retry_policy=SINGLE_ATTEMPT_RETRY_POLICY)
+
+    reconcile = lambda: _reconcile_finalization_read(bound, stage_key, read_document)
+    for _ in range(3):
+        sdk_fakes.docs.queue(
+            "documents.get", error=ConnectionError("synthetic reconciliation read failure"),
+        )
+    with pytest.raises(ReconciledStageFailure):
+        bound.run_stage(
+            queue_id, stage_key, read_document, now=NOW, owner=new_owner,
+            fence=new_fence, reconcile=reconcile, checkpoint_success=False,
+        )
+    for _ in range(2):
+        with pytest.raises(ConnectionError):
+            bound.run_stage(
+                queue_id, stage_key, read_document, now=NOW, owner=new_owner,
+                fence=new_fence, reconcile=reconcile, checkpoint_success=False,
+            )
+    final_stage = bound.get_stage(queue_id, stage_key)
+    assert final_stage.failures == 3 and final_stage.attempts_started == 3
+    assert final_stage.last_error.service == "google_docs"
+    assert final_stage.in_flight_attempt_id is None and final_stage.result is None
+    docs_calls = [event for event in sdk_fakes.trace
+                  if event["boundary"] == "docs" and event["operation"] == "documents.get"]
+    assert len(docs_calls) == 3
+    with pytest.raises(RetryBudgetExceeded):
+        bound.run_stage(
+            queue_id, stage_key, lambda: pytest.fail("exhausted stage must not dispatch"),
+            now=NOW, owner=new_owner, fence=new_fence,
+            reconcile=reconcile, checkpoint_success=False,
+        )
+    assert len([event for event in sdk_fakes.trace
+                if event["boundary"] == "docs" and event["operation"] == "documents.get"]) == 3
+
+
+def test_stale_parent_cannot_settle_common_save_from_an_old_terminal_finalizer_stage(
+    firestore_fake, sdk_fakes,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.integrations.firestore.operations import get_operation
+    from core.operations.retries import RetryGovernor, UnknownOutcome
+    from services.connectors.telegram.runtime.save_core import _run_finalization_read_boundary
+    from services.connectors.telegram.runtime.save_fencing import telegram_error_classifier
+
+    client = firestore_fake.client_class()
+    core_lease, _intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    context_id, queue_id, owner, fence = "stale-finalize-context", "stale-finalize-op", "owner-a", 6
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.set({
+        "active_operation_id": queue_id, "reserved_operation_id": queue_id,
+        "lock_owner": owner, "fence": fence, "lock_expires_at": NOW + timedelta(minutes=2),
+    })
+    context_ref.collection("operations").document(queue_id).set({
+        "operation_id": queue_id, "state": "running", "sequence": 1,
+    })
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: NOW),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+        error_classifier=telegram_error_classifier,
+    )
+    stage_key = f"telegram.finalize.{OPERATION_ID}.docs"
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            governor.run_stage(
+                queue_id, stage_key,
+                lambda: (_ for _ in ()).throw(RuntimeError("synthetic read error")),
+                now=NOW, owner=owner, fence=fence,
+            )
+    assert governor.get_stage(queue_id, stage_key).failures == 3
+    context_ref.update({"lock_owner": "owner-b", "fence": fence + 1})
+    calls = []
+
+    class Runtime:
+        clock = staticmethod(lambda: NOW)
+
+        @staticmethod
+        def _assert_parent_lease(*_args):
+            raise PermissionError("the parent queue lease is stale")
+
+    before = get_operation(client, OPERATION_ID)
+    with pytest.raises(UnknownOutcome):
+        _run_finalization_read_boundary(
+            Runtime(), client=client, parent_operation_id=queue_id,
+            operation_id=OPERATION_ID, context_id=context_id,
+            lease=SimpleNamespace(owner=owner, fence=fence),
+            core_owner=core_lease.lease_owner, core_fence=core_lease.fence,
+            retry_governor=governor, boundary="docs",
+            callback=lambda: calls.append("provider") or "read",
+        )
+    after = get_operation(client, OPERATION_ID)
+    assert calls == []
+    assert after.state == before.state and after.error == before.error is None
+    assert after.lease_owner == before.lease_owner == core_lease.lease_owner
+    assert after.fence == before.fence == core_lease.fence
+
+
+def _synthetic_google_oauth(monkeypatch):
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-synthetic-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-synthetic-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-synthetic-secret")
+
+
+def test_process_one_hashes_the_google_docs_reader_projection_and_publishes_after_all_writes(
+    app_root, sdk_fakes, firestore_fake, monkeypatch,
+):
+    from core.indexing import processor
+
+    from google.genai import types
+    from core.integrations.qdrant import writer
+
+    reader_projection = (
+        "DATE: 2026-03-04\nTIME: 10:00\nPROVIDER: tldv\n---\n"
+        "Speaker A :: Invented reader projection content."
+    )
+    monkeypatch.setattr(processor, "read_google_doc", lambda _doc_id: reader_projection)
+    writer.upsert_user_facts([{
+        "type": "user_fact", "doc_id": DOC_ID,
+        "text": "Invented user fact remains available.", "root_folder_id": ROOT_ID,
+    }], [[0.25]])
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(candidates=[
+        types.Candidate(content=types.Content(parts=[
+            types.Part(text=json.dumps({"summary": "Synthetic summary.", "facts": ["Invented fact."]}))
+        ]))
+    ]))
+    for _ in range(3):
+        sdk_fakes.gemini.queue("embed_content", response=types.EmbedContentResponse(
+            embeddings=[types.ContentEmbedding(values=[0.125] * 768)]
+        ))
+    effects = []
+    for method_name in ("upsert_utterances", "upsert_summaries", "upsert_facts", "delete_old_versions",
+                        "update_skipped_utterances", "update_index"):
+        original = getattr(processor, method_name)
+        def record(*args, _name=method_name, _original=original, **kwargs):
+            effects.append(_name)
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(processor, method_name, record)
+    original_upsert = processor.upsert_facts
+    writes_before_receipt = []
+    monkeypatch.setattr(
+        processor,
+        "upsert_facts",
+        lambda *args, **kwargs: (writes_before_receipt.append("facts"), original_upsert(*args, **kwargs))[1],
+    )
+
+    assert processor.process_one(DOC_ID, PARENT_ID, ROOT_ID) == "processed"
+
+    content_hash = hashlib.sha256(reader_projection.encode("utf-8")).hexdigest()
+    receipt = _stored_generation(firestore_fake, DOC_ID, content_hash)
+    assert receipt is not None
+    assert receipt["content_hash"] == content_hash
+    assert receipt["version"] == content_hash
+    assert receipt["provider"] == "tldv"
+    assert receipt["parent_id"] == PARENT_ID
+    assert receipt["status"] == "completed"
+    assert writes_before_receipt == ["facts"]
+    qdrant_mutations = {"upsert_utterances", "upsert_summaries", "upsert_facts", "delete_old_versions"}
+    qdrant_positions = [i for i, effect in enumerate(effects) if effect in qdrant_mutations]
+    final_checkpoint = max(i for i, effect in enumerate(effects) if effect == "update_index")
+    assert qdrant_mutations <= set(effects)
+    assert max(qdrant_positions) < final_checkpoint
+    assert "mark_synced" not in effects
+    receipt_path = f"index_completions/{DOC_ID}/generations/{content_hash}"
+    firestore_trace = firestore_fake.trace()
+    receipt_commit = max(i for i, event in enumerate(firestore_trace)
+                         if event["path"] == receipt_path and event["outcome"] == "committed")
+    index_commits = [i for i, event in enumerate(firestore_trace)
+                     if event["path"] == f"transcript_index/{DOC_ID}" and event["outcome"] == "committed"]
+    # Receipt plus transcript synced status are one fenced Firestore commit;
+    # the fake reports both document writes separately in that commit.
+    assert index_commits and receipt_commit >= max(index_commits) - 1
+    deletes = [event["arguments"] for event in sdk_fakes.trace
+               if event["boundary"] == "qdrant" and event["operation"] == "delete"]
+    _assert_user_fact_excluded(deletes)
+    assert any(
+        event["boundary"] == "qdrant" and event["operation"] == "upsert"
+        for event in sdk_fakes.trace
+    )
+
+
+def test_unknown_index_batch_keeps_common_guard_blocking_after_lease_expiry(
+    firestore_fake, fake_clock,
+):
+    from core.integrations.firestore.mutations import (
+        acquire_index_guard, begin_index_effect, get_resource_guard,
+        release_index_guard, settle_index_effect,
+    )
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    client.collection("transcript_index").document(DOC_ID).set({"doc_id": DOC_ID, "status": "syncing"})
+    owner = "synthetic-index-worker"
+    acquired = acquire_index_guard(
+        client, doc_id=DOC_ID, owner=owner, now=fake_clock.now(), lease_seconds=5,
+        root_folder_id=ROOT_ID,
+    )
+    assert acquired is not None
+    fence, _epoch = acquired
+    assert begin_index_effect(
+        client, doc_id=DOC_ID, owner=owner, fence=fence, effect_id="batch-1",
+        kind="upsert_utterances", payload_digest="sha256:batch", now=fake_clock.now(),
+    )
+    assert settle_index_effect(
+        client, doc_id=DOC_ID, owner=owner, fence=fence, effect_id="batch-1",
+        now=fake_clock.now(), confirmed=False,
+    )
+
+    fake_clock.advance(seconds=6)
+
+    assert acquire_index_guard(
+        client, doc_id=DOC_ID, owner="takeover", now=fake_clock.now(), lease_seconds=30,
+        root_folder_id=ROOT_ID,
+    ) is None
+    assert not settle_index_effect(
+        client, doc_id=DOC_ID, owner=owner, fence=fence, effect_id="batch-1",
+        now=fake_clock.now(), confirmed=True,
+    )
+    assert not release_index_guard(
+        client, doc_id=DOC_ID, owner=owner, fence=fence, now=fake_clock.now(),
+    )
+    assert get_resource_guard(client, f"document:{DOC_ID}").unsettled_effect_ids == ("batch-1",)
+
+
+def test_managed_index_reference_binds_route_operation_intent_and_outbox(
+    firestore_fake, sdk_fakes,
+):
+    from core.indexing.processor import _validate_managed_reference
+    from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record
+    from core.integrations.firestore.save_intents import update_save_intent_checkpoints
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    outbox_id = "index-dispatch-managed-reference"
+    create_outbox_record(
+        client, outbox_id, target_kind=OutboxTargetKind.INDEX_DISPATCH, generation=1,
+        schedule_at=NOW, now=NOW, operation_id=OPERATION_ID,
+        document_id=DOC_ID, save_intent_id=save_intent_id,
+    )
+    assert update_save_intent_checkpoints(
+        client, save_intent_id, operation_id=OPERATION_ID, owner=OWNER,
+        fence=lease.fence, now=NOW, index_checkpoint_ref=outbox_id,
+    ) is not None
+    reference = {
+        "schema_version": 1, "outbox_id": outbox_id, "target_kind": "index_dispatch",
+        "generation": 1, "operation_id": OPERATION_ID, "document_id": DOC_ID,
+        "save_intent_id": save_intent_id,
+    }
+
+    assert _validate_managed_reference(reference, DOC_ID, PARENT_ID) is not None
+    with pytest.raises(ValueError, match="invalid managed index reference"):
+        _validate_managed_reference(reference, "another-doc", PARENT_ID)
+
+
+def test_managed_index_stage_uses_durable_budget_and_completed_replay(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+    from core.integrations.firestore.operations import get_operation, release_operation
+    from core.integrations.firestore.save_intents import get_save_intent
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, content = _save_fixture(client, sdk_fakes)
+    assert release_operation(client, OPERATION_ID, owner=OWNER, fence=lease.fence, now=NOW)
+    monkeypatch.setattr(
+        processor, "_validate_managed_reference",
+        lambda _reference, _doc_id, _parent_id: (
+            get_operation(client, OPERATION_ID), get_save_intent(client, save_intent_id),
+        ),
+    )
+    calls = []
+
+    def attempt(*_args, **_kwargs):
+        calls.append("called")
+        if len(calls) == 1:
+            raise ValueError("synthetic retryable attempt")
+        return "processed"
+
+    monkeypatch.setattr(processor, "process_one", attempt)
+    reference = {"unused": "validation is patched in this unit"}
+    with pytest.raises(ValueError, match="synthetic retryable"):
+        processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference)
+    assert processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference) == "processed"
+    assert processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference) == "processed"
+    from core.operations.retries import RetryGovernor
+    assert RetryGovernor(client).get_stage(OPERATION_ID, "managed_index").state.value == "completed"
+    assert len(calls) == 2
+
+
+def _prepare_mcp_completed_index(client, sdk_fakes, *, monkeypatch):
+    from core.integrations.firestore.operations import release_operation
+    from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record
+    from core.integrations.firestore.save_intents import update_save_intent_checkpoints
+
+    lease, save_intent_id, receipt, content = _save_fixture(client, sdk_fakes)
+    digest = "a" * 64
+    session_hash, request_hash = "b" * 64, "c" * 64
+    origin_ref = f"mcp_sessions/{session_hash}/requests/{request_hash}"
+    operation_ref = client.collection("dialog_operations").document(OPERATION_ID)
+    operation_data = operation_ref.get().to_dict()
+    operation_data.update({
+        "origin": "mcp", "origin_operation_ref": origin_ref,
+        "immutable_input_digest": digest, "doc_id": DOC_ID,
+        "desired_content_hash": receipt["content_hash"],
+        "desired_parent_id_hash": receipt["parent_id_hash"],
+    })
+    operation_ref.set(operation_data)
+    intent_ref = client.collection("dialog_save_intents").document(save_intent_id)
+    intent_data = intent_ref.get().to_dict()
+    intent_data["immutable_input_digest"] = digest
+    intent_ref.set(intent_data)
+    client.collection("mcp_sessions").document(session_hash).collection("requests").document(request_hash).set({
+        "operation_id": OPERATION_ID,
+    })
+
+    index_outbox_id = "mcp-index-dispatch"
+    create_outbox_record(
+        client, index_outbox_id, target_kind=OutboxTargetKind.INDEX_DISPATCH,
+        generation=7, schedule_at=NOW, now=NOW, operation_id=OPERATION_ID,
+        document_id=DOC_ID, save_intent_id=save_intent_id,
+    )
+    assert update_save_intent_checkpoints(
+        client, save_intent_id, operation_id=OPERATION_ID, owner=OWNER,
+        fence=lease.fence, now=NOW, index_checkpoint_ref=index_outbox_id,
+    ) is not None
+    receipt.update({
+        "work_manifest_ref": operation_data["immutable_input_ref"],
+        "checkpoint_refs": [intent_data["fill_checkpoint_ref"], index_outbox_id],
+    })
+    _set_generation(client, DOC_ID, receipt["content_hash"], receipt)
+    client.collection("transcript_index").document(DOC_ID).set({**receipt, "status": "synced"})
+
+    assert release_operation(client, OPERATION_ID, owner=OWNER, fence=lease.fence, now=NOW)
+    monkeypatch.setattr("core.integrations.firestore.client.get_client", lambda: client)
+    from core.indexing.processor import process_managed_one
+    assert process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, {
+        "schema_version": 1, "outbox_id": index_outbox_id, "target_kind": "index_dispatch",
+        "generation": 7, "operation_id": OPERATION_ID, "document_id": DOC_ID,
+        "save_intent_id": save_intent_id,
+    }) in {"processed", "skipped"}
+    assert not [event for event in sdk_fakes.trace if event["boundary"] in {"gemini", "qdrant"}]
+    return save_intent_id, content, {
+        "schema_version": 1, "outbox_id": index_outbox_id, "target_kind": "index_dispatch",
+        "generation": 7, "operation_id": OPERATION_ID, "document_id": DOC_ID,
+        "save_intent_id": save_intent_id,
+    }
+
+
+def test_managed_mcp_index_dispatches_stable_task_then_existing_worker_finalizes(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from types import SimpleNamespace
+    from core.integrations.firestore.operations import claim_operation, get_operation, release_operation
+    from core.integrations.firestore.outbox import OutboxState, get_outbox_record
+    from core.operations.mcp_completion import dispatch_completed_managed_mcp_index
+    from core.operations.outbox import TaskTargetConfig
+    from services.mcp.app import dialog_worker
+
+    client = firestore_fake.client_class()
+    save_intent_id, content, reference = _prepare_mcp_completed_index(
+        client, sdk_fakes, monkeypatch=monkeypatch,
+    )
+    _synthetic_google_oauth(monkeypatch)
+    enqueue_calls = []
+    accepted_tasks = set()
+
+    def enqueue_with_lost_ack(**kwargs):
+        enqueue_calls.append(kwargs)
+        accepted_tasks.add(kwargs["task_id"])
+        if len(enqueue_calls) == 1:
+            raise TimeoutError("synthetic accepted task acknowledgement lost")
+        return False
+
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", enqueue_with_lost_ack)
+    target = TaskTargetConfig(
+        "dialog-operations", "https://mcp.example.invalid/internal/dialog-operations",
+        "invoker@example.invalid", "https://mcp.example.invalid",
+    )
+    first = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content, target=target, now=NOW + timedelta(seconds=1),
+    )
+    assert first is not None and first.outcome == "failed"
+    recovery_payload = enqueue_calls[0]["body"]
+    assert get_outbox_record(client, recovery_payload["outbox_id"]).state is OutboxState.RETRY
+
+    later_lease = claim_operation(
+        client, OPERATION_ID, owner="redelivery-fence", now=NOW + timedelta(seconds=2), lease_seconds=30,
+    )
+    assert later_lease is not None
+    assert release_operation(
+        client, OPERATION_ID, owner="redelivery-fence", fence=later_lease.fence,
+        now=NOW + timedelta(seconds=2),
+    )
+    replay = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content, target=target, now=NOW + timedelta(seconds=3),
+    )
+    assert replay is not None and replay.outcome == "already_exists"
+    assert enqueue_calls[0]["task_id"] == enqueue_calls[1]["task_id"]
+    assert accepted_tasks == {enqueue_calls[1]["task_id"]}
+    assert enqueue_calls[0]["body"] == enqueue_calls[1]["body"] == recovery_payload
+    assert get_outbox_record(client, recovery_payload["outbox_id"]).state is OutboxState.DELIVERED
+
+    from services.mcp.app.mcp import handler
+    monkeypatch.setattr(handler, "_advance_add_dialog_save", lambda *_args: SimpleNamespace(save_intent_id=save_intent_id))
+    monkeypatch.setattr(handler, "_publish_add_dialog_index_work", lambda *_args: None)
+    monkeypatch.setattr(dialog_worker.folder_repository, "get_all_folders", lambda *_args: {})
+    monkeypatch.setattr(dialog_worker, "get_root_folder_id", lambda: ROOT_ID)
+
+    assert dialog_worker.process_dialog_operation(client, recovery_payload).status == "processed"
+    operation = get_operation(client, OPERATION_ID)
+    intent = client.collection("dialog_save_intents").document(save_intent_id).get().to_dict()
+    assert operation.state.value == "completed"
+    assert operation.result.document_id == DOC_ID
+    assert intent["completion_certificate"]["doc_id"] == DOC_ID
+    assert intent["completion_certificate"]["save_intent_id"] == save_intent_id
+    operation_data = client.collection("dialog_operations").document(OPERATION_ID).get().to_dict()
+    assert intent["cleanup_authorization"]["certificate_id"] == operation_data["cleanup_authorization"]["certificate_id"]
+
+
+def test_eligible_mcp_completion_without_target_remains_pending_for_retry(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.outbox import OutboxState, get_outbox_record
+    from core.operations.mcp_completion import dispatch_completed_managed_mcp_index
+    from core.operations.outbox import TaskTargetConfig
+
+    client = firestore_fake.client_class()
+    save_intent_id, content, reference = _prepare_mcp_completed_index(
+        client, sdk_fakes, monkeypatch=monkeypatch,
+    )
+    missing = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content, target=None, now=NOW + timedelta(seconds=1),
+    )
+    assert missing is not None and missing.retryable
+    record_path = next(path for path in firestore_fake.documents if path.startswith("task_outbox/mcp-save-recovery-"))
+    assert firestore_fake.documents[record_path]["state"] == OutboxState.PENDING.value
+
+    calls = []
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", lambda **kwargs: calls.append(kwargs) or True)
+    later = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content,
+        target=TaskTargetConfig("dialog-operations", "https://mcp.example.invalid/internal/dialog-operations"),
+        now=NOW + timedelta(seconds=2),
+    )
+    assert later is not None and later.outcome == "published"
+    assert calls[0]["task_id"] == firestore_fake.documents[record_path]["task_name"]
+
+
+@pytest.mark.parametrize(
+    "invalid_proof",
+    ["cross_operation", "non_mcp", "terminal", "intent_operation", "digest", "parent", "no_stage", "no_receipt", "stale_receipt"],
+)
+def test_managed_mcp_completion_rejects_invalid_or_stale_proof(
+    firestore_fake, sdk_fakes, monkeypatch, invalid_proof,
+):
+    from core.operations.mcp_completion import dispatch_completed_managed_mcp_index
+    from core.operations.outbox import TaskTargetConfig
+    from core.integrations.firestore.operations import _stage_id
+
+    client = firestore_fake.client_class()
+    save_intent_id, content, reference = _prepare_mcp_completed_index(
+        client, sdk_fakes, monkeypatch=monkeypatch,
+    )
+    operation_ref = client.collection("dialog_operations").document(OPERATION_ID)
+    intent_ref = client.collection("dialog_save_intents").document(save_intent_id)
+    transcript_ref = client.collection("transcript_index").document(DOC_ID)
+    if invalid_proof == "cross_operation":
+        reference = {**reference, "operation_id": "other-operation"}
+    elif invalid_proof == "non_mcp":
+        operation_ref.update({"origin": "telegram"})
+    elif invalid_proof == "terminal":
+        operation_ref.update({"state": "completed"})
+    elif invalid_proof == "intent_operation":
+        intent_ref.update({"dispatch_operation_id": "other-operation"})
+    elif invalid_proof == "digest":
+        operation_ref.update({"desired_content_hash": "f" * 64})
+    elif invalid_proof == "parent":
+        intent_ref.update({"desired_parent_id_hash": "f" * 64})
+    elif invalid_proof == "no_stage":
+        stage_id = _stage_id(OPERATION_ID, "managed_index")
+        client.collection("dialog_operations").document(OPERATION_ID).collection("stages").document(stage_id).delete()
+    elif invalid_proof == "no_receipt":
+        client.collection("index_completions").document(DOC_ID).collection("generations").document(
+            hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        ).delete()
+    elif invalid_proof == "stale_receipt":
+        transcript_ref.update({"status": "syncing"})
+
+    calls = []
+    monkeypatch.setattr("core.operations.outbox.enqueue_task", lambda **kwargs: calls.append(kwargs) or True)
+    result = dispatch_completed_managed_mcp_index(
+        client, reference, doc_id=DOC_ID, parent_id=PARENT_ID, root_folder_id=ROOT_ID,
+        raw_text=content, target=TaskTargetConfig("dialog-operations", "https://mcp.example.invalid/callback"),
+        now=NOW + timedelta(seconds=1),
+    )
+    assert result is None
+    assert calls == []
+
+
+def test_fresh_managed_claim_with_lower_operation_fence_refreshes_current_generation(
+    firestore_fake, sdk_fakes,
+):
+    from core.indexing import processor
+    from core.integrations.firestore.outbox import OutboxTargetKind, create_outbox_record
+    from core.integrations.firestore.save_intents import update_save_intent_checkpoints
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, previous, content = _save_fixture(client, sdk_fakes)
+    previous = {
+        **previous, "fence": 12, "work_manifest_ref": "prior-operation-input",
+        "checkpoint_refs": ["prior-fill", "prior-index"],
+    }
+    client.collection("transcript_index").document(DOC_ID).set({**previous, "status": "synced"})
+    _set_generation(client, DOC_ID, previous["content_hash"], previous)
+
+    outbox_id = "fresh-managed-index-dispatch"
+    create_outbox_record(
+        client, outbox_id, target_kind=OutboxTargetKind.INDEX_DISPATCH, generation=1,
+        schedule_at=NOW, now=NOW, operation_id=OPERATION_ID,
+        document_id=DOC_ID, save_intent_id=save_intent_id,
+    )
+    assert update_save_intent_checkpoints(
+        client, save_intent_id, operation_id=OPERATION_ID, owner=OWNER,
+        fence=lease.fence, now=NOW, index_checkpoint_ref=outbox_id,
+    ) is not None
+    reference = {
+        "schema_version": 1, "outbox_id": outbox_id, "target_kind": "index_dispatch",
+        "generation": 1, "operation_id": OPERATION_ID, "document_id": DOC_ID,
+        "save_intent_id": save_intent_id,
+    }
+
+    assert processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference) == "skipped"
+
+    current = _stored_generation(firestore_fake, DOC_ID, previous["content_hash"])
+    assert current["fence"] < previous["fence"]
+    assert current["index_fence"] > previous["index_fence"]
+    assert current["work_manifest_ref"] == "synthetic-dialog-input-ref"
+    assert not [event for event in sdk_fakes.trace if event["boundary"] in {"gemini", "qdrant"}]
+
+
+def test_three_managed_index_failures_are_terminal_and_duplicate_does_not_dispatch(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+    from core.integrations.firestore.operations import get_operation, release_operation
+    from core.integrations.firestore.save_intents import get_save_intent
+    from core.operations.retries import RetryGovernor
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, content = _save_fixture(client, sdk_fakes)
+    assert release_operation(client, OPERATION_ID, owner=OWNER, fence=lease.fence, now=NOW)
+    monkeypatch.setattr(
+        processor, "_validate_managed_reference",
+        lambda _reference, _doc_id, _parent_id: (
+            get_operation(client, OPERATION_ID), get_save_intent(client, save_intent_id),
+        ),
+    )
+    calls = []
+
+    def always_fail(*_args, **_kwargs):
+        calls.append("called")
+        raise ValueError("synthetic managed index failure")
+
+    monkeypatch.setattr(processor, "process_one", always_fail)
+    reference = {"unused": "validation is patched in this unit"}
+    for _ in range(3):
+        with pytest.raises(ValueError, match="synthetic managed index failure"):
+            processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference)
+
+    operation = get_operation(client, OPERATION_ID)
+    stage = RetryGovernor(client).get_stage(OPERATION_ID, "managed_index")
+    assert operation.state.value == "failed"
+    assert stage.state.value == "failed"
+    assert stage.failures == 3
+    assert len(calls) == 3
+    assert processor.process_managed_one(DOC_ID, PARENT_ID, ROOT_ID, content, reference) == "managed_terminal"
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("payload_matches", [True, False])
+def test_qdrant_upsert_readback_compares_stored_payload_digest(
+    monkeypatch, payload_matches,
+):
+    from types import SimpleNamespace
+    from core.indexing import processor
+    from core.integrations.qdrant import client as qdrant_client
+    from core.integrations.qdrant.schema import get_collection_name
+
+    expected_payload = {"doc_id": DOC_ID, "type": "utterance", "text": "synthetic transcript text"}
+    stored_payload = dict(expected_payload)
+    if not payload_matches:
+        stored_payload["text"] = "different synthetic text"
+    digest = hashlib.sha256(json.dumps(
+        expected_payload, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode()).hexdigest()
+
+    class RetrieveOnlyQdrant:
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, **kwargs):
+            self.calls.append(kwargs)
+            return [SimpleNamespace(id="expected-point-id", payload=stored_payload)]
+
+    fake = RetrieveOnlyQdrant()
+    monkeypatch.setattr(qdrant_client, "get_client", lambda: fake)
+    intent = {"readback": {"action": "upsert", "points": [
+        {"id": "expected-point-id", "payload_digest": digest},
+    ]}}
+
+    assert processor._readback_confirms(intent) is payload_matches
+    assert fake.calls == [{
+        "collection_name": get_collection_name(),
+        "ids": ["expected-point-id"], "with_payload": True, "with_vectors": False,
+    }]
+
+
+@pytest.mark.parametrize("stale_field", ["synced_status", "content_hash", "version", "provider", "parent_id"])
+def test_stale_metadata_or_receipt_identity_cannot_verify_current_generation(
+    firestore_fake, stale_field,
+):
+    from core.indexing import processor
+
+    client = firestore_fake.client_class()
+    current_text = "DATE: 2026-03-04\nPROVIDER: tldv\n---\nSpeaker A :: Current content.\n"
+    current_hash = hashlib.sha256(current_text.encode("utf-8")).hexdigest()
+    current = {
+        "doc_id": DOC_ID,
+        "root_folder_id": ROOT_ID,
+        "content_hash": current_hash,
+        "version": current_hash,
+        "parent_id_hash": hashlib.sha256(PARENT_ID.encode("utf-8")).hexdigest(),
+        "provider": "tldv",
+        "parent_id": PARENT_ID,
+        "status": "completed",
+        "skipped_utterances": [],
+        "completed_at": NOW,
+        "error": None,
+        "owner": "index-worker",
+        "fence": 1,
+        "index_fence": 1,
+        "resource_epoch": 0,
+        "work_manifest_ref": "synthetic-work-manifest",
+        "checkpoint_refs": ["synthetic-index-checkpoint"],
+    }
+    client.collection("transcript_index").document(DOC_ID).set({
+        **current,
+        "status": "error" if stale_field == "synced_status" else "synced",
+        "synced_at": NOW,
+    })
+    receipt = {**current, "status": "completed"}
+    if stale_field != "synced_status":
+        stale = dict(receipt)
+        stale[stale_field] = "sha256:older-value"
+        generation_key = stale["content_hash"] if stale_field == "content_hash" else current_hash
+        _set_generation(client, DOC_ID, generation_key, stale)
+    else:
+        _set_generation(client, DOC_ID, current_hash, receipt)
+    assert processor.verify_current_generation(DOC_ID, PARENT_ID, ROOT_ID, current_text) is False
+
+
+def test_dirty_incremental_window_is_retried_after_hash_checkpoint_and_user_fact_is_preserved(
+    app_root, sdk_fakes, firestore_fake, monkeypatch,
+):
+    from core.indexing import processor
+
+    from tests.core.indexing.test_incremental_recovery import (
+        DOC_ID as INCREMENTAL_DOC,
+        PARENT_ID as INCREMENTAL_PARENT,
+        ROOT_ID as INCREMENTAL_ROOT,
+        _inputs,
+        _queue_generation,
+        _qdrant_events,
+    )
+
+    old, new, new_hashes = _inputs(
+        app_root, sdk_fakes, firestore_fake, insertion_and_deletion=False,
+        queue_responses=False,
+    )
+    from core.integrations.qdrant import writer
+
+    writer.upsert_user_facts([{
+        "type": "user_fact", "doc_id": INCREMENTAL_DOC,
+        "text": "Invented user authored fact.", "root_folder_id": INCREMENTAL_ROOT,
+    }], [[0.25]])
+    _queue_generation(sdk_fakes)
+    original = processor.upsert_summaries
+    failed = False
+
+    def fail_after_hash_checkpoint(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            error = RuntimeError("synthetic summary write interruption")
+            error.outcome = "rejected"
+            raise error
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(processor, "upsert_summaries", fail_after_hash_checkpoint)
+    with pytest.raises(RuntimeError, match="summary write interruption"):
+        processor.process_one(INCREMENTAL_DOC, INCREMENTAL_PARENT, INCREMENTAL_ROOT, new)
+    interrupted = firestore_fake.documents[f"transcript_index/{INCREMENTAL_DOC}"]
+    assert interrupted["utterance_hashes"]["7"] == new_hashes["7"]
+
+    monkeypatch.setattr(processor, "upsert_summaries", original)
+    _queue_generation(sdk_fakes)
+    start = len(sdk_fakes.trace)
+    assert processor.process_one(INCREMENTAL_DOC, INCREMENTAL_PARENT, INCREMENTAL_ROOT, new) == "processed"
+    retry_trace = sdk_fakes.trace[start:]
+    assert any(e["boundary"] == "qdrant" and e["operation"] == "upsert" for e in retry_trace)
+    deletes = _qdrant_events(sdk_fakes, "delete")
+    _assert_user_fact_excluded(deletes)
+    assert old != new
+
+
+def test_mutation_between_final_read_and_completion_commit_is_serialized_or_rejected(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from google.api_core.exceptions import Aborted
+    from core.integrations.firestore.mutations import dispatch_mutation
+    from core.indexing import processor
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    original_verify = processor.verify_current_generation
+    mutation_operation_id = "completion-racing-mutation"
+    mutation_lease = _lease(client, operation_id=mutation_operation_id, owner="mutation-worker")
+    mutation_effects = []
+
+    def mutate_after_final_read(*args, **kwargs):
+        verified = original_verify(*args, **kwargs)
+        result = dispatch_mutation(
+            client, operation_id=mutation_operation_id, effect_id="edit-after-final-read",
+            owner="mutation-worker", fence=mutation_lease.fence, kind="content_update",
+            resources=(RESOURCE,), payload_digest="sha256:changed-doc",
+            desired_state_digest="sha256:changed-doc", now=NOW,
+            mutation_callback=lambda: mutation_effects.append("changed") or "updated",
+        )
+        if result is not None:
+            mutation_effects.append(result)
+        return verified
+
+    monkeypatch.setattr(processor, "verify_current_generation", mutate_after_final_read)
+    try:
+        _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    except Aborted:
+        assert mutation_effects
+    operation = firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]
+    intent = firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]
+    if mutation_effects:
+        assert operation.get("result") is None
+        assert operation.get("state") != "completed"
+        assert operation.get("document_finalized") is None
+        assert operation.get("cleanup_authorization") is None
+        assert intent.get("completion_certificate") is None
+        assert intent.get("cleanup_authorization") is None
+    else:
+        assert operation.get("state") == "completed"
+        assert intent.get("completion_certificate") is not None
+
+
+def test_stale_index_publisher_cannot_publish_after_new_fence(firestore_fake, fake_clock):
+    from core.integrations.firestore import index_completions
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    parent_hash = hashlib.sha256(PARENT_ID.encode("utf-8")).hexdigest()
+    transcript = {
+        "doc_id": DOC_ID, "content_hash": "sha256:current-generation",
+        "root_folder_id": ROOT_ID, "version": "sha256:current-generation",
+        "parent_id_hash": parent_hash, "provider": "tldv", "parent_id": PARENT_ID,
+        "status": "synced", "skipped_utterances": [], "completed_at": fake_clock.now(),
+        "error": None, "owner": "index-worker", "fence": 2, "index_fence": 2,
+        "resource_epoch": 0, "work_manifest_ref": "synthetic-current-manifest",
+        "checkpoint_refs": ["synthetic-current-checkpoint"],
+        "completion_ref": "sha256:previous-generation",
+    }
+    client.collection("transcript_index").document(DOC_ID).set(transcript)
+    previous = {
+        **transcript, "content_hash": "sha256:previous-generation",
+        "version": "sha256:previous-generation", "status": "completed", "index_fence": 1,
+        "fence": 1,
+    }
+    _set_generation(client, DOC_ID, previous["content_hash"], previous)
+    before = dict(firestore_fake.documents)
+    stale = {
+        **transcript, "content_hash": "sha256:stale-index-generation",
+        "version": "sha256:stale-index-generation", "status": "completed", "index_fence": 1,
+        "fence": 1,
+    }
+    assert index_completions.publish_completion(client, stale, now=fake_clock.now()) is False
+    assert firestore_fake.documents == before
+    assert _stored_generation(firestore_fake, DOC_ID, stale["content_hash"]) is None
+
+
+def test_ordinary_repeat_refreshes_managed_completion_without_reindexing(
+    app_root, firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+    from core.indexing.hashing import sha256_text, sha256_utterance
+    from core.parsing.parser import parse_document
+
+    content = (
+        "DATE: 2026-03-04\nPROVIDER: manual\n---\n"
+        "Speaker A :: A previously indexed synthetic transcript."
+    )
+    metadata, utterances = parse_document(content)
+    content_hash = sha256_text(content)
+    parent_hash = sha256_text(PARENT_ID)
+    transcript = {
+        "doc_id": DOC_ID, "root_folder_id": ROOT_ID, "content_hash": content_hash,
+        "version": content_hash, "parent_id": PARENT_ID, "parent_id_hash": parent_hash,
+        "provider": metadata["provider"], "status": "synced", "fence": 9,
+        "index_fence": 3, "resource_epoch": 0, "skipped_utterances": [],
+        "utterance_hashes": {
+            str(item["order_index"]): sha256_utterance(
+                item["order_index"], item["speaker"], item["text"],
+            ) for item in utterances
+        },
+    }
+    firestore_fake.client_class().collection("transcript_index").document(DOC_ID).set(transcript)
+    managed_receipt = {
+        **transcript,
+        "work_manifest_ref": "save-inputs/managed-generation",
+        "checkpoint_refs": ["fill-checkpoint", "managed-index-checkpoint"],
+        "completed_at": NOW, "error": None, "owner": "managed-index-worker",
+        "status": "completed",
+    }
+    _set_generation(firestore_fake.client_class(), DOC_ID, content_hash, managed_receipt)
+
+    assert processor.process_one(DOC_ID, PARENT_ID, ROOT_ID, content) == "skipped"
+
+    final = firestore_fake.documents[f"transcript_index/{DOC_ID}"]
+    receipt = _stored_generation(firestore_fake, DOC_ID, content_hash)
+    assert final["status"] == "synced"
+    assert final["index_fence"] == receipt["index_fence"]
+    assert receipt["work_manifest_ref"] == "legacy-index/" + DOC_ID
+    assert processor.verify_current_generation(DOC_ID, PARENT_ID, ROOT_ID, content)
+    assert not [event for event in sdk_fakes.trace if event["boundary"] in {"gemini", "qdrant"}]
+
+    from core.integrations.qdrant import writer
+    writer.upsert_user_facts([{
+        "type": "user_fact", "doc_id": DOC_ID,
+        "text": "Synthetic user fact survives parent move.", "root_folder_id": ROOT_ID,
+    }], [[0.25]])
+    trace_offset = len(sdk_fakes.trace)
+    new_parent = "completion-parent-moved"
+    assert processor.process_one(DOC_ID, new_parent, ROOT_ID, content) == "skipped"
+
+    moved = firestore_fake.documents[f"transcript_index/{DOC_ID}"]
+    moved_receipt = _stored_generation(firestore_fake, DOC_ID, content_hash)
+    assert moved["parent_id"] == new_parent
+    assert moved_receipt["parent_id"] == new_parent
+    assert moved_receipt["parent_id_hash"] == sha256_text(new_parent)
+    assert processor.verify_current_generation(DOC_ID, new_parent, ROOT_ID, content)
+    before_move = sdk_fakes.trace[:trace_offset]
+    move_events = sdk_fakes.trace[trace_offset:]
+    assert [event for event in before_move
+            if event["boundary"] == "qdrant" and event["operation"] == "upsert"]
+    assert not [event for event in move_events if event["boundary"] == "gemini"]
+    assert not [event for event in move_events
+                if event["boundary"] == "qdrant" and event["operation"] in {"upsert", "delete"}]
+    payload_calls = [event for event in move_events
+                     if event["boundary"] == "qdrant" and event["operation"] == "set_payload"]
+    assert len(payload_calls) == 1
+    assert payload_calls[0]["arguments"]["payload"] == {"parent_id": new_parent}
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+    assert payload_calls[0]["arguments"]["points"] == Filter(must=[
+        FieldCondition(key="doc_id", match=MatchValue(value=DOC_ID)),
+        FieldCondition(key="root_folder_id", match=MatchValue(value=ROOT_ID)),
+    ])
+
+
+def test_ordinary_receipt_refresh_preserves_committed_save_certificate_and_replay(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+    from core.indexing.hashing import sha256_utterance
+    from core.parsing.parser import parse_document
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, content = _save_fixture(client, sdk_fakes)
+    _, utterances = parse_document(content)
+    client.collection("transcript_index").document(DOC_ID).update({
+        "utterance_hashes": {
+            str(item["order_index"]): sha256_utterance(
+                item["order_index"], item["speaker"], item["text"],
+            ) for item in utterances
+        },
+    })
+    _synthetic_google_oauth(monkeypatch)
+    sdk_fakes.docs.queue("documents.get", response={
+        "revisionId": "synthetic-revision",
+        "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
+            for line in content.splitlines()
+        ]},
+    })
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document", "parents": [PARENT_ID], "trashed": False,
+    })
+
+    result = _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    intent_path = f"dialog_save_intents/{save_intent_id}"
+    operation_path = f"dialog_operations/{OPERATION_ID}"
+    completed_intent = firestore_fake.documents[intent_path]
+    completed_operation = firestore_fake.documents[operation_path]
+    certificate = completed_intent["completion_certificate"]
+    cleanup_authorization = completed_intent["cleanup_authorization"]
+    committed_result = completed_operation["result"]
+
+    assert processor.process_one(DOC_ID, PARENT_ID, ROOT_ID, content) == "skipped"
+    assert processor.verify_current_generation(DOC_ID, PARENT_ID, ROOT_ID, content)
+    assert firestore_fake.documents[intent_path]["completion_certificate"] == certificate
+    assert firestore_fake.documents[intent_path]["cleanup_authorization"] == cleanup_authorization
+    assert firestore_fake.documents[operation_path]["cleanup_authorization"] == cleanup_authorization
+    assert firestore_fake.documents[operation_path]["result"] == committed_result
+
+    trace_after_refresh = len(sdk_fakes.trace)
+    replayed = _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    assert replayed == result
+    assert len(sdk_fakes.trace) == trace_after_refresh
+
+
+def test_expired_finalization_fence_cannot_commit_result_or_cleanup_authorization(
+    firestore_fake, fake_clock, sdk_fakes,
+):
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    old, save_intent_id, _receipt, _content = _save_fixture(
+        client, sdk_fakes, now=fake_clock.now(), lease_seconds=5,
+    )
+    fake_clock.advance(seconds=6)
+    from core.integrations.firestore.operations import claim_operation
+    current = claim_operation(
+        client, OPERATION_ID, owner="new-worker", now=fake_clock.now(), lease_seconds=30,
+    )
+    assert current is not None and current.fence > old.fence
+    _finalize(client, save_intent_id=save_intent_id, fence=old.fence, now=fake_clock.now())
+    operation = firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]
+    intent = firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]
+    assert operation.get("result") is None
+    assert operation.get("state") != "completed"
+    assert operation.get("document_finalized") is None
+    assert operation.get("cleanup_authorization") is None
+    assert intent.get("completion_certificate") is None
+    assert intent.get("cleanup_authorization") is None
+
+
+def test_abandoned_finalization_guard_is_reclaimed_after_lease_expiry(
+    firestore_fake, fake_clock, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.mutations import acquire_completion_guard, get_resource_guard
+    from core.integrations.firestore.operations import claim_operation
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    old, save_intent_id, _receipt, _content = _save_fixture(
+        client, sdk_fakes, now=fake_clock.now(), lease_seconds=5,
+    )
+    reservation = acquire_completion_guard(
+        client, operation_id=OPERATION_ID, owner=OWNER, fence=old.fence,
+        resource=RESOURCE, now=fake_clock.now(), clock=fake_clock.now,
+    )
+    assert reservation is not None
+    # Model process death: deliberately leave the completion reservation in place.
+    fake_clock.advance(seconds=6)
+    current = claim_operation(
+        client, OPERATION_ID, owner="restarted-worker", now=fake_clock.now(), lease_seconds=30,
+    )
+    assert current is not None and current.fence > old.fence
+    assert not get_resource_guard(client, RESOURCE).unsettled_effect_ids
+
+    _synthetic_google_oauth(monkeypatch)
+    result = _finalize(
+        client, save_intent_id=save_intent_id, owner="restarted-worker",
+        fence=current.fence, now=fake_clock.now(), clock=fake_clock.now,
+    )
+    assert result is not None
+    assert firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]["state"] == "completed"
+    assert firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]["completion_certificate"]
+
+
+def test_finalization_checks_lease_again_after_slow_external_read(
+    firestore_fake, fake_clock, sdk_fakes, monkeypatch,
+):
+    from core.indexing import processor
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    lease, save_intent_id, _receipt, _content = _save_fixture(
+        client, sdk_fakes, now=fake_clock.now(), lease_seconds=5,
+    )
+    _synthetic_google_oauth(monkeypatch)
+    original_verify = processor.verify_current_generation
+
+    def expire_lease_during_read(*args, **kwargs):
+        verified = original_verify(*args, **kwargs)
+        fake_clock.advance(seconds=6)
+        return verified
+
+    monkeypatch.setattr(processor, "verify_current_generation", expire_lease_during_read)
+    assert _finalize(
+        client, save_intent_id=save_intent_id, fence=lease.fence,
+        now=fake_clock.now(), clock=fake_clock.now,
+    ) is None
+    operation = firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]
+    intent = firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]
+    assert operation.get("state") != "completed"
+    assert operation.get("result") is None
+    assert intent.get("completion_certificate") is None
+    assert intent.get("cleanup_authorization") is None
+
+
+def test_provider_mismatch_cannot_finalize(firestore_fake, sdk_fakes, monkeypatch):
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    operation_ref = client.collection("dialog_operations").document(OPERATION_ID)
+    operation_ref.update({"provider": "fireflies"})
+
+    assert _finalize(client, save_intent_id=save_intent_id, fence=lease.fence) is None
+    operation = firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]
+    intent = firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]
+    assert operation.get("state") != "completed"
+    assert intent.get("completion_certificate") is None
+    assert intent.get("cleanup_authorization") is None
+
+
+def test_public_finalize_wrapper_accepts_explicit_retry_binding_without_rewriting_create_gate(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.operations import OPERATIONS_COLLECTION
+    from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION
+    from core.integrations.firestore.operations import get_operation
+
+    client = firestore_fake.client_class()
+    lease, intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    retry_id = "completion-numbered-retry"
+    origin_binding = {
+        "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+        "manifest_digest": "sha256:synthetic-manifest",
+    }
+    original = client.collection(OPERATIONS_COLLECTION).document(OPERATION_ID).get().to_dict()
+    retry_authorization = {
+        "operation_id": retry_id, "previous_operation_id": OPERATION_ID,
+        "create_gate_operation_id": OPERATION_ID,
+        **origin_binding, "caller_binding": original["caller_binding"],
+        "immutable_input_digest": original["immutable_input_digest"],
+    }
+    retry = {
+        **original, "operation_id": retry_id, "state": "running",
+        "lease_owner": "retry-worker", "lease_expires_at": NOW + timedelta(minutes=2),
+        "fence": 1, "origin_binding": origin_binding,
+        "retry_authorization": retry_authorization,
+        "retry_of_operation_id": OPERATION_ID,
+        "retry_draft_id": origin_binding["draft_id"],
+        "updated_at": NOW,
+    }
+    client.collection(OPERATIONS_COLLECTION).document(retry_id).set(retry)
+    intent_before = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).get().to_dict()
+    assert intent_before["dispatch_operation_id"] == OPERATION_ID
+    _synthetic_google_oauth(monkeypatch)
+
+    result = _completion_module().finalize_save(
+        client, operation_id=retry_id, save_intent_id=intent_id,
+        owner="retry-worker", fence=1, origin_binding=origin_binding,
+        now=NOW, clock=lambda: NOW,
+    )
+
+    assert result is not None and result.document_id == DOC_ID
+    assert get_operation(client, retry_id).state.value == "completed"
+    certificate = client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).get().to_dict()[
+        "completion_certificate"
+    ]
+    assert certificate["operation_id"] == retry_id
+    assert certificate["origin_binding"] == origin_binding
+    assert client.collection(SAVE_INTENTS_COLLECTION).document(intent_id).get().to_dict()[
+        "dispatch_operation_id"
+    ] == OPERATION_ID
+
+
+@pytest.mark.parametrize("certificate_field", ["operation_id", "save_intent_id", "doc_id"])
+def test_misbound_completion_certificate_does_not_replay(
+    firestore_fake, sdk_fakes, monkeypatch, certificate_field,
+):
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    assert _finalize(client, save_intent_id=save_intent_id, fence=lease.fence) is not None
+    intent_ref = client.collection("dialog_save_intents").document(save_intent_id)
+    intent = intent_ref.get().to_dict()
+    intent["completion_certificate"][certificate_field] = f"misbound-{certificate_field}"
+    intent_ref.set(intent)
+    trace_length = len(sdk_fakes.trace)
+
+    assert _finalize(client, save_intent_id=save_intent_id, fence=lease.fence) is None
+    assert len(sdk_fakes.trace) == trace_length
+
+
+def test_new_fence_cannot_finalize_or_redispatch_while_old_qdrant_batch_is_unknown(
+    firestore_fake, fake_clock, sdk_fakes,
+):
+    from core.integrations.firestore.mutations import dispatch_mutation, get_resource_guard
+    from core.integrations.firestore.operations import claim_operation
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    old, save_intent_id, _receipt, _content = _save_fixture(
+        client, sdk_fakes, now=fake_clock.now(), lease_seconds=5,
+    )
+    calls = []
+
+    def unknown_batch():
+        calls.append("old-qdrant-batch")
+        raise TimeoutError("synthetic Qdrant outcome unknown")
+
+    with pytest.raises(TimeoutError, match="outcome unknown"):
+        dispatch_mutation(
+            client, operation_id=OPERATION_ID, effect_id="old-index-batch", owner=OWNER,
+            fence=old.fence, kind="provider_call", resources=(RESOURCE,),
+            payload_digest="sha256:batch", now=fake_clock.now(), mutation_callback=unknown_batch,
+        )
+    fake_clock.advance(seconds=6)
+    current = claim_operation(
+        client, OPERATION_ID, owner="new-worker", now=fake_clock.now(), lease_seconds=30,
+    )
+    assert current is not None and current.fence > old.fence
+    assert get_resource_guard(client, RESOURCE).unsettled_effect_ids == ("old-index-batch",)
+    _finalize(client, save_intent_id=save_intent_id, owner="new-worker",
+              fence=current.fence, now=fake_clock.now())
+    operation = firestore_fake.documents[f"dialog_operations/{OPERATION_ID}"]
+    intent = firestore_fake.documents[f"dialog_save_intents/{save_intent_id}"]
+    assert operation.get("result") is None
+    assert operation.get("state") != "completed"
+    assert operation.get("document_finalized") is None
+    assert operation.get("cleanup_authorization") is None
+    assert intent.get("completion_certificate") is None
+    assert intent.get("cleanup_authorization") is None
+    assert dispatch_mutation(
+        client, operation_id=OPERATION_ID, effect_id="new-index-batch", owner="new-worker",
+        fence=current.fence, kind="provider_call", resources=(RESOURCE,),
+        payload_digest="sha256:batch", now=fake_clock.now(),
+        mutation_callback=lambda: calls.append("conflicting-redispatch"),
+    ) is None
+    assert calls == ["old-qdrant-batch"]
+
+
+@pytest.mark.parametrize("readback_confirms", [True, False])
+def test_unknown_qdrant_effect_reconciliation_requires_readback(
+    firestore_fake, monkeypatch, readback_confirms,
+):
+    from core.indexing import processor
+    from core.indexing.processor import _IndexClaim
+    from core.integrations.firestore.mutations import (
+        acquire_index_guard, begin_index_effect, get_unsettled_index_effects,
+        settle_index_effect,
+    )
+
+    client = firestore_fake.client_class()
+    test_now = datetime.now(timezone.utc)
+    old_owner = "old-index-worker"
+    old_fence, _epoch = acquire_index_guard(
+        client, doc_id=DOC_ID, owner=old_owner, now=test_now, lease_seconds=5,
+        root_folder_id=ROOT_ID,
+    )
+    assert begin_index_effect(
+        client, doc_id=DOC_ID, owner=old_owner, fence=old_fence, effect_id="uncertain-upsert",
+        kind="upsert_utterances", payload_digest="sha256:batch", now=test_now,
+        readback={"action": "upsert", "points": [{"id": "point-1", "payload_digest": "sha256:payload"}]},
+    )
+    assert settle_index_effect(
+        client, doc_id=DOC_ID, owner=old_owner, fence=old_fence,
+        effect_id="uncertain-upsert", now=test_now, confirmed=False,
+    )
+    takeover_at = test_now + timedelta(seconds=6)
+    new_owner = "new-index-worker"
+    new_fence, epoch = acquire_index_guard(
+        client, doc_id=DOC_ID, owner=new_owner, now=takeover_at, lease_seconds=30,
+        root_folder_id=ROOT_ID, allow_unsettled_index_effects=True,
+    )
+    assert get_unsettled_index_effects(client, DOC_ID)["uncertain-upsert"]["state"] == "unknown"
+    assert get_unsettled_index_effects(client, DOC_ID)["uncertain-upsert"]["fence"] < new_fence
+    monkeypatch.setattr(processor, "_readback_confirms", lambda _intent: readback_confirms)
+    claim = _IndexClaim(DOC_ID, new_owner, new_fence, epoch, client)
+
+    confirmed = processor._reconcile_unknown_effects(claim)
+    assert confirmed is readback_confirms
+    unsettled = get_unsettled_index_effects(client, DOC_ID)
+    assert bool(unsettled) is (not readback_confirms)
+
+
+def test_index_claim_waits_for_active_regular_resource_owner(firestore_fake):
+    from core.integrations.firestore.mutations import _resource_ref, acquire_index_guard
+
+    client = firestore_fake.client_class()
+    guard = _resource_ref(client, RESOURCE)
+    guard.set({"resource": RESOURCE, "owner_operation_id": "active-agent-op",
+               "expires_at": NOW + timedelta(minutes=1), "resource_epoch": 3,
+               "unsettled_effect_ids": []})
+    assert acquire_index_guard(
+        client, doc_id=DOC_ID, owner="index-worker", now=NOW, lease_seconds=30,
+        root_folder_id=ROOT_ID,
+    ) is None
+    guard.set({"resource": RESOURCE, "owner_operation_id": "expired-agent-op",
+               "expires_at": NOW - timedelta(seconds=1), "resource_epoch": 3,
+               "unsettled_effect_ids": []})
+    assert acquire_index_guard(
+        client, doc_id=DOC_ID, owner="index-worker", now=NOW, lease_seconds=30,
+        root_folder_id=ROOT_ID,
+    ) is not None
+
+
+def test_operation_result_and_immutable_completion_certificate_commit_atomically_and_replay(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    client = firestore_fake.client_class()
+    lease, save_intent_id, receipt, _content = _save_fixture(
+        client, sdk_fakes, skipped_utterances=(2, 7),
+    )
+    _synthetic_google_oauth(monkeypatch)
+    operation_path = f"dialog_operations/{OPERATION_ID}"
+    intent_path = f"dialog_save_intents/{save_intent_id}"
+    firestore_fake.fail_next(
+        "commit", path=intent_path, phase="before",
+        exception=RuntimeError("synthetic pre-commit crash"),
+    )
+    with pytest.raises(RuntimeError, match="pre-commit crash"):
+        _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    assert firestore_fake.documents[operation_path].get("result") is None
+    assert firestore_fake.documents[operation_path].get("state") != "completed"
+    assert firestore_fake.documents[operation_path].get("input_cleanup_state") is None
+    assert firestore_fake.documents[intent_path].get("completion_certificate") is None
+
+    content = "DATE: 2026-03-04\nPROVIDER: tldv\n---\nSpeaker A :: Completed synthetic transcript."
+    sdk_fakes.docs.queue("documents.get", response={
+        "revisionId": "synthetic-revision",
+        "body": {"content": [
+            {"paragraph": {"elements": [{"textRun": {"content": line + "\n"}}]}}
+            for line in content.splitlines()
+        ]},
+    })
+    sdk_fakes.drive.queue("files.get", response={
+        "id": DOC_ID, "name": "Synthetic transcript",
+        "mimeType": "application/vnd.google-apps.document", "parents": [PARENT_ID], "trashed": False,
+    })
+
+    firestore_fake.fail_next(
+        "commit", path=intent_path, phase="after",
+        exception=RuntimeError("synthetic response lost after commit"),
+    )
+    with pytest.raises(RuntimeError, match="response lost after commit"):
+        _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    first_operation = firestore_fake.documents[operation_path]
+    first_intent = firestore_fake.documents[intent_path]
+    certificate = first_intent["completion_certificate"]
+    assert first_operation["state"] == "completed"
+    assert first_operation["input_cleanup_state"] == "pending"
+    assert first_operation["cleanup_authorization"] == first_intent["cleanup_authorization"]
+    assert first_operation["result"]["document_id"] == DOC_ID
+    assert first_operation["result"]["skipped_utterances"] == [2, 7]
+    assert certificate["save_intent_id"] == save_intent_id
+    assert certificate["operation_id"] == OPERATION_ID
+    assert certificate["doc_id"] == DOC_ID
+    assert certificate["content_hash"] == receipt["content_hash"]
+    assert certificate["origin_binding"] == {
+        "context_id": "synthetic-context", "draft_id": "synthetic-draft",
+        "manifest_digest": "sha256:synthetic-manifest",
+    }
+    assert first_operation["result"]["document_id"] == certificate["doc_id"]
+    trace_after_commit = len(sdk_fakes.trace)
+
+    replayed_result = _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+
+    assert firestore_fake.documents[operation_path] == first_operation
+    assert firestore_fake.documents[intent_path] == first_intent
+    assert len(sdk_fakes.trace) == trace_after_commit
+    assert replayed_result.skipped_utterances == (2, 7)
+
+
+def test_legacy_operation_results_without_skips_keep_their_serialized_shape():
+    from core.integrations.firestore.operations import _result_data, _result_from
+    from core.operations.models import OperationResult
+
+    legacy_data = {"document_id": DOC_ID, "title": "Legacy", "resource_url": None}
+    restored = _result_from(legacy_data)
+    assert restored == OperationResult(document_id=DOC_ID, title="Legacy")
+    assert restored.skipped_utterances is None
+    assert _result_data(restored) == legacy_data
+
+
+def test_independent_edit_after_commit_does_not_revoke_certificate(firestore_fake, sdk_fakes, monkeypatch):
+    from core.integrations.firestore.mutations import dispatch_mutation
+
+    client = firestore_fake.client_class()
+    lease, save_intent_id, _receipt, _content = _save_fixture(client, sdk_fakes)
+    _synthetic_google_oauth(monkeypatch)
+    _finalize(client, save_intent_id=save_intent_id, fence=lease.fence)
+    intent_path = f"dialog_save_intents/{save_intent_id}"
+    certificate = firestore_fake.documents[intent_path]["completion_certificate"]
+
+    mutation_operation_id = "completion-later-edit"
+    mutation_lease = _lease(
+        client, operation_id=mutation_operation_id, owner="later-editor",
+        now=NOW + timedelta(seconds=1),
+    )
+    result = dispatch_mutation(
+        client, operation_id=mutation_operation_id, effect_id="later-independent-edit", owner="later-editor",
+        fence=mutation_lease.fence, kind="content_update", resources=(RESOURCE,),
+        payload_digest="sha256:next-version", now=NOW + timedelta(seconds=1),
+        mutation_callback=lambda: "updated",
+    )
+    assert result == "updated"
+
+    assert firestore_fake.documents[intent_path]["completion_certificate"] == certificate

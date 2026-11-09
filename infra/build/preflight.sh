@@ -6,6 +6,12 @@ runner="$script_dir/bootstrap_runner.py"
 image_metadata="$script_dir/image_metadata.py"
 image_mode=false
 verify_mode=false
+python_mode=false
+if [[ "${1:-}" == "--python-mode" ]]; then
+    python_mode=true
+    shift
+    [[ $# -gt 0 ]] || { echo "preflight: --python-mode requires Python arguments" >&2; exit 2; }
+fi
 if [[ "${1:-}" == "--image-mode" ]]; then
     image_mode=true
     shift
@@ -25,6 +31,9 @@ for candidate_name in python3; do
     if command -v "$candidate_name" >/dev/null 2>&1; then
         candidate="$(command -v "$candidate_name")"
         if ! is_store_alias "$candidate"; then
+            if [[ "$python_mode" == true ]]; then
+                exec "$candidate" "$@"
+            fi
             if [[ "$image_mode" == true ]]; then
                 exec "$candidate" "$image_metadata" image-preflight "$@"
             fi
@@ -43,6 +52,9 @@ if command -v powershell.exe >/dev/null 2>&1; then
             candidate="$(cygpath -u "$candidate")"
         fi
         if ! is_store_alias "$candidate"; then
+            if [[ "$python_mode" == true ]]; then
+                exec "$candidate" "$@"
+            fi
             if [[ "$image_mode" == true ]]; then
                 exec "$candidate" "$image_metadata" image-preflight "$@"
             fi
@@ -62,6 +74,9 @@ if command -v gcloud >/dev/null 2>&1; then
             candidate="$(cygpath -u "$candidate")"
         fi
         if ! is_store_alias "$candidate"; then
+            if [[ "$python_mode" == true ]]; then
+                exec "$candidate" "$@"
+            fi
             if [[ "$image_mode" == true ]]; then
                 exec "$candidate" "$image_metadata" image-preflight "$@"
             fi

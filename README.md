@@ -8,6 +8,8 @@ TLBrain indexes meeting transcripts from TL;DV, stores everything in Google Driv
 graph LR
     A[TL;DV] -->|transcripts| B[Google Drive]
     B -->|incremental sync| C[TLBrain]
+    T[Telegram (optional)] -->|dialog intake| C
+    C -->|saves new dialog as Google Drive Doc| B
     C -->|MCP retrieval| D[Claude]
     C -->|MCP retrieval| E[ChatGPT]
     C -->|MCP retrieval| F[Codex]
@@ -70,6 +72,8 @@ You can ask your assistant for a full list of folders and their sync status at a
 ## ⚡ Quick Start
  
 **Prerequisites:** Bash, `gcloud` authenticated and configured for a Google Cloud project with the required access, a TL;DV account, Qdrant Cloud, a Gemini API key, and the existing `.env` values described below. Ordinary deployment uses published service images and source packages. It does not require Docker or a system Python installation; build preflight supplies a private Python 3.12 runner. Docker is needed only for local image builds and image checks.
+
+Normal and local deployment helpers share Python discovery, including the Google Cloud CLI fallback on Windows, so no manual Python `PATH` adjustment is required. Telegram webhook registration uses a temporary private Python 3.12 environment with the existing Firestore SDK requirements.
 
 Despite the one-command deployment, all third-party services (Google Cloud, Firebase, Qdrant, Google AI Studio) must be registered and configured manually — the steps below walk you through each one.
 
@@ -161,6 +165,8 @@ ALLOWED_EMAIL=first@example.com,second@example.com
 
 `ALLOWED_EMAIL` accepts a single email or a comma-separated list. Use no spaces in `.env`; matching is case-insensitive. Every listed account has access to the same TLBrain knowledge base and tools. Leave it empty to skip OAuth — anyone with the MCP URL then gets access to your transcripts.
 
+With a nonempty `ALLOWED_EMAIL`, MCP access uses OAuth and the listed email allowlist. An empty value means open MCP access; it does not protect the MCP endpoint.
+
 ### 8. Get a Gemini API Key
 
 Open https://aistudio.google.com/apikey, create an API key.
@@ -194,6 +200,12 @@ VECTOR_SYNC_MAX_INSTANCES=2
 MCP_MAX_INSTANCES=1
 TLDV_IMPORT_MAX_INSTANCES=2
 
+# Optional connectors and installation timezone
+TLDV_API_KEY=your-tldv-api-key
+TELEGRAM_BOT_TOKEN=your-telegram-bot-token
+TELEGRAM_ALLOWED_USER_IDS=111111111,222222222  # synthetic example IDs
+TZ=UTC
+
 # Cloud Tasks
 VECTOR_SYNC_QUEUE=tlbrain-vector-sync-queue
  
@@ -222,13 +234,15 @@ If `GOOGLE_REFRESH_TOKEN` is not set, deployment opens a browser for Google Driv
 - If you see a "Google hasn't verified this app" warning — click **Advanced → Go to TLBrain MCP (unsafe)**
 - On the permissions screen, make sure all checkboxes are selected, then click **Continue**
 
-Deploys the three Cloud Run services (`mcp`, `vector_sync`, `tldv_import`) and three HTTP Cloud Functions gen2 (`sync_checker`, `tldv_webhook`, `tldv_reconciliation`), along with their Cloud Tasks queues and scheduled checker/reconciliation jobs. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
+Deploys the three shared runtime targets and any enabled optional connector targets, along with their required Cloud Tasks queues and scheduled checker/reconciliation jobs. The script will ask `Continue deploy? (y/n)` — enter `y` to proceed.
 
-When finished, the script prints the MCP URL and TL;DV webhook URL — copy them, you'll need them in the next steps.
+Before deploying services, Firestore preparation compares the declared indexes and field exemptions with the database configuration. It skips ready settings, submits missing changes asynchronously so they can build concurrently, and reports pending progress. Existing operations are reused. Service deployment starts only after the operations succeed and the requested configuration is ready.
+
+When finished, the script prints the MCP URL and URLs for enabled connectors. Copy the relevant URLs for the next steps.
 
 The ordinary deployment uses already-published versioned images for Cloud Run services and deploys Functions from source/preflight artifacts. To build local service images before deployment, use `bash infra/deploy/local_deploy.sh`; this route requires Docker. Neither route adds a migration or reindex step.
 
-> The deploy takes ~7 minutes to complete.
+The first deployment can take longer while Firestore builds new indexes and applies field exemptions. Later deployments skip settings that are already ready; image build and deployment times depend on the enabled services.
  
 ### 11. Connect TL;DV
 
@@ -307,7 +321,7 @@ The existing OAuth and `ALLOWED_EMAIL` configuration continues to apply. `GOOGLE
  
 **Conversation-aware retrieval.** Retrieval works with utterance windows, not arbitrary chunks. Summaries cover overlapping ranges; facts are anchored to specific dialogue segments.
  
-**Deterministic pipeline.** `temperature=0` and idempotency keys based on transcript content hash let unchanged content reuse existing index entries.
+**Content-based reuse.** Idempotency keys based on transcript content hash let unchanged content reuse existing index entries. Model-generated summaries and facts can vary between calls.
  
 **No vendor lock-in.** Google Drive, Qdrant Cloud, and Gemini use free or pay-per-use plans. Qdrant Cloud free tier can suit small deployments.
  
@@ -354,9 +368,9 @@ TLBrain is designed to keep infrastructure costs low for small teams using a sha
 - Embeddings only for summaries and facts → ~10–20% of utterance volume
 - Enough for many small deployments
 
-**Gemini (~$0.20 per transcript):**
-- You only pay for Gemini when indexing new transcripts
-- ~$0.20 per transcript — depends on conversation length, number of utterances, and content volume
+**Gemini (pay per use):**
+- Usage includes indexing, automatic folder advisory and optional Telegram agent/audio requests
+- Cost depends on conversation length, the number of windows and generated tokens, including thinking
 - `gemini-embedding-2`, `output_dimensionality=768` → 4× cheaper than 3072
 - One Gemini request per window (summary + facts together)
 - If a file hasn't changed, it's skipped — Gemini is never called again
@@ -384,7 +398,16 @@ As long as you stay within the free tier limits, you only pay for syncing new tr
  
 ### Runtime targets
 
-The deployment has six targets: three ASGI Cloud Run services (`mcp`, `vector_sync`, and `tldv_import`) and three HTTP Cloud Functions gen2 (`sync_checker`, deployed as target `checker`; `tldv_webhook`; and `tldv_reconciliation`). The MCP service provides remote tools and retrieval; vector sync indexes Google Docs; the TL;DV import service creates transcript documents. The checker processes Drive changes, the webhook accepts TL;DV events, and reconciliation checks for missed imports.
+The service manifest defines seven possible runtime targets: three shared targets (`mcp`, `vector_sync`, and `sync_checker`), three TL;DV targets (`tldv_import`, `tldv_webhook`, and `tldv_reconciliation`), and optional Telegram (`telegram`). Four targets are ASGI Cloud Run services: `mcp`, `vector_sync`, `tldv_import`, and `telegram`. The other three are HTTP Cloud Functions gen2: `sync_checker` (deployed under target name `checker`), `tldv_webhook`, and `tldv_reconciliation`. The deployment count depends on connector configuration:
+
+| TL;DV (`TLDV_API_KEY`) | Telegram credential pair | Runtime targets |
+|---|---|---:|
+| Off | Off | 3 |
+| On | Off | 6 |
+| Off | On | 4 |
+| On | On | 7 |
+
+These counts include Cloud Run services and HTTP functions only. Cloud Tasks queues and scheduled jobs are supporting infrastructure, not runtime targets. The MCP service provides remote tools and retrieval; vector sync indexes Google Docs; the TL;DV import service creates transcript documents. The checker processes Drive changes, the webhook accepts TL;DV events, reconciliation checks for missed imports, and Telegram accepts private-chat updates for the configured user allowlist.
 
 `ALLOWED_EMAIL` may contain multiple approved accounts. Those accounts share one corpus; TLBrain does not isolate data by user or tenant. Google OAuth and the server-side `GOOGLE_REFRESH_TOKEN` Drive credential keep their existing roles.
 
@@ -415,6 +438,10 @@ During indexing, each document is processed through anchor-based windowing:
 - **Window** = `[i-2, i-1, i, i+1, i+2]` around the anchor
 - Overlap between adjacent windows happens automatically
 
+Summaries, facts and automatic folder advisory use `gemini-3.5-flash-lite`. The shared client explicitly selects stable Gemini Developer API `v1`; structured responses use its native JSON schema format. Telegram agent calls use the same model, while audio transcription uses `gemini-3.5-transcribe`.
+
+Existing index entries are retained when the model changes. New generation uses the selected model; no migration or automatic full reindex is required.
+
 For each window — one Gemini request returning:
 - **Summary** — brief description of the topic, decisions, and next steps
 - **Facts** — list of structured facts (prices, objections, agreements)
@@ -438,6 +465,9 @@ Utterances are always saved. A failure in summary/facts generation does not bloc
 4. Generates summaries, facts, BM25 sparse vectors
 5. Full-document replacement writes the new version before deleting the old version. Incremental replacement deletes affected entries before writing replacements, so continuous availability is not guaranteed.
 6. Updates status: `syncing → synced`
+7. For managed MCP saves, queues the existing completion worker after indexing finishes. The worker verifies the saved document and marks the save operation `completed`.
+
+Completion delivery reuses the durable task outbox and completed indexing checkpoint, so a delivery retry does not recreate the document or repeat model generation. Normal MCP completion does not wait for the scheduled recovery sweep.
 
 Status machine: `queued → downloading → imported → syncing → synced / error`
  
@@ -491,10 +521,11 @@ Drive folder association is stored in the `parent_id` payload field. The current
 | `create_folder` | Create a folder with `name` and optional `parent_path`. |
 | `rename_folder` | Rename a folder using `folder_path` and `new_name`. |
 | `sync_changes` | Trigger a checker pass. Optional `doc_id` targets one document; without it, the checker runs its generic pass. |
-| `sync_status` | Show transcript sync counts and unassigned transcripts. |
+| `sync_status` | Show transcript sync counts and unassigned transcripts, or look up one operation by optional `operation_id`. |
 | `add_fact` | Attach a fact to a transcript using `doc_id` and `text`. |
 | `list_recent_transcripts` | List recent transcripts; supports folder/date filters and `limit`/`offset`. |
 | `rename_transcript` | Rename a transcript using `doc_id` and `new_title`. |
+| `add_dialog` | Save a validated dialog through the durable MCP operation and indexing pipeline. |
  
 ### Repository Structure
  
@@ -519,7 +550,9 @@ tlbrain/
 │   ├── mcp/
 │   ├── vector_sync/
 │   ├── sync_checker/
-│   └── connectors/tldv/      # import_service, webhook, reconciliation
+│   └── connectors/
+│       ├── tldv/             # import_service, webhook, reconciliation
+│       └── telegram/         # webhook, FIFO operations, status checks, notifications
 ├── infra/
 │   ├── build/                # Runtime assembly and validation
 │   ├── deploy/
@@ -552,10 +585,10 @@ python3.12 -m venv ../.venv-test
 
 The offline test suite uses synthetic fixtures and boundaries; it does not call cloud or paid APIs.
 
-Assemble all six runtime packages from the application root with Python 3.12 (PowerShell):
+Assemble all seven manifest runtime targets from the application root with Python 3.12 (PowerShell):
 
 ```powershell
-$serviceIds = 'mcp', 'vector_sync', 'tldv_import', 'sync_checker', 'tldv_webhook', 'tldv_reconciliation'
+$serviceIds = 'mcp', 'vector_sync', 'tldv_import', 'sync_checker', 'tldv_webhook', 'tldv_reconciliation', 'telegram'
 foreach ($serviceId in $serviceIds) {
     python infra/build/assemble.py --service $serviceId --output ".build/$serviceId"
     if ($LASTEXITCODE -ne 0) { throw "Assembly failed: $serviceId" }
@@ -568,7 +601,30 @@ Optional Docker image builds (Docker is required for these local image builds an
 docker build -f infra/docker/Dockerfile.mcp -t tlbrain-mcp:2.0.1-check .
 docker build -f infra/docker/Dockerfile.vector_sync -t tlbrain-vector-sync:2.0.1-check .
 docker build -f infra/docker/Dockerfile.tldv_import -t tlbrain-tldv-import:2.0.1-check .
+docker build -f infra/docker/Dockerfile.telegram -t tlbrain-telegram:2.0.1-check .
 ```
+
+CI validates source artifacts for all seven targets. It builds and validates final images for the four ASGI targets: MCP, Vector Sync, TL;DV Import, and Telegram. Telegram image publication runs on pushes only after regression, source and image validation, and native bootstrap checks pass. The normal Telegram deploy route verifies an image digest with compile, import, and startup evidence; the local route builds and preflights the Docker image.
+
+### Optional Telegram lifecycle and route access
+
+Telegram is enabled only when both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_IDS` are nonblank. The allowed IDs are comma-separated positive decimal Telegram user IDs. A partial or blank pair fails preflight before Cloud or Docker mutations. `TLDV_API_KEY` independently enables TL;DV. `TZ` must be an IANA timezone and defaults to UTC. The Telegram webhook secret is generated and reused in Firestore; it is not an environment setting.
+
+Enabled Telegram deployments also reuse the existing Gemini, Drive, Qdrant and retrieval settings. The deployment passes these settings, the target project/region and confirmed shared-service URLs through a private temporary environment file. Local webhook registration uses the active `gcloud` identity and the explicit deployment project for Firestore access; a separate Application Default Credentials login is not required. Its short-lived access token stays in memory, and bot/API credentials are excluded from the token subprocess. Check for `Telegram webhook registration succeeded` at the end of deployment. Cloud Run continues to use its runtime service account.
+
+`GET /` reports process liveness and whether Telegram credentials are configured. Verify message delivery separately: a real message must reach `POST /telegram/webhook`, enter the task queue and produce a reply. Cloud Run request logs show HTTP delivery; application logs include safe webhook event/stage and exception-type diagnostics without message contents, credentials or provider exception text.
+
+The default application lazily composes the command queue and shared save pipeline. Offline integration tests cover ordinary replies, forwarded text/audio saves, prolonged indexing waits, numbered retries, cleanup recovery, direct saves and predecessor-bound commands through a verified final reply. Shared Telegram reads and save finalization use the common durable retry budget, including OAuth and SDK construction. Three failed stage attempts stop automatic execution; numbered retry resumes the original Doc and save intent. Pending indexing consumes no failure attempts. Existing MCP and TL;DV retry defaults remain compatible. Local validation covers T001–T136; live deployment still requires verification.
+
+Each selected conversation sends its complete ordered history on every request. Plain chat retains history between messages, and questions about a draft include its accepted forwarded text, captions and completed transcripts. Pending audio is identified explicitly. Conversations stay isolated; service notices and pure session switches do not enter their substantive history. History is not silently truncated or summarized, and an external context limit produces a visible error. Existing conversation records and turns are reused without a migration.
+
+The public `POST /telegram/webhook` route checks the generated Firestore webhook secret and accepts only private chats from the configured user allowlist. Each context processes one agent operation at a time through a durable FIFO queue. Accepted operations schedule status checks relative to acceptance at 60, 120, and 300 seconds. Failed drafts and already-created Docs are retained; recovery requires an explicit numbered retry. Source cleanup is restartable and requires proof from the completed save certificate.
+
+The internal `POST /internal/dispatch`, `/internal/status-check`, and `/internal/deliver` routes require signed task OIDC identity. `POST /internal/disable-webhook` has a separate trusted deployer OIDC identity. MCP `POST /mcp` follows its OAuth/open access mode; its `POST /internal/dialog-operations` recovery callback has its own OIDC identity.
+
+Turning Telegram off first calls the existing service's disable route and requires confirmed `deleteWebhook` before runtime bot credentials are removed. If credentials are unavailable or deletion is unconfirmed, the deploy does not claim the webhook is disabled and retains credentials. This transition does not delete pending updates, Docs, failed drafts, mappings, or operation/save-intent records. Re-enabling resumes recoverable nonterminal work from checkpoints.
+
+Core rollout is compatibility-first: deploy readers that understand both legacy and `json-string-v1` transcript formats, then compatible guards and fences. MCP's new writer readiness remains deferred until an operator confirms old workers and external I/O have drained or stopped. The new fence does not constrain an unchanged old binary. No Firestore or Qdrant migration or mass reindex is required. For rollback, keep the `json-string-v1` decoder and guard/fence enforcement while new-format Docs or managed operations remain; settle or quiesce unfinished work safely, and never replay an unknown Doc create. A pre-feature binary is not a safe generic rollback target.
  
 ### Google Doc format:
  

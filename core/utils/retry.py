@@ -1,6 +1,8 @@
 import logging
 import time
+from dataclasses import dataclass
 from functools import wraps
+from inspect import signature
 from typing import Callable, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -10,6 +12,32 @@ BACKOFFS = [1, 2, 4]
 RATE_LIMIT_BACKOFFS = [30, 60, 120]
 
 F = TypeVar("F", bound=Callable)
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Controls how many times a decorated provider call is attempted."""
+
+    attempts: int
+
+    def __post_init__(self) -> None:
+        if self.attempts < 1:
+            raise ValueError("retry policy attempts must be at least one")
+
+
+class ProviderBoundaryError(RuntimeError):
+    """Trusted adapter marker that identifies a provider without exposing its error text."""
+
+    def __init__(self, service: str, error: BaseException):
+        if service not in {"gemini", "qdrant", "google_docs", "google_drive", "firestore"}:
+            raise ValueError("provider boundary service is not supported")
+        self.service = service
+        self.original_error = error
+        super().__init__(f"{service} request failed ({type(error).__name__})")
+
+
+LEGACY_RETRY_POLICY = RetryPolicy(attempts=RETRIES)
+SINGLE_ATTEMPT_RETRY_POLICY = RetryPolicy(attempts=1)
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -54,12 +82,18 @@ def _is_rate_limit(exc: Exception) -> bool:
 
 
 def with_retry(fn: F) -> F:
+    """Wrap provider calls; one-attempt calls omit retry warnings and exception text."""
+    accepts_policy = "retry_policy" in signature(fn).parameters
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        retry_policy = kwargs.pop("retry_policy", LEGACY_RETRY_POLICY)
+        if not isinstance(retry_policy, RetryPolicy):
+            raise TypeError("retry_policy must be a RetryPolicy")
         last_exc: Exception | None = None
-        for attempt in range(RETRIES):
+        for attempt in range(retry_policy.attempts):
             try:
-                return fn(*args, **kwargs)
+                call_kwargs = {**kwargs, **({"retry_policy": retry_policy} if accepts_policy else {})}
+                return fn(*args, **call_kwargs)
             except Exception as exc:
                 if _is_rate_limit(exc):
                     backoffs = RATE_LIMIT_BACKOFFS
@@ -68,14 +102,17 @@ def with_retry(fn: F) -> F:
                 else:
                     raise
                 last_exc = exc
-                logger.warning(
-                    "Transient error on attempt %d/%d for %s: %s",
-                    attempt + 1, RETRIES, fn.__name__, exc,
-                )
-                if attempt < RETRIES - 1:
-                    time.sleep(backoffs[attempt])
+                if retry_policy.attempts > 1:
+                    logger.warning(
+                        "Transient error on attempt %d/%d for %s: %s",
+                        attempt + 1, retry_policy.attempts, fn.__name__, exc,
+                    )
+                if attempt < retry_policy.attempts - 1:
+                    time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+                elif retry_policy.attempts == 1:
+                    raise
         raise RuntimeError(
-            f"{fn.__name__} failed after {RETRIES} attempts"
+            f"{fn.__name__} failed after {retry_policy.attempts} attempts"
         ) from last_exc
 
     return wrapper  # type: ignore[return-value]

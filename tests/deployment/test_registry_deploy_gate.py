@@ -41,6 +41,12 @@ def _sandbox(tmp_path: Path, service: str, *, verifier_fails: bool = False) -> t
     bin_dir.mkdir()
     script = deploy_dir / SCRIPTS[service].name
     shutil.copyfile(SCRIPTS[service], script)
+    helper_dir = deploy_dir / "helpers"
+    helper_dir.mkdir()
+    shutil.copyfile(
+        ROOT / "infra" / "deploy" / "core" / "helpers" / "deploy_dialog_operations.sh",
+        helper_dir / "deploy_dialog_operations.sh",
+    )
 
     verifier = build_dir / "preflight.sh"
     verifier.write_text(
@@ -57,7 +63,10 @@ def _sandbox(tmp_path: Path, service: str, *, verifier_fails: bool = False) -> t
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "printf '%s\\n' \"$*\" >> \"$GCLOUD_LOG\"\n"
-        "case \"$*\" in *'services describe'*) printf 'https://service.example\\n' ;; esac\n",
+        "case \"$*\" in "
+        "*'serviceAccountName'*) printf 'synthetic-runtime@synthetic-project.iam.gserviceaccount.com\\n' ;; "
+        "*'projects describe'*) printf '123456789012\\n' ;; "
+        "*'services describe'*) printf 'https://service.example\\n' ;; esac\n",
         encoding="utf-8",
     )
     gcloud.chmod(0o755)
@@ -108,6 +117,14 @@ def test_deploy_verifies_selected_tag_then_uses_returned_digest(
     deploy = next(call for call in gcloud_calls if call.startswith("run deploy "))
     assert f"--image {repository}@{DIGEST}" in deploy
     assert f"{repository}:v2026.10.11" not in deploy
+    if service == "vector_sync":
+        vector_update = next(
+            call for call in gcloud_calls
+            if call.startswith("run services update tlbrain-vector-sync ")
+        )
+        assert "INTERNAL_DIALOG_OPERATIONS_URL=https://service.example/internal/dialog-operations" in vector_update
+        assert "DIALOG_OPERATIONS_QUEUE=tlbrain-dialog-operations" in vector_update
+        assert "CLOUD_TASKS_OIDC_AUDIENCE=https://service.example" in vector_update
 
 
 @pytest.mark.parametrize("service", ["mcp", "vector_sync"])
@@ -153,8 +170,8 @@ def test_deploy_settings_are_preserved() -> None:
     mcp = SCRIPTS["mcp"].read_text(encoding="utf-8")
     vector = SCRIPTS["vector_sync"].read_text(encoding="utf-8")
     assert '--max-instances "${MCP_MAX_INSTANCES}"' in mcp
-    assert 'VECTOR_SYNC_URL="${VECTOR_SYNC_URL}"' in mcp
-    assert 'VERSION="${VERSION}"' in mcp
+    assert '"VECTOR_SYNC_URL=${VECTOR_SYNC_URL}"' in mcp
+    assert '"VERSION=${VERSION}"' in mcp
     assert "--timeout 3600" in vector
     assert "--concurrency 1" in vector
     assert '--max-instances "${VECTOR_SYNC_MAX_INSTANCES}"' in vector

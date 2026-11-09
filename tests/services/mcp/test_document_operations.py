@@ -22,7 +22,7 @@ def test_move_transcript_adapter_preserves_success_response(monkeypatch):
     handler = importlib.import_module("services.mcp.app.mcp.handler")
     outcome_type = handler.document_operations.MoveTranscriptResult
     monkeypatch.setattr(
-        handler.document_operations,
+        handler.write_operations,
         "move_transcript",
         lambda doc_id, folder_path: outcome_type([{"doc_id": "left"}]),
     )
@@ -45,7 +45,7 @@ def test_move_transcript_adapter_preserves_success_response(monkeypatch):
 def test_move_transcript_adapter_maps_path_errors_and_generic_failures(monkeypatch):
     handler = importlib.import_module("services.mcp.app.mcp.handler")
     monkeypatch.setattr(
-        handler.document_operations,
+        handler.write_operations,
         "move_transcript",
         lambda *_args: (_ for _ in ()).throw(handler.document_operations.FolderPathNotFound(["missing"])),
     )
@@ -59,7 +59,7 @@ def test_move_transcript_adapter_maps_path_errors_and_generic_failures(monkeypat
     }
 
     monkeypatch.setattr(
-        handler.document_operations,
+        handler.write_operations,
         "move_transcript",
         lambda *_args: (_ for _ in ()).throw(
             handler.document_operations.AmbiguousFolderPathError(["same"], 2)
@@ -75,7 +75,7 @@ def test_move_transcript_adapter_maps_path_errors_and_generic_failures(monkeypat
     }
 
     monkeypatch.setattr(
-        handler.document_operations,
+        handler.write_operations,
         "move_transcript",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("write failed")),
     )
@@ -92,7 +92,7 @@ def test_move_transcript_adapter_maps_path_errors_and_generic_failures(monkeypat
 def test_rename_transcript_adapter_maps_missing_record_and_success(monkeypatch):
     handler = importlib.import_module("services.mcp.app.mcp.handler")
     monkeypatch.setattr(
-        handler.document_operations,
+        handler.write_operations,
         "rename_transcript",
         lambda *_args: (_ for _ in ()).throw(handler.document_operations.TranscriptNotFound("doc-1")),
     )
@@ -103,7 +103,7 @@ def test_rename_transcript_adapter_maps_missing_record_and_success(monkeypatch):
 
     calls = []
     monkeypatch.setattr(
-        handler.document_operations,
+        handler.write_operations,
         "rename_transcript",
         lambda doc_id, title: calls.append((doc_id, title)),
     )
@@ -114,7 +114,7 @@ def test_rename_transcript_adapter_maps_missing_record_and_success(monkeypatch):
     assert _payload(renamed) == {"status": "ok", "doc_id": "doc-1", "new_title": "New title"}
 
     monkeypatch.setattr(
-        handler.document_operations,
+        handler.write_operations,
         "rename_transcript",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("drive failed")),
     )

@@ -1,5 +1,7 @@
 import logging
 import os
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import functions_framework
 from google.cloud import firestore
@@ -25,7 +27,16 @@ from core.integrations.firestore.transcripts import (
     update_index,
 )
 from core.integrations.firestore.sync_state import get_drive_sync_token, set_drive_sync_token
+from core.integrations.firestore.input_parts import cleanup_completed_input_parts
 from core.integrations.cloud_tasks.client import enqueue_task
+from core.integrations.firestore.outbox import OutboxTargetKind
+from core.integrations.firestore.telegram_recovery import FirestoreTelegramQueueRecoveryStore
+from core.operations.outbox import (
+    TaskTargetConfig,
+    enqueue_expired_telegram_queue_recoveries,
+    enqueue_stale_mcp_save_recoveries,
+    publish_due_outbox_records,
+)
 
 from core.utils.logging import configure_logging
 
@@ -34,6 +45,132 @@ logger = logging.getLogger(__name__)
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
+MCP_RECOVERY_SWEEP_LIMIT = 50
+
+
+def _mcp_recovery_target() -> TaskTargetConfig | None:
+    """Build the recovery target only from complete, verifier-matched config."""
+    callback_url = os.environ.get("INTERNAL_DIALOG_OPERATIONS_URL")
+    queue_name = os.environ.get("DIALOG_OPERATIONS_QUEUE")
+    audience = os.environ.get("CLOUD_TASKS_OIDC_AUDIENCE") or os.environ.get("TASK_OIDC_AUDIENCE")
+    service_account = (
+        os.environ.get("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("TASK_OIDC_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("TASK_SERVICE_ACCOUNT_EMAIL")
+    )
+    expected_audience = os.environ.get("OIDC_AUDIENCE")
+    expected_account = os.environ.get("OIDC_SERVICE_ACCOUNT_EMAIL")
+    try:
+        parsed = urlsplit(callback_url or "")
+        valid_url = (
+            parsed.scheme == "https" and bool(parsed.hostname)
+            and parsed.username is None and parsed.password is None
+            and parsed.path == "/internal/dialog-operations"
+            and not parsed.query and not parsed.fragment
+        )
+        if not (
+            valid_url and queue_name and queue_name.strip()
+            and audience and audience.strip() and audience == expected_audience
+            and service_account and service_account.strip()
+            and service_account == expected_account
+        ):
+            return None
+        return TaskTargetConfig(
+            queue_name=queue_name,
+            url=callback_url,
+            service_account_email=service_account,
+            audience=audience,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_mcp_recovery_sweep(db: firestore.Client) -> None:
+    try:
+        cleaned_parts = cleanup_completed_input_parts(db)
+        if cleaned_parts:
+            logger.info("Completed dialog input cleanup: deleted=%d part(s)", cleaned_parts)
+    except Exception:
+        # Cleanup is additive maintenance; never let it block recovery or Drive sync.
+        logger.warning("Completed dialog input cleanup failed; Checker will continue")
+    targets = {}
+    mcp_target = _mcp_recovery_target()
+    telegram_target = _telegram_recovery_target()
+    if mcp_target is not None:
+        targets[OutboxTargetKind.MCP_SAVE_RECOVERY] = mcp_target
+    if telegram_target is not None:
+        targets[OutboxTargetKind.TELEGRAM_DISPATCH] = telegram_target
+        targets[OutboxTargetKind.TELEGRAM_STATUS_CHECK] = TaskTargetConfig(
+            queue_name=telegram_target.queue_name,
+            url=urlsplit(telegram_target.url)._replace(path="/internal/status-check").geturl(),
+            service_account_email=telegram_target.service_account_email,
+            audience=telegram_target.audience,
+            dispatch_deadline=telegram_target.dispatch_deadline,
+        )
+    now = datetime.now(timezone.utc)
+    if mcp_target is not None:
+        try:
+            enqueue_stale_mcp_save_recoveries(db, now=now, limit=MCP_RECOVERY_SWEEP_LIMIT)
+        except Exception:
+            logger.warning("MCP recovery selection failed; Checker will continue")
+    try:
+        enqueue_expired_telegram_queue_recoveries(
+            FirestoreTelegramQueueRecoveryStore(db), now=now, limit=MCP_RECOVERY_SWEEP_LIMIT,
+        )
+    except Exception:
+        logger.warning("Telegram queue recovery selection failed; Checker will continue")
+    if not targets:
+        return
+    try:
+        result = publish_due_outbox_records(
+            db,
+            targets,
+            now=now,
+            limit=MCP_RECOVERY_SWEEP_LIMIT,
+        )
+        logger.info("Task outbox recovery sweep: selected=%d failed=%d", result.selected, result.failed)
+    except Exception:
+        # Keep additive recovery failures from interrupting scheduled Drive reconciliation.
+        logger.warning("Task outbox recovery sweep failed; Checker will continue")
+
+
+def _telegram_recovery_target() -> TaskTargetConfig | None:
+    """Build the Telegram target only from complete verifier-matched config."""
+    callback_url = os.environ.get("TELEGRAM_CONTROL_URL")
+    queue_name = os.environ.get("TELEGRAM_CONTROL_QUEUE")
+    audience = os.environ.get("CLOUD_TASKS_OIDC_AUDIENCE") or os.environ.get("TASK_OIDC_AUDIENCE")
+    service_account = (
+        os.environ.get("CLOUD_TASKS_OIDC_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("TASK_OIDC_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL")
+        or os.environ.get("TASK_SERVICE_ACCOUNT_EMAIL")
+    )
+    expected_audience = os.environ.get("OIDC_AUDIENCE")
+    expected_account = os.environ.get("OIDC_SERVICE_ACCOUNT_EMAIL")
+    try:
+        parsed = urlsplit(callback_url or "")
+        valid_url = (
+            parsed.scheme == "https" and bool(parsed.hostname)
+            and parsed.username is None and parsed.password is None
+            and parsed.path == "/internal/dispatch"
+            and not parsed.query and not parsed.fragment
+        )
+        if not (
+            valid_url and queue_name and queue_name.strip()
+            and audience and audience.strip() and audience == expected_audience
+            and service_account and service_account.strip()
+            and service_account == expected_account
+        ):
+            return None
+        return TaskTargetConfig(
+            queue_name=queue_name,
+            url=callback_url,
+            service_account_email=service_account,
+            audience=audience,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 @functions_framework.http
@@ -50,6 +187,8 @@ def checker(request):
         enqueue_task(queue_name=queue_name, url=f"{sync_url}/sync/doc/{doc_id}")
         logger.info("Targeted resync: doc_id=%s", doc_id)
         return {"mode": "doc", "doc_id": doc_id, "queued": 1}, 200
+
+    _run_mcp_recovery_sweep(db)
 
     stale_syncing = get_stale_syncing(db=db)
     for doc_id in stale_syncing:

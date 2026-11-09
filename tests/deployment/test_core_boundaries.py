@@ -218,6 +218,62 @@ def test_importing_integration_modules_constructs_no_clients_or_models() -> None
 
 
 @pytest.mark.offline
+def test_importing_foundation_operations_and_config_is_passive() -> None:
+    module_names = sorted(
+        "core." + ".".join(path.relative_to(CORE_ROOT).with_suffix("").parts)
+        for path in _python_files(CORE_ROOT / "operations")
+        if path.name != "__init__.py"
+    ) + ["core.config"]
+    code = "\n".join(
+        [
+            "import importlib, importlib.abc, os, socket, sys",
+            f"sys.path.insert(0, {str(APP_ROOT)!r})",
+            "blocked = ('services',)",
+            "class RejectServices(importlib.abc.MetaPathFinder):",
+            "    def find_spec(self, fullname, path=None, target=None):",
+            "        if any(fullname == root or fullname.startswith(root + '.') for root in blocked): raise AssertionError('blocked import attempted: ' + fullname)",
+            "sys.meta_path.insert(0, RejectServices())",
+            "os.environ['TELEGRAM_BOT_TOKEN'] = 'synthetic-token'",
+            "os.environ.pop('TELEGRAM_ALLOWED_USER_IDS', None)",
+            "os.environ.pop('TLDV_API_KEY', None)",
+            "def no_network(*args, **kwargs): raise AssertionError('network access attempted')",
+            "socket.create_connection = no_network",
+            "socket.socket.connect = no_network",
+            "socket.socket.connect_ex = no_network",
+            "import google.cloud.firestore as firestore_sdk",
+            "from google.cloud import tasks_v2",
+            "from google import genai",
+            "import google.auth",
+            "from google.oauth2.credentials import Credentials",
+            "import google_auth_httplib2",
+            "import httplib2",
+            "from googleapiclient import discovery",
+            "from qdrant_client import QdrantClient",
+            "from fastembed import SparseTextEmbedding",
+            "calls = []",
+            "def spy(label):",
+            "    def call(*args, **kwargs): calls.append(label); raise AssertionError(label + ' constructed during import')",
+            "    return call",
+            "firestore_sdk.Client.__init__ = spy('Firestore client')",
+            "tasks_v2.CloudTasksClient.__init__ = spy('Cloud Tasks client')",
+            "genai.Client.__init__ = spy('Gemini client')",
+            "google.auth.default = spy('Google ADC credentials')",
+            "Credentials.__init__ = spy('Google OAuth credentials')",
+            "google_auth_httplib2.AuthorizedHttp.__init__ = spy('AuthorizedHttp')",
+            "httplib2.Http.__init__ = spy('httplib2.Http')",
+            "discovery.build = spy('Drive/Docs discovery')",
+            "QdrantClient.__init__ = spy('Qdrant client')",
+            "SparseTextEmbedding.__init__ = spy('FastEmbed model')",
+            f"modules = {module_names!r}",
+            "for name in modules: importlib.import_module(name)",
+            "assert calls == [], repr(calls)",
+        ]
+    )
+    completed = _run_isolated(code)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.offline
 def test_parser_windowing_and_folder_algorithms_import_with_unrelated_roots_blocked() -> None:
     code = "\n".join(
         [
@@ -277,6 +333,10 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
             "get_or_create_folder",
             "resolve_registered_folder_path",
             "expand_registered_subtree",
+            "prepare_create_folder",
+            "prepare_move_folder",
+            "apply_move_folder",
+            "apply_rename_folder",
         },
         "core/integrations/google_drive/scanner.py": {"scan_root_folder"},
         "core/integrations/google_drive/changes.py": {
@@ -285,6 +345,8 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
         },
         "core/integrations/google_drive/files.py": {
             "get_file_parent_folder_id",
+            "get_file_metadata",
+            "get_file_metadata_if_exists",
             "move_file_to_folder",
             "rename_file",
         },
@@ -294,6 +356,10 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
             "upsert_folder",
         },
         "core/indexing/processor.py": {"process_one"},
+        "core/operations/write.py": {
+            "move_transcript", "rename_transcript", "move_folder", "rename_folder",
+            "create_folder", "add_fact",
+        },
     }
     for relative, expected in owners.items():
         assert expected <= _function_nodes(APP_ROOT / relative).keys(), relative
@@ -305,6 +371,7 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
         "build_folder_tree": {"core/integrations/google_drive/folders.py"},
         "list_folders": {
             "core/integrations/google_drive/folder_service.py",
+            "core/operations/read.py",
             "core/retrieval/folders.py",
         },
         "get_or_create_folder": {"core/integrations/google_drive/folder_service.py"},
@@ -312,6 +379,33 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
         "upsert_folder": {"core/integrations/firestore/folders.py"},
         "get_bm25_model": {"core/integrations/fastembed/bm25.py"},
         "process_one": {"core/indexing/processor.py"},
+        "get_file_metadata": {"core/integrations/google_drive/files.py"},
+        "get_file_metadata_if_exists": {"core/integrations/google_drive/files.py"},
+        "prepare_create_folder": {"core/integrations/google_drive/folder_service.py"},
+        "prepare_move_folder": {"core/integrations/google_drive/folder_service.py"},
+        "apply_move_folder": {"core/integrations/google_drive/folder_service.py"},
+        "apply_rename_folder": {"core/integrations/google_drive/folder_service.py"},
+        "get_parent_ids_by_doc_ids": {"core/integrations/qdrant/reader.py"},
+        "get_user_fact_payload": {"core/integrations/qdrant/reader.py"},
+        "user_fact_point_id": {"core/integrations/qdrant/writer.py"},
+        "move_transcript": {
+            "core/documents/operations.py", "core/operations/write.py",
+        },
+        "rename_transcript": {
+            "core/documents/operations.py", "core/operations/write.py",
+        },
+        "move_folder": {
+            "core/integrations/google_drive/folder_service.py", "core/operations/write.py",
+        },
+        "rename_folder": {
+            "core/integrations/google_drive/client.py", "core/integrations/google_drive/folder_service.py",
+            "core/operations/write.py",
+        },
+        "create_folder": {
+            "core/integrations/google_drive/client.py", "core/integrations/google_drive/folder_service.py",
+            "core/operations/write.py",
+        },
+        "add_fact": {"core/operations/write.py"},
     }
     actual_definitions: dict[str, set[str]] = {name: set() for name in allowed_definitions}
     for root in (CORE_ROOT, APP_ROOT / "services"):
@@ -322,6 +416,7 @@ def test_audited_shared_operation_owners_and_compatibility_forwarders() -> None:
     assert actual_definitions == allowed_definitions
 
     wrappers = {
+        "core/operations/read.py": {"list_folders": "list_folders"},
         "core/retrieval/folders.py": {"list_folders": "service_list_folders"},
     }
     for relative, expected_calls in wrappers.items():

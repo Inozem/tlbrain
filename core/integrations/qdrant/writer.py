@@ -1,5 +1,5 @@
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, PointStruct, SparseVector
 
@@ -71,16 +71,30 @@ def delete_old_versions(doc_id: str, new_version: str, root_folder_id: str) -> N
 
 
 @with_retry
-def upsert_user_facts(user_facts: list[dict[str, Any]], vectors: list[list[float]]) -> None:
+def upsert_user_facts(
+    user_facts: list[dict[str, Any]], vectors: list[list[float]], *, point_ids: list[str] | None = None,
+) -> None:
     if not user_facts:
+        if point_ids not in (None, []):
+            raise ValueError("point_ids must match user_facts")
         return
+    if point_ids is not None:
+        if len(point_ids) != len(user_facts):
+            raise ValueError("point_ids must match user_facts")
+        try:
+            for point_id in point_ids:
+                UUID(point_id)
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("point_ids must contain UUIDs") from None
+        if len(vectors) != len(user_facts):
+            raise ValueError("vectors must match user_facts")
     points = [
         PointStruct(
-            id=_point_id("user_fact", f["doc_id"], f["text"]),
+            id=point_ids[index] if point_ids is not None else _point_id("user_fact", f["doc_id"], f["text"]),
             vector={"dense": vector},
             payload=f,
         )
-        for f, vector in zip(user_facts, vectors)
+        for index, (f, vector) in enumerate(zip(user_facts, vectors))
     ]
     get_client().upsert(collection_name=get_collection_name(), points=points)
 
@@ -161,3 +175,8 @@ def delete_summaries_by_center_indexes(
 
 def _point_id(type_: str, doc_id: str, key: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"{type_}:{doc_id}:{key}"))
+
+
+def user_fact_point_id(doc_id: str, text: str) -> str:
+    """Return the legacy deterministic ID used for sessionless user facts."""
+    return _point_id("user_fact", doc_id, text)

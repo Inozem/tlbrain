@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import httpx
@@ -60,7 +59,7 @@ def test_tools_list_matches_static_baseline():
     response = _request("post", "/mcp", json=_rpc("tools/list", "baseline-tools"))
     assert response.status_code == 200
     assert response.json() == expected
-    assert len(expected["result"]["tools"]) == 13
+    assert len(expected["result"]["tools"]) == 14
 
 
 def test_initialize_and_jsonrpc_id_types(monkeypatch):
@@ -121,7 +120,9 @@ def test_json_and_sse_envelopes():
     assert response.media_type == "text/event-stream"
     assert response.headers["cache-control"] == "no-cache"
     assert response.headers["x-accel-buffering"] == "no"
-    assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", response.headers["mcp-session-id"])
+    session_id = response.headers.get("mcp-session-id")
+    assert session_id
+    assert session_id != body["id"]
     event = _run(response.body_iterator.__anext__())
     assert event == f"data: {json.dumps(expected)}\n\n"
 
@@ -146,6 +147,7 @@ def test_protocol_and_operation_errors(monkeypatch):
         "jsonrpc": "2.0", "id": 10, "error": {"code": -32602, "message": "folder_path is required"}
     }
 
+    monkeypatch.setenv("TLDV_API_KEY", "synthetic-tldv-key")
     missing_config = _request("post", "/mcp", json=_rpc("tools/call", 11, {"name": "import_all_transcripts"}))
     assert missing_config.json() == {
         "jsonrpc": "2.0", "id": 11,
@@ -155,7 +157,7 @@ def test_protocol_and_operation_errors(monkeypatch):
     def fail_retrieval(**kwargs):
         raise RuntimeError("synthetic retrieval failure")
 
-    monkeypatch.setattr(handler, "get_transcripts", fail_retrieval)
+    monkeypatch.setattr(handler.read_operations, "get_transcript", fail_retrieval)
     failed_operation = _request("post", "/mcp", json=_rpc("tools/call", 12, {
         "name": "get_transcript", "arguments": {"doc_id": "synthetic-doc"}
     }))
@@ -171,7 +173,7 @@ def test_protocol_and_operation_errors(monkeypatch):
 
 def test_unicode_tool_content_round_trip(monkeypatch):
     payload = "שלום, réunion 🌍"
-    monkeypatch.setattr(handler, "get_transcripts", lambda **kwargs: ([{"doc_id": "d1", "text": payload}], {
+    monkeypatch.setattr(handler.read_operations, "get_transcript", lambda **kwargs: ([{"doc_id": "d1", "text": payload}], {
         "truncated": False, "total_matches": 1, "returned_segments": 1
     }))
     response = _request("post", "/mcp", json=_rpc("tools/call", "unicode", {
@@ -189,7 +191,7 @@ def test_existing_tool_argument_defaults_and_conversions(monkeypatch):
         transcript_calls.append(kwargs)
         return [], {"truncated": False, "total_matches": 0, "returned_segments": 0}
 
-    monkeypatch.setattr(handler, "get_transcripts", get_transcripts)
+    monkeypatch.setattr(handler.read_operations, "get_transcript", get_transcripts)
     request = JSONRPCRequest(**_rpc("tools/call", "get", {"name": "get_transcript", "arguments": {"limit": 0}}))
     _run(handler.handle_mcp_request(request.model_dump(exclude_none=True)))
     assert transcript_calls[-1]["limit"] == 1
@@ -198,7 +200,7 @@ def test_existing_tool_argument_defaults_and_conversions(monkeypatch):
     assert transcript_calls[-1]["limit"] == "0"
 
     recent_calls = []
-    monkeypatch.setattr(handler, "list_transcripts", lambda **kwargs: recent_calls.append(kwargs) or {
+    monkeypatch.setattr(handler.read_operations, "list_recent_transcripts", lambda **kwargs: recent_calls.append(kwargs) or {
         "transcripts": [], "total": 0, "returned": 0
     })
     request = JSONRPCRequest(**_rpc("tools/call", "recent", {
@@ -214,6 +216,7 @@ def test_existing_tool_argument_defaults_and_conversions(monkeypatch):
     assert recent_calls[-1]["limit"] == 7
     assert recent_calls[-1]["offset"] == 0
 
+    monkeypatch.setenv("TLDV_API_KEY", "synthetic-tldv-key")
     monkeypatch.setenv("TLDV_RECONCILIATION_URL", "http://reconciliation.test/run")
     posted = []
 
@@ -235,6 +238,53 @@ def test_existing_tool_argument_defaults_and_conversions(monkeypatch):
     }))
     _run(handler.handle_mcp_request(request.model_dump(exclude_none=True)))
     assert posted[-1][1]["json"] == {"limit": "4", "full_scan": True, "since": "2025-01-02"}
+
+
+def test_tldv_import_is_unavailable_without_key_even_with_stale_url(monkeypatch):
+    monkeypatch.setenv("TLDV_API_KEY", " \t ")
+    monkeypatch.setenv("TLDV_RECONCILIATION_URL", "http://stale-reconciliation.test/run")
+    monkeypatch.setattr(httpx, "post", lambda *_args, **_kwargs: pytest.fail("must not post"))
+
+    response = _request("post", "/mcp", json=_rpc("tools/call", "disabled-tldv", {
+        "name": "import_all_transcripts", "arguments": {},
+    }))
+    assert response.json() == {
+        "jsonrpc": "2.0", "id": "disabled-tldv",
+        "error": {
+            "code": -32603,
+            "message": "TL;DV integration is unavailable because TLDV_API_KEY is not configured",
+        },
+    }
+
+
+def test_common_search_and_sync_remain_available_without_tldv_key(monkeypatch):
+    monkeypatch.delenv("TLDV_API_KEY", raising=False)
+    monkeypatch.setenv("TLDV_RECONCILIATION_URL", "http://stale-reconciliation.test/run")
+    monkeypatch.setenv("SYNC_CHECKER_URL", "http://checker.test/run")
+    monkeypatch.setattr(handler.read_operations, "query", lambda **_kwargs: ([{"doc_id": "d1", "text": "hit"}], {
+        "truncated": False, "total_matches": 1, "returned_segments": 1,
+    }))
+
+    class SyncResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"queued": 1}
+
+    posted = []
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: posted.append((args, kwargs)) or SyncResponse())
+
+    search = _request("post", "/mcp", json=_rpc("tools/call", "common-search", {
+        "name": "query", "arguments": {"query": "synthetic"},
+    }))
+    sync = _request("post", "/mcp", json=_rpc("tools/call", "common-sync", {
+        "name": "sync_changes", "arguments": {},
+    }))
+
+    assert search.json()["result"]["content"][0]["text"]
+    assert sync.json()["result"]["content"][0]["text"] == '{"status": "ok", "queued": 1}'
+    assert posted == [(("http://checker.test/run",), {"json": None, "timeout": 300})]
 
 
 def test_oauth_discovery():
