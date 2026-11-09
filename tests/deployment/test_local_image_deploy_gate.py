@@ -91,13 +91,12 @@ def _run_sandbox(tmp_path: Path, service: str, *, gate_fails: bool = False) -> t
     bin_dir.mkdir()
     script = deploy_dir / SCRIPTS[service].name
     shutil.copyfile(SCRIPTS[service], script)
-    if service == "mcp":
-        helper_dir = deploy_dir / "helpers"
-        helper_dir.mkdir()
-        shutil.copyfile(
-            ROOT / "infra" / "deploy" / "core" / "helpers" / "deploy_dialog_operations.sh",
-            helper_dir / "deploy_dialog_operations.sh",
-        )
+    helper_dir = deploy_dir / "helpers"
+    helper_dir.mkdir()
+    shutil.copyfile(
+        ROOT / "infra" / "deploy" / "core" / "helpers" / "deploy_dialog_operations.sh",
+        helper_dir / "deploy_dialog_operations.sh",
+    )
 
     preflight = build_dir / "preflight.sh"
     preflight.write_text(
@@ -160,6 +159,14 @@ def test_local_image_gate_precedes_push_and_deploy(tmp_path: Path, service: str)
     assert events[1].startswith("gate:--image-mode")
     assert events[2].startswith("docker:push ")
     assert any(event.startswith("gcloud:run deploy ") for event in events)
+    if service == "vector_sync":
+        vector_update = next(
+            event for event in events
+            if event.startswith("gcloud:run services update tlbrain-vector-sync ")
+        )
+        assert "INTERNAL_DIALOG_OPERATIONS_URL=https://service.example/internal/dialog-operations" in vector_update
+        assert "DIALOG_OPERATIONS_QUEUE=tlbrain-dialog-operations" in vector_update
+        assert "CLOUD_TASKS_OIDC_AUDIENCE=https://service.example" in vector_update
 
 
 @pytest.mark.parametrize("service", ["mcp", "vector_sync"])

@@ -41,13 +41,12 @@ def _sandbox(tmp_path: Path, service: str, *, verifier_fails: bool = False) -> t
     bin_dir.mkdir()
     script = deploy_dir / SCRIPTS[service].name
     shutil.copyfile(SCRIPTS[service], script)
-    if service == "mcp":
-        helper_dir = deploy_dir / "helpers"
-        helper_dir.mkdir()
-        shutil.copyfile(
-            ROOT / "infra" / "deploy" / "core" / "helpers" / "deploy_dialog_operations.sh",
-            helper_dir / "deploy_dialog_operations.sh",
-        )
+    helper_dir = deploy_dir / "helpers"
+    helper_dir.mkdir()
+    shutil.copyfile(
+        ROOT / "infra" / "deploy" / "core" / "helpers" / "deploy_dialog_operations.sh",
+        helper_dir / "deploy_dialog_operations.sh",
+    )
 
     verifier = build_dir / "preflight.sh"
     verifier.write_text(
@@ -118,6 +117,14 @@ def test_deploy_verifies_selected_tag_then_uses_returned_digest(
     deploy = next(call for call in gcloud_calls if call.startswith("run deploy "))
     assert f"--image {repository}@{DIGEST}" in deploy
     assert f"{repository}:v2026.10.11" not in deploy
+    if service == "vector_sync":
+        vector_update = next(
+            call for call in gcloud_calls
+            if call.startswith("run services update tlbrain-vector-sync ")
+        )
+        assert "INTERNAL_DIALOG_OPERATIONS_URL=https://service.example/internal/dialog-operations" in vector_update
+        assert "DIALOG_OPERATIONS_QUEUE=tlbrain-dialog-operations" in vector_update
+        assert "CLOUD_TASKS_OIDC_AUDIENCE=https://service.example" in vector_update
 
 
 @pytest.mark.parametrize("service", ["mcp", "vector_sync"])
