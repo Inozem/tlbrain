@@ -6,13 +6,23 @@ TLBrain indexes meeting transcripts from TL;DV, stores everything in Google Driv
  
 ```mermaid
 graph LR
-    A[TL;DV] -->|transcripts| B[Google Drive]
-    B -->|incremental sync| C[TLBrain]
-    T["Telegram (optional)"] -->|dialog intake| C
-    C -->|saves new dialog as Google Drive Doc| B
-    C -->|MCP retrieval| D[Claude]
-    C -->|MCP retrieval| E[ChatGPT]
-    C -->|MCP retrieval| F[Codex]
+    TLDV["TL;DV"] -->|"transcripts"| PROCESSING
+    TELEGRAM["Telegram (optional)"] <-->|"read, save, search"| PROCESSING
+
+    subgraph BRAIN["TLBrain"]
+        PROCESSING["Processing and search"]
+        DRIVE["Google Drive / Docs (source transcripts)"]
+        QDRANT["Qdrant (derived search index)"]
+        MCP["MCP server"]
+
+        PROCESSING <-->|"read and save Docs"| DRIVE
+        PROCESSING <-->|"index and search"| QDRANT
+        PROCESSING <-->|"shared operations"| MCP
+    end
+
+    MCP <-->|"MCP"| CLAUDE["Claude"]
+    MCP <-->|"MCP"| CHATGPT["ChatGPT"]
+    MCP <-->|"MCP"| CODEX["Codex"]
 ```
  
 Works with **Claude** · **ChatGPT** · **Codex** via remote MCP
