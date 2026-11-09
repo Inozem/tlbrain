@@ -8,7 +8,7 @@ TLBrain indexes meeting transcripts from TL;DV, stores everything in Google Driv
 graph LR
     A[TL;DV] -->|transcripts| B[Google Drive]
     B -->|incremental sync| C[TLBrain]
-    T[Telegram (optional)] -->|dialog intake| C
+    T["Telegram (optional)"] -->|dialog intake| C
     C -->|saves new dialog as Google Drive Doc| B
     C -->|MCP retrieval| D[Claude]
     C -->|MCP retrieval| E[ChatGPT]
