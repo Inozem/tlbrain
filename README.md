@@ -1,4 +1,4 @@
-# 🧠 TLBrain `v2.1.0`
+# 🧠 TLBrain `v2.1.1`
 
 Personal semantic memory for Claude and ChatGPT — built on top of your client calls.
  
@@ -191,10 +191,10 @@ GEMINI_API_KEY=your-gemini-api-key
 
 ### 9. Optional `.env` settings
 
-Merges or pushes to `main` publish `latest` after all checks pass. Semantic-version Docker tags such as `2.1.0` are published from pushed Git tags such as `v2.1.0`; wait for the tagged image build to finish before deploying with `VERSION=2.1.0`.
+Merges or pushes to `main` publish `latest` after all checks pass. Semantic-version Docker tags such as `2.1.1` are published from pushed Git tags such as `v2.1.1`; wait for the tagged image build to finish before deploying with `VERSION=2.1.1`.
 
 ```env
-VERSION=2.1.0  # or latest for the most recent build
+VERSION=2.1.1  # or latest for the most recent build
  
 # Google Cloud
 REGION=europe-west1
@@ -610,10 +610,10 @@ foreach ($serviceId in $serviceIds) {
 Optional Docker image builds (Docker is required for these local image builds and image checks):
 
 ```bash
-docker build -f infra/docker/Dockerfile.mcp -t tlbrain-mcp:2.1.0-check .
-docker build -f infra/docker/Dockerfile.vector_sync -t tlbrain-vector-sync:2.1.0-check .
-docker build -f infra/docker/Dockerfile.tldv_import -t tlbrain-tldv-import:2.1.0-check .
-docker build -f infra/docker/Dockerfile.telegram -t tlbrain-telegram:2.1.0-check .
+docker build -f infra/docker/Dockerfile.mcp -t tlbrain-mcp:2.1.1-check .
+docker build -f infra/docker/Dockerfile.vector_sync -t tlbrain-vector-sync:2.1.1-check .
+docker build -f infra/docker/Dockerfile.tldv_import -t tlbrain-tldv-import:2.1.1-check .
+docker build -f infra/docker/Dockerfile.telegram -t tlbrain-telegram:2.1.1-check .
 ```
 
 CI validates source artifacts for all seven targets. It builds and validates final images for the four ASGI targets: MCP, Vector Sync, TL;DV Import, and Telegram. Telegram image publication runs on pushes only after regression, source and image validation, and native bootstrap checks pass. The normal Telegram deploy route verifies an image digest with compile, import, and startup evidence; the local route builds and preflights the Docker image.
