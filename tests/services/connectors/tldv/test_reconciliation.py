@@ -71,6 +71,11 @@ def test_recovery_uses_inclusive_age_window_and_only_eligible_statuses(
         "downloading-at-old-edge": {"status": "downloading", "status_changed_at": oldest},
         "error-no-stage": {"status": "error", "status_changed_at": stale},
         "error-import": {"status": "error", "error_stage": "import", "status_changed_at": stale},
+        "unknown-write": {
+            "status": "error", "error_stage": "import",
+            "error": "Google Docs write outcome unknown (RuntimeError); reconcile before retrying.",
+            "status_changed_at": stale,
+        },
         "queued-outside-new-edge": {
             "status": "queued", "status_changed_at": stale + timedelta(seconds=1)
         },
@@ -134,6 +139,9 @@ def test_recovery_uses_inclusive_age_window_and_only_eligible_statuses(
         "body": json.dumps({"meeting_id": "downloading-at-old-edge"}).encode(),
     }
     assert "transcript_index/tldv-queued-outside-new-edge" in firestore_fake.documents
+    unknown = firestore_fake.documents["transcript_index/tldv-unknown-write"]
+    assert unknown["status"] == "error" and unknown["error_stage"] == "import"
+    assert "write outcome unknown" in unknown["error"]
 
 
 def test_recovery_empty_transcript_and_nonfinal_http_error_leave_records_unchanged(
@@ -399,3 +407,53 @@ def test_batch_writes_placeholder_before_named_task_and_already_exists_is_not_co
             "body": json.dumps({"meeting_id": meeting_id}).encode(),
         },
     }
+
+
+def test_unknown_write_remains_existing_through_full_reconciliation_listing(
+    reconciliation, firestore_fake, monkeypatch, sdk_fakes
+):
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
+    _fixed_now(monkeypatch, reconciliation, now)
+    meeting_id = "unknown-write-listed"
+    original = {
+        "meeting_id": meeting_id, "provider": "tldv", "status": "error",
+        "error_stage": "import",
+        "error": "Google Docs write outcome unknown (RuntimeError); reconcile before retrying.",
+        "status_changed_at": now - timedelta(minutes=5),
+    }
+    _seed(firestore_fake, f"tldv-{meeting_id}", original)
+    provider_calls = []
+    monkeypatch.setattr(reconciliation, "tldv_get", lambda path: provider_calls.append(path) or {"results": []})
+    monkeypatch.setattr(reconciliation, "get_meetings", lambda _since: [{"id": meeting_id}])
+    monkeypatch.setenv("TLDV_IMPORT_SERVICE_URL", "https://import.synthetic.test")
+
+    result, status_code = reconciliation.tldv_reconciliation(_request({}))
+
+    assert status_code == 200
+    assert result["missing"] == 0 and result["queued"] == 0
+    assert provider_calls == []
+    assert _task_events(sdk_fakes) == []
+    assert firestore_fake.documents[f"transcript_index/tldv-{meeting_id}"] == original
+
+
+@pytest.mark.parametrize("status", ["queued", "imported"])
+def test_canonical_dispatch_pending_doc_is_requeued_without_recovery_reset(
+    reconciliation, firestore_fake, monkeypatch, sdk_fakes, status
+):
+    meeting_id = f"canonical-dispatch-{status}"
+    doc_id = f"doc-{meeting_id}"
+    original = {
+        "doc_id": doc_id, "meeting_id": meeting_id, "provider": "tldv",
+        "status": status, "status_changed_at": datetime(2026, 10, 9, 11, 55, tzinfo=timezone.utc),
+        "source_file": "Synthetic saved Doc",
+    }
+    _seed(firestore_fake, doc_id, original)
+    monkeypatch.setenv("TLDV_IMPORT_SERVICE_URL", "https://import.synthetic.test")
+    monkeypatch.setattr(reconciliation, "tldv_get", lambda _path: pytest.fail("saved Doc must not recover as a placeholder"))
+    monkeypatch.setattr(reconciliation, "get_meetings", lambda _since: [{"id": meeting_id}])
+
+    result, status_code = reconciliation.tldv_reconciliation(_request({"full_scan": True}))
+
+    assert status_code == 200 and result["queued"] == 1
+    assert len(_task_events(sdk_fakes)) == 1
+    assert firestore_fake.documents[f"transcript_index/{doc_id}"] == original

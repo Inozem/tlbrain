@@ -139,7 +139,11 @@ def _detect_target_folder_id(
             )
             return folder_name, confidence
         except Exception as exc:
-            logger.warning("Stage %s folder detection failed: %s", "2" if stage == "title" else "3", exc)
+            logger.warning(
+                "Stage %s folder detection failed (%s)",
+                "2" if stage == "title" else "3",
+                type(exc).__name__,
+            )
             raise
 
     normalized_utterances = tuple(

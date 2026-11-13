@@ -7,6 +7,8 @@ import requests
 from google.cloud import firestore
 
 from core.integrations.firestore.transcripts import (
+    is_tldv_canonical_record,
+    is_tldv_unknown_write_outcome,
     is_tldv_transcript_record,
     mark_download_error,
     stream_index_records,
@@ -49,13 +51,17 @@ def _recover_stale_import_docs(
         if not is_tldv_transcript_record(data):
             continue
 
+        if is_tldv_canonical_record(doc.id, data):
+            continue
+
         meeting_id = data.get("meeting_id")
 
         status = data.get("status")
         error_stage = data.get("error_stage")
         eligible = (
             status in ("queued", "downloading")
-            or (status == "error" and error_stage in (None, "import"))
+            or (status == "error" and error_stage in (None, "import")
+                and not is_tldv_unknown_write_outcome(data))
         )
         if not eligible:
             continue
@@ -154,8 +160,14 @@ def tldv_reconciliation(request):
         if not is_tldv_transcript_record(data):
             continue
         mid = data.get("meeting_id")
-        if data.get("status") == "error" and data.get("error_stage") == "import":
-            continue  # allow reconciliation to retry import errors
+        status = data.get("status")
+        canonical_doc = is_tldv_canonical_record(doc.id, data)
+        if canonical_doc and status in ("imported", "queued"):
+            continue
+        if status == "error" and data.get("error_stage") == "import":
+            if is_tldv_unknown_write_outcome(data):
+                existing.add(mid)
+            continue
         if data.get("status") == "queued":
             changed_at = data.get("status_changed_at")
             if not changed_at or changed_at < stale_cutoff:

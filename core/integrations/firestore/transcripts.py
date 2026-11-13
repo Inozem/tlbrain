@@ -12,6 +12,8 @@ from core.integrations.firestore.client import COLLECTION_NAME, get_client
 logger = logging.getLogger(__name__)
 
 STALE_SYNCING_MINUTES = 15
+STALE_TLDV_DOWNLOADING_HOURS = 1
+TLDV_UNKNOWN_WRITE_ERROR_PREFIX = "Google Docs write outcome unknown"
 _NO_RETRY_STAGES = {"import", "invalid_format"}
 
 
@@ -23,6 +25,39 @@ def is_tldv_transcript_record(data: dict[str, Any] | None) -> bool:
     if not isinstance(meeting_id, str) or not meeting_id.strip():
         return False
     return "provider" not in data or data.get("provider") == "tldv"
+
+
+def is_tldv_unknown_write_outcome(data: dict[str, Any] | None) -> bool:
+    """Return whether an import error requires Doc reconciliation before retry."""
+    return (
+        isinstance(data, dict)
+        and data.get("status") == "error"
+        and data.get("error_stage") == "import"
+        and str(data.get("error") or "").startswith(TLDV_UNKNOWN_WRITE_ERROR_PREFIX)
+    )
+
+
+def is_tldv_canonical_record(doc_id: str, data: dict[str, Any] | None) -> bool:
+    """Recognize a TL;DV record that proves its index key is its saved Doc ID."""
+    return is_tldv_transcript_record(data) and data.get("doc_id") == doc_id
+
+
+def is_tldv_placeholder_record(doc_id: str, data: dict[str, Any] | None) -> bool:
+    """Identify deterministic import placeholders without matching foreign records."""
+    if not is_tldv_transcript_record(data):
+        return False
+    meeting_id = data.get("meeting_id")
+    if doc_id != f"tldv-{meeting_id}":
+        return False
+    if data.get("doc_id") == doc_id:
+        return False
+    if data.get("status") in ("queued", "downloading"):
+        return True
+    return (
+        data.get("status") == "error"
+        and data.get("error_stage") in (None, "import")
+        and data.get("doc_id") != doc_id
+    )
 
 
 def get_transcript_record(doc_id: str, db: firestore.Client | None = None) -> dict | None:
@@ -51,6 +86,36 @@ def save_index(
     client = db if db is not None else get_client()
     client.collection(COLLECTION_NAME).document(doc_id).set(payload)
     logger.info("Index saved: %s", doc_id)
+
+
+def save_tldv_index(
+    doc_id: str,
+    meeting_id: str,
+    payload: dict[str, Any],
+    db: firestore.Client | None = None,
+) -> bool:
+    """Publish a canonical TL;DV Doc only over its own matching placeholder."""
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(doc_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        snapshot = ref.get(transaction=transaction)
+        if snapshot.exists:
+            data = snapshot.to_dict() or {}
+            if (
+                not is_tldv_transcript_record(data)
+                or data.get("meeting_id") != meeting_id
+                or not is_tldv_placeholder_record(doc_id, data)
+            ):
+                return False
+        transaction.set(ref, payload)
+        return True
+
+    result = _txn(client.transaction())
+    if result:
+        logger.info("Saved TL;DV index: %s", doc_id)
+    return result
 
 
 def get_index_records_by_meeting_id(meeting_id: str, db: firestore.Client | None = None):
@@ -117,7 +182,7 @@ def list_transcripts(
         stream = query.stream()
     for doc in stream:
         data = doc.to_dict() or {}
-        if data.get("status") in ("queued", "downloading"):
+        if data.get("status") in ("queued", "downloading") or is_tldv_placeholder_record(doc.id, data):
             continue
         if folder_ids is not None and data.get("parent_id") not in folder_ids:
             continue
@@ -312,7 +377,10 @@ def write_queued(meeting_id: str, db: firestore.Client | None = None) -> bool:
             data = snapshot.to_dict() or {}
             if not is_tldv_transcript_record(data):
                 return False
-            if data.get("status") == "error" and data.get("error_stage") == "import":
+            if data.get("doc_id") == ref.id:
+                return False
+            if (data.get("status") == "error" and data.get("error_stage") == "import"
+                    and not is_tldv_unknown_write_outcome(data)):
                 transaction.update(ref, {
                     "status": "queued",
                     "error": None,
@@ -348,23 +416,128 @@ def mark_downloading(meeting_id: str, db: firestore.Client | None = None) -> Non
     logger.info("Marked downloading: %s", meeting_id)
 
 
+def claim_tldv_import(meeting_id: str, db: firestore.Client | None = None) -> bool:
+    """Atomically claim an available TL;DV placeholder for import or recovery."""
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=STALE_TLDV_DOWNLOADING_HOURS)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        snapshot = ref.get(transaction=transaction)
+        if not snapshot.exists:
+            transaction.set(ref, {
+                "meeting_id": meeting_id,
+                "provider": "tldv",
+                "status": "downloading",
+                "status_changed_at": firestore.SERVER_TIMESTAMP,
+            })
+            return True
+        data = snapshot.to_dict() or {}
+        if not is_tldv_transcript_record(data):
+            return True
+        if not is_tldv_placeholder_record(ref.id, data):
+            return False
+        status = data.get("status")
+        available = status == "queued" or (
+            status == "error" and data.get("error_stage") in (None, "import")
+            and not is_tldv_unknown_write_outcome(data)
+        )
+        if status == "downloading":
+            changed_at = data.get("status_changed_at")
+            available = changed_at is None or changed_at <= cutoff
+        if not available:
+            return False
+        transaction.update(ref, {
+            "status": "downloading",
+            "error": None,
+            "error_stage": None,
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
+        })
+        return True
+
+    claimed = _txn(client.transaction())
+    if claimed:
+        logger.info("Claimed TL;DV import: %s", meeting_id)
+    return claimed
+
+
 def mark_download_error(
     meeting_id: str,
     error: str,
     db: firestore.Client | None = None,
-) -> None:
+) -> bool:
     client = db if db is not None else get_client()
     ref = client.collection(COLLECTION_NAME).document(f"tldv-{meeting_id}")
-    snapshot = ref.get()
-    if snapshot.exists and not is_tldv_transcript_record(snapshot.to_dict() or {}):
-        return
-    ref.update({
-        "status": "error",
-        "error": error,
-        "error_stage": "import",
-        "status_changed_at": firestore.SERVER_TIMESTAMP,
-    })
-    logger.info("Marked download error: %s — %s", meeting_id, error)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        snapshot = ref.get(transaction=transaction)
+        if snapshot.exists:
+            data = snapshot.to_dict() or {}
+            if (
+                not is_tldv_transcript_record(data)
+                or not is_tldv_placeholder_record(ref.id, data)
+                or is_tldv_unknown_write_outcome(data)
+            ):
+                return False
+            transaction.update(ref, {
+                "status": "error", "error": error, "error_stage": "import",
+                "status_changed_at": firestore.SERVER_TIMESTAMP,
+            })
+        else:
+            transaction.set(ref, {
+                "meeting_id": meeting_id, "provider": "tldv", "status": "error",
+                "error": error, "error_stage": "import",
+                "status_changed_at": firestore.SERVER_TIMESTAMP,
+            })
+        return True
+
+    result = _txn(client.transaction())
+    if result:
+        logger.info("Marked download error: %s — %s", meeting_id, error)
+    return result
+
+
+def settle_tldv_dispatch(
+    doc_id: str,
+    meeting_id: str,
+    *,
+    error: str | None = None,
+    db: firestore.Client | None = None,
+) -> bool:
+    """Settle dispatch only while the canonical Doc remains pre-indexing."""
+    client = db if db is not None else get_client()
+    ref = client.collection(COLLECTION_NAME).document(doc_id)
+
+    @firestore.transactional
+    def _txn(transaction: firestore.Transaction) -> bool:
+        snapshot = ref.get(transaction=transaction)
+        data = snapshot.to_dict() if snapshot.exists else {}
+        if (
+            not is_tldv_transcript_record(data)
+            or data.get("meeting_id") != meeting_id
+            or data.get("doc_id") not in (None, doc_id)
+            or is_tldv_placeholder_record(doc_id, data)
+        ):
+            return False
+        status = data.get("status")
+        dispatch_error = status == "error" and data.get("error_stage") == "import"
+        if status not in ("imported", "queued") and not dispatch_error:
+            return False
+        fields = {
+            "status": "error" if error is not None else "imported",
+            "error": error,
+            "error_stage": "import" if error is not None else None,
+            "status_changed_at": firestore.SERVER_TIMESTAMP,
+        }
+        transaction.update(ref, fields)
+        return True
+
+    settled = _txn(client.transaction())
+    if settled and error is not None:
+        logger.info("Marked TL;DV dispatch error: %s", doc_id)
+    return settled
 
 
 def delete_queued_placeholder(meeting_id: str, db: firestore.Client | None = None) -> None:
@@ -377,8 +550,8 @@ def delete_queued_placeholder(meeting_id: str, db: firestore.Client | None = Non
     if not is_tldv_transcript_record(data):
         return
     is_placeholder = (
-        data.get("status") in ("queued", "downloading")
-        or (data.get("status") == "error" and data.get("error_stage") == "import")
+        is_tldv_placeholder_record(ref.id, data)
+        and not is_tldv_unknown_write_outcome(data)
     )
     if not is_placeholder:
         return

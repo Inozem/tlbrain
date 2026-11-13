@@ -240,21 +240,120 @@ def test_existing_tool_argument_defaults_and_conversions(monkeypatch):
     assert posted[-1][1]["json"] == {"limit": "4", "full_scan": True, "since": "2025-01-02"}
 
 
-def test_tldv_import_is_unavailable_without_key_even_with_stale_url(monkeypatch):
-    monkeypatch.setenv("TLDV_API_KEY", " \t ")
-    monkeypatch.setenv("TLDV_RECONCILIATION_URL", "http://stale-reconciliation.test/run")
+@pytest.mark.parametrize("api_key", [None, "", " \t ", "synthetic-tldv-key"])
+def test_tldv_import_posts_to_connector_without_requiring_mcp_key(monkeypatch, api_key):
+    if api_key is None:
+        monkeypatch.delenv("TLDV_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("TLDV_API_KEY", api_key)
+    monkeypatch.setenv("TLDV_RECONCILIATION_URL", "http://reconciliation.test/run")
+    posted = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"queued": 2, "remaining": 3}
+
+    def post(*args, **kwargs):
+        posted.append((args, kwargs))
+        return Response()
+
+    monkeypatch.setattr(httpx, "post", post)
+    response = _request("post", "/mcp", json=_rpc("tools/call", "available-tldv", {
+        "name": "import_all_transcripts", "arguments": {"limit": 1, "since": "2025-01-02"},
+    }))
+
+    assert response.status_code == 200
+    assert response.json()["jsonrpc"] == "2.0"
+    assert response.json()["id"] == "available-tldv"
+    payload = json.loads(response.json()["result"]["content"][0]["text"])
+    assert payload["status"] == "ok"
+    assert payload["queued"] == 2
+    assert payload["suggestion"] == (
+        "Import started for 2 transcript(s). "
+        "While they are downloading, check two things: "
+        "1. Call list_recent_transcripts(folder_path=[\"_unassigned\"]) — transcripts the system could not assign, move them manually via move_transcript. "
+        "2. Call list_folders to verify transcripts that were assigned automatically went to the correct folder. "
+        "The more accurately transcripts are assigned, the better the system will detect folders for future imports."
+    )
+    assert posted == [(('http://reconciliation.test/run',), {
+        "json": {"limit": 1, "full_scan": True, "since": "2025-01-02"}, "timeout": 300,
+    })]
+
+
+@pytest.mark.parametrize(
+    ("api_key", "reconciliation_url"),
+    [
+        (None, None),
+        (None, ""),
+        ("synthetic-tldv-key", None),
+        ("synthetic-tldv-key", ""),
+    ],
+)
+def test_tldv_import_requires_reconciliation_url_without_posting(monkeypatch, api_key, reconciliation_url):
+    if api_key is None:
+        monkeypatch.delenv("TLDV_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("TLDV_API_KEY", api_key)
+    if reconciliation_url is None:
+        monkeypatch.delenv("TLDV_RECONCILIATION_URL", raising=False)
+    else:
+        monkeypatch.setenv("TLDV_RECONCILIATION_URL", reconciliation_url)
     monkeypatch.setattr(httpx, "post", lambda *_args, **_kwargs: pytest.fail("must not post"))
 
-    response = _request("post", "/mcp", json=_rpc("tools/call", "disabled-tldv", {
+    response = _request("post", "/mcp", json=_rpc("tools/call", "missing-url", {
         "name": "import_all_transcripts", "arguments": {},
     }))
+    assert response.status_code == 200
     assert response.json() == {
-        "jsonrpc": "2.0", "id": "disabled-tldv",
+        "jsonrpc": "2.0", "id": "missing-url",
+        "error": {"code": -32603, "message": "TLDV_RECONCILIATION_URL is not configured"},
+    }
+
+
+@pytest.mark.parametrize("failure", ["http", "transport"])
+def test_tldv_downstream_failures_remain_errors_without_mcp_key(monkeypatch, failure):
+    monkeypatch.delenv("TLDV_API_KEY", raising=False)
+    monkeypatch.setenv("TLDV_RECONCILIATION_URL", "http://reconciliation.test/run")
+    posted = []
+
+    class FailedResponse:
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError("synthetic downstream failure", request=None, response=None)
+
+    def post(*args, **kwargs):
+        posted.append((args, kwargs))
+        if failure == "transport":
+            raise httpx.ConnectError("synthetic transport failure")
+        return FailedResponse()
+
+    monkeypatch.setattr(httpx, "post", post)
+    response = _request("post", "/mcp", json=_rpc("tools/call", f"failure-{failure}", {
+        "name": "import_all_transcripts", "arguments": {"limit": 1},
+    }))
+    result = response.json()
+    assert response.status_code == 200
+    assert result["jsonrpc"] == "2.0"
+    assert result["id"] == f"failure-{failure}"
+    assert result == {
+        "jsonrpc": "2.0",
+        "id": f"failure-{failure}",
         "error": {
             "code": -32603,
-            "message": "TL;DV integration is unavailable because TLDV_API_KEY is not configured",
+            "message": "Failed to trigger sync",
+            "details": (
+                "synthetic downstream failure"
+                if failure == "http"
+                else "synthetic transport failure"
+            ),
         },
     }
+    assert len(posted) == 1
+    assert posted[0][0] == ("http://reconciliation.test/run",)
+    assert posted[0][1]["json"] == {"limit": 1, "full_scan": True}
+    assert posted[0][1]["timeout"] == 300
 
 
 def test_common_search_and_sync_remain_available_without_tldv_key(monkeypatch):

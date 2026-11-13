@@ -462,7 +462,7 @@ def test_tldv_placeholder_stage_fields_and_delete(firestore_fake):
     transcript_repository.delete_queued_placeholder("meeting-a")
     assert placeholder_path not in firestore_fake.documents
     relevant = _writes(firestore_fake, placeholder_path)
-    assert [event["operation"] for event in relevant] == ["commit", "update", "update", "commit", "delete"]
+    assert [event["operation"] for event in relevant] == ["commit", "update", "commit", "commit", "delete"]
 
 
 def test_tldv_placeholder_helpers_preserve_foreign_reserved_id(firestore_fake):
@@ -481,6 +481,149 @@ def test_tldv_placeholder_helpers_preserve_foreign_reserved_id(firestore_fake):
     transcript_repository.delete_queued_placeholder(meeting_id)
 
     assert firestore_fake.documents[path] == before
+
+
+def test_tldv_import_claim_is_atomic_and_recovers_only_available_placeholders(firestore_fake, monkeypatch):
+    now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(transcript_repository, "datetime", FrozenDateTime)
+    firestore_fake.set_clock(lambda: now)
+    db = _client(firestore_fake)
+    docs = db.collection(INDEX)
+    docs.document("tldv-fresh").set({
+        "meeting_id": "fresh", "provider": "tldv", "status": "downloading",
+        "status_changed_at": now - timedelta(minutes=59, seconds=59),
+    })
+    docs.document("tldv-stale").set({
+        "meeting_id": "stale", "provider": "tldv", "status": "downloading",
+        "status_changed_at": now - timedelta(hours=1),
+    })
+    docs.document("tldv-failed").set({
+        "meeting_id": "failed", "provider": "tldv", "status": "error",
+        "error": "safe failure", "error_stage": "import",
+    })
+    foreign = {"meeting_id": "foreign", "provider": "telegram", "status": "imported", "keep": True}
+    docs.document("tldv-foreign").set(foreign)
+    docs.document("tldv-canonical").set({
+        "meeting_id": "canonical", "provider": "tldv", "status": "imported", "doc_id": "tldv-canonical",
+    })
+
+    assert transcript_repository.claim_tldv_import("fresh", db) is False
+    assert transcript_repository.claim_tldv_import("stale", db) is True
+    assert transcript_repository.claim_tldv_import("failed", db) is True
+    assert transcript_repository.claim_tldv_import("foreign", db) is True
+    assert transcript_repository.claim_tldv_import("canonical", db) is False
+    assert docs.document("tldv-stale").get().to_dict()["status"] == "downloading"
+    assert docs.document("tldv-failed").get().to_dict()["error"] is None
+    assert docs.document("tldv-foreign").get().to_dict() == foreign
+    assert docs.document("tldv-canonical").get().to_dict()["status"] == "imported"
+    commits = [event for event in firestore_fake.trace() if event.get("operation") == "commit"]
+    assert [event["path"] for event in commits] == [f"{INDEX}/tldv-stale", f"{INDEX}/tldv-failed"]
+
+
+def test_unknown_tldv_write_placeholder_is_not_reset_or_listed_as_a_saved_doc(firestore_fake):
+    db = _client(firestore_fake)
+    docs = db.collection(INDEX)
+    docs.document("tldv-uncertain").set({
+        "meeting_id": "uncertain", "provider": "tldv", "status": "error",
+        "error_stage": "import", "error": "Google Docs write outcome unknown (RuntimeError).",
+        "parent_id": "folder-a", "source_file": "Synthetic title",
+    })
+    docs.document("tldv-canonical-error").set({
+        "doc_id": "tldv-canonical-error", "meeting_id": "canonical-error", "provider": "tldv",
+        "status": "error", "error_stage": "import", "parent_id": "folder-a",
+        "source_file": "Saved title", "modifiedTime": "synthetic-time",
+    })
+    foreign = {
+        "meeting_id": "foreign-error", "provider": "telegram", "status": "error",
+        "error_stage": "import", "parent_id": "folder-a", "source_file": "Foreign title",
+    }
+    docs.document("tldv-foreign-error").set(foreign)
+
+    assert transcript_repository.write_queued("uncertain", db) is False
+    assert transcript_repository.claim_tldv_import("uncertain", db) is False
+    transcript_repository.delete_queued_placeholder("uncertain", db)
+    visible = transcript_repository.list_transcripts(folder_ids=["folder-a"])
+    assert [item["doc_id"] for item in visible["transcripts"]] == [
+        "tldv-canonical-error", "tldv-foreign-error",
+    ]
+    assert transcript_repository.get_sync_status()["error"] == 3
+    assert firestore_fake.documents[f"{INDEX}/tldv-uncertain"]["error_stage"] == "import"
+    assert firestore_fake.documents[f"{INDEX}/tldv-foreign-error"] == foreign
+
+
+@pytest.mark.parametrize(
+    ("status", "error_stage"),
+    [("queued", None), ("downloading", None), ("error", "import")],
+)
+def test_reserved_id_canonical_proof_prevents_placeholder_mutations(firestore_fake, status, error_stage):
+    meeting_id = f"reserved-canonical-{status}"
+    doc_id = f"tldv-{meeting_id}"
+    record = {
+        "doc_id": doc_id, "meeting_id": meeting_id, "provider": "tldv",
+        "status": status, "parent_id": "folder-a", "source_file": "Saved title",
+    }
+    if error_stage:
+        record.update(error_stage=error_stage, error="saved canonical error")
+    db = _client(firestore_fake)
+    db.collection(INDEX).document(doc_id).set(record)
+
+    assert transcript_repository.is_tldv_placeholder_record(doc_id, record) is False
+    assert transcript_repository.claim_tldv_import(meeting_id, db) is False
+    assert transcript_repository.write_queued(meeting_id, db) is False
+    assert transcript_repository.mark_download_error(meeting_id, "attempted placeholder error", db) is False
+    transcript_repository.delete_queued_placeholder(meeting_id, db)
+    assert firestore_fake.documents[f"{INDEX}/{doc_id}"] == record
+
+
+def test_providerless_legacy_import_error_is_a_retryable_placeholder(firestore_fake):
+    meeting_id = "legacy-error-without-stage"
+    doc_id = f"tldv-{meeting_id}"
+    record = {"meeting_id": meeting_id, "status": "error", "error": "old import failure"}
+    db = _client(firestore_fake)
+    db.collection(INDEX).document(doc_id).set(record)
+
+    assert transcript_repository.is_tldv_placeholder_record(doc_id, record) is True
+    assert transcript_repository.claim_tldv_import(meeting_id, db) is True
+    assert firestore_fake.documents[f"{INDEX}/{doc_id}"]["status"] == "downloading"
+
+
+def test_dispatch_settlement_refuses_placeholder_record(firestore_fake):
+    meeting_id = "dispatch-placeholder"
+    doc_id = f"tldv-{meeting_id}"
+    record = {"meeting_id": meeting_id, "provider": "tldv", "status": "queued"}
+    db = _client(firestore_fake)
+    db.collection(INDEX).document(doc_id).set(record)
+
+    assert transcript_repository.settle_tldv_dispatch(doc_id, meeting_id, db=db) is False
+    assert firestore_fake.documents[f"{INDEX}/{doc_id}"] == record
+
+
+def test_competing_tldv_claims_have_one_winner_and_missing_placeholder_is_created(firestore_fake):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    db = _client(firestore_fake)
+    db.collection(INDEX).document("tldv-competing").set({
+        "meeting_id": "competing", "provider": "tldv", "status": "queued",
+    })
+    barrier = Barrier(8)
+
+    def claim():
+        barrier.wait(timeout=5)
+        return transcript_repository.claim_tldv_import("competing", db)
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        outcomes = list(workers.map(lambda _index: claim(), range(8)))
+
+    assert outcomes.count(True) == 1
+    assert transcript_repository.claim_tldv_import("direct-import", db) is True
+    assert firestore_fake.documents[f"{INDEX}/tldv-direct-import"]["status"] == "downloading"
 
 
 def test_sync_error_and_move_writers_preserve_or_clear_fields_explicitly(firestore_fake):
