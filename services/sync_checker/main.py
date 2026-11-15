@@ -9,6 +9,7 @@ from googleapiclient.errors import HttpError
 
 from core.config import get_root_folder_id
 from core.integrations.google_drive.changes import get_drive_changes, get_start_page_token
+from core.integrations.google_drive.folders import expand_subtree
 from core.integrations.google_drive.scanner import scan_root_folder
 from core.integrations.firestore.folders import (
     delete_folder,
@@ -307,6 +308,33 @@ def _full_scan(
     return queued
 
 
+def _folder_change_scope(changes: list[dict], db: firestore.Client, root_folder_id: str) -> set[str]:
+    """Monitor root descendants, including folders entering or leaving the tree."""
+    if not any(
+        change.get("removed") or change.get("file", {}).get("mimeType") == GOOGLE_FOLDER_MIME
+        for change in changes
+    ):
+        return set()
+
+    folders = get_all_folders(db)
+    previous_scope = set(expand_subtree(root_folder_id, folders))
+    # Overlay the whole batch so new descendants do not depend on event order.
+    for change in changes:
+        file_id = change.get("fileId")
+        if not file_id:
+            continue
+        file = change.get("file", {})
+        if change.get("removed") or file.get("trashed"):
+            folders.pop(file_id, None)
+        elif file.get("mimeType") == GOOGLE_FOLDER_MIME:
+            name, parents = file.get("name"), file.get("parents", [])
+            if name and parents:
+                folders[file_id] = {"name": name, "parent_id": parents[0]}
+
+    # Keep existing move-out/removal handling without admitting unrelated folders.
+    return previous_scope | set(expand_subtree(root_folder_id, folders))
+
+
 def _process_changes(
     changes: list[dict],
     sync_url: str,
@@ -315,6 +343,7 @@ def _process_changes(
     root_folder_id: str,
 ) -> int:
     queued = 0
+    folder_scope = _folder_change_scope(changes, db, root_folder_id)
 
     for change in changes:
         file_id = change.get("fileId")
@@ -324,6 +353,8 @@ def _process_changes(
         if change.get("removed"):
             # No mimeType available — check folders/ to distinguish folder vs doc
             if get_folder_by_id(file_id):
+                if file_id not in folder_scope:
+                    continue
                 orphan_folder_children(file_id)
                 orphan_transcript_children(file_id)
                 delete_folder(file_id)
@@ -335,6 +366,8 @@ def _process_changes(
         file = change.get("file", {})
         if file.get("trashed"):
             if file.get("mimeType") == GOOGLE_FOLDER_MIME:
+                if file_id not in folder_scope:
+                    continue
                 orphan_folder_children(file_id)
                 orphan_transcript_children(file_id)
                 delete_folder(file_id)
@@ -346,6 +379,8 @@ def _process_changes(
         mime_type = file.get("mimeType")
 
         if mime_type == GOOGLE_FOLDER_MIME:
+            if file_id not in folder_scope:
+                continue
             # Folder rename or move — update folders/ only, no cascade to docs
             name = file.get("name")
             parents = file.get("parents", [])
