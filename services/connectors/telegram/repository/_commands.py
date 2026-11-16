@@ -23,6 +23,9 @@ from core.integrations.firestore.operation_queue import (
 )
 from services.connectors.telegram.models import TelegramDraftState, build_context_id
 from services.connectors.telegram.repository._common import (
+    ROUTING_PROTOCOL,
+    ROUTING_SCHEMA_VERSION,
+    ROUTING_KINDS,
     NOTIFICATIONS,
     SESSIONS,
     TelegramIntakeResult,
@@ -32,6 +35,9 @@ from services.connectors.telegram.repository._common import (
     _receipt_result,
     _aware,
     _context_defaults,
+    _routing_checkpoint_path,
+    _read_routing_checkpoint_value,
+    _routing_reference_data,
 )
 
 @dataclass(slots=True)
@@ -92,6 +98,64 @@ class _QuestionDeliveryTiming:
     delivered_at: datetime
     observed_at: datetime
     binding_kind: str
+
+
+def _v2_route_control_data(route: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and project only the context-v2 route's metadata fields."""
+    fields = {
+        "routing_protocol", "schema_version", "status", "kind", "actor_id",
+        "context_conversation_id", "context_ref", "context_digest", "decision_ref",
+        "decision_digest", "intent_ref", "intent_digest", "result_category",
+    }
+    if set(route) - fields:
+        raise ValueError("v2 route contains unsupported fields")
+    statuses = {"ok", "success", "invalid_route", "uncertain", "error",
+                "not_found", "unconfirmed"}
+    kinds = {"pure_switch", "search", "substantive", "save", "retry", "annotation"}
+    categories = {
+        "resolved", "clarification_required", "not_found", "inaccessible",
+        "invalid_target", "model_error", "action_error", "unknown_outcome",
+    }
+    status, kind = route.get("status"), route.get("kind")
+    actor_id, conversation_id = route.get("actor_id"), route.get("context_conversation_id")
+    category = route.get("result_category")
+    if (route.get("routing_protocol") != ROUTING_PROTOCOL
+            or type(route.get("schema_version")) is not int
+            or route["schema_version"] != ROUTING_SCHEMA_VERSION
+            or not isinstance(status, str) or status not in statuses
+            or (kind is not None and (not isinstance(kind, str) or kind not in kinds))
+            or type(actor_id) is not int or actor_id <= 0
+            or not isinstance(conversation_id, str) or not conversation_id
+            or not isinstance(category, str) or category not in categories):
+        raise ValueError("v2 route metadata is invalid")
+    safe: dict[str, Any] = {
+        "routing_protocol": ROUTING_PROTOCOL,
+        "schema_version": ROUTING_SCHEMA_VERSION,
+        "status": status,
+        "actor_id": actor_id,
+        "context_conversation_id": conversation_id,
+        "result_category": category,
+    }
+    if kind is not None:
+        safe["kind"] = kind
+    successful = status in {"ok", "success"}
+    for artifact_kind in ("context", "decision", "intent"):
+        ref_field, digest_field = f"{artifact_kind}_ref", f"{artifact_kind}_digest"
+        ref_value, digest = route.get(ref_field), route.get(digest_field)
+        if (ref_value is None) != (digest is None):
+            raise ValueError(f"{artifact_kind} checkpoint reference/digest pair is incomplete")
+        if ref_value is None:
+            if successful and artifact_kind in {"context", "decision"}:
+                raise ValueError(f"successful v2 route requires {artifact_kind} checkpoint")
+            continue
+        ref_data = _routing_reference_data(ref_value)
+        if (ref_data["kind"] != artifact_kind or ref_data["actor_id"] != actor_id
+                or ref_data["conversation_id"] != conversation_id
+                or not isinstance(digest, str) or digest != ref_data["digest"]):
+            raise ValueError(f"{artifact_kind} checkpoint binding is invalid")
+        safe[ref_field] = ref_data
+        safe[digest_field] = digest
+    return safe
 
 
 def _prepare_command_identity(
@@ -745,6 +809,17 @@ class _TelegramCommandMixin:
     @staticmethod
     def _route_control_data(route: Mapping[str, Any]) -> dict[str, Any]:
         """Project route state to metadata safe for the operation ledger."""
+        protocol = route.get("routing_protocol")
+        if protocol is not None and protocol != ROUTING_PROTOCOL:
+            raise ValueError("route protocol is unknown")
+        if protocol is None and any(route.get(key) is not None for key in (
+            "schema_version", "actor_id", "context_conversation_id", "context_ref",
+            "context_digest", "decision_ref", "decision_digest", "intent_ref",
+            "intent_digest", "result_category",
+        )):
+            raise ValueError("v2 route metadata requires its protocol tag")
+        if protocol == ROUTING_PROTOCOL:
+            return _v2_route_control_data(route)
         allowed_status = {
             "ok", "success", "invalid_route", "uncertain", "error",
             "not_found", "unconfirmed",
@@ -959,6 +1034,8 @@ class _TelegramCommandMixin:
         fence = _integer(fence, "fence", minimum=1)
         now = _aware(now, "now")
         safe_route = self._route_control_data(route)
+        if safe_route.get("routing_protocol") == ROUTING_PROTOCOL:
+            self._validate_v2_route_checkpoints(safe_route, context_id, operation_id)
         context_ref = self.client.collection(SESSIONS).document(context_id)
         operation_ref = context_ref.collection("operations").document(operation_id)
 
@@ -991,11 +1068,33 @@ class _TelegramCommandMixin:
                         )):
                     return False
                 return dict(existing_route) == safe_route
+            if (safe_route.get("routing_protocol") == ROUTING_PROTOCOL
+                    and (type(command.get("user_id")) is not int
+                         or command["user_id"] <= 0
+                         or command.get("user_id") != safe_route.get("actor_id"))):
+                raise ValueError("v2 route actor does not own accepted command")
             existing_route = operation.get("route_control")
-            if isinstance(existing_route, Mapping) and existing_route.get("status") in {
-                "ok", "success",
-            }:
-                return dict(existing_route) == safe_route
+            if isinstance(existing_route, Mapping):
+                existing_protocol = existing_route.get("routing_protocol")
+                if existing_protocol not in (None, ROUTING_PROTOCOL):
+                    raise ValueError("pinned route protocol is unknown")
+                if (existing_protocol == ROUTING_PROTOCOL
+                        and safe_route.get("routing_protocol") != ROUTING_PROTOCOL):
+                    raise ValueError("v2 route cannot be downgraded")
+                if existing_route.get("status") in {"ok", "success"}:
+                    return dict(existing_route) == safe_route
+            if safe_route.get("routing_protocol") == ROUTING_PROTOCOL:
+                for kind in ROUTING_KINDS:
+                    reference = safe_route.get(f"{kind}_ref")
+                    if reference is None:
+                        continue
+                    checkpoint = _document_ref(self.client, reference["ref"])
+                    checkpoint_snapshot = checkpoint.get(transaction=transaction)
+                    if not checkpoint_snapshot.exists:
+                        raise ValueError("v2 route checkpoint is not published")
+                    row = checkpoint_snapshot.to_dict() or {}
+                    if any(row.get(key) != reference.get(key) for key in reference):
+                        raise ValueError("v2 route checkpoint publication changed")
             transaction.update(operation_ref, {
                 "route_control": safe_route,
                 "route_control_recorded_at": now,
@@ -1003,6 +1102,23 @@ class _TelegramCommandMixin:
             return True
 
         return _txn(self.client.transaction(max_attempts=5))
+
+    def _validate_v2_route_checkpoints(
+        self, route: Mapping[str, Any], context_id: str, operation_id: str,
+    ) -> None:
+        """Verify each published reference before a route can pin it."""
+        for kind in ROUTING_KINDS:
+            reference = route.get(f"{kind}_ref")
+            if reference is None:
+                continue
+            ref = _routing_reference_data(reference)
+            if (ref["context_id"] != context_id or ref["operation_id"] != operation_id
+                    or ref["kind"] != kind or ref["actor_id"] != route.get("actor_id")
+                    or ref["conversation_id"] != route.get("context_conversation_id")
+                    or ref["digest"] != route.get(f"{kind}_digest")
+                    or ref["ref"] != _routing_checkpoint_path(context_id, operation_id, kind)):
+                raise ValueError("v2 route checkpoint scope is invalid")
+            _read_routing_checkpoint_value(self.client, ref)
 
     def get_route_control(self, context_id: str, operation_id: str) -> dict[str, Any] | None:
         """Read the allowlisted pinned route for safe operation replay."""
@@ -1013,7 +1129,29 @@ class _TelegramCommandMixin:
         if not snapshot.exists:
             return None
         value = (snapshot.to_dict() or {}).get("route_control")
-        return dict(value) if isinstance(value, Mapping) else None
+        if not isinstance(value, Mapping):
+            return None
+        result = dict(value)
+        protocol = result.get("routing_protocol")
+        if protocol is not None and protocol != ROUTING_PROTOCOL:
+            raise ValueError("pinned route protocol is unknown")
+        if protocol == ROUTING_PROTOCOL:
+            validated = _v2_route_control_data(result)
+            if validated != result:
+                raise ValueError("stored v2 route metadata is malformed")
+            operation = snapshot.to_dict() or {}
+            if (operation.get("operation_id") != operation_id
+                    or operation.get("context_id") not in (None, context_id)):
+                raise ValueError("stored v2 route operation binding is invalid")
+            _, command = self._command_for_operation(
+                None, context_id=context_id, operation_id=operation_id, operation=operation,
+            )
+            if (command is None or type(command.get("user_id")) is not int
+                    or command["user_id"] <= 0
+                    or command["user_id"] != result.get("actor_id")):
+                raise ValueError("stored v2 route actor binding is invalid")
+            self._validate_v2_route_checkpoints(result, context_id, operation_id)
+        return result
 
     def get_ingress_binding(self, context_id: str, operation_id: str) -> dict[str, Any] | None:
         """Read this operation's server-owned provisional forwarding association."""

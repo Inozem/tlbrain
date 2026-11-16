@@ -14,8 +14,20 @@ from google.cloud import firestore
 from core.integrations.firestore.operation_queue import validate_context_queue_lease
 from core.integrations.firestore.input_parts import MAX_PART_BYTES, read_input_parts, write_input_parts
 from services.connectors.telegram.repository import SESSIONS
+from services.connectors.telegram.repository._common import (
+    ROUTING_INLINE_CHECKPOINT_BYTES,
+    ROUTING_PROTOCOL,
+    ROUTING_SCHEMA_VERSION,
+    ROUTING_KINDS,
+    _document_ref,
+    _identifier,
+    _routing_checkpoint_path,
+    _read_routing_checkpoint_value,
+    _routing_json_bytes,
+    _routing_reference_data,
+)
 
-_INLINE_CHECKPOINT_VALUE_BYTES = 4 * 1024
+_INLINE_CHECKPOINT_VALUE_BYTES = ROUTING_INLINE_CHECKPOINT_BYTES
 
 
 def _response_rounds(value: Any) -> list[Any]:
@@ -169,6 +181,194 @@ class FirestoreAgentLedger:
                 raise ValueError("agent payload parts do not verify")
             return self._json_value(payload)
         return dict(stored)
+
+    def _routing_command(self, transaction: Any = None) -> dict[str, Any]:
+        """Resolve this operation's accepted command, including after candidate cleanup."""
+        operation_ref = (self.client.collection(SESSIONS).document(self.context_id)
+                         .collection("operations").document(self.operation_id))
+        operation_snapshot = operation_ref.get(transaction=transaction)
+        operation = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
+        input_ref = operation.get("input_ref")
+        parts = input_ref.split("/") if isinstance(input_ref, str) else []
+        if (operation.get("context_id") not in (None, self.context_id)
+                or operation.get("operation_id") != self.operation_id
+                or len(parts) != 4
+                or parts[:3] != [SESSIONS, self.context_id, "commands"]):
+            raise PermissionError("routing checkpoint has no accepted command")
+        try:
+            _identifier(parts[3], "command_id")
+        except ValueError:
+            raise PermissionError("routing checkpoint command reference is invalid") from None
+        command_snapshot = _document_ref(self.client, input_ref).get(transaction=transaction)
+        command = command_snapshot.to_dict() or {} if command_snapshot.exists else {}
+        if (not command_snapshot.exists or command.get("context_id") != self.context_id
+                or command.get("operation_id") != self.operation_id
+                or type(command.get("user_id")) is not int or command["user_id"] <= 0):
+            raise PermissionError("routing checkpoint command binding is invalid")
+        return command
+
+    def _check_routing_sibling_scope(
+        self, transaction: Any, *, actor_id: int, conversation_id: str,
+    ) -> dict[str, Any]:
+        """Read all three canonical headers and ensure one operation scope."""
+        references = {}
+        for kind in sorted(ROUTING_KINDS):
+            checkpoint_ref = _document_ref(
+                self.client, _routing_checkpoint_path(self.context_id, self.operation_id, kind),
+            )
+            snapshot = checkpoint_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                references[kind] = None
+                continue
+            row = snapshot.to_dict() or {}
+            if set(row) != {
+                "routing_protocol", "schema_version", "kind", "context_id", "operation_id",
+                "actor_id", "conversation_id", "ref", "digest", "byte_length", "payload",
+            }:
+                raise ValueError("routing checkpoint sibling header is malformed")
+            header = _routing_reference_data({key: row.get(key) for key in (
+                "routing_protocol", "schema_version", "kind", "context_id",
+                "operation_id", "actor_id", "conversation_id", "ref", "digest",
+                "byte_length",
+            )})
+            if (header["kind"] != kind or header["context_id"] != self.context_id
+                    or header["operation_id"] != self.operation_id
+                    or header["actor_id"] != actor_id
+                    or header["conversation_id"] != conversation_id):
+                raise ValueError("routing checkpoint actor/conversation scope changed")
+            references[kind] = header
+        return references
+
+    def save_routing_checkpoint(
+        self, kind: str, *, actor_id: int, conversation_id: str, value: Any,
+    ) -> dict[str, Any]:
+        """Publish one immutable, operation-owned context-v2 routing artifact."""
+        if not isinstance(kind, str) or kind not in ROUTING_KINDS:
+            raise ValueError("routing checkpoint kind is invalid")
+        if type(actor_id) is not int or actor_id <= 0:
+            raise ValueError("routing checkpoint actor is invalid")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ValueError("routing checkpoint conversation is invalid")
+        self._assert_live()
+        value_copy = deepcopy(value)
+        envelope = {
+            "routing_protocol": ROUTING_PROTOCOL,
+            "schema_version": ROUTING_SCHEMA_VERSION,
+            "kind": kind,
+            "context_id": self.context_id,
+            "operation_id": self.operation_id,
+            "actor_id": actor_id,
+            "conversation_id": conversation_id,
+            "value": value_copy,
+        }
+        payload = _routing_json_bytes(envelope)
+        digest = hashlib.sha256(payload).hexdigest()
+        byte_length = len(payload)
+        reference = {
+            "routing_protocol": ROUTING_PROTOCOL,
+            "schema_version": ROUTING_SCHEMA_VERSION,
+            "kind": kind,
+            "context_id": self.context_id,
+            "operation_id": self.operation_id,
+            "actor_id": actor_id,
+            "conversation_id": conversation_id,
+            "ref": _routing_checkpoint_path(self.context_id, self.operation_id, kind),
+            "digest": digest,
+            "byte_length": byte_length,
+        }
+        checkpoint_ref = _document_ref(self.client, reference["ref"])
+
+        # Fast retry path: validate lease and command, then preserve the original row.
+        @firestore.transactional
+        def find_existing(transaction: Any) -> dict[str, Any] | None:
+            self._assert_current(transaction)
+            command = self._routing_command(transaction)
+            if command.get("user_id") != actor_id:
+                raise PermissionError("routing checkpoint actor does not own command")
+            self._check_routing_sibling_scope(
+                transaction, actor_id=actor_id, conversation_id=conversation_id,
+            )
+            snapshot = checkpoint_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return None
+            row = snapshot.to_dict() or {}
+            if set(row) != set(reference) | {"payload"}:
+                raise ValueError("routing checkpoint record shape is invalid")
+            stored_ref = _routing_reference_data({key: row.get(key) for key in reference})
+            if stored_ref != reference:
+                raise ValueError("routing checkpoint is immutable")
+            return reference
+
+        existing = find_existing(self.client.transaction(max_attempts=5))
+        if existing is not None:
+            _read_routing_checkpoint_value(self.client, existing)
+            return existing
+
+        kind_key = "routing-" + kind
+        stored_payload = self._store_payload(
+            kind_key, envelope, write_assertion=self._assert_current,
+        )
+        # Recheck fence, accepted command and canonical row after parts are ready.
+        @firestore.transactional
+        def publish(transaction: Any) -> dict[str, Any]:
+            self._assert_current(transaction)
+            command = self._routing_command(transaction)
+            if command.get("user_id") != actor_id:
+                raise PermissionError("routing checkpoint actor does not own command")
+            self._check_routing_sibling_scope(
+                transaction, actor_id=actor_id, conversation_id=conversation_id,
+            )
+            snapshot = checkpoint_ref.get(transaction=transaction)
+            if snapshot.exists:
+                row = snapshot.to_dict() or {}
+                if set(row) != set(reference) | {"payload"}:
+                    raise ValueError("routing checkpoint is immutable")
+                stored_ref = _routing_reference_data({key: row.get(key) for key in reference})
+                if stored_ref != reference:
+                    raise ValueError("routing checkpoint is immutable")
+                return reference
+            transaction.set(checkpoint_ref, {**reference, "payload": stored_payload})
+            return reference
+
+        published = publish(self.client.transaction(max_attempts=5))
+        _read_routing_checkpoint_value(self.client, published)
+        return published
+
+    def load_routing_checkpoint(
+        self, kind: str, *, actor_id: int, conversation_id: str,
+        reference: Any = None,
+    ) -> dict[str, Any] | None:
+        """Read and verify an operation checkpoint without requiring a live lease."""
+        if not isinstance(kind, str) or kind not in ROUTING_KINDS:
+            raise ValueError("routing checkpoint kind is invalid")
+        if type(actor_id) is not int or actor_id <= 0:
+            raise ValueError("routing checkpoint actor is invalid")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ValueError("routing checkpoint conversation is invalid")
+        command = self._routing_command()
+        if command.get("user_id") != actor_id:
+            raise ValueError("routing checkpoint actor does not own command")
+        self._check_routing_sibling_scope(
+            None, actor_id=actor_id, conversation_id=conversation_id,
+        )
+        if reference is None:
+            path = _routing_checkpoint_path(self.context_id, self.operation_id, kind)
+            snapshot = _document_ref(self.client, path).get()
+            if not snapshot.exists:
+                return None
+            row = snapshot.to_dict() or {}
+            reference = {key: row.get(key) for key in (
+                "routing_protocol", "schema_version", "kind", "context_id", "operation_id",
+                "actor_id", "conversation_id", "ref", "digest", "byte_length",
+            )}
+        ref = _routing_reference_data(reference)
+        if (ref["context_id"] != self.context_id
+                or ref["operation_id"] != self.operation_id
+                or ref["kind"] != kind or ref["actor_id"] != actor_id
+                or ref["conversation_id"] != conversation_id):
+            raise ValueError("routing checkpoint reference scope is invalid")
+        value = _read_routing_checkpoint_value(self.client, ref)
+        return {"reference": ref, "value": value}
 
     def save_search_exchange(
         self, conversation_id: str, *, checkpoint_conversation_id: str,

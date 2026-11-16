@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -9,6 +12,7 @@ from typing import Any, Mapping
 
 from core.integrations.firestore.operations import OPERATIONS_COLLECTION
 from core.integrations.firestore.save_intents import SAVE_INTENTS_COLLECTION
+from core.integrations.firestore.input_parts import MAX_PART_BYTES
 from services.connectors.telegram.models import (
     TelegramContext,
     TelegramDraft,
@@ -17,6 +21,10 @@ from services.connectors.telegram.models import (
 )
 
 SESSIONS = "telegram_sessions"
+ROUTING_PROTOCOL = "context-v2"
+ROUTING_SCHEMA_VERSION = 1
+ROUTING_KINDS = frozenset({"context", "decision", "intent"})
+ROUTING_INLINE_CHECKPOINT_BYTES = 4 * 1024
 NOTIFICATIONS = "notification_outbox"
 NOTIFICATION_KINDS = frozenset({"draft_ack", "receipt_card", "unsupported_forward", "queued", "switch_notice", "progress", "final", "error"})
 NOTIFICATION_MAX_SENDS = 3
@@ -54,6 +62,146 @@ def _document_ref(client: Any, path: str) -> Any:
     for index in range(2, len(parts), 2):
         ref = ref.collection(parts[index]).document(parts[index + 1])
     return ref
+
+
+def _routing_checkpoint_path(context_id: str, operation_id: str, kind: str) -> str:
+    if not isinstance(kind, str) or kind not in ROUTING_KINDS:
+        raise ValueError("routing checkpoint kind is invalid")
+    _identifier(context_id, "context_id")
+    _identifier(operation_id, "operation_id")
+    return f"{SESSIONS}/{context_id}/operations/{operation_id}/routing_checkpoints/{kind}"
+
+
+def _routing_json_bytes(value: Any) -> bytes:
+    """Canonical strict JSON for new routing artifacts (legacy codec is unchanged)."""
+    def validate(item: Any) -> None:
+        if item is None or type(item) in (str, bool, int):
+            return
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("routing checkpoint value must be JSON-safe")
+            return
+        if type(item) is list:
+            for child in item:
+                validate(child)
+            return
+        if type(item) is dict:
+            if any(not isinstance(key, str) for key in item):
+                raise ValueError("routing checkpoint value must be JSON-safe")
+            for child in item.values():
+                validate(child)
+            return
+        raise ValueError("routing checkpoint value must be JSON-safe")
+
+    try:
+        validate(value)
+        return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("routing checkpoint value must be JSON-safe") from exc
+
+
+def _routing_reference_data(reference: Any) -> dict[str, Any]:
+    """Validate the exact connector-private v2 checkpoint reference shape."""
+    expected = {"routing_protocol", "schema_version", "kind", "context_id",
+                "operation_id", "actor_id", "conversation_id", "ref", "digest",
+                "byte_length"}
+    if not isinstance(reference, Mapping) or set(reference) != expected:
+        raise ValueError("routing checkpoint reference shape is invalid")
+    data = dict(reference)
+    if (data.get("routing_protocol") != ROUTING_PROTOCOL
+            or type(data.get("schema_version")) is not int
+            or data["schema_version"] != ROUTING_SCHEMA_VERSION
+            or not isinstance(data.get("kind"), str)
+            or data["kind"] not in ROUTING_KINDS
+            or not isinstance(data.get("context_id"), str)
+            or not isinstance(data.get("operation_id"), str)
+            or type(data.get("actor_id")) is not int or data["actor_id"] <= 0
+            or not isinstance(data.get("conversation_id"), str)
+            or not data["conversation_id"]
+            or data.get("ref") != _routing_checkpoint_path(
+                data["context_id"], data["operation_id"], data["kind"],
+            )
+            or not isinstance(data.get("digest"), str)
+            or len(data["digest"]) != 64
+            or any(ch not in "0123456789abcdef" for ch in data["digest"])
+            or type(data.get("byte_length")) is not int or data["byte_length"] <= 0):
+        raise ValueError("routing checkpoint reference binding is invalid")
+    _identifier(data["context_id"], "context_id")
+    _identifier(data["operation_id"], "operation_id")
+    return data
+
+
+def _read_routing_checkpoint_value(client: Any, reference: Any) -> Any:
+    """Read and verify the published record and inline or multipart payload envelope."""
+    from core.integrations.firestore.input_parts import read_input_parts
+
+    ref = _routing_reference_data(reference)
+    row = _document_ref(client, ref["ref"]).get()
+    if not row.exists:
+        raise ValueError("routing checkpoint record is absent")
+    record = row.to_dict() or {}
+    if set(record) != set(ref) | {"payload"}:
+        raise ValueError("routing checkpoint record shape is invalid")
+    stored_ref = _routing_reference_data({key: record.get(key) for key in ref})
+    if stored_ref != ref:
+        raise ValueError("routing checkpoint record binding is invalid")
+    stored = record.get("payload")
+    if not isinstance(stored, Mapping) or ("_inline" in stored) == ("_input_ref" in stored):
+        raise ValueError("routing checkpoint payload mode is invalid")
+    if "_inline" in stored and set(stored) != {"_inline", "sha256", "byte_length"}:
+        raise ValueError("routing checkpoint inline payload shape is invalid")
+    if "_input_ref" in stored and set(stored) != {
+        "_input_ref", "sha256", "byte_length", "max_part_bytes",
+    }:
+        raise ValueError("routing checkpoint multipart payload shape is invalid")
+    if (stored.get("sha256") != ref["digest"]
+            or type(stored.get("byte_length")) is not int
+            or stored["byte_length"] != ref["byte_length"]):
+        raise ValueError("routing checkpoint payload metadata is invalid")
+    kind = "routing-" + ref["kind"]
+    if "_inline" in stored:
+        payload = _routing_json_bytes(stored["_inline"])
+        if len(payload) > ROUTING_INLINE_CHECKPOINT_BYTES:
+            raise ValueError("routing checkpoint inline payload exceeds threshold")
+    else:
+        digest = ref["digest"]
+        data_operation = "telegram-ledger-" + hashlib.sha256(
+            f"{ref['context_id']}\0{ref['operation_id']}\0{kind}\0{digest}".encode()
+        ).hexdigest()
+        expected_input_ref = f"dialog_operations/{data_operation}/input_parts/manifest"
+        if (stored.get("_input_ref") != expected_input_ref
+                or type(stored.get("max_part_bytes")) is not int
+                or stored.get("max_part_bytes") != MAX_PART_BYTES):
+            raise ValueError("routing checkpoint input ownership is invalid")
+        payload = read_input_parts(client, expected_input_ref)
+        if len(payload) <= ROUTING_INLINE_CHECKPOINT_BYTES:
+            raise ValueError("routing checkpoint multipart payload is below threshold")
+    if (len(payload) != ref["byte_length"]
+            or hashlib.sha256(payload).hexdigest() != ref["digest"]):
+        raise ValueError("routing checkpoint payload does not verify")
+    try:
+        envelope = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("routing checkpoint envelope is corrupt") from exc
+    expected_envelope = {key: ref[key] for key in (
+        "routing_protocol", "schema_version", "kind", "context_id", "operation_id",
+        "actor_id", "conversation_id",
+    )}
+    if not isinstance(envelope, Mapping) or set(envelope) != set(expected_envelope) | {"value"}:
+        raise ValueError("routing checkpoint envelope binding is invalid")
+    if (type(envelope.get("routing_protocol")) is not str
+            or type(envelope.get("schema_version")) is not int
+            or type(envelope.get("kind")) is not str
+            or type(envelope.get("context_id")) is not str
+            or type(envelope.get("operation_id")) is not str
+            or type(envelope.get("actor_id")) is not int
+            or type(envelope.get("conversation_id")) is not str
+            or any(envelope[key] != expected for key, expected in expected_envelope.items())):
+        raise ValueError("routing checkpoint envelope binding is invalid")
+    if _routing_json_bytes(envelope) != payload:
+        raise ValueError("routing checkpoint envelope is not canonical")
+    return envelope["value"]
 
 
 def _enum_value(value: Any) -> Any:

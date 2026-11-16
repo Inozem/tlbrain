@@ -521,6 +521,861 @@ def test_legacy_route_metadata_accepts_save_retry_and_annotation_records(firesto
         assert operation.get().to_dict() == before_replay_state
 
 
+def _context_v2_worker(client, *, chat_id: int, now=None):
+    from core.integrations.firestore.operation_queue import claim_head
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    now = now or BASE_TIME + timedelta(seconds=1)
+    repository = TelegramRepository(client=client)
+    accepted = repository.accept_command(
+        chat_id, chat_id=chat_id, user_id=17,
+        command=parse_command("What did we decide about the price?"), now=BASE_TIME,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner=f"context-v2-worker-{chat_id}", now=now)
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    return repository, accepted, context_ref, lease, ledger, now
+
+
+def _context_v2_route(accepted, conversation_id, context_ref, decision_ref, **overrides):
+    route = {
+        "routing_protocol": "context-v2", "schema_version": 1, "status": "ok",
+        "kind": "substantive", "actor_id": 17,
+        "context_conversation_id": conversation_id,
+        "context_ref": context_ref, "context_digest": context_ref["digest"],
+        "decision_ref": decision_ref, "decision_digest": decision_ref["digest"],
+        "result_category": "resolved",
+    }
+    route.update(overrides)
+    return route
+
+
+def test_context_v2_routing_checkpoints_and_immutable_route_pin(firestore_fake):
+    """New operation-owned artifacts verify multipart bytes and pin only metadata."""
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    client = firestore_fake.client_class()
+    repository, accepted, _context_ref, lease, ledger, now = _context_v2_worker(
+        client, chat_id=88101,
+    )
+    conversation_id = "source-conversation-v2"
+    context_value = {"history": "История🙂" * 900, "refs": [{"doc_id": "doc-b"}]}
+    context_ref_data = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation_id, value=context_value,
+    )
+    decision_value = {"target": {"doc_id": "doc-b"}, "result_category": "resolved"}
+    decision_ref_data = ledger.save_routing_checkpoint(
+        "decision", actor_id=17, conversation_id=conversation_id, value=decision_value,
+    )
+    intent_value = {"slots": {"doc_id": "doc-b"}, "history_ref": "exchange-1"}
+    intent_ref_data = ledger.save_routing_checkpoint(
+        "intent", actor_id=17, conversation_id=conversation_id, value=intent_value,
+    )
+    durable = deepcopy(firestore_fake.documents)
+    assert ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation_id, value=context_value,
+    ) == context_ref_data
+    assert firestore_fake.documents == durable
+    restarted = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    assert restarted.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation_id, value=context_value,
+    ) == context_ref_data
+    assert firestore_fake.documents == durable
+    assert restarted.load_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation_id,
+        reference=context_ref_data,
+    ) == {"reference": context_ref_data, "value": context_value}
+    assert restarted.load_routing_checkpoint(
+        "decision", actor_id=17, conversation_id=conversation_id,
+    )["value"] == decision_value
+
+    route = _context_v2_route(accepted, conversation_id, context_ref_data, decision_ref_data,
+                              intent_ref=intent_ref_data,
+                              intent_digest=intent_ref_data["digest"])
+    assert repository.persist_route(
+        accepted.operation_id, route, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    pinned = repository.get_route_control(accepted.context_id, accepted.operation_id)
+    assert pinned == route
+    assert "history" not in pinned
+    pinned_store = deepcopy(firestore_fake.documents)
+    assert repository.persist_route(
+        accepted.operation_id, route, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    assert repository.get_route_control(accepted.context_id, accepted.operation_id) == pinned
+    assert firestore_fake.documents == pinned_store
+    changed_route = {**route, "result_category": "unknown_outcome"}
+    assert not repository.persist_route(
+        accepted.operation_id, changed_route, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    with pytest.raises(ValueError, match="immutable"):
+        ledger.save_routing_checkpoint(
+            "context", actor_id=17, conversation_id=conversation_id,
+            value={"history": "changed"},
+        )
+    assert firestore_fake.documents == pinned_store
+    decision_doc = client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id).collection(
+        "routing_checkpoints",
+    ).document("decision")
+    damaged = decision_doc.get().to_dict()
+    damaged["payload"]["_inline"]["value"]["target"]["doc_id"] = "tampered"
+    decision_doc.set(damaged)
+    with pytest.raises(ValueError, match="does not verify"):
+        restarted.load_routing_checkpoint(
+            "decision", actor_id=17, conversation_id=conversation_id,
+        )
+    with pytest.raises(ValueError, match="does not verify"):
+        repository.get_route_control(accepted.context_id, accepted.operation_id)
+
+
+def test_context_v2_rejects_unknown_or_downgraded_route_protocol(firestore_fake):
+    from services.connectors.telegram.repository import TelegramRepository
+
+    repository = TelegramRepository(client=firestore_fake.client_class())
+    with pytest.raises(ValueError, match="unknown"):
+        repository._route_control_data({"routing_protocol": "future-v9", "status": "error"})
+    with pytest.raises(ValueError, match="protocol tag"):
+        repository._route_control_data({
+            "status": "error", "actor_id": 17, "result_category": "model_error",
+        })
+
+
+def test_context_v2_discovers_all_kinds_and_keeps_json_copy_isolated(firestore_fake):
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88201,
+    )
+    conversation = "source-v2"
+    inputs = {
+        "context": {"history": "original", "refs": ["r1"]},
+        "decision": {"decision": "resolved"},
+        "intent": {"slots": {"doc_id": "doc-a"}},
+    }
+    references = {
+        kind: ledger.save_routing_checkpoint(
+            kind, actor_id=17, conversation_id=conversation, value=value,
+        ) for kind, value in inputs.items()
+    }
+    inputs["context"]["history"] = "changed after save"
+    for kind in inputs:
+        loaded = ledger.load_routing_checkpoint(
+            kind, actor_id=17, conversation_id=conversation,
+        )
+        assert loaded["reference"] == references[kind]
+        if kind == "context":
+            assert loaded["value"] == {"history": "original", "refs": ["r1"]}
+        else:
+            assert loaded["value"] == inputs[kind]
+    with pytest.raises(ValueError, match="scope"):
+        ledger.save_routing_checkpoint(
+            "decision", actor_id=17, conversation_id="other-source", value={"x": 1},
+        )
+    with pytest.raises(PermissionError, match="actor"):
+        ledger.save_routing_checkpoint(
+            "decision", actor_id=18, conversation_id=conversation, value={"x": 1},
+        )
+    missing = {
+        **references["intent"], "kind": "decision",
+        "ref": f"telegram_sessions/{accepted.context_id}/operations/{accepted.operation_id}/routing_checkpoints/decision",
+    }
+    client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document(
+        "decision",
+    ).delete()
+    with pytest.raises(ValueError, match="absent"):
+        ledger.load_routing_checkpoint(
+            "decision", actor_id=17, conversation_id=conversation, reference=missing,
+        )
+
+
+def test_context_v2_rejects_sequential_cross_kind_source_conversation(firestore_fake):
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88218,
+    )
+    context_ref = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id="source-A", value={"history": "A"},
+    )
+    with pytest.raises(ValueError, match="scope changed"):
+        ledger.save_routing_checkpoint(
+            "decision", actor_id=17, conversation_id="source-B", value={"decision": "B"},
+        )
+    decision_doc = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("decision")
+    assert not decision_doc.get().exists
+    assert ledger.load_routing_checkpoint(
+        "context", actor_id=17, conversation_id="source-A", reference=context_ref,
+    )["value"] == {"history": "A"}
+
+
+def test_context_v2_cross_kind_first_publication_race_has_one_source_scope(firestore_fake):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from tests.fixtures.firestore_fake import FakeFirestoreClient
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    part_barrier = Barrier(2)
+
+    class BarrierTransaction:
+        def __init__(self, transaction):
+            self._transaction = transaction
+            self._waited_for_part = False
+
+        def __getattr__(self, name):
+            return getattr(self._transaction, name)
+
+        def _commit(self):
+            if not self._waited_for_part and any(
+                "/input_parts/part-" in reference.path
+                for _operation, reference, _data, _merge in self._transaction._writes
+            ):
+                self._waited_for_part = True
+                part_barrier.wait(timeout=10)
+            return self._transaction._commit()
+
+    class BarrierFirestoreClient(FakeFirestoreClient):
+        def transaction(self, max_attempts=5, read_only=False):
+            return BarrierTransaction(super().transaction(
+                max_attempts=max_attempts, read_only=read_only,
+            ))
+
+    client = BarrierFirestoreClient()
+    repository, accepted, _context, lease, _ledger, now = _context_v2_worker(
+        client, chat_id=88219,
+    )
+    ledgers = {
+        kind: FirestoreAgentLedger(
+            client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+            owner=lease.owner, fence=lease.fence, clock=lambda: now,
+        ) for kind in ("context", "decision")
+    }
+
+    def publish(kind, conversation):
+        try:
+            reference = ledgers[kind].save_routing_checkpoint(
+                kind, actor_id=17, conversation_id=conversation,
+                value={"history": "x" * 12_000, "kind": kind},
+            )
+            return "published", reference
+        except ValueError as exc:
+            return "rejected", str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        context_future = pool.submit(publish, "context", "source-A")
+        decision_future = pool.submit(publish, "decision", "source-B")
+        outcomes = [context_future.result(timeout=15), decision_future.result(timeout=15)]
+    assert sorted(outcome[0] for outcome in outcomes) == ["published", "rejected"]
+    rejected = next(outcome[1] for outcome in outcomes if outcome[0] == "rejected")
+    assert "scope changed" in rejected
+    canonical = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints")
+    assert sum(canonical.document(kind).get().exists for kind in ("context", "decision")) == 1
+    route = repository.get_route_control(accepted.context_id, accepted.operation_id)
+    assert route is None
+
+
+def test_context_v2_exact_inline_threshold_and_multiple_input_parts(firestore_fake):
+    from core.integrations.firestore.input_parts import MAX_PART_BYTES
+    from services.connectors.telegram.repository._common import _routing_json_bytes
+
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88202,
+    )
+    for kind, target_length in (("context", 4096), ("decision", 4097)):
+        base_envelope = {
+            "routing_protocol": "context-v2", "schema_version": 1, "kind": kind,
+            "context_id": accepted.context_id, "operation_id": accepted.operation_id,
+            "actor_id": 17, "conversation_id": "threshold-source", "value": {"history": ""},
+        }
+        base_size = len(_routing_json_bytes(base_envelope))
+        value = {"history": "x" * (target_length - base_size)}
+        assert len(_routing_json_bytes({**base_envelope, "value": value})) == target_length
+        reference = ledger.save_routing_checkpoint(
+            kind, actor_id=17, conversation_id="threshold-source", value=value,
+        )
+        checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+            "operations",
+        ).document(accepted.operation_id).collection("routing_checkpoints").document(kind).get().to_dict()
+        assert ("_inline" in checkpoint["payload"]) is (target_length == 4096)
+        assert ledger.load_routing_checkpoint(
+            kind, actor_id=17, conversation_id="threshold-source", reference=reference,
+        )["value"] == value
+    large_value = {"history": "漢🙂" * 190_000, "references": ["ref-1", "ref-2"]}
+    large_ref = ledger.save_routing_checkpoint(
+        "intent", actor_id=17, conversation_id="threshold-source", value=large_value,
+    )
+    row = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("intent").get().to_dict()
+    payload_ref = row["payload"]["_input_ref"]
+    assert row["payload"]["byte_length"] > MAX_PART_BYTES * 2
+    manifest = client.collection("dialog_operations").document(
+        payload_ref.split("/")[1],
+    ).collection("input_parts").document("manifest").get().to_dict()
+    assert manifest["part_count"] >= 3
+    assert ledger.load_routing_checkpoint(
+        "intent", actor_id=17, conversation_id="threshold-source", reference=large_ref,
+    )["value"] == large_value
+
+
+@pytest.mark.parametrize("value", [b"binary", float("nan"), ("tuple", "is not JSON")])
+def test_context_v2_rejects_non_json_values_before_writing(firestore_fake, value):
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88217,
+    )
+    with pytest.raises(ValueError, match="JSON-safe"):
+        ledger.save_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2", value={"value": value},
+        )
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("context")
+    assert not checkpoint.get().exists
+
+
+@pytest.mark.parametrize("field,value", [
+    ("routing_protocol", "future-v9"), ("schema_version", True),
+    ("kind", "intent"), ("context_id", "other-context"),
+    ("operation_id", "other-operation"), ("actor_id", 18),
+    ("conversation_id", "other-source"), ("ref", "telegram_sessions/guessed"),
+    ("digest", "A" * 64), ("byte_length", True),
+])
+def test_context_v2_supplied_checkpoint_references_fail_closed(firestore_fake, field, value):
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88203,
+    )
+    reference = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id="source-v2", value={"history": "x"},
+    )
+    broken = dict(reference)
+    broken[field] = value
+    with pytest.raises(ValueError):
+        ledger.load_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2", reference=broken,
+        )
+    with pytest.raises(ValueError, match="shape"):
+        ledger.load_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2",
+            reference={**reference, "injected": "not allowed"},
+        )
+    with pytest.raises(ValueError):
+        ledger.load_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2", reference="bare-reference",
+        )
+    assert ledger.load_routing_checkpoint(
+        "decision", actor_id=17, conversation_id="source-v2",
+    ) is None
+
+
+@pytest.mark.parametrize("header,corrupt_value", [("schema_version", True), ("actor_id", 17.0)])
+def test_context_v2_stored_headers_reject_bool_float_aliases(
+    firestore_fake, header, corrupt_value,
+):
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88204,
+    )
+    reference = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id="source-v2", value={"x": "small"},
+    )
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("context")
+    damaged = checkpoint.get().to_dict()
+    damaged[header] = corrupt_value
+    checkpoint.set(damaged)
+    with pytest.raises(ValueError, match="reference binding"):
+        ledger.load_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2", reference=reference,
+        )
+
+
+def test_context_v2_envelope_identity_types_are_strict_after_rehash(firestore_fake):
+    from services.connectors.telegram.repository._common import _routing_json_bytes
+
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88205,
+    )
+    ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id="source-v2", value={"x": "small"},
+    )
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("context")
+    row = checkpoint.get().to_dict()
+    envelope = row["payload"]["_inline"]
+    envelope["schema_version"] = True
+    encoded = _routing_json_bytes(envelope)
+    digest = hashlib.sha256(encoded).hexdigest()
+    row.update({"digest": digest, "byte_length": len(encoded)})
+    row["payload"].update({"sha256": digest, "byte_length": len(encoded), "_inline": envelope})
+    checkpoint.set(row)
+    with pytest.raises(ValueError, match="envelope binding"):
+        ledger.load_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2",
+        )
+
+
+@pytest.mark.parametrize("damage", [
+    "missing_part", "reordered_part", "corrupt_part", "not_ready", "wrong_input_ref",
+    "wrong_max_part_bytes",
+])
+def test_context_v2_multipart_tampering_is_rejected(firestore_fake, damage):
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88206,
+    )
+    reference = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id="source-v2", value={"history": "z" * 12_000},
+    )
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("context")
+    row = checkpoint.get().to_dict()
+    payload_ref = row["payload"]["_input_ref"]
+    data_op = payload_ref.split("/")[1]
+    parts = client.collection("dialog_operations").document(data_op).collection("input_parts")
+    manifest = parts.document("manifest")
+    if damage == "missing_part":
+        parts.document("part-000000").delete()
+    elif damage == "reordered_part":
+        part = parts.document("part-000000").get().to_dict()
+        part["index"] = 1
+        parts.document("part-000000").set(part)
+    elif damage == "corrupt_part":
+        part = parts.document("part-000000").get().to_dict()
+        part["payload"] = part["payload"][:-1] + b"X"
+        parts.document("part-000000").set(part)
+    elif damage == "not_ready":
+        manifest.update({"ready": False})
+    elif damage == "wrong_input_ref":
+        row["payload"]["_input_ref"] = "dialog_operations/guessed/input_parts/manifest"
+        checkpoint.set(row)
+    else:
+        row["payload"]["max_part_bytes"] = 123
+        checkpoint.set(row)
+    with pytest.raises(ValueError):
+        ledger.load_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2", reference=reference,
+        )
+
+
+@pytest.mark.parametrize("damage", ["content", "digest", "length", "mode"])
+def test_context_v2_inline_tampering_is_rejected(firestore_fake, damage):
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88207,
+    )
+    reference = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id="source-v2", value={"x": "small"},
+    )
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("context")
+    row = checkpoint.get().to_dict()
+    if damage == "content":
+        row["payload"]["_inline"]["value"]["x"] = "tampered"
+    elif damage == "digest":
+        row["payload"]["sha256"] = "0" * 64
+    elif damage == "length":
+        row["payload"]["byte_length"] += 1
+    else:
+        row["payload"]["_input_ref"] = "dialog_operations/guessed/input_parts/manifest"
+    checkpoint.set(row)
+    with pytest.raises(ValueError):
+        ledger.load_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2", reference=reference,
+        )
+
+
+@pytest.mark.parametrize("field,value", [
+    ("result_category", "invented"), ("schema_version", True),
+    ("actor_id", 17.0), ("context_ref", "bare-ref"),
+])
+def test_context_v2_route_metadata_rejects_invalid_fields(firestore_fake, field, value):
+    from services.connectors.telegram.repository import TelegramRepository
+
+    repository = TelegramRepository(client=firestore_fake.client_class())
+    route = {
+        "routing_protocol": "context-v2", "schema_version": 1, "status": "error",
+        "actor_id": 17, "context_conversation_id": "source-v2",
+        "result_category": "model_error",
+    }
+    if field == "context_ref":
+        route["context_digest"] = "0" * 64
+    route[field] = value
+    with pytest.raises(ValueError):
+        repository._route_control_data(route)
+    for leaked_field in ("annotation_text", "annotation_payload", "tool_choice"):
+        with pytest.raises(ValueError, match="unsupported fields"):
+            repository._route_control_data({
+                "routing_protocol": "context-v2", "schema_version": 1,
+                "status": "error", "actor_id": 17,
+                "context_conversation_id": "source-v2", "result_category": "model_error",
+                leaked_field: "must not persist",
+            })
+
+
+def test_context_v2_model_error_can_retry_to_success(firestore_fake):
+    client = firestore_fake.client_class()
+    repository, accepted, _context, lease, ledger, now = _context_v2_worker(
+        client, chat_id=88208,
+    )
+    conversation = "retry-source"
+    failed = {
+        "routing_protocol": "context-v2", "schema_version": 1, "status": "error",
+        "kind": "substantive", "actor_id": 17,
+        "context_conversation_id": conversation, "result_category": "model_error",
+    }
+    assert repository.persist_route(
+        accepted.operation_id, failed, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    context_ref = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation, value={"history": "ok"},
+    )
+    decision_ref = ledger.save_routing_checkpoint(
+        "decision", actor_id=17, conversation_id=conversation, value={"decision": "resolved"},
+    )
+    success = _context_v2_route(accepted, conversation, context_ref, decision_ref)
+    assert repository.persist_route(
+        accepted.operation_id, success, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    operation_ref = client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id)
+    before_replay = operation_ref.get().to_dict()
+    assert repository.persist_route(
+        accepted.operation_id, success, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    assert operation_ref.get().to_dict() == before_replay
+    assert repository.get_route_control(accepted.context_id, accepted.operation_id) == success
+    with pytest.raises(ValueError, match="downgraded"):
+        repository.persist_route(
+            accepted.operation_id, {"status": "error"}, context_id=accepted.context_id,
+            owner=lease.owner, fence=lease.fence, now=now,
+        )
+
+
+@pytest.mark.parametrize("tamper", [
+    "command_actor", "command_context", "command_operation", "operation_id", "stored_body",
+])
+def test_context_v2_failed_route_read_checks_command_identity_without_refs(
+    firestore_fake, tamper,
+):
+    client = firestore_fake.client_class()
+    repository, accepted, _context, lease, _ledger, now = _context_v2_worker(
+        client, chat_id=88209,
+    )
+    route = {
+        "routing_protocol": "context-v2", "schema_version": 1, "status": "error",
+        "actor_id": 17, "context_conversation_id": "source-v2",
+        "result_category": "model_error",
+    }
+    assert repository.persist_route(
+        accepted.operation_id, route, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    operation_ref = client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id)
+    operation = operation_ref.get().to_dict()
+    command_ref = client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("commands").document(operation["input_ref"].rsplit("/", 1)[-1])
+    command = command_ref.get().to_dict()
+    if tamper == "command_actor":
+        command["user_id"] = 18
+        command_ref.set(command)
+    elif tamper == "command_context":
+        command["context_id"] = "foreign-context"
+        command_ref.set(command)
+    elif tamper == "command_operation":
+        command["operation_id"] = "foreign-operation"
+        command_ref.set(command)
+    elif tamper == "stored_body":
+        operation["route_control"]["annotation_text"] = "body must be rejected"
+        operation_ref.set(operation)
+    else:
+        operation["operation_id"] = "foreign-operation"
+        operation_ref.set(operation)
+    with pytest.raises(ValueError, match="actor binding|operation binding|unsupported fields"):
+        repository.get_route_control(accepted.context_id, accepted.operation_id)
+
+
+def test_context_v2_terminal_read_survives_cleared_candidate_and_expired_lease(firestore_fake):
+    client = firestore_fake.client_class()
+    repository, accepted, context_ref, lease, ledger, now = _context_v2_worker(
+        client, chat_id=88210,
+    )
+    conversation = "terminal-source"
+    context_ref_data = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation, value={"history": "x"},
+    )
+    decision_ref_data = ledger.save_routing_checkpoint(
+        "decision", actor_id=17, conversation_id=conversation, value={"decision": "ok"},
+    )
+    route = _context_v2_route(accepted, conversation, context_ref_data, decision_ref_data)
+    assert repository.persist_route(
+        accepted.operation_id, route, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    assert repository.clear_command_candidate(
+        accepted.context_id, accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    operation_ref = context_ref.collection("operations").document(accepted.operation_id)
+    operation_ref.update({"state": "completed"})
+    context_ref.update({"lock_expires_at": now - timedelta(seconds=1)})
+    assert repository.get_route_control(accepted.context_id, accepted.operation_id) == route
+    assert ledger.load_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation,
+        reference=context_ref_data,
+    )["value"] == {"history": "x"}
+    assert ledger.load_routing_checkpoint(
+        "decision", actor_id=17, conversation_id=conversation,
+    )["value"] == {"decision": "ok"}
+
+
+def test_context_v2_legacy_successful_pin_cannot_be_overwritten(firestore_fake):
+    client = firestore_fake.client_class()
+    repository, accepted, _context, lease, ledger, now = _context_v2_worker(
+        client, chat_id=88211,
+    )
+    legacy = {"status": "ok", "kind": "substantive"}
+    assert repository.persist_route(
+        accepted.operation_id, legacy, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    conversation = "v2-source"
+    context_ref = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation, value={"history": "x"},
+    )
+    decision_ref = ledger.save_routing_checkpoint(
+        "decision", actor_id=17, conversation_id=conversation, value={"decision": "ok"},
+    )
+    route = _context_v2_route(accepted, conversation, context_ref, decision_ref)
+    assert not repository.persist_route(
+        accepted.operation_id, route, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    assert repository.get_route_control(accepted.context_id, accepted.operation_id) == legacy
+
+
+@pytest.mark.parametrize("tamper", [
+    "actor", "conversation", "context", "operation", "kind", "digest",
+])
+def test_context_v2_route_rejects_foreign_checkpoint_bindings(firestore_fake, tamper):
+    client = firestore_fake.client_class()
+    repository, accepted, _context, lease, ledger, now = _context_v2_worker(
+        client, chat_id=88215,
+    )
+    conversation = "route-source"
+    context_ref = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation, value={"history": "x"},
+    )
+    decision_ref = ledger.save_routing_checkpoint(
+        "decision", actor_id=17, conversation_id=conversation, value={"decision": "ok"},
+    )
+    route = _context_v2_route(accepted, conversation, context_ref, decision_ref)
+    if tamper == "actor":
+        route["actor_id"] = 18
+    elif tamper == "conversation":
+        route["context_conversation_id"] = "foreign-source"
+    elif tamper == "context":
+        route["context_ref"] = {
+            **context_ref, "context_id": "foreign-context",
+            "ref": context_ref["ref"].replace(accepted.context_id, "foreign-context"),
+        }
+    elif tamper == "operation":
+        route["decision_ref"] = {
+            **decision_ref, "operation_id": "foreign-operation",
+            "ref": decision_ref["ref"].replace(accepted.operation_id, "foreign-operation"),
+        }
+    elif tamper == "kind":
+        route["context_ref"] = decision_ref
+        route["context_digest"] = decision_ref["digest"]
+    else:
+        route["decision_digest"] = "0" * 64
+    with pytest.raises(ValueError):
+        repository.persist_route(
+            accepted.operation_id, route, context_id=accepted.context_id,
+            owner=lease.owner, fence=lease.fence, now=now,
+        )
+
+
+def test_context_v2_route_rejects_unpublished_reference_and_protocol_downgrade(
+    firestore_fake,
+):
+    client = firestore_fake.client_class()
+    repository, accepted, _context, lease, ledger, now = _context_v2_worker(
+        client, chat_id=88216,
+    )
+    conversation = "route-source"
+    context_ref = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id=conversation, value={"history": "x"},
+    )
+    decision_ref = ledger.save_routing_checkpoint(
+        "decision", actor_id=17, conversation_id=conversation, value={"decision": "ok"},
+    )
+    route = _context_v2_route(accepted, conversation, context_ref, decision_ref)
+    client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document(
+        "decision",
+    ).delete()
+    with pytest.raises(ValueError, match="absent"):
+        repository.persist_route(
+            accepted.operation_id, route, context_id=accepted.context_id,
+            owner=lease.owner, fence=lease.fence, now=now,
+        )
+    failed = {**route, "status": "error", "result_category": "model_error",
+              "decision_ref": None, "decision_digest": None,
+              "context_ref": None, "context_digest": None}
+    assert repository.persist_route(
+        accepted.operation_id, failed, context_id=accepted.context_id,
+        owner=lease.owner, fence=lease.fence, now=now,
+    )
+    with pytest.raises(ValueError, match="downgraded"):
+        repository.persist_route(
+            accepted.operation_id, {"status": "error"}, context_id=accepted.context_id,
+            owner=lease.owner, fence=lease.fence, now=now,
+        )
+    operation_ref = client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id)
+    operation_ref.update({"route_control": {"routing_protocol": "future-v9", "status": "error"}})
+    with pytest.raises(ValueError, match="unknown"):
+        repository.get_route_control(accepted.context_id, accepted.operation_id)
+
+
+@pytest.mark.parametrize("invalid_identity", ["owner", "fence", "expired"])
+def test_context_v2_save_requires_current_live_lease(firestore_fake, invalid_identity):
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, lease, ledger, now = _context_v2_worker(
+        client, chat_id=88212,
+    )
+    if invalid_identity == "owner":
+        ledger = FirestoreAgentLedger(
+            client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+            owner="foreign-owner", fence=lease.fence, clock=lambda: now,
+        )
+    elif invalid_identity == "fence":
+        ledger = FirestoreAgentLedger(
+            client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+            owner=lease.owner, fence=lease.fence + 1, clock=lambda: now,
+        )
+    else:
+        ledger.clock = lambda: now + timedelta(days=1)
+    with pytest.raises(PermissionError, match="lease is stale"):
+        ledger.save_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2", value={"x": "y"},
+        )
+    path = f"telegram_sessions/{accepted.context_id}/operations/{accepted.operation_id}/routing_checkpoints/context"
+    assert not client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id).collection(
+        "routing_checkpoints",
+    ).document("context").get().exists
+
+
+@pytest.mark.parametrize("failure_point", ["part", "manifest"])
+def test_context_v2_part_write_failure_never_publishes_checkpoint(firestore_fake, failure_point):
+    from services.connectors.telegram.repository._common import _routing_json_bytes
+
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, _lease, ledger, _now = _context_v2_worker(
+        client, chat_id=88213,
+    )
+    value = {"history": "a" * 12_000}
+    envelope = {
+        "routing_protocol": "context-v2", "schema_version": 1, "kind": "context",
+        "context_id": accepted.context_id, "operation_id": accepted.operation_id,
+        "actor_id": 17, "conversation_id": "source-v2", "value": value,
+    }
+    digest = hashlib.sha256(_routing_json_bytes(envelope)).hexdigest()
+    data_operation = "telegram-ledger-" + hashlib.sha256(
+        f"{accepted.context_id}\0{accepted.operation_id}\0routing-context\0{digest}".encode()
+    ).hexdigest()
+    input_parts = f"dialog_operations/{data_operation}/input_parts"
+    fail_path = f"{input_parts}/part-000000" if failure_point == "part" else f"{input_parts}/manifest"
+    client.fail_next("commit", path=fail_path, exception=RuntimeError("synthetic write fault"))
+    with pytest.raises(RuntimeError, match="synthetic write fault"):
+        ledger.save_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2", value=value,
+        )
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("context")
+    assert not checkpoint.get().exists
+    written_parts = [path for path in firestore_fake.documents
+                     if path.startswith("dialog_operations/") and "/input_parts/part-" in path]
+    assert bool(written_parts) is (failure_point == "manifest")
+    assert not any(path.endswith("/input_parts/manifest")
+                   for path in firestore_fake.documents)
+    operation = client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id).get().to_dict()
+    assert "route_control" not in operation
+
+
+def test_context_v2_lease_loss_during_multipart_preparation_does_not_publish(firestore_fake):
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    client = firestore_fake.client_class()
+    _repository, accepted, _context, lease, _ledger, now = _context_v2_worker(
+        client, chat_id=88214,
+    )
+    calls = 0
+    def lease_clock():
+        nonlocal calls
+        calls += 1
+        return now if calls < 6 else now + timedelta(days=1)
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lease_clock,
+    )
+    with pytest.raises(PermissionError, match="lease is stale"):
+        ledger.save_routing_checkpoint(
+            "context", actor_id=17, conversation_id="source-v2",
+            value={"history": "a" * 1_100_000},
+        )
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("routing_checkpoints").document("context")
+    assert not checkpoint.get().exists
+    written_parts = [path for path in firestore_fake.documents
+                     if path.startswith("dialog_operations/") and "/input_parts/part-" in path]
+    assert written_parts
+    assert not any(path.endswith("/input_parts/manifest")
+                   for path in firestore_fake.documents)
+
+
 def _executor_for_folder_write(client, *, now, chat_id, monkeypatch):
     from core.integrations.firestore.operation_queue import claim_head
     from services.connectors.telegram.commands import parse_command
