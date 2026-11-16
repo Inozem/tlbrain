@@ -13,7 +13,7 @@ from core.integrations.firestore.mutations import get_mutation_effect, get_resou
 from core.integrations.firestore.operations import claim_operation, create_operation
 from core.integrations.google_drive import folder_service
 from core.operations import write
-from core.operations.mutations import MutationConflict, MutationOutcomeUnknown
+from core.operations.mutations import MutationConflict, MutationNotSent, MutationOutcomeUnknown
 from core.operations.models import OperationOrigin
 
 
@@ -42,6 +42,23 @@ def _configure_firestore(monkeypatch, firestore_fake, fake_clock):
     monkeypatch.setattr(write.firestore_client, "get_client", lambda: client)
     monkeypatch.setattr(write, "get_root_folder_id", lambda: "root-id")
     return client
+
+
+def _live_drive_metadata(monkeypatch, root_id, *, folders=(), documents=()):
+    """Give legacy behavior tests realistic metadata at the Drive SDK boundary."""
+    from core.integrations.google_drive.files import GOOGLE_DOC_MIME_TYPE
+
+    values = {root_id: {"id": root_id, "name": "Root", "mimeType": "application/vnd.google-apps.folder",
+                        "parents": [], "trashed": False}}
+    for folder_id, parent_id in folders:
+        values[folder_id] = {"id": folder_id, "name": folder_id,
+                             "mimeType": "application/vnd.google-apps.folder",
+                             "parents": [parent_id], "trashed": False}
+    for doc_id, parent_id in documents:
+        values[doc_id] = {"id": doc_id, "name": doc_id, "mimeType": GOOGLE_DOC_MIME_TYPE,
+                          "parents": [parent_id], "trashed": False}
+    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda file_id: values[file_id])
+    return values
 
 
 def _install_firestore_map_name_boundary(monkeypatch):
@@ -75,11 +92,15 @@ def test_move_transcript_uses_real_guard_and_replays_without_resolving_path(
     state = {"drive": {"id": "doc-1", "name": "title", "parents": ["old"]},
              "record": {"status": "synced", "parent_id": "old", "source_file": "title"},
              "qparent": "old"}
+    live = _live_drive_metadata(monkeypatch, "root-id", folders=[("old", "root-id"),
+                                                                  ("folder-new", "root-id")],
+                                documents=[("doc-1", "old")])
+    state["drive"] = live["doc-1"]
     resolutions, writes, provider_reads = [], [], []
     monkeypatch.setattr(document_operations, "resolve_move_target",
                         lambda path, _db=None: resolutions.append(path) or "folder-new")
     monkeypatch.setattr(write.drive_files, "get_file_metadata",
-                        lambda _id: provider_reads.append("drive") or state["drive"])
+                        lambda file_id: provider_reads.append("drive") or live[file_id])
     monkeypatch.setattr(write.transcripts, "get_transcript_record",
                         lambda _id, _db=None: provider_reads.append("firestore") or state["record"])
     monkeypatch.setattr(write.qdrant_reader, "get_parent_ids_by_doc_ids",
@@ -89,6 +110,7 @@ def test_move_transcript_uses_real_guard_and_replays_without_resolving_path(
     def apply(doc_id, parent_id, root_id, *, single_attempt, db=None, **_kwargs):
         writes.append((doc_id, parent_id, root_id, single_attempt))
         state["drive"]["parents"] = [parent_id]
+        live["doc-1"]["parents"] = [parent_id]
         state["record"]["parent_id"] = parent_id
         state["record"]["status"] = "imported"
         state["qparent"] = parent_id
@@ -124,13 +146,16 @@ def test_folder_only_transcript_move_updates_selected_doc_payload_without_embedd
         "records": {"doc-selected": {"status": "synced", "parent_id": "old"}},
         "parents": {"doc-selected": ["old"]},
     }
+    live = _live_drive_metadata(monkeypatch, "root-id", folders=[("old", "root-id"),
+                                                                  ("folder-new", "root-id")],
+                                documents=[("doc-selected", "old")])
+    state["drive"]["doc-selected"] = live["doc-selected"]
     state["drive"]["doc-next"] = {"id": "doc-next", "name": "next title", "parents": ["next-old"]}
     state["records"]["doc-next"] = {"status": "synced", "parent_id": "next-old"}
     state["parents"]["doc-next"] = ["next-old"]
     payload_updates = []
     monkeypatch.setattr(document_operations, "resolve_move_target", lambda *_args: "folder-new")
-    monkeypatch.setattr(write.drive_files, "get_file_metadata",
-                        lambda doc_id: state["drive"][doc_id])
+    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda doc_id: live[doc_id])
     monkeypatch.setattr(write.transcripts, "get_transcript_record",
                         lambda doc_id, _db=None: state["records"][doc_id])
     monkeypatch.setattr(write.qdrant_reader, "get_parent_ids_by_doc_ids",
@@ -250,15 +275,20 @@ def test_move_folder_success_reserves_tree_folder_and_descendant_document(
     context = _context(client, fake_clock)
     state = {"drive": {"id": "folder-a", "name": "A", "parents": ["old-parent"]},
              "folder": {"name": "A", "parent_id": "old-parent"}}
+    live = _live_drive_metadata(monkeypatch, "root-id", folders=[("old-parent", "root-id"),
+                                                                  ("folder-a", "old-parent"),
+                                                                  ("new-parent", "root-id")])
+    state["drive"] = live["folder-a"]
     monkeypatch.setattr(folder_service, "prepare_move_folder", lambda *_args, **_kwargs: ("folder-a", "new-parent"))
     monkeypatch.setattr(folder_service, "expand_registered_subtree", lambda _id, _db=None: ["folder-a"])
     monkeypatch.setattr(write, "_document_ids_in_folders", lambda _ids, _db=None: ["doc-a"])
-    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda _id: state["drive"])
+    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda file_id: live[file_id])
     monkeypatch.setattr(write.folder_repository, "get_folder_by_id", lambda _id, _db=None: state["folder"])
     monkeypatch.setattr(write.folder_repository, "get_all_folders", lambda _db=None: {"folder-a": state["folder"]})
 
     def apply(folder_id, parent_id, *, db=None, **_kwargs):
         state["drive"]["parents"] = [parent_id]
+        live["folder-a"]["parents"] = [parent_id]
         state["folder"]["parent_id"] = parent_id
         return folder_id, parent_id
 
@@ -380,6 +410,432 @@ def test_shared_write_authorization_allows_registered_live_root_transcript(monke
 
 
 @pytest.mark.offline
+def test_shared_write_authorization_accepts_nested_live_target_and_stale_cached_source_parent(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.set_file("nested", name="Nested", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    harness.files["target"]["parents"] = ["nested"]
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=["nested"])
+    client.collection("folders").document("nested").set({
+        "folder_id": "nested", "name": "Nested", "parent_id": ROOT_FOLDER_ID,
+    })
+    client.collection("folders").document("target").update({"parent_id": ROOT_FOLDER_ID})
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": "outside-root",
+        "source_file": "Source", "user_fact": "preserve-me",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    context = _context(client, fake_clock, operation_id="shared-auth-nested-live")
+
+    result = write.move_transcript("source", ["Target"], context=context)
+
+    assert result.unassigned_count == 0
+    assert harness.files["source"]["parents"] == ["target"]
+    assert len(harness.drive_mutations) == len(harness.qdrant_mutations) == 1
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("scenario", ["wrong_type", "trashed", "forbidden", "malformed", "cycle"])
+def test_shared_write_authorization_rejects_invalid_live_ancestor(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock, scenario,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.set_file("ancestor", name="Ancestor", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    harness.set_file("target", name="Target", mime_type="application/vnd.google-apps.folder",
+                     parents=["ancestor"])
+    if scenario == "wrong_type":
+        harness.files["ancestor"]["mimeType"] = "application/vnd.google-apps.document"
+    elif scenario == "trashed":
+        harness.files["ancestor"]["trashed"] = True
+    elif scenario == "forbidden":
+        import httplib2
+        from googleapiclient.errors import HttpError
+        harness.files["ancestor"] = HttpError(httplib2.Response({"status": "403"}), b"forbidden")
+    elif scenario == "malformed":
+        harness.files["ancestor"]["parents"] = "not-a-parent-list"
+    elif scenario == "cycle":
+        harness.files["ancestor"]["parents"] = ["target"]
+    client.collection("folders").document("ancestor").set({
+        "folder_id": "ancestor", "name": "Ancestor", "parent_id": ROOT_FOLDER_ID,
+    })
+    client.collection("folders").document("target").update({"parent_id": "ancestor"})
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+        "source_file": "Source",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    before = harness.snapshot_domain(client)
+    context = _context(client, fake_clock, operation_id="shared-auth-ancestor-" + scenario)
+
+    with pytest.raises((folder_service.FolderOperationError, write.WriteError)):
+        write.move_transcript("source", ["Ancestor", "Target"], context=context)
+
+    assert harness.drive_mutations == harness.qdrant_mutations == []
+    assert harness.snapshot_domain(client) == before
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("resource, failure", [
+    ("source", "http500"), ("source", "timeout"),
+    ("ancestor", "http500"), ("ancestor", "timeout"),
+    ("parent", "http500"), ("parent", "timeout"),
+])
+def test_shared_write_metadata_technical_failures_are_not_reported_as_not_found(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock, resource, failure,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+    from core.integrations.firestore.effects import get_effect_allocation
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    if resource == "source":
+        harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                         parents=[ROOT_FOLDER_ID])
+        client.collection("transcript_index").document("source").set({
+            "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+        })
+        harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+        failed_id = "source"
+    else:
+        harness.set_file("ancestor", name="Ancestor", mime_type="application/vnd.google-apps.folder",
+                         parents=[ROOT_FOLDER_ID])
+        if resource == "ancestor":
+            harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                             parents=[ROOT_FOLDER_ID])
+            client.collection("transcript_index").document("source").set({
+                "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+            })
+            harness.set_file("target", name="Target", mime_type="application/vnd.google-apps.folder",
+                             parents=["ancestor"])
+            client.collection("folders").document("ancestor").set({
+                "folder_id": "ancestor", "name": "Ancestor", "parent_id": ROOT_FOLDER_ID,
+            })
+            client.collection("folders").document("target").update({"parent_id": "ancestor"})
+            failed_id = "ancestor"
+        else:
+            client.collection("folders").document("Parent").set({
+                "folder_id": "Parent", "name": "Parent", "parent_id": ROOT_FOLDER_ID,
+            })
+            failed_id = "Parent"
+    if failure == "http500":
+        import httplib2
+        from googleapiclient.errors import HttpError
+        harness.files[failed_id] = HttpError(httplib2.Response({"status": "500"}), b"private provider body")
+    else:
+        harness.files[failed_id] = TimeoutError("private provider body")
+    context = _context(client, fake_clock, operation_id=f"shared-auth-tech-{resource}-{failure}")
+    before = harness.snapshot_domain(client)
+
+    with pytest.raises(write.WriteError) as error:
+        if resource == "source":
+            write.move_transcript("source", ["Target"], context=context)
+        elif resource == "ancestor":
+            write.move_transcript("source", ["Ancestor", "Target"], context=context)
+        else:
+            write.create_folder("Child", ["Parent"], context=context)
+
+    assert not isinstance(error.value, (document_operations.TranscriptNotFound,
+                                        folder_service.FolderNotFound))
+    assert "private provider body" not in str(error.value)
+    assert harness.drive_mutations == harness.qdrant_mutations == []
+    assert failed_id in harness.drive_reads
+    if failure == "http500":
+        assert (failed_id, 500) in harness.drive_errors
+    assert harness.snapshot_domain(client) == before
+    if resource == "parent":
+        assert get_effect_allocation(client, context.operation_id, context.effect_id) is None
+
+
+@pytest.mark.offline
+def test_shared_write_revalidates_fixed_target_before_dispatch_and_marks_failure_unsent(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+        "source_file": "Source",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    target_reads = 0
+
+    def drift_target(file_id, value, _read_number):
+        nonlocal target_reads
+        if file_id == "target":
+            target_reads += 1
+            if target_reads == 2:
+                value["parents"] = ["outside-root"]
+
+    harness.on_drive_read = drift_target
+    before = harness.snapshot_domain(client)
+    context = _context(client, fake_clock, operation_id="shared-auth-fixed-target-drift")
+
+    with pytest.raises((folder_service.FolderOperationError, write.WriteError)):
+        write.move_transcript("source", ["Target"], context=context)
+
+    from core.integrations.firestore.mutations import get_mutation_effect
+    from core.integrations.firestore.write_plans import get_write_plan
+    from core.operations.models import EffectState
+
+    assert target_reads == 2
+    assert harness.drive_mutations == harness.qdrant_mutations == []
+    assert harness.files["source"]["parents"] == [ROOT_FOLDER_ID]
+    current = harness.snapshot_domain(client)
+    expected = before.copy()
+    expected["drive"] = before["drive"].copy()
+    expected["drive"]["target"] = before["drive"]["target"].copy()
+    expected["drive"]["target"]["parents"] = ["outside-root"]
+    assert current == expected
+    plan = get_write_plan(client, context.operation_id, context.effect_id)
+    assert plan is not None and plan["plan"]["metadata"]["target_id"] == "target"
+    effect = get_mutation_effect(client, context.operation_id, context.effect_id)
+    assert effect is not None and effect.state == EffectState.FAILED
+    assert effect.confirmed_result is None
+    for resource in (f"document:source", f"tree:{ROOT_FOLDER_ID}"):
+        guard = get_resource_guard(client, resource)
+        assert guard.mutation_state == EffectState.FAILED.value
+        assert guard.unsettled_effect_ids == ()
+
+
+@pytest.mark.offline
+def test_shared_move_folder_rejects_live_descendant_hidden_by_stale_registry(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID, SharedWriteAuthorizationHarness
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-shared-write-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-shared-write-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-shared-write-secret")
+    harness = SharedWriteAuthorizationHarness(monkeypatch, sdk_fakes)
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    harness.set_file("parent", name="Parent", mime_type="application/vnd.google-apps.folder",
+                     parents=["source"])
+    client.collection("folders").document("source").set({
+        "folder_id": "source", "name": "Source", "parent_id": ROOT_FOLDER_ID,
+    })
+    # Cached registry says parent is a sibling; live Drive says it is under source.
+    client.collection("folders").document("parent").set({
+        "folder_id": "parent", "name": "Parent", "parent_id": ROOT_FOLDER_ID,
+    })
+    context = _context(client, fake_clock, operation_id="shared-auth-live-subtree")
+
+    with pytest.raises(folder_service.FolderSubtreeMove):
+        write.move_folder(["Source"], ["Parent"], context=context)
+
+    assert harness.drive_mutations == []
+    assert harness.files["source"]["parents"] == [ROOT_FOLDER_ID]
+
+
+@pytest.mark.offline
+def _seed_create_plan(client, harness, context, root_id, *, name, parent_id, arguments,
+                      root_binding="legacy", resources=None):
+    from core.integrations.firestore.write_plans import persist_write_plan
+
+    intent = write._json_digest({"name": name, "parent_id": parent_id})
+    allocation = write.allocate_folder_id(
+        client, operation_id=context.operation_id, effect_id=context.effect_id,
+        intent_digest=intent, owner=context.owner, fence=context.fence, now=context.now(),
+        clock=context.now, id_factory=lambda: "legacy-planned-folder",
+    )
+    folder_id, marker = allocation["resource_id"], allocation["intent_marker"]
+    metadata = {
+        "kind": "provider_call", "write_type": "create_folder", "result_kind": "string",
+        "name": name, "parent_id": parent_id, "folder_id": folder_id, "marker": marker,
+        "resources": resources if resources is not None else [
+            f"tree:{root_id}", f"folder:{parent_id}", f"folder:{folder_id}",
+        ],
+        "desired_state": {
+            "drive": {"id": folder_id, "name": name,
+                      "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id],
+                      "trashed": False, "marker": marker},
+            "firestore": {"id": folder_id, "name": name, "parent": parent_id},
+        },
+        "result_value": folder_id,
+    }
+    if root_binding != "legacy":
+        metadata["root_id"] = root_binding
+    snapshot = write._snapshot_create_folder(metadata, context)
+    arguments_digest = write._json_digest(arguments)
+    planned = {
+        "arguments_digest": arguments_digest,
+        "metadata": metadata,
+        "expected_pre_state": write.digest(snapshot),
+    }
+    persisted = persist_write_plan(
+        client, operation_id=context.operation_id, effect_id=context.effect_id,
+        owner=context.owner, fence=context.fence, now=context.now(),
+        arguments_digest=arguments_digest, plan=planned, clock=context.now,
+    )
+    return persisted, allocation
+
+
+@pytest.mark.offline
+def test_legacy_create_plan_uses_its_persisted_tree_binding_and_fixed_folder_id(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+    from core.integrations.firestore.write_plans import get_write_plan
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.set_file("parent", name="Parent", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("folders").document("parent").set({
+        "folder_id": "parent", "name": "Parent", "parent_id": ROOT_FOLDER_ID,
+    })
+    context = _context(client, fake_clock, operation_id="shared-auth-legacy-create-plan")
+    args = {"name": "Legacy", "parent_path": ["Parent"]}
+    persisted, allocation = _seed_create_plan(
+        client, harness, context, ROOT_FOLDER_ID, name="Legacy", parent_id="parent", arguments=args,
+    )
+    before = get_write_plan(client, context.operation_id, context.effect_id)
+    # The path is no longer resolvable, but the persisted parent ID remains live.
+    client.collection("folders").document("parent").update({"name": "Renamed"})
+
+    assert write.create_folder("Legacy", ["Parent"], context=context) == allocation["resource_id"]
+
+    assert before is not None
+    assert before["plan"]["metadata"]["resources"] == [
+        f"tree:{ROOT_FOLDER_ID}", "folder:parent", "folder:legacy-planned-folder",
+    ]
+    assert "root_id" not in before["plan"]["metadata"]
+    assert get_write_plan(client, context.operation_id, context.effect_id) == before
+    assert harness.files[allocation["resource_id"]]["parents"] == ["parent"]
+    assert len(harness.drive_mutations) == 1
+    assert harness.drive_mutations[0]["body"]["id"] == allocation["resource_id"]
+    assert not [event for event in sdk_fakes.trace
+                if event["boundary"] == "drive" and event["operation"] == "files.generateIds"]
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize(
+    ("case", "root_binding", "resources"),
+    [
+        ("legacy_missing", "legacy", ["folder:root", "folder:legacy-planned-folder"]),
+        ("legacy_ambiguous", "legacy", ["tree:pytest-synthetic-root", "tree:other-root",
+                                           "folder:pytest-synthetic-root", "folder:legacy-planned-folder"]),
+        ("inconsistent", "other-root", ["tree:pytest-synthetic-root", "folder:pytest-synthetic-root",
+                                           "folder:legacy-planned-folder"]),
+        ("explicit_false", False, ["tree:pytest-synthetic-root", "folder:pytest-synthetic-root",
+                                   "folder:legacy-planned-folder"]),
+    ],
+)
+def test_create_plan_rejects_invalid_persisted_root_binding_without_not_found(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock, case, root_binding, resources,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+    from core.integrations.firestore.write_plans import get_write_plan
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    context = _context(client, fake_clock, operation_id="shared-auth-root-binding-" + case)
+    args = {"name": "Legacy", "parent_path": []}
+    before, _allocation = _seed_create_plan(
+        client, harness, context, ROOT_FOLDER_ID, name="Legacy", parent_id=ROOT_FOLDER_ID,
+        arguments=args, root_binding=root_binding, resources=resources,
+    )
+
+    with pytest.raises((write.WritePlanConflict, MutationConflict)) as error:
+        write.create_folder("Legacy", context=context)
+
+    from core.integrations.firestore.mutations import get_mutation_effect
+    from core.operations.models import EffectState
+    effect = get_mutation_effect(client, context.operation_id, context.effect_id)
+    assert effect is not None and effect.state == EffectState.FAILED
+    assert not isinstance(error.value, folder_service.FolderNotFound)
+    assert harness.drive_mutations == []
+    assert get_write_plan(client, context.operation_id, context.effect_id) == before
+
+
+@pytest.mark.offline
+def test_create_plan_rejects_current_root_drift_without_rewriting_plan(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+    from core.integrations.firestore.write_plans import get_write_plan
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    context = _context(client, fake_clock, operation_id="shared-auth-root-binding-drift")
+    args = {"name": "Legacy", "parent_path": []}
+    before, _allocation = _seed_create_plan(
+        client, harness, context, ROOT_FOLDER_ID, name="Legacy", parent_id=ROOT_FOLDER_ID,
+        arguments=args, root_binding=ROOT_FOLDER_ID,
+    )
+    monkeypatch.setenv("ROOT_FOLDER_URL", "https://drive.google.com/drive/folders/current-root")
+
+    with pytest.raises(MutationConflict):
+        write.create_folder("Legacy", context=context)
+
+    from core.integrations.firestore.mutations import get_mutation_effect
+    from core.operations.models import EffectState
+    effect = get_mutation_effect(client, context.operation_id, context.effect_id)
+    assert effect is not None and effect.state == EffectState.FAILED
+    assert harness.drive_mutations == []
+    assert get_write_plan(client, context.operation_id, context.effect_id) == before
+
+
+@pytest.mark.offline
+def test_shared_preflight_lease_expiry_is_definitely_unsent(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+        "source_file": "Source",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    source_reads = 0
+
+    def expire_lease_during_dispatch_preflight(file_id, _value, _read_number):
+        nonlocal source_reads
+        if file_id == ROOT_FOLDER_ID:
+            source_reads += 1
+            if source_reads == 2:
+                fake_clock.advance(seconds=61)
+
+    harness.on_drive_read = expire_lease_during_dispatch_preflight
+    context = _context(client, fake_clock, operation_id="shared-auth-preflight-expired")
+
+    with pytest.raises((MutationNotSent, write.WriteError)):
+        write.move_transcript("source", ["Target"], context=context)
+
+    from core.integrations.firestore.mutations import get_mutation_effect
+    from core.integrations.firestore.write_plans import get_write_plan
+    from core.operations.models import EffectState
+
+    assert source_reads == 2  # Root was re-read after the guarded pre-state check.
+    assert harness.drive_mutations == harness.qdrant_mutations == []
+    plan = get_write_plan(client, context.operation_id, context.effect_id)
+    assert plan is not None and plan["plan"]["metadata"]["target_id"] == "target"
+    effect = get_mutation_effect(client, context.operation_id, context.effect_id)
+    assert effect is not None and effect.state in {EffectState.DISPATCHED, EffectState.UNKNOWN,
+                                                    EffectState.FAILED}
+    assert effect.confirmed_result is None
+    guard = get_resource_guard(client, f"tree:{ROOT_FOLDER_ID}")
+    if effect.state == EffectState.FAILED:
+        assert context.effect_id not in guard.unsettled_effect_ids
+    else:
+        assert context.effect_id in guard.unsettled_effect_ids
+
+
+@pytest.mark.offline
 def test_shared_write_authorization_rejects_destination_live_parent_drift(monkeypatch, firestore_fake, sdk_fakes, fake_clock):
     from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
 
@@ -423,14 +879,19 @@ def test_competing_move_folder_plan_winner_supplies_read_and_apply_targets(
     state = {
         "drive": {"folder-loser": {"parents": ["old"]}, "folder-winner": {"parents": ["old"]}},
         "folder": {"folder-loser": {"name": "Loser", "parent_id": "old"},
-                   "folder-winner": {"name": "Winner", "parent_id": "old"}},
+                   "folder-winner": {"name": "Winner", "parent_id": "old"},
+                   "new": {"name": "New", "parent_id": "root-id"}},
     }
+    live = _live_drive_metadata(monkeypatch, "root-id", folders=[("old", "root-id"),
+                                                                  ("folder-loser", "old"),
+                                                                  ("folder-winner", "old"),
+                                                                  ("new", "root-id")])
     monkeypatch.setattr(folder_service, "prepare_move_folder",
                         lambda *_args, **_kwargs: ("folder-loser", "new"))
     monkeypatch.setattr(folder_service, "expand_registered_subtree", lambda folder_id, _db=None: [folder_id])
     monkeypatch.setattr(write, "_document_ids_in_folders",
                         lambda folder_ids, _db=None: ["doc-" + folder_ids[0].split("-")[-1]])
-    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda folder_id: state["drive"][folder_id])
+    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda folder_id: live[folder_id])
     monkeypatch.setattr(write.folder_repository, "get_folder_by_id",
                         lambda folder_id, _db=None: state["folder"][folder_id])
 
@@ -455,6 +916,7 @@ def test_competing_move_folder_plan_winner_supplies_read_and_apply_targets(
     def apply(folder_id, parent_id, *, db=None, before_bookkeeping=None):
         applied.append(folder_id)
         state["drive"][folder_id]["parents"] = [parent_id]
+        live[folder_id]["parents"] = [parent_id]
         state["folder"][folder_id]["parent_id"] = parent_id
         return folder_id, parent_id
     monkeypatch.setattr(folder_service, "apply_move_folder", apply)
@@ -485,11 +947,15 @@ def test_move_folder_guards_descendant_documents_and_rejects_changed_membership(
     context = _context(client, fake_clock)
     state = {"drive": {"id": "folder-a", "name": "A", "parents": ["old-parent"]},
              "folder": {"name": "A", "parent_id": "old-parent"}, "docs": ["doc-a"]}
+    live = _live_drive_metadata(monkeypatch, "root-id", folders=[("old-parent", "root-id"),
+                                                                  ("folder-a", "old-parent"),
+                                                                  ("new-parent", "root-id")])
+    state["drive"] = live["folder-a"]
     reads, writes = [], []
     monkeypatch.setattr(folder_service, "prepare_move_folder", lambda *_args, **_kwargs: ("folder-a", "new-parent"))
     monkeypatch.setattr(folder_service, "expand_registered_subtree", lambda _id, _db=None: ["folder-a"])
     monkeypatch.setattr(write, "_document_ids_in_folders", lambda _ids, _db=None: list(state["docs"]))
-    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda _id: state["drive"])
+    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda file_id: live[file_id])
     monkeypatch.setattr(write.folder_repository, "get_folder_by_id", lambda _id, _db=None: state["folder"])
     monkeypatch.setattr(write.folder_repository, "get_all_folders", lambda _db=None: {"folder-a": state["folder"]})
     monkeypatch.setattr(write.transcripts, "stream_index_records", lambda **_kwargs: [])
@@ -522,6 +988,10 @@ def test_rename_folder_and_create_folder_use_guarded_drive_and_registry_state(
     client = _configure_firestore(monkeypatch, firestore_fake, fake_clock)
     state = {"drive": {"id": "folder-a", "name": "Old", "parents": ["parent"]},
              "folder": {"name": "Old", "parent_id": "parent"}}
+    live = _live_drive_metadata(monkeypatch, "root-id", folders=[("parent", "root-id"),
+                                                                  ("folder-a", "parent")])
+    live["folder-a"].update({"name": "Old"})
+    state["drive"] = live["folder-a"]
     path_resolutions, sibling_checks, rename_calls = [], [], []
     monkeypatch.setattr(folder_service, "resolve_registered_folder_path",
                         lambda _path, _db=None: path_resolutions.append("resolve") or ["folder-a"])
@@ -529,7 +999,8 @@ def test_rename_folder_and_create_folder_use_guarded_drive_and_registry_state(
     monkeypatch.setattr(write.folder_repository, "get_folder_by_id", lambda _id, _db=None: state["folder"])
     monkeypatch.setattr(write.folder_repository, "folder_name_exists",
                         lambda *_a, **_k: sibling_checks.append("check") or False)
-    monkeypatch.setattr(write.drive_files, "get_file_metadata", lambda _id: state["drive"])
+    monkeypatch.setattr(write.drive_files, "get_file_metadata",
+                        lambda file_id: live[file_id] if file_id in live else state["drive"])
     def rename_drive(_id, name):
         rename_calls.append(name)
         state["drive"].update(name=name)
@@ -564,8 +1035,11 @@ def test_rename_folder_and_create_folder_use_guarded_drive_and_registry_state(
     monkeypatch.setattr(write, "allocate_folder_id", allocate)
     monkeypatch.setattr(folder_service, "prepare_create_folder", lambda *_args, **_kwargs: "parent")
     created = {"drive": None, "folder": None}
+    live = _live_drive_metadata(monkeypatch, "root-id", folders=[("parent", "root-id")])
     monkeypatch.setattr(write.drive_files, "get_file_metadata_if_exists", lambda _id: created["drive"])
-    monkeypatch.setattr(write.folder_repository, "get_folder_by_id", lambda _id, _db=None: created["folder"])
+    monkeypatch.setattr(write.folder_repository, "get_folder_by_id",
+                        lambda folder_id, _db=None: ({"name": "Parent", "parent_id": "root-id"}
+                                                     if folder_id == "parent" else created["folder"]))
 
     def create(name, parent, *, folder_id, intent_marker):
         assert allocated and allocated[0]["resource_id"] == folder_id
@@ -633,6 +1107,8 @@ def test_create_folder_rechecks_sibling_uniqueness_inside_tree_guard(
 ):
     client = _configure_firestore(monkeypatch, firestore_fake, fake_clock)
     records, drive_folders, created = {}, {}, []
+    records["parent"] = {"name": "Parent", "parent_id": "root-id"}
+    _live_drive_metadata(monkeypatch, "root-id", folders=[("parent", "root-id")])
     monkeypatch.setattr(folder_service, "prepare_create_folder", lambda *_args, **_kwargs: "parent")
     monkeypatch.setattr(write.folder_repository, "folder_name_exists",
                         lambda name, parent, _db=None, *, exclude_id=None: any(

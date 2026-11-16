@@ -38,9 +38,14 @@ class SharedWriteAuthorizationHarness:
         from tests.fixtures import sdk_fakes as sdk_module
 
         self.files: dict[str, dict[str, Any]] = {}
+        monkeypatch.setenv(
+            "ROOT_FOLDER_URL",
+            f"https://drive.google.com/drive/folders/{ROOT_FOLDER_ID}",
+        )
         self.drive_mutations: list[dict[str, Any]] = []
         self.drive_reads: list[str] = []
         self.drive_errors: list[tuple[str, int]] = []
+        self.on_drive_read = None
         self.qdrant_points: dict[tuple[str, str], list[str | None]] = {}
         self.qdrant_mutations: list[dict[str, Any]] = []
         self.set_file(ROOT_FOLDER_ID, name="Root", mime_type="application/vnd.google-apps.folder", parents=[])
@@ -55,6 +60,8 @@ class SharedWriteAuthorizationHarness:
                 file_id = request.args["fileId"]
                 self.drive_reads.append(file_id)
                 value = self.files.get(file_id)
+                if self.on_drive_read is not None:
+                    self.on_drive_read(file_id, value, len(self.drive_reads))
                 if isinstance(value, BaseException):
                     status = getattr(value, "status_code", None)
                     if isinstance(status, int):

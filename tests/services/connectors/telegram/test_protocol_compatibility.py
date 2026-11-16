@@ -340,9 +340,14 @@ def test_candidate_cleared_pinned_legacy_write_route_replays_first_effect_withou
     # Drive is absent on preflight, then accepts the stable ID already allocated
     # in Firestore. The real folder operation performs its own durable read-back.
     drive_404 = HttpError(httplib2.Response({"status": "404"}), b"synthetic missing")
+    root_metadata = {"id": root_id, "name": "TLBrain",
+                     "mimeType": "application/vnd.google-apps.folder",
+                     "parents": [], "trashed": False}
     sdk_fakes.drive.queue("files.generateIds", response={"ids": [child_folder_id]})
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
     sdk_fakes.drive.queue("files.get", error=drive_404)
     sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
     sdk_fakes.drive.queue("files.create", response={"id": child_folder_id})
     sdk_fakes.drive.queue("files.get", response={
         "id": child_folder_id, "name": "Archive",
@@ -1454,8 +1459,13 @@ def test_confirmed_shared_folder_result_replays_from_checkpoint_without_provider
     ).hexdigest()
     effect_id, marker = _folder_marker(accepted.operation_id, child_id, root_id)
     sdk_fakes.drive.queue("files.generateIds", response={"ids": [folder_id]})
+    root_metadata = {"id": root_id, "name": "TLBrain",
+                     "mimeType": "application/vnd.google-apps.folder",
+                     "parents": [], "trashed": False}
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
     sdk_fakes.drive.queue("files.get", error=_http_404())
     sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
     sdk_fakes.drive.queue("files.create", response={"id": folder_id})
     sdk_fakes.drive.queue("files.get", response={
         "id": folder_id, "name": "Archive",
@@ -1510,8 +1520,13 @@ def test_unknown_shared_folder_effect_retries_only_readback_and_keeps_identity(
     ).hexdigest()
     effect_id, _marker = _folder_marker(accepted.operation_id, child_id, root_id)
     sdk_fakes.drive.queue("files.generateIds", response={"ids": ["t003-unknown-folder"]})
+    root_metadata = {"id": root_id, "name": "TLBrain",
+                     "mimeType": "application/vnd.google-apps.folder",
+                     "parents": [], "trashed": False}
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
     sdk_fakes.drive.queue("files.get", error=_http_404())
     sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
     sdk_fakes.drive.queue("files.create", error=TimeoutError("synthetic lost response"))
     sdk_fakes.drive.queue("files.get", error=_http_404())
     from core.integrations.firestore.mutations import get_mutation_effect, get_resource_guard

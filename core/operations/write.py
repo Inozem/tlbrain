@@ -24,6 +24,7 @@ from core.integrations.firestore.write_plans import (
 from core.integrations.google_drive import client as drive_client
 from core.integrations.google_drive import files as drive_files
 from core.integrations.google_drive import folder_service
+from core.integrations.google_drive.files import GOOGLE_DOC_MIME_TYPE
 from core.integrations.qdrant import writer as qdrant_writer
 from core.integrations.qdrant import reader as qdrant_reader
 from core.operations.effects import allocate_fact_id, allocate_folder_id
@@ -365,28 +366,152 @@ def _read_snapshot(metadata: dict[str, Any], context: WriteContext) -> dict[str,
     return reader(metadata, context)
 
 
+def _provider_http_status(error: Exception) -> int | None:
+    status = getattr(error, "status_code", None) or getattr(getattr(error, "resp", None), "status", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _validated_plan_root(metadata: dict[str, Any]) -> str:
+    """Return the immutable root binding after validating its persisted guard."""
+    tree_resources = [
+        item.removeprefix("tree:") for item in metadata.get("resources", [])
+        if isinstance(item, str) and item.startswith("tree:") and item.removeprefix("tree:")
+    ]
+    if metadata.get("write_type") == "create_folder" and "root_id" not in metadata:
+        # Older persisted create plans bound their root only through the guarded
+        # resource key. Keep that immutable binding; never adopt a newly read root.
+        if len(tree_resources) != 1:
+            raise WritePlanConflict("persisted root binding is missing or ambiguous")
+        root_id = tree_resources[0]
+    else:
+        root_id = metadata.get("root_id")
+    if (not isinstance(root_id, str) or not root_id or len(tree_resources) != 1
+            or tree_resources[0] != root_id):
+        raise WritePlanConflict("persisted root binding is malformed or inconsistent")
+    return root_id
+
+
+def _validate_live_transcript_move(
+    metadata: dict[str, Any], context: WriteContext, root_id: str,
+    cache: dict[str, dict[str, Any]],
+) -> None:
+    record = transcripts.get_transcript_record(metadata["doc_id"], _client(context))
+    if not isinstance(record, dict):
+        raise document_operations.TranscriptNotFound(metadata["doc_id"])
+    try:
+        drive = drive_files.get_file_metadata(metadata["doc_id"])
+    except Exception as error:
+        status = _provider_http_status(error)
+        if status == 404:
+            raise document_operations.TranscriptNotFound(metadata["doc_id"]) from None
+        message = "transcript source is inaccessible" if status == 403 else "transcript metadata is unavailable"
+        raise WriteError(message) from None
+    if not isinstance(drive, dict) or drive.get("id") != metadata["doc_id"]:
+        raise WriteError("transcript metadata response is malformed")
+    parents = drive.get("parents") if isinstance(drive, dict) else None
+    if (not isinstance(drive.get("mimeType"), str) or "trashed" not in drive
+            or not isinstance(drive.get("trashed"), bool) or not isinstance(parents, list)):
+        raise WriteError("transcript metadata response is malformed")
+    if (drive.get("mimeType") != GOOGLE_DOC_MIME_TYPE or drive.get("trashed") is not False
+            or len(parents) != 1):
+        raise folder_service.LiveFolderValidationError("transcript source is missing, inaccessible, or invalid")
+    if not isinstance(parents[0], str) or not parents[0].strip():
+        raise WriteError("transcript ancestry metadata is malformed")
+    folder_service.validate_live_folder_ancestry(parents[0], root_id, cache=cache)
+    folder_service.validate_live_folder_ancestry(metadata["target_id"], root_id, cache=cache)
+
+
+def _validate_live_folder_move(
+    metadata: dict[str, Any], context: WriteContext, root_id: str,
+    cache: dict[str, dict[str, Any]],
+) -> None:
+    source_record = folder_repository.get_folder_by_id(metadata["folder_id"], _client(context))
+    if not isinstance(source_record, dict):
+        raise folder_service.LiveFolderValidationError("source folder is not registered")
+    if metadata["parent_id"] != root_id:
+        parent_record = folder_repository.get_folder_by_id(metadata["parent_id"], _client(context))
+        if not isinstance(parent_record, dict):
+            raise folder_service.LiveFolderValidationError("destination folder is not registered")
+    parent_lineage: list[str] = []
+    folder_service.validate_live_folder_ancestry(
+        metadata["folder_id"], root_id, cache=cache,
+    )
+    folder_service.validate_live_folder_ancestry(
+        metadata["parent_id"], root_id, cache=cache, lineage=parent_lineage,
+    )
+    if metadata["folder_id"] in parent_lineage:
+        raise folder_service.FolderSubtreeMove()
+
+
+def _validate_live_folder_create(
+    metadata: dict[str, Any], context: WriteContext, root_id: str,
+    cache: dict[str, dict[str, Any]],
+) -> None:
+    if metadata["parent_id"] != root_id:
+        parent_record = folder_repository.get_folder_by_id(metadata["parent_id"], _client(context))
+        if not isinstance(parent_record, dict):
+            raise folder_service.LiveFolderValidationError("parent folder is not registered")
+    folder_service.validate_live_folder_ancestry(metadata["parent_id"], root_id, cache=cache)
+
+
+def _validate_live_shared_targets(metadata: dict[str, Any], context: WriteContext) -> None:
+    """Authorize the immutable IDs against current Drive state before a shared write."""
+    root_id = _validated_plan_root(metadata)
+    if get_root_folder_id() != root_id:
+        raise MutationConflict("configured root changed since write planning")
+    cache: dict[str, dict[str, Any]] = {}
+    kind = metadata.get("write_type")
+    if kind == "move_transcript":
+        _validate_live_transcript_move(metadata, context, root_id, cache)
+    elif kind == "move_folder":
+        _validate_live_folder_move(metadata, context, root_id, cache)
+    elif kind == "create_folder":
+        _validate_live_folder_create(metadata, context, root_id, cache)
+
+
+def _apply_after_live_preflight(metadata: dict[str, Any], context: WriteContext, apply: Callable):
+    """Keep pre-dispatch authorization failures definitely unsent; preserve provider outcomes."""
+    try:
+        _validate_live_shared_targets(metadata, context)
+    except MutationNotSent:
+        raise
+    except Exception as error:
+        if _is_domain_error(error):
+            raise MutationNotSent(error) from None
+        raise MutationNotSent(WriteError("live write preflight is unavailable")) from None
+    _lease_checkpoint(context, definitely_unsent=True)
+    return apply(metadata)
+
+
 def _prepare_from_plan(metadata: dict[str, Any], arguments: dict[str, Any], context: WriteContext):
     """Rebuild mutation callbacks from durable IDs without resolving old paths."""
     kind = metadata["write_type"]
     if kind == "move_transcript":
-        apply = lambda m: document_operations.apply_move_transcript(
+        domain_apply = lambda m: document_operations.apply_move_transcript(
             m["doc_id"], m["target_id"], m["root_id"], single_attempt=True,
             db=_client(context), before_bookkeeping=lambda: _lease_checkpoint(context),
         )
+        apply = lambda m: _apply_after_live_preflight(m, context, domain_apply)
     elif kind == "rename_transcript":
         apply = lambda m: document_operations.apply_rename_transcript(
             m["doc_id"], m["new_title"], _client(context),
             before_bookkeeping=lambda: _lease_checkpoint(context),
         )
     elif kind == "move_folder":
-        apply = lambda m: folder_service.apply_move_folder(
+        domain_apply = lambda m: folder_service.apply_move_folder(
             m["folder_id"], m["parent_id"], db=_client(context),
             before_bookkeeping=lambda: _lease_checkpoint(context),
         )
+        apply = lambda m: _apply_after_live_preflight(m, context, domain_apply)
     elif kind == "rename_folder":
         apply = lambda m: _apply_rename_folder_guarded(m, context)
     elif kind == "create_folder":
-        apply = lambda m: _apply_create_folder(m, context)
+        apply = lambda m: _apply_after_live_preflight(
+            m, context, lambda current: _apply_create_folder(current, context),
+        )
     elif kind == "add_fact":
         text = arguments["text"].strip()
         apply = lambda m: _apply_fact(m, text, context)
@@ -406,6 +531,7 @@ def move_transcript(doc_id: str, folder_path: list[str], *, context: WriteContex
                     "result_kind": "move_transcript", "doc_id": doc_id, "target_id": target_id,
                     "root_id": root_id, "resources": [f"document:{doc_id}", f"tree:{root_id}"],
                     "desired_state": None}
+        _validate_live_shared_targets(metadata, ctx)
         before = _read_snapshot(metadata, ctx)
         metadata["_expected_pre_state"] = digest(before)
         qdrant_before = before["qdrant_parents"]
@@ -452,6 +578,7 @@ def move_folder(folder_path: list[str], new_parent_path: list[str] | None = None
                     "result_kind": "move_folder", "folder_id": folder_id, "parent_id": parent_id,
                     "root_id": root_id, "descendants": descendants, "docs": docs,
                     "resources": resources, "desired_state": None}
+        _validate_live_shared_targets(metadata, ctx)
         before = _read_snapshot(metadata, ctx)
         if before["descendants"] != descendants or before["docs"] != docs:
             raise MutationConflict("folder subtree changed during write planning")
@@ -502,6 +629,11 @@ def create_folder(name: str, parent_path: list[str] | None = None, *, context: W
     ctx = _context(context, arguments)
     def prepare():
         parent_id = folder_service.prepare_create_folder(name, parent_path, db=_client(ctx))
+        root_id = get_root_folder_id()
+        _validate_live_shared_targets({
+            "write_type": "create_folder", "root_id": root_id, "parent_id": parent_id,
+            "resources": [f"tree:{root_id}"],
+        }, ctx)
         intent = _json_digest({"name": name, "parent_id": parent_id})
         allocation = allocate_folder_id(
             _client(ctx), operation_id=ctx.operation_id, effect_id=ctx.effect_id,
@@ -509,10 +641,9 @@ def create_folder(name: str, parent_path: list[str] | None = None, *, context: W
             clock=ctx.now,
         )
         folder_id, marker = allocation["resource_id"], allocation["intent_marker"]
-        root_id = get_root_folder_id()
         metadata = {"kind": "provider_call", "write_type": "create_folder",
                     "result_kind": "string", "name": name, "parent_id": parent_id,
-                    "folder_id": folder_id, "marker": marker,
+                    "folder_id": folder_id, "marker": marker, "root_id": root_id,
                     "resources": [f"tree:{root_id}", f"folder:{parent_id}", f"folder:{folder_id}"],
                     "desired_state": {"drive": {"id": folder_id, "name": name,
                                                    "mimeType": "application/vnd.google-apps.folder",

@@ -327,3 +327,42 @@ def test_shared_write_authorization_mcp_create_folder_allows_live_root_parent(
     assert len(harness.drive_mutations) == 1
     assert harness.drive_mutations[0]["body"]["parents"] == ["parent"]
     assert client.collection("folders").document("created-folder").get().to_dict()["parent_id"] == "parent"
+
+
+@pytest.mark.offline
+def test_shared_write_authorization_mcp_metadata_server_error_is_technical(
+    monkeypatch, firestore_fake, sdk_fakes,
+):
+    import httplib2
+    from googleapiclient.errors import HttpError
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID, SharedWriteAuthorizationHarness
+
+    harness = SharedWriteAuthorizationHarness(monkeypatch, sdk_fakes)
+    harness.set_file("parent", name="Parent", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    harness.files["parent"] = HttpError(httplib2.Response({"status": "500"}), b"private provider detail")
+    client = firestore_fake.client_class()
+    client.collection("folders").document("parent").set({
+        "folder_id": "parent", "name": "Parent", "parent_id": ROOT_FOLDER_ID,
+    })
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-shared-write-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-shared-write-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-shared-write-secret")
+    before = harness.snapshot_domain(client)
+    request = JSONRPCRequest(
+        jsonrpc="2.0", id="create-parent-technical", method="tools/call",
+        params={"name": "create_folder", "arguments": {
+            "name": "Child", "parent_path": ["Parent"],
+        }},
+    )
+
+    response = handler.handle_tools_call(request)
+
+    assert response["id"] == "create-parent-technical"
+    assert response["error"]["code"] == -32603
+    assert "not found" not in response["error"]["message"].lower()
+    assert "private provider detail" not in str(response["error"])
+    assert "parent" in harness.drive_reads
+    assert ("parent", 500) in harness.drive_errors
+    assert harness.drive_mutations == []
+    assert harness.snapshot_domain(client) == before

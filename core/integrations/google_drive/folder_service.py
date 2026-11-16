@@ -7,6 +7,7 @@ from core.config import get_root_folder_id
 from core.integrations.firestore import folders as folder_repository
 from core.integrations.firestore.transcripts import aggregate_transcripts_by_folder
 from core.integrations.google_drive import client as drive_client
+from core.integrations.google_drive import files as drive_files
 from core.integrations.google_drive.folders import (
     build_folder_tree,
     expand_subtree,
@@ -64,6 +65,86 @@ class FolderNameConflict(FolderOperationError):
 
 class FolderSubtreeMove(FolderOperationError):
     pass
+
+
+class LiveFolderValidationError(FolderNotFound):
+    """A Drive folder cannot be proven live, accessible, and inside the configured root."""
+
+    def __init__(self, message: str = "folder is unavailable", role: str = "folder"):
+        self.reason = message
+        super().__init__([message], role)
+
+
+class DriveMetadataReadError(RuntimeError):
+    """A provider metadata read failed for a reason other than a confirmed 404."""
+
+
+def _http_status(error: Exception) -> int | None:
+    status = getattr(error, "status_code", None) or getattr(getattr(error, "resp", None), "status", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_live_folder_ancestry(
+    folder_id: str, root_id: str, *, cache: dict[str, dict[str, Any]] | None = None,
+    lineage: list[str] | None = None,
+) -> dict[str, Any]:
+    """Validate a selected folder and every live Drive parent up to ``root_id``.
+
+    The cache is deliberately caller-owned and should live for one preflight only.
+    A known-ID metadata request is used at every step; no corpus scan or cached
+    Firestore parent is treated as authority.
+    """
+    folder_mime = "application/vnd.google-apps.folder"
+    if not isinstance(folder_id, str) or not folder_id.strip() or not isinstance(root_id, str) or not root_id.strip():
+        raise LiveFolderValidationError("folder is outside the configured root")
+    metadata_cache = cache if cache is not None else {}
+
+    def read(file_id: str) -> dict[str, Any]:
+        if file_id not in metadata_cache:
+            try:
+                value = drive_files.get_file_metadata(file_id)
+            except Exception as error:
+                status = _http_status(error)
+                if status == 404:
+                    raise LiveFolderValidationError("folder not found") from None
+                reason = "folder is inaccessible" if status == 403 else "folder metadata is unavailable"
+                raise DriveMetadataReadError(reason) from None
+            if not isinstance(value, dict) or value.get("id") != file_id:
+                raise DriveMetadataReadError("folder metadata response is malformed")
+            if (not isinstance(value.get("mimeType"), str) or "trashed" not in value
+                    or not isinstance(value.get("trashed"), bool)):
+                raise DriveMetadataReadError("folder metadata response is malformed")
+            metadata_cache[file_id] = value
+        value = metadata_cache[file_id]
+        if value.get("mimeType") != folder_mime or value.get("trashed") is not False:
+            raise LiveFolderValidationError("folder is missing, inaccessible, or invalid")
+        return value
+
+    read(root_id)  # The configured root is the trust boundary; its own parent is irrelevant.
+    current_id = folder_id
+    visited: set[str] = set()
+    current_lineage: list[str] = []
+    while current_id != root_id:
+        if current_id in visited:
+            raise LiveFolderValidationError("folder ancestry contains a cycle")
+        visited.add(current_id)
+        current_lineage.append(current_id)
+        current = read(current_id)
+        parents = current.get("parents")
+        if not isinstance(parents, list):
+            raise DriveMetadataReadError("folder ancestry metadata is malformed")
+        if len(parents) != 1:
+            raise LiveFolderValidationError("folder ancestry is malformed or ambiguous")
+        if not isinstance(parents[0], str) or not parents[0].strip():
+            raise DriveMetadataReadError("folder ancestry metadata is malformed")
+        current_id = parents[0]
+    current_lineage.append(root_id)
+    if lineage is not None:
+        lineage.extend(current_lineage)
+    return read(folder_id)
 
 
 _STABLE_INTENT_MARKER = re.compile(r"v1:[0-9a-f]{64}\Z")
