@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+import re
+
+
+_CLARIFICATION_ID = re.compile(r"^[A-Za-z0-9_-]{1,480}$")
 
 
 def build_context_id(chat_id: int, thread_id: int | None = None) -> str:
@@ -68,10 +72,19 @@ class TelegramContext:
     status_revision: int = 0
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    # Appended for positional-constructor compatibility with older callers.
+    pending_clarification_id: str | None = None
+    clarification_generation: int = 0
 
     def __post_init__(self) -> None:
         if self.draft_status not in (None, TelegramDraftState.COLLECTING.value):
             raise ValueError("draft_status must be 'collecting' or None")
+        if (self.pending_clarification_id is not None
+                and (not isinstance(self.pending_clarification_id, str)
+                     or not _CLARIFICATION_ID.fullmatch(self.pending_clarification_id))):
+            raise ValueError("pending_clarification_id must be a valid ID or None")
+        if type(self.clarification_generation) is not int or self.clarification_generation < 0:
+            raise ValueError("clarification_generation must be a nonnegative integer")
 
     @property
     def context_id(self) -> str:

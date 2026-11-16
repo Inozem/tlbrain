@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from google.cloud import firestore
@@ -23,6 +23,7 @@ from core.integrations.firestore.operation_queue import (
 )
 from services.connectors.telegram.models import TelegramDraftState, build_context_id
 from services.connectors.telegram.repository._common import (
+    NOTIFICATIONS,
     SESSIONS,
     TelegramIntakeResult,
     _document_ref,
@@ -60,6 +61,37 @@ class _CommandAcceptanceState:
     context: dict[str, Any]
     snapshot: _CommandSnapshot
     command_data: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _QuestionPromptIdentity:
+    notification_id: str
+    revision: int
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _QuestionObservationScope:
+    context_id: str
+    user_id: int
+    clarification_id: str
+    generation: int
+    chat_id: int
+    thread_id: int | None
+
+    @property
+    def question_ref(self) -> str:
+        return (
+            f"{SESSIONS}/{self.context_id}/clarifications/"
+            f"{self.clarification_id}/questions/{self.generation}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _QuestionDeliveryTiming:
+    delivered_at: datetime
+    observed_at: datetime
+    binding_kind: str
 
 
 def _prepare_command_identity(
@@ -195,6 +227,12 @@ def _command_data(
     command: Any,
     snapshot: _CommandSnapshot,
     now: datetime,
+    message_id: int | None,
+    message_date: datetime | None,
+    reply_to_message_id: int | None,
+    observed_clarification_id: str | None = None,
+    observed_clarification_generation: int | None = None,
+    observed_question_delivery_ref: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create the command candidate record without copying draft content."""
     return {
@@ -203,6 +241,16 @@ def _command_data(
         "user_id": user_id,
         "kind": command.kind,
         "candidate": command.text,
+        "message_id": message_id,
+        "message_date": message_date,
+        "reply_to_message_id": reply_to_message_id,
+        "observed_clarification_id": observed_clarification_id,
+        "observed_clarification_generation": observed_clarification_generation,
+        "observed_presentation_id": None,
+        "observed_question_delivery_ref": (
+            dict(observed_question_delivery_ref)
+            if observed_question_delivery_ref is not None else None
+        ),
         **({"action_metadata": dict(command.action_metadata)}
            if isinstance(command.action_metadata, Mapping) else {}),
         "draft_id": snapshot.draft_id,
@@ -226,6 +274,9 @@ def _load_command_acceptance_state(
     topic_name: str | None,
     command: Any,
     now: datetime,
+    message_id: int | None,
+    message_date: datetime | None,
+    reply_to_message_id: int | None,
 ) -> _CommandAcceptanceState:
     """Load the context and prepare command data before reserving or writing."""
     context_snapshot = identity.context_ref.get(transaction=transaction)
@@ -249,8 +300,286 @@ def _load_command_acceptance_state(
             command=command,
             snapshot=snapshot,
             now=now,
+            message_id=message_id,
+            message_date=message_date,
+            reply_to_message_id=reply_to_message_id,
         ),
     )
+
+
+def _recorded_question_observation(
+    client: Any,
+    transaction: Any,
+    *,
+    context_id: str,
+    context: Mapping[str, Any],
+    user_id: int,
+    chat_id: int,
+    thread_id: int | None,
+    message_date: datetime | None,
+    reply_to_message_id: int | None,
+    now: datetime,
+) -> tuple[str | None, int | None, dict[str, Any] | None]:
+    """Capture only a fully scoped current question and its settled delivery proof."""
+    clarification_id = context.get("pending_clarification_id")
+    generation = context.get("clarification_generation")
+    if not _valid_pending_pointer(clarification_id, generation):
+        return None, None, None
+    scope = _QuestionObservationScope(
+        context_id=context_id,
+        user_id=user_id,
+        clarification_id=clarification_id,
+        generation=generation,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+
+    clarification_ref = (
+        client.collection(SESSIONS).document(context_id).collection("clarifications")
+        .document(clarification_id)
+    )
+    clarification_snapshot = clarification_ref.get(transaction=transaction)
+    clarification = (clarification_snapshot.to_dict() or {}
+                     if clarification_snapshot.exists else {})
+    parent_created_utc = _validated_clarification_parent_time(
+        clarification, scope, now,
+    )
+    if parent_created_utc is None:
+        return None, None, None
+
+    # An explicit Telegram reply cannot silently degrade into a plain answer.
+    hint_id, hint_generation = clarification_id, generation
+    if reply_to_message_id is not None:
+        hint_id = hint_generation = None
+
+    question_document = clarification_ref.collection("questions").document(str(generation))
+    question_snapshot = question_document.get(transaction=transaction)
+    question = question_snapshot.to_dict() or {} if question_snapshot.exists else {}
+    if not question:
+        return hint_id, hint_generation, None
+    prompt = _question_prompt_identity(question, scope)
+    if prompt is None:
+        return hint_id, hint_generation, None
+
+    notification_ref = client.collection(NOTIFICATIONS).document(prompt.notification_id)
+    notification_snapshot = notification_ref.get(transaction=transaction)
+    notification = notification_snapshot.to_dict() or {} if notification_snapshot.exists else {}
+    if not _notification_matches_question(
+        notification, prompt, question, scope,
+    ):
+        return hint_id, hint_generation, None
+
+    proof = _question_delivery_proof(
+        parent_created_utc,
+        question,
+        notification,
+        prompt,
+        scope,
+        now=now,
+        message_date=message_date,
+        reply_to_message_id=reply_to_message_id,
+    )
+    if proof is not None and reply_to_message_id is not None:
+        hint_id, hint_generation = clarification_id, generation
+    return hint_id, hint_generation, proof
+
+
+def _valid_pending_pointer(clarification_id: Any, generation: Any) -> bool:
+    if (not isinstance(clarification_id, str) or type(generation) is not int
+            or generation < 1):
+        return False
+    try:
+        _identifier(clarification_id, "pending_clarification_id")
+    except ValueError:
+        return False
+    return True
+
+
+def _validated_clarification_parent_time(
+    clarification: Mapping[str, Any],
+    scope: _QuestionObservationScope,
+    now: datetime,
+) -> datetime | None:
+    if not (
+        clarification.get("clarification_id") == scope.clarification_id
+        and clarification.get("context_id") == scope.context_id
+        and clarification.get("protocol") == "clarification-v1"
+        and type(clarification.get("actor_id")) is int
+        and clarification.get("actor_id") == scope.user_id
+        and clarification.get("state") == "waiting"
+        and type(clarification.get("generation")) is int
+        and clarification.get("generation") == scope.generation
+    ):
+        return None
+    created_at = clarification.get("created_at")
+    if not _is_aware_datetime(created_at):
+        return None
+    try:
+        created_utc = created_at.astimezone(timezone.utc)
+        intake_now_utc = now.astimezone(timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return created_utc if created_utc <= intake_now_utc else None
+
+
+def _question_prompt_identity(
+    question: Mapping[str, Any],
+    scope: _QuestionObservationScope,
+) -> _QuestionPromptIdentity | None:
+    notification_id = question.get("prompt_notification_id")
+    revision = question.get("prompt_notification_revision")
+    digest = question.get("prompt_digest")
+    if (not isinstance(notification_id, str) or not notification_id
+            or type(revision) is not int or revision < 1
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+            or question.get("clarification_id") != scope.clarification_id
+            or question.get("context_id") != scope.context_id
+            or type(question.get("actor_id")) is not int
+            or question.get("actor_id") != scope.user_id
+            or type(question.get("generation")) is not int
+            or question.get("generation") != scope.generation):
+        return None
+    try:
+        _identifier(notification_id, "prompt_notification_id")
+    except ValueError:
+        return None
+    return _QuestionPromptIdentity(notification_id, revision, digest)
+
+
+def _notification_matches_question(
+    notification: Mapping[str, Any],
+    prompt: _QuestionPromptIdentity,
+    question: Mapping[str, Any],
+    scope: _QuestionObservationScope,
+) -> bool:
+    body = notification.get("body")
+    if not isinstance(body, str):
+        return False
+    try:
+        body_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return False
+    return bool(
+        notification.get("notification_id") == prompt.notification_id
+        and notification.get("kind") == "clarification"
+        and notification.get("context_id") == scope.context_id
+        and type(notification.get("actor_id")) is int
+        and notification.get("actor_id") == scope.user_id
+        and notification.get("clarification_id") == scope.clarification_id
+        and type(notification.get("generation")) is int
+        and notification.get("generation") == scope.generation
+        and type(notification.get("chat_id")) is int
+        and notification.get("chat_id") == scope.chat_id
+        and ((scope.thread_id is None and notification.get("thread_id") is None)
+             or (type(scope.thread_id) is int and type(notification.get("thread_id")) is int
+                 and notification.get("thread_id") == scope.thread_id))
+        and type(notification.get("revision")) is int
+        and notification.get("revision") == prompt.revision
+        and type(notification.get("message_id")) is int
+        and notification.get("message_id") > 0
+        and notification.get("state") == "delivered"
+        and prompt.digest == body_digest
+        and _is_aware_datetime(question.get("created_at"))
+        and _is_aware_datetime(notification.get("delivered_at"))
+    )
+
+
+def _question_delivery_timing(
+    parent_created_utc: datetime,
+    question_created_at: Any,
+    delivered_at: Any,
+    *,
+    now: datetime,
+    message_date: datetime | None,
+    reply_to_message_id: int | None,
+    prompt_message_id: Any,
+) -> _QuestionDeliveryTiming | None:
+    try:
+        created_utc, delivered_utc, now_utc = (
+            question_created_at.astimezone(timezone.utc),
+            delivered_at.astimezone(timezone.utc),
+            now.astimezone(timezone.utc),
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
+    if not (parent_created_utc <= created_utc <= delivered_utc <= now_utc):
+        return None
+    try:
+        message_date_utc = (message_date.astimezone(timezone.utc)
+                            if _is_aware_datetime(message_date) else None)
+    except (OverflowError, OSError, ValueError):
+        message_date_utc = None
+    if message_date_utc is not None and message_date_utc > now_utc:
+        return None
+    if reply_to_message_id is not None:
+        if (prompt_message_id != reply_to_message_id
+                or (message_date_utc is not None and created_utc > message_date_utc)):
+            return None
+        binding_kind = "explicit_reply"
+    else:
+        if (message_date_utc is None or delivered_utc >= message_date_utc
+                or created_utc > message_date_utc):
+            return None
+        binding_kind = "plain"
+    return _QuestionDeliveryTiming(
+        delivered_at=delivered_utc,
+        observed_at=now_utc,
+        binding_kind=binding_kind,
+    )
+
+
+def _question_delivery_proof(
+    parent_created_utc: datetime,
+    question: Mapping[str, Any],
+    notification: Mapping[str, Any],
+    prompt: _QuestionPromptIdentity,
+    scope: _QuestionObservationScope,
+    *,
+    now: datetime,
+    message_date: datetime | None,
+    reply_to_message_id: int | None,
+) -> dict[str, Any] | None:
+    timing = _question_delivery_timing(
+        parent_created_utc,
+        question.get("created_at"),
+        notification.get("delivered_at"),
+        now=now,
+        message_date=message_date,
+        reply_to_message_id=reply_to_message_id,
+        prompt_message_id=notification.get("message_id"),
+    )
+    if timing is None:
+        return None
+    return {
+        "context_id": scope.context_id,
+        "actor_id": scope.user_id,
+        "clarification_id": scope.clarification_id,
+        "generation": scope.generation,
+        "question_ref": scope.question_ref,
+        "notification_id": prompt.notification_id,
+        "notification_revision": prompt.revision,
+        "message_id": notification["message_id"],
+        "prompt_digest": prompt.digest,
+        "delivered_at": timing.delivered_at,
+        "observed_at": timing.observed_at,
+        "binding_kind": timing.binding_kind,
+    }
+
+
+def _is_aware_datetime(value: Any) -> bool:
+    return (isinstance(value, datetime) and value.tzinfo is not None
+            and value.utcoffset() is not None)
+
+
+def _trusted_transport_date(timestamp: int | None) -> datetime | None:
+    if type(timestamp) is not int or timestamp <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _register_command_operation(
@@ -815,6 +1144,7 @@ class _TelegramCommandMixin:
         command: Any,
         message_id: int | None,
         transport_timestamp: int | None,
+        reply_to_message_id: int | None,
         now: datetime,
     ) -> TelegramIntakeResult:
         """Coordinate the all-reads-first freeform command reservation."""
@@ -833,7 +1163,27 @@ class _TelegramCommandMixin:
             topic_name=topic_name,
             command=command,
             now=now,
+            message_id=message_id,
+            message_date=_trusted_transport_date(transport_timestamp),
+            reply_to_message_id=reply_to_message_id,
         )
+        message_date = _trusted_transport_date(transport_timestamp)
+        observed_id, observed_generation, delivery_ref = _recorded_question_observation(
+            self.client, transaction,
+            context_id=identity.context_id,
+            context=state.context,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_date=message_date,
+            reply_to_message_id=reply_to_message_id,
+            now=now,
+        )
+        state.command_data.update({
+            "observed_clarification_id": observed_id,
+            "observed_clarification_generation": observed_generation,
+            "observed_question_delivery_ref": delivery_ref,
+        })
         ingress_binding = None
         if command.kind == "freeform" and message_id is not None:
             recent_source = _bind_text_to_recent_receipt_group(
@@ -903,6 +1253,7 @@ class _TelegramCommandMixin:
         command: Any,
         message_id: int | None = None,
         transport_timestamp: int | None = None,
+        reply_to_message_id: int | None = None,
         now: datetime,
     ) -> TelegramIntakeResult:
         """Accept command text and reserve its FIFO position with a save cutoff."""
@@ -924,6 +1275,8 @@ class _TelegramCommandMixin:
             message_id = _integer(message_id, "message_id", minimum=1)
         if transport_timestamp is not None:
             transport_timestamp = _integer(transport_timestamp, "transport_timestamp", minimum=1)
+        if reply_to_message_id is not None:
+            reply_to_message_id = _integer(reply_to_message_id, "reply_to_message_id", minimum=1)
         context_id = build_context_id(chat_id, thread_id)
         identity = _prepare_command_identity(
             self.client,
@@ -945,6 +1298,7 @@ class _TelegramCommandMixin:
                 command=command,
                 message_id=message_id,
                 transport_timestamp=transport_timestamp,
+                reply_to_message_id=reply_to_message_id,
                 now=now,
             )
 
@@ -1050,6 +1404,7 @@ class _TelegramCommandMixin:
                 chat_id=chat_id, user_id=user_id, thread_id=thread_id,
                 topic_name=context.get("topic_name"), command=command, now=now,
                 message_id=None, transport_timestamp=None,
+                reply_to_message_id=None,
             )
             write_prepared_outbox_record(transaction, saving_outbox)
             next_revision = _integer(row.get("revision", 1), "revision", minimum=1) + 1

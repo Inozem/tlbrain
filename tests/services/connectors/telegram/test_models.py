@@ -43,7 +43,7 @@ def test_context_schema_key_and_immutability():
         "last_doc_id", "next_dialog_number", "next_operation_sequence", "head_sequence",
         "active_operation_id", "lock_owner", "lock_expires_at", "fence",
         "reserved_operation_id", "status_message_id", "status_revision", "created_at",
-        "updated_at",
+        "updated_at", "pending_clarification_id", "clarification_generation",
     )
     assert _field_names(TelegramContext) == expected
     context = TelegramContext(chat_id=-8_000_000_001, thread_id=5_000_000_007)
@@ -51,6 +51,8 @@ def test_context_schema_key_and_immutability():
     assert context.chat_id == -8_000_000_001
     assert context.thread_id == 5_000_000_007
     assert context.draft_status is None
+    assert context.pending_clarification_id is None
+    assert context.clarification_generation == 0
     assert not hasattr(context, "__dict__")
     with pytest.raises(FrozenInstanceError):
         context.chat_id = 7

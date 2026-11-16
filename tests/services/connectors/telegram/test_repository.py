@@ -67,6 +67,8 @@ def test_forward_transaction_persists_receipt_draft_dialog_message_and_ack(fires
         "status_revision": 0,
         "created_at": NOW,
         "updated_at": NOW,
+        "pending_clarification_id": None,
+        "clarification_generation": 0,
         "next_intake_sequence": 2,
     }
     assert _read(client, f"telegram_sessions/{context_id}/updates/1")["draft_id"] == result.draft_id

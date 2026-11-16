@@ -253,6 +253,19 @@ def _context_defaults(
     return data
 
 
+def _pending_clarification_clear_patch(
+    context: Mapping[str, Any], *, clarification_id: str, generation: int,
+) -> dict[str, Any] | None:
+    """Return a pointer-only CAS patch when the expected clarification is current."""
+    if (not isinstance(clarification_id, str) or not clarification_id
+            or type(generation) is not int or generation < 0
+            or context.get("pending_clarification_id") != clarification_id
+            or type(context.get("clarification_generation")) is not int
+            or context.get("clarification_generation") != generation):
+        return None
+    return {"pending_clarification_id": None}
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramIntakeResult:
     accepted: bool

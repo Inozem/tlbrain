@@ -265,6 +265,26 @@ class TelegramIntake:
         text = message.get("text")
         if not isinstance(text, str) or not text.strip():
             return None
+        reply_to_message_id = None
+        if "reply_to_message" in message:
+            reply = message.get("reply_to_message")
+            if not isinstance(reply, Mapping):
+                return None
+            reply_to_message_id = _integer(reply.get("message_id"))
+            if reply_to_message_id is None or reply_to_message_id <= 0:
+                return None
+            reply_chat = reply.get("chat")
+            if reply_chat is not None:
+                if (not isinstance(reply_chat, Mapping)
+                        or _integer(reply_chat.get("id")) != chat_id
+                        or (reply_chat.get("type") is not None
+                            and reply_chat.get("type") != "private")):
+                    return None
+            reply_thread = reply.get("message_thread_id")
+            if reply_thread is not None:
+                if (type(reply_thread) is not int or reply_thread <= 0
+                        or reply_thread != thread_id):
+                    return None
         accepted = self.repository.accept_command(
             update_id,
             chat_id=chat_id,
@@ -274,6 +294,7 @@ class TelegramIntake:
             command=parse_command(text),
             message_id=_integer(message.get("message_id")),
             transport_timestamp=_transport_timestamp(message),
+            reply_to_message_id=reply_to_message_id,
             now=self.clock(),
         )
         self._publish_if_accepted(accepted)
