@@ -268,6 +268,153 @@ def test_move_folder_success_reserves_tree_folder_and_descendant_document(
         assert get_resource_guard(client, resource).resource_epoch == 1
 
 
+def _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID, SharedWriteAuthorizationHarness
+
+    client = firestore_fake.client_class()
+    firestore_fake.set_clock(fake_clock)
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-shared-write-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-shared-write-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-shared-write-secret")
+    harness = SharedWriteAuthorizationHarness(monkeypatch, sdk_fakes)
+    harness.set_file("target", name="Target", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("folders").document("target").set({
+        "folder_id": "target", "name": "Target", "parent_id": ROOT_FOLDER_ID,
+    })
+    return client, harness
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize(
+    "scenario",
+    ["source_outside_root", "source_unregistered", "live_parent_drift",
+     "source_missing", "source_forbidden", "source_trashed", "source_wrong_type"],
+)
+def test_shared_write_authorization_rejects_unauthorized_transcript_source(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock, scenario,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    source_parent = ROOT_FOLDER_ID
+    if scenario == "source_outside_root":
+        source_parent = "outside-root"
+    elif scenario == "live_parent_drift":
+        source_parent = "outside-root"
+    registry_parent = "outside-root" if scenario == "source_outside_root" else ROOT_FOLDER_ID
+    source_mime_type = ("application/vnd.google-apps.folder" if scenario == "source_wrong_type"
+                        else "application/vnd.google-apps.document")
+    harness.set_file("source", name="Source", mime_type=source_mime_type,
+                     parents=[source_parent], trashed=(scenario == "source_trashed"))
+    if scenario == "source_missing":
+        import httplib2
+        from googleapiclient.errors import HttpError
+        harness.files["source"] = HttpError(httplib2.Response({"status": "404"}), b"missing")
+    elif scenario == "source_forbidden":
+        import httplib2
+        from googleapiclient.errors import HttpError
+        harness.files["source"] = HttpError(httplib2.Response({"status": "403"}), b"forbidden")
+    if scenario != "source_unregistered":
+        client.collection("transcript_index").document("source").set({
+            "doc_id": "source", "status": "synced", "parent_id": registry_parent,
+            "source_file": "Source", "content_hash": "sha256:original",
+            "user_fact": "preserve-me",
+        })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    harness.add_qdrant_parent("sentinel", ROOT_FOLDER_ID)
+    harness.add_qdrant_parent("source", "outside-root", "unrelated-root")
+    before_domain = harness.snapshot_domain(client)
+    context = _context(client, fake_clock, operation_id="shared-auth-" + scenario)
+
+    refused = False
+    unknown = False
+    try:
+        write.move_transcript("source", ["Target"], context=context)
+    except (write.WriteError, document_operations.TranscriptNotFound,
+            document_operations.FolderPathNotFound, folder_service.FolderOperationError,
+            MutationConflict):
+        refused = True
+    except MutationOutcomeUnknown:
+        unknown = True
+
+    assert harness.drive_mutations == [], scenario
+    assert harness.qdrant_mutations == [], scenario
+    assert refused and not unknown, scenario
+    if isinstance(harness.files["source"], dict):
+        assert harness.files["source"].get("parents") == [source_parent], scenario
+    if scenario != "source_unregistered":
+        assert "source" in harness.drive_reads, scenario
+    if scenario in {"source_missing", "source_forbidden"}:
+        assert ("source", 404 if scenario == "source_missing" else 403) in harness.drive_errors
+    assert harness.snapshot_domain(client) == before_domain
+
+
+@pytest.mark.offline
+def test_shared_write_authorization_allows_registered_live_root_transcript(monkeypatch, firestore_fake, sdk_fakes, fake_clock):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID, "source_file": "Source",
+        "content_hash": "sha256:original", "user_fact": "preserve-me",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    harness.add_qdrant_parent("sentinel", ROOT_FOLDER_ID)
+    harness.add_qdrant_parent("source", "outside-root", "unrelated-root")
+    context = _context(client, fake_clock, operation_id="shared-auth-valid-source")
+
+    result = write.move_transcript("source", ["Target"], context=context)
+
+    assert result.unassigned_count == 0
+    assert len(harness.drive_mutations) == 1
+    assert harness.files["source"]["parents"] == ["target"]
+    assert len(harness.qdrant_mutations) == 1
+    assert harness.qdrant_points[("sentinel", ROOT_FOLDER_ID)] == [ROOT_FOLDER_ID]
+    assert harness.qdrant_points[("source", "unrelated-root")] == ["outside-root"]
+    saved = client.collection("transcript_index").document("source").get().to_dict()
+    assert saved["parent_id"] == "target"
+    assert saved["user_fact"] == "preserve-me"
+
+
+@pytest.mark.offline
+def test_shared_write_authorization_rejects_destination_live_parent_drift(monkeypatch, firestore_fake, sdk_fakes, fake_clock):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.files["target"]["parents"] = ["outside-root"]
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID, "source_file": "Source",
+        "user_fact": "preserve-me",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    harness.add_qdrant_parent("sentinel", ROOT_FOLDER_ID)
+    harness.add_qdrant_parent("source", "outside-root", "unrelated-root")
+    before_domain = harness.snapshot_domain(client)
+    context = _context(client, fake_clock, operation_id="shared-auth-destination-drift")
+
+    refused = False
+    unknown = False
+    try:
+        write.move_transcript("source", ["Target"], context=context)
+    except (write.WriteError, document_operations.TranscriptNotFound,
+            document_operations.FolderPathNotFound, folder_service.FolderOperationError,
+            MutationConflict):
+        refused = True
+    except MutationOutcomeUnknown:
+        unknown = True
+
+    assert harness.drive_mutations == []
+    assert harness.qdrant_mutations == []
+    assert refused and not unknown
+    assert "target" in harness.drive_reads
+    assert harness.snapshot_domain(client) == before_domain
+
+
 def test_competing_move_folder_plan_winner_supplies_read_and_apply_targets(
     monkeypatch, firestore_fake, fake_clock,
 ):

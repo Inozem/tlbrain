@@ -166,3 +166,164 @@ def test_fresh_same_name_folder_rename_keeps_legacy_mcp_conflict(
         "details": "Use list_folders to see the existing folder hierarchy.",
     }
     assert list(client.collection("resource_mutations").stream()) == []
+
+
+@pytest.mark.offline
+def test_shared_write_authorization_mcp_move_transcript_rejects_outside_source(
+    monkeypatch, firestore_fake, sdk_fakes,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID, SharedWriteAuthorizationHarness
+
+    harness = SharedWriteAuthorizationHarness(monkeypatch, sdk_fakes)
+    root_id = ROOT_FOLDER_ID
+    client = firestore_fake.client_class()
+    harness.set_file("target", name="Target", mime_type="application/vnd.google-apps.folder",
+                     parents=[root_id])
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=["outside-root"])
+    client.collection("folders").document("target").set({
+        "folder_id": "target", "name": "Target", "parent_id": root_id,
+    })
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": root_id,
+        "source_file": "Source", "user_fact": "preserve-me",
+    })
+    harness.add_qdrant_parent("source", root_id)
+    harness.add_qdrant_parent("sentinel", root_id)
+    harness.add_qdrant_parent("source", root_id, "unrelated-root")
+    before_domain = harness.snapshot_domain(client)
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-shared-write-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-shared-write-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-shared-write-secret")
+    request = JSONRPCRequest(
+        jsonrpc="2.0", id="shared-write-source", method="tools/call",
+        params={"name": "move_transcript", "arguments": {
+            "doc_id": "source", "folder_path": ["Target"],
+        }},
+    )
+
+    response = handler.handle_tools_call(request)
+
+    assert response["id"] == "shared-write-source"
+    assert harness.drive_mutations == []
+    assert harness.qdrant_mutations == []
+    assert harness.qdrant_points[("sentinel", root_id)] == [root_id]
+    assert harness.qdrant_points[("source", "unrelated-root")] == [root_id]
+    assert "source" in harness.drive_reads
+    assert "error" in response and "result" not in response
+    assert response["error"]["code"] in {-32602, -32603}
+    assert len(response["error"]["message"]) <= 200
+    assert harness.snapshot_domain(client) == before_domain
+
+
+@pytest.mark.offline
+def test_shared_write_authorization_mcp_move_folder_rejects_live_parent_drift(
+    monkeypatch, firestore_fake, sdk_fakes,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID, SharedWriteAuthorizationHarness
+
+    harness = SharedWriteAuthorizationHarness(monkeypatch, sdk_fakes)
+    root_id = ROOT_FOLDER_ID
+    client = firestore_fake.client_class()
+    harness.set_file("folder", name="Folder", mime_type="application/vnd.google-apps.folder",
+                     parents=[root_id])
+    harness.set_file("parent", name="Parent", mime_type="application/vnd.google-apps.folder",
+                     parents=["outside-root"])
+    client.collection("folders").document("folder").set({
+        "folder_id": "folder", "name": "Folder", "parent_id": root_id,
+    })
+    client.collection("folders").document("parent").set({
+        "folder_id": "parent", "name": "Parent", "parent_id": root_id,
+    })
+    before_domain = harness.snapshot_domain(client)
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-shared-write-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-shared-write-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-shared-write-secret")
+    request = JSONRPCRequest(
+        jsonrpc="2.0", id=73002, method="tools/call",
+        params={"name": "move_folder", "arguments": {
+            "folder_path": ["Folder"], "new_parent_path": ["Parent"],
+        }},
+    )
+
+    response = handler.handle_tools_call(request)
+
+    assert response["id"] == 73002
+    assert harness.drive_mutations == []
+    assert "parent" in harness.drive_reads
+    assert "error" in response and "result" not in response
+    assert response["error"]["code"] in {-32602, -32603}
+    assert len(response["error"]["message"]) <= 200
+    assert harness.snapshot_domain(client) == before_domain
+
+
+@pytest.mark.offline
+def test_shared_write_authorization_mcp_create_folder_rejects_live_parent_drift(
+    monkeypatch, firestore_fake, sdk_fakes,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID, SharedWriteAuthorizationHarness
+
+    harness = SharedWriteAuthorizationHarness(monkeypatch, sdk_fakes)
+    root_id = ROOT_FOLDER_ID
+    client = firestore_fake.client_class()
+    harness.set_file("parent", name="Parent", mime_type="application/vnd.google-apps.folder",
+                     parents=["outside-root"])
+    client.collection("folders").document("parent").set({
+        "folder_id": "parent", "name": "Parent", "parent_id": root_id,
+    })
+    before_domain = harness.snapshot_domain(client)
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": ["created-folder"]})
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-shared-write-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-shared-write-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-shared-write-secret")
+    request = JSONRPCRequest(
+        jsonrpc="2.0", id="create-parent-drift", method="tools/call",
+        params={"name": "create_folder", "arguments": {
+            "name": "Child", "parent_path": ["Parent"],
+        }},
+    )
+
+    response = handler.handle_tools_call(request)
+
+    assert response["id"] == "create-parent-drift"
+    assert harness.drive_mutations == []
+    assert "parent" in harness.drive_reads
+    assert "error" in response and "result" not in response
+    assert response["error"]["code"] in {-32602, -32603}
+    assert len(response["error"]["message"]) <= 200
+    assert harness.snapshot_domain(client) == before_domain
+
+
+@pytest.mark.offline
+def test_shared_write_authorization_mcp_create_folder_allows_live_root_parent(
+    monkeypatch, firestore_fake, sdk_fakes,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID, SharedWriteAuthorizationHarness
+
+    harness = SharedWriteAuthorizationHarness(monkeypatch, sdk_fakes)
+    root_id = ROOT_FOLDER_ID
+    client = firestore_fake.client_class()
+    harness.set_file("parent", name="Parent", mime_type="application/vnd.google-apps.folder",
+                     parents=[root_id])
+    client.collection("folders").document("parent").set({
+        "folder_id": "parent", "name": "Parent", "parent_id": root_id,
+    })
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": ["created-folder"]})
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "pytest-shared-write-refresh")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "pytest-shared-write-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "pytest-shared-write-secret")
+    request = JSONRPCRequest(
+        jsonrpc="2.0", id="create-root-parent", method="tools/call",
+        params={"name": "create_folder", "arguments": {
+            "name": "Child", "parent_path": ["Parent"],
+        }},
+    )
+
+    response = handler.handle_tools_call(request)
+
+    assert response["id"] == "create-root-parent"
+    assert "result" in response
+    assert "error" not in response
+    assert len(harness.drive_mutations) == 1
+    assert harness.drive_mutations[0]["body"]["parents"] == ["parent"]
+    assert client.collection("folders").document("created-folder").get().to_dict()["parent_id"] == "parent"
