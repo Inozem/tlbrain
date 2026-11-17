@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import secrets
 from typing import Any, Mapping
 
@@ -21,7 +22,11 @@ from services.connectors.telegram.repository._common import (
     _identifier,
     _integer,
     _aware,
+    _pending_clarification_clear_patch,
+    _clarification_question_path,
+    _routing_checkpoint_path,
 )
+from services.connectors.telegram.models import ClarificationState, PendingClarification
 
 
 def _retry_deadline(now: datetime, delay_seconds: int) -> datetime:
@@ -103,6 +108,273 @@ def _receipt_status_body(
     if skipped_count:
         body += f"\n\nSkipped {skipped_count} unsupported item(s)."
     return body
+
+
+_PENDING_CLARIFICATION_FIELDS = frozenset({
+    "clarification_id", "context_id", "actor_id", "initiating_operation_id",
+    "origin_conversation_id", "original_command_ref", "original_command_digest",
+    "action", "resolved_parameters", "missing_slots", "evidence_snapshot_ref",
+    "evidence_snapshot_digest", "generation", "revision", "state",
+    "execution_operation_id", "execution_plan_ref", "execution_plan_digest",
+    "result_ref", "safe_error", "questions_ref", "answers_ref", "created_at",
+    "updated_at", "protocol",
+})
+
+
+def _pending_clarification_model(data: Mapping[str, Any]) -> PendingClarification:
+    """Validate the strict known intent fields while allowing future metadata to survive updates."""
+    return PendingClarification.from_dict({
+        key: value for key, value in data.items() if key in _PENDING_CLARIFICATION_FIELDS
+    })
+
+
+def _clarification_delivery_binding(
+    repository: Any, transaction: Any, notification: Mapping[str, Any], *,
+    require_waiting: bool,
+) -> tuple[dict[str, Any], Any, dict[str, Any], Any, dict[str, Any]] | None:
+    """Read the addressed records, then verify immutable prompt and route binding."""
+    context_id = notification.get("context_id")
+    clarification_id = notification.get("clarification_id")
+    generation = notification.get("generation")
+    if (not isinstance(context_id, str) or not isinstance(clarification_id, str)
+            or type(generation) is not int or generation < 1):
+        raise ValueError("clarification notification identity is malformed")
+    _identifier(context_id, "context_id")
+    _identifier(clarification_id, "clarification_id")
+    context_ref = repository.client.collection(SESSIONS).document(context_id)
+    context_snapshot = context_ref.get(transaction=transaction)
+    if not context_snapshot.exists:
+        return None
+    context = context_snapshot.to_dict() or {}
+    if (require_waiting and
+            (context.get("pending_clarification_id") != clarification_id
+             or type(context.get("clarification_generation")) is not int
+             or context.get("clarification_generation") != generation)):
+        return None
+
+    parent_ref = _document_ref(
+        repository.client,
+        f"{SESSIONS}/{context_id}/clarifications/{clarification_id}",
+    )
+    parent_snapshot = parent_ref.get(transaction=transaction)
+    if not parent_snapshot.exists:
+        return None
+    parent_data = parent_snapshot.to_dict() or {}
+    try:
+        parent = _pending_clarification_model(parent_data)
+    except (TypeError, ValueError, KeyError, OverflowError):
+        raise ValueError("current clarification record is malformed") from None
+    if parent_data.get("protocol") != "clarification-v1":
+        raise ValueError("current clarification record is malformed")
+    if (parent.context_id != context_id or parent.clarification_id != clarification_id
+            or type(notification.get("actor_id")) is not int
+            or parent.actor_id != notification.get("actor_id")):
+        raise ValueError("current clarification identity is malformed")
+    if require_waiting and (
+            parent.state is not ClarificationState.WAITING
+            or parent.generation != generation):
+        return None
+    if not require_waiting and parent.generation < generation:
+        raise ValueError("clarification generation moved backwards")
+
+    question_path = _clarification_question_path(context_id, clarification_id, generation)
+    question_ref = _document_ref(repository.client, question_path)
+    question_snapshot = question_ref.get(transaction=transaction)
+    if not question_snapshot.exists:
+        return None
+    question = question_snapshot.to_dict() or {}
+    binding = _validate_clarification_prompt_binding(
+        notification, context, parent, question, question_path,
+    )
+    return binding, context_ref, context, parent_ref, dict(parent_data)
+
+
+def _validate_clarification_prompt_binding(
+    notification: Mapping[str, Any], context: Mapping[str, Any],
+    parent: PendingClarification, question: Mapping[str, Any], question_path: str,
+) -> dict[str, Any]:
+    """Check question, prompt bytes, canonical ID and persisted Telegram route."""
+    context_id, clarification_id, generation = (
+        parent.context_id, parent.clarification_id, notification.get("generation"),
+    )
+    revision = notification.get("revision")
+    digest = question.get("prompt_digest")
+    body = notification.get("body")
+    expected_question = {
+        "protocol": "clarification-question-v1", "context_id": context_id,
+        "actor_id": parent.actor_id, "clarification_id": clarification_id,
+        "generation": generation, "question_ref": question_path,
+        "prompt_notification_id": notification.get("notification_id"),
+        "prompt_notification_revision": revision,
+    }
+    if (any(question.get(key) != value for key, value in expected_question.items())
+            or any(type(question.get(key)) is not int for key in (
+                "actor_id", "generation", "prompt_notification_revision",
+            ))
+            or type(revision) is not int or revision < 1
+            or notification.get("desired_status_revision") != revision
+            or type(notification.get("desired_status_revision")) is not int
+            or not isinstance(body, str) or not body.strip() or len(body) > 4096
+            or not isinstance(digest, str) or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+            ):
+        raise ValueError("clarification question prompt binding is malformed")
+    try:
+        body_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    except UnicodeError:
+        raise ValueError("clarification question prompt binding is malformed") from None
+    if body_digest != digest:
+        raise ValueError("clarification question prompt binding is malformed")
+    created_at = question.get("created_at")
+    if not isinstance(created_at, datetime) or created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("clarification question timestamp is malformed")
+    producer_operation_id = notification.get("producer_operation_id")
+    try:
+        _identifier(producer_operation_id, "producer_operation_id")
+    except ValueError:
+        raise ValueError("clarification question producer is malformed") from None
+    if generation == 1 and producer_operation_id != parent.initiating_operation_id:
+        raise ValueError("initial clarification question producer is malformed")
+    payload_ref = question.get("question_payload_ref")
+    if payload_ref != _routing_checkpoint_path(context_id, producer_operation_id, "intent"):
+        raise ValueError("clarification question payload reference is malformed")
+    payload_digest = question.get("question_payload_digest")
+    if (not isinstance(payload_digest, str) or len(payload_digest) != 64
+            or any(char not in "0123456789abcdef" for char in payload_digest)):
+        raise ValueError("clarification question payload digest is malformed")
+    chat_id = context.get("chat_id")
+    thread_id = context.get("thread_id")
+    if type(chat_id) is not int:
+        raise ValueError("clarification context route is malformed")
+    if type(thread_id) is int and thread_id == 0:
+        thread_id = None
+    elif thread_id is not None and (type(thread_id) is not int or thread_id < 1):
+        raise ValueError("clarification context route is malformed")
+    notification_thread_id = notification.get("thread_id")
+    if type(notification_thread_id) is int and notification_thread_id == 0:
+        notification_thread_id = None
+    elif (notification_thread_id is not None
+          and (type(notification_thread_id) is not int or notification_thread_id < 1)):
+        raise ValueError("clarification notification route is malformed")
+    if (type(notification.get("chat_id")) is not int
+            or notification.get("chat_id") != chat_id
+            or notification_thread_id != thread_id
+            or notification.get("operation_id") is not None
+            or notification.get("kind") != "clarification"
+            or notification.get("notification_id") != question.get("prompt_notification_id")):
+        raise ValueError("clarification notification route or identity is malformed")
+    expected_notification_id = "tgclarif-" + hashlib.sha256(
+        f"{clarification_id}:{generation}".encode("utf-8")
+    ).hexdigest()
+    if notification.get("notification_id") != expected_notification_id:
+        raise ValueError("clarification notification identity is not canonical")
+    return {
+        "context_id": context_id, "actor_id": parent.actor_id,
+        "clarification_id": clarification_id, "generation": generation,
+        "clarification_revision": parent.revision,
+        "question_ref": question_path,
+        "notification_id": notification["notification_id"],
+        "revision": revision, "prompt_digest": digest,
+        "producer_operation_id": producer_operation_id,
+        "question_payload_ref": payload_ref,
+        "question_payload_digest": payload_digest,
+        "chat_id": chat_id, "thread_id": thread_id,
+    }
+
+
+_CLARIFICATION_BINDING_FIELDS = frozenset({
+    "context_id", "actor_id", "clarification_id", "generation",
+    "clarification_revision", "question_ref", "notification_id", "revision",
+    "prompt_digest", "producer_operation_id", "question_payload_ref",
+    "question_payload_digest", "chat_id", "thread_id",
+})
+
+
+def _validated_attempt_clarification_binding(
+    value: Any, *, attempt_id: str, revision: int,
+) -> dict[str, Any]:
+    """Validate a transaction-stored binding without Python bool/int aliases."""
+    if not isinstance(value, Mapping) or set(value) != {
+            "attempt_id", "attempt_revision", "question_binding"}:
+        raise ValueError("clarification attempt binding is malformed")
+    if (type(value.get("attempt_id")) is not str
+            or value["attempt_id"] != attempt_id
+            or type(value.get("attempt_revision")) is not int
+            or value["attempt_revision"] != revision):
+        raise ValueError("clarification attempt binding is malformed")
+    binding = value.get("question_binding")
+    if not isinstance(binding, Mapping) or set(binding) != _CLARIFICATION_BINDING_FIELDS:
+        raise ValueError("clarification attempt binding is malformed")
+    for field in ("context_id", "clarification_id", "question_ref", "notification_id",
+                  "prompt_digest", "producer_operation_id", "question_payload_ref",
+                  "question_payload_digest"):
+        if type(binding.get(field)) is not str:
+            raise ValueError("clarification attempt binding is malformed")
+    for field in ("actor_id", "generation", "clarification_revision", "revision", "chat_id"):
+        if type(binding.get(field)) is not int:
+            raise ValueError("clarification attempt binding is malformed")
+    thread_id = binding.get("thread_id")
+    if thread_id is not None and type(thread_id) is not int:
+        raise ValueError("clarification attempt binding is malformed")
+    if (binding["actor_id"] < 1 or binding["generation"] < 1
+            or binding["clarification_revision"] < 1 or binding["revision"] < 1
+            or (thread_id is not None and thread_id < 1)
+            or len(binding["prompt_digest"]) != 64
+            or any(char not in "0123456789abcdef" for char in binding["prompt_digest"])):
+        raise ValueError("clarification attempt binding is malformed")
+    if (len(binding["question_payload_digest"]) != 64
+            or any(char not in "0123456789abcdef" for char in binding["question_payload_digest"])):
+        raise ValueError("clarification attempt binding is malformed")
+    return dict(binding)
+
+
+def _same_clarification_binding(left: Any, right: Any) -> bool:
+    """Compare caller and stored bindings only after strict shape/type validation."""
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    try:
+        validated_left = _validated_attempt_clarification_binding(
+            {"attempt_id": "unused", "attempt_revision": 1, "question_binding": left},
+            attempt_id="unused", revision=1,
+        )
+        validated_right = _validated_attempt_clarification_binding(
+            {"attempt_id": "unused", "attempt_revision": 1, "question_binding": right},
+            attempt_id="unused", revision=1,
+        )
+    except ValueError:
+        return False
+    return validated_left == validated_right
+
+
+def _fail_clarification_if_current(
+    transaction: Any, *, binding: Mapping[str, Any], context_ref: Any,
+    context: Mapping[str, Any], parent_ref: Any, parent_data: Mapping[str, Any],
+    now: datetime,
+) -> bool:
+    """Stage a fixed terminal delivery failure only for the exact current waiting intent."""
+    try:
+        parent = _pending_clarification_model(parent_data)
+    except (TypeError, ValueError, KeyError, OverflowError):
+        raise ValueError("current clarification record is malformed") from None
+    pointer_patch = _pending_clarification_clear_patch(
+        context, clarification_id=binding["clarification_id"],
+        generation=binding["generation"],
+    )
+    if (parent.state is not ClarificationState.WAITING
+            or parent.context_id != binding["context_id"]
+            or parent.actor_id != binding["actor_id"]
+            or parent.clarification_id != binding["clarification_id"]
+            or parent.generation != binding["generation"]
+            or parent.revision != binding["clarification_revision"]
+            or pointer_patch is None):
+        return False
+    transaction.update(parent_ref, {
+        "state": ClarificationState.FAILED.value, "missing_slots": [],
+        "safe_error": "clarification_prompt_delivery_failed",
+        "revision": parent.revision + 1, "updated_at": now,
+    })
+    transaction.update(context_ref, pointer_patch)
+    return True
 
 
 class _TelegramNotificationMixin:
@@ -351,6 +623,8 @@ class _TelegramNotificationMixin:
             if not snap.exists:
                 raise ValueError("notification does not exist")
             data = snap.to_dict() or {}
+            if data.get("kind") == "clarification":
+                raise ValueError("clarification prompts cannot be revised generically")
             if data.get("receipt_terminal") is True:
                 raise ValueError("terminal receipt card cannot be revised")
             if data.get("state") in {"failed", "delivery_unknown"}:
@@ -393,6 +667,8 @@ class _TelegramNotificationMixin:
         notification_id, context_id = _identifier(notification_id, "notification_id"), _identifier(context_id, "context_id")
         if kind not in NOTIFICATION_KINDS:
             raise ValueError("kind is not an allowed notification kind")
+        if kind == "clarification":
+            raise ValueError("clarification prompts require atomic publication")
         if not isinstance(body, str) or not body.strip() or len(body) > 4096:
             raise ValueError("body must be non-empty text of at most 4096 characters")
         if dialog_number is not None:
@@ -433,6 +709,8 @@ class _TelegramNotificationMixin:
         context_id = _identifier(context_id, "context_id")
         if kind not in NOTIFICATION_KINDS:
             raise ValueError("kind is not an allowed notification kind")
+        if kind == "clarification":
+            raise ValueError("clarification prompts require atomic publication")
         if not isinstance(body, str) or not body.strip() or len(body) > 4096:
             raise ValueError("body must be non-empty text of at most 4096 characters")
         if dialog_number is not None:
@@ -492,6 +770,16 @@ class _TelegramNotificationMixin:
             data = snap.to_dict() or {}
             if data.get("state") in {"delivered", "failed", "delivery_unknown"}:
                 return {**data, "reserved": False}
+            clarification_binding = None
+            clarification_records = None
+            if data.get("kind") == "clarification":
+                verified = _clarification_delivery_binding(
+                    self, transaction, data, require_waiting=True,
+                )
+                if verified is None:
+                    return {**data, "reserved": False, "state": "superseded"}
+                clarification_binding = verified[0]
+                clarification_records = verified
             if data.get("kind") == "progress" and data.get("operation_id"):
                 operation_ref = self.client.collection("dialog_operations").document(data["operation_id"])
                 operation_snap = operation_ref.get(transaction=transaction)
@@ -526,12 +814,22 @@ class _TelegramNotificationMixin:
                            "last_error": "attempts_exhausted", "failed_at": now,
                            "in_flight_attempt_id": None, "attempt_expires_at": None}
                 self._persist_final_delivery_state(transaction, data, terminal, now)
+                if clarification_records is not None:
+                    _, context_ref, context, parent_ref, parent_data = clarification_records
+                    _fail_clarification_if_current(
+                        transaction, binding=clarification_binding,
+                        context_ref=context_ref, context=context,
+                        parent_ref=parent_ref, parent_data=parent_data, now=now,
+                    )
                 transaction.update(ref, updates)
                 return {**data, **updates, "reserved": False}
             revision = _integer(data.get("revision", 1), "revision", minimum=1)
             updates = {"state": "sending" if is_send else "editing", "in_flight_attempt_id": attempt_id,
                        "attempt_revision": revision, "attempt_expires_at": now + NOTIFICATION_ATTEMPT_LEASE,
                        "updated_at": now}
+            if clarification_binding is not None:
+                # Persist and return the verified canonical route used by the publisher.
+                updates["thread_id"] = clarification_binding["thread_id"]
             if rich_markup_fallback:
                 updates["presentation"] = None
             numbered_revision = data.get("receipt_numbered_revision")
@@ -560,15 +858,29 @@ class _TelegramNotificationMixin:
                                     "last_error": "attempts_exhausted", "failed_at": now,
                                     "in_flight_attempt_id": None, "attempt_expires_at": None})
                     self._persist_final_delivery_state(transaction, data, "failed", now)
+                    if clarification_records is not None:
+                        _, context_ref, context, parent_ref, parent_data = clarification_records
+                        _fail_clarification_if_current(
+                            transaction, binding=clarification_binding,
+                            context_ref=context_ref, context=context,
+                            parent_ref=parent_ref, parent_data=parent_data, now=now,
+                        )
                     transaction.update(ref, updates)
                     return {**data, **updates, "reserved": False}
                 updates["edit_attempts_started"] = edit_attempts + 1
                 if data.get("receipt_card") is True:
                     per_revision[revision_key] = revision_attempts + 1
                     updates["edit_attempts_by_revision"] = per_revision
+            if clarification_binding is not None:
+                updates["attempt_clarification_binding"] = {
+                    "attempt_id": attempt_id, "attempt_revision": revision,
+                    "question_binding": dict(clarification_binding),
+                }
             transaction.update(ref, updates)
             return {**data, **updates, "reserved": True, "attempt_id": attempt_id,
-                    "attempt_revision": revision, "is_send": is_send}
+                    "attempt_revision": revision, "is_send": is_send,
+                    **({"clarification_binding": dict(clarification_binding)}
+                       if clarification_binding is not None else {})}
 
         return _txn(self.client.transaction(max_attempts=5))
 
@@ -619,6 +931,7 @@ class _TelegramNotificationMixin:
     def settle_notification_attempt(
         self, notification_id: str, *, attempt_id: str, revision: int, outcome: str,
         now: datetime, message_id: int | None = None, retry_after: int | None = None,
+        clarification_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Settle the reserved attempt, retaining success from a superseded revision."""
         notification_id = _identifier(notification_id, "notification_id")
@@ -647,6 +960,32 @@ class _TelegramNotificationMixin:
                 return {**data, "settled": False}
             stale_revision = data.get("revision") != revision
             final_operation = self._read_final_delivery_operation(transaction, data)
+            clarification_records = None
+            if data.get("kind") == "clarification":
+                if not isinstance(clarification_binding, Mapping):
+                    raise ValueError("clarification attempt binding is missing")
+                stored_binding = _validated_attempt_clarification_binding(
+                    data.get("attempt_clarification_binding"),
+                    attempt_id=attempt_id, revision=revision,
+                )
+                if not _same_clarification_binding(clarification_binding, stored_binding):
+                    raise ValueError("clarification attempt binding does not match stored authority")
+                verified = _clarification_delivery_binding(
+                    self, transaction, data, require_waiting=False,
+                )
+                captured_identity = {
+                    key: value for key, value in stored_binding.items()
+                    if key != "clarification_revision"
+                }
+                verified_identity = (None if verified is None else {
+                    key: value for key, value in verified[0].items()
+                    if key != "clarification_revision"
+                })
+                if verified is None or captured_identity != verified_identity:
+                    raise ValueError("clarification attempt binding changed")
+                clarification_records = (
+                    stored_binding, *verified[1:],
+                )
             ack_draft_ref = None
             ack_draft_snapshot = None
             if (outcome in {"sent", "edited"}
@@ -710,12 +1049,27 @@ class _TelegramNotificationMixin:
                     if outcome == "unknown" and data.get("message_id") is None:
                         updates["unknown_send_outcome"] = True
             result = {**data, **updates, "settled": True}
+            if clarification_records is not None and outcome == "sent":
+                evidence = {
+                    **clarification_records[0], "message_id": message_id,
+                    "delivered_at": now,
+                }
+                updates["question_delivery_evidence"] = evidence
+                result["question_delivery_evidence"] = evidence
             if (result.get("state") in {"failed", "delivery_unknown"}
                     and data.get("kind") == "draft_ack" and data.get("message_id") is None):
                 action = self._settle_terminal_ack_failure(transaction, result, now)
                 if action is not None:
                     result["ack_failure_action"] = action
                     updates["ack_failure_action"] = action
+            if (clarification_records is not None
+                    and result.get("state") in {"failed", "delivery_unknown"}):
+                _, context_ref, context, parent_ref, parent_data = clarification_records
+                _fail_clarification_if_current(
+                    transaction, binding=clarification_records[0],
+                    context_ref=context_ref, context=context,
+                    parent_ref=parent_ref, parent_data=parent_data, now=now,
+                )
             if (ack_draft_ref is not None and ack_draft_snapshot is not None
                     and ack_draft_snapshot.exists
                     and result.get("attempt_receipt_ack_revision") == revision):

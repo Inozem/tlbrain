@@ -26,7 +26,7 @@ ROUTING_SCHEMA_VERSION = 1
 ROUTING_KINDS = frozenset({"context", "decision", "intent"})
 ROUTING_INLINE_CHECKPOINT_BYTES = 4 * 1024
 NOTIFICATIONS = "notification_outbox"
-NOTIFICATION_KINDS = frozenset({"draft_ack", "receipt_card", "unsupported_forward", "queued", "switch_notice", "progress", "final", "error"})
+NOTIFICATION_KINDS = frozenset({"draft_ack", "receipt_card", "unsupported_forward", "queued", "switch_notice", "progress", "final", "error", "clarification"})
 NOTIFICATION_MAX_SENDS = 3
 NOTIFICATION_ATTEMPT_LEASE = timedelta(seconds=60)
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,480}$")
@@ -421,6 +421,17 @@ def _pending_clarification_clear_patch(
             or context.get("clarification_generation") != generation):
         return None
     return {"pending_clarification_id": None}
+
+
+def _clarification_question_path(
+    context_id: str, clarification_id: str, generation: int,
+) -> str:
+    """Return the one canonical immutable question path for this generation."""
+    _identifier(context_id, "context_id")
+    _identifier(clarification_id, "clarification_id")
+    _integer(generation, "generation", minimum=1)
+    return (f"{SESSIONS}/{context_id}/clarifications/{clarification_id}/"
+            f"questions/{generation}")
 
 
 @dataclass(frozen=True, slots=True)

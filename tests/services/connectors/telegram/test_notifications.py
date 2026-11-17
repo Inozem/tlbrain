@@ -1623,3 +1623,748 @@ def test_sealed_ack_failure_preserves_newer_collecting_pointer_without_exact_par
     assert state["selection_sequence"] == 2
     assert state["reserved_operation_id"] == "unrelated-parent"
     assert repo.get_draft(accepted.context_id, accepted.draft_id)["manifest_digest"] == "old-digest"
+
+
+def _publish_t011_clarification(
+    firestore_fake, *, update_id=99001, chat_id=910, user_id=77, thread_id=5,
+):
+    """Create a real accepted/claimed operation and publish a T011 prompt."""
+    import hashlib
+
+    from core.integrations.firestore.operation_queue import claim_head
+    from services.connectors.telegram.models import (
+        ClarificationState, PendingClarification, build_clarification_id,
+    )
+    from services.connectors.telegram.repository._common import SESSIONS
+    from services.connectors.telegram.repository._clarifications import build_clarification_request
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.routing_context import BoundRef, RoutingContextSnapshot
+    from services.connectors.telegram.commands import parse_command
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client)
+    command = parse_command("Move the conversation to Archive")
+    accepted = repository.accept_command(
+        update_id, chat_id=chat_id, user_id=user_id, thread_id=thread_id,
+        command=command, now=NOW,
+    )
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="clarifier", now=NOW)
+    assert lease is not None
+    operation = context_ref.collection("operations").document(accepted.operation_id).get().to_dict()
+    conversation_id = "conversation-clarification-test"
+    command_ref = BoundRef(
+        ref=operation["input_ref"], digest=hashlib.sha256(command.text.encode()).hexdigest(),
+        context_id=accepted.context_id, actor_id=user_id, conversation_id=conversation_id,
+        operation_id=accepted.operation_id,
+    )
+    history_ref = BoundRef(
+        ref="history-test", digest=hashlib.sha256(b"history").hexdigest(),
+        context_id=accepted.context_id, actor_id=user_id, conversation_id=conversation_id,
+        operation_id="history-test-op",
+    )
+    snapshot = RoutingContextSnapshot(
+        context_id=accepted.context_id, actor_id=user_id, operation_id=accepted.operation_id,
+        selected_conversation_id=conversation_id, selected_conversation_kind="chat",
+        accepted_command=command.text, accepted_command_ref=command_ref,
+        full_history_ref=history_ref,
+    )
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: NOW,
+    )
+    context_checkpoint = ledger.save_routing_checkpoint(
+        "context", actor_id=user_id, conversation_id=conversation_id, value=snapshot.to_dict(),
+    )
+    clarification_id = build_clarification_id(accepted.context_id, accepted.operation_id)
+    prefix = f"{SESSIONS}/{accepted.context_id}/clarifications/{clarification_id}/"
+    pending = PendingClarification(
+        clarification_id=clarification_id, context_id=accepted.context_id, actor_id=user_id,
+        initiating_operation_id=accepted.operation_id,
+        origin_conversation_id=conversation_id,
+        original_command_ref=context_checkpoint["ref"],
+        original_command_digest=context_checkpoint["digest"], action="move_transcript",
+        resolved_parameters={"doc_id": "doc-a"}, missing_slots=("destination",),
+        evidence_snapshot_ref=context_checkpoint["ref"],
+        evidence_snapshot_digest=context_checkpoint["digest"],
+        state=ClarificationState.WAITING, created_at=NOW, updated_at=NOW,
+        questions_ref=prefix + "questions", answers_ref=prefix + "answers",
+    )
+    request = build_clarification_request(
+        pending, context_checkpoint,
+        question={"slot": "destination", "options": ["A", "B"]},
+        prompt_body="Which destination should I use?",
+    )
+    intent_checkpoint = ledger.save_routing_checkpoint(
+        "intent", actor_id=user_id, conversation_id=conversation_id, value=request,
+    )
+    completion = repository.prepare_clarification_completion(intent_checkpoint)
+    assert repository.complete_with_clarification(
+        accepted.context_id, accepted.operation_id, owner=lease.owner,
+        fence=lease.fence, completion=completion, now=NOW, clock=lambda: NOW,
+    )
+    return client, repository, accepted, completion.pending
+
+
+def test_t011_clarification_publishes_verified_question_delivery_evidence(firestore_fake):
+    import hashlib
+
+    from core.integrations.firestore.outbox import get_outbox_record, task_payload
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    assert telegram.sent == [(910, "Which destination should I use?", 5)]
+    notification = repository.get_notification(notification_id)
+    assert notification["operation_id"] is None
+    assert notification["message_id"] == 901
+    evidence = notification["question_delivery_evidence"]
+    assert evidence["context_id"] == accepted.context_id
+    assert evidence["clarification_id"] == pending.clarification_id
+    assert evidence["question_ref"].endswith("/questions/1")
+    assert evidence["message_id"] == 901 and evidence["delivered_at"].tzinfo is not None
+    assert evidence["prompt_digest"] == hashlib.sha256(
+        notification["body"].encode("utf-8")
+    ).hexdigest()
+    operation = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "operations").document(accepted.operation_id).get().to_dict()
+    assert operation["state"] == "completed"
+    assert operation.get("lease_owner") is None
+    task = get_outbox_record(client, operation["result"]["prompt_outbox_id"])
+    assert task.context_id == accepted.context_id
+    assert task.notification_id == notification_id
+    assert task.operation_id is None
+    assert "operation_id" not in task_payload(task)
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    assert len(telegram.sent) == 1
+
+
+def test_superseded_clarification_reservation_does_not_send_or_charge_budget(firestore_fake):
+    import hashlib
+
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    context = context_ref.get().to_dict()
+    context["pending_clarification_id"] = None
+    context_ref.set(context)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+
+    assert _run(publisher.publish(notification_id)) == "superseded"
+    assert telegram.sent == []
+    row = repository.get_notification(notification_id)
+    assert row["send_attempts_started"] == 0
+    assert row.get("question_delivery_evidence") is None
+
+
+def test_clarification_send_settlement_keeps_evidence_after_concurrent_cancellation(firestore_fake):
+    import hashlib
+
+    from services.connectors.telegram.models import ClarificationState, PendingClarification
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    parent_ref = context_ref.collection("clarifications").document(pending.clarification_id)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+
+    class CancellingTelegram(_Telegram):
+        async def send_message(self, chat_id, text, *, message_thread_id=None,
+                               reply_markup=None, presentation=None):
+            parent = PendingClarification.from_dict(parent_ref.get().to_dict()).to_dict()
+            parent.update({"state": ClarificationState.CANCELLED.value,
+                           "missing_slots": [], "revision": parent["revision"] + 1,
+                           "updated_at": NOW + timedelta(seconds=1)})
+            parent_ref.set(parent)
+            context = context_ref.get().to_dict()
+            context["pending_clarification_id"] = None
+            context_ref.set(context)
+            return await super().send_message(
+                chat_id, text, message_thread_id=message_thread_id,
+                reply_markup=reply_markup, presentation=presentation,
+            )
+
+    telegram = CancellingTelegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    notification = repository.get_notification(notification_id)
+    assert notification["message_id"] == 901
+    assert notification["question_delivery_evidence"]["message_id"] == 901
+    assert notification["question_delivery_evidence"]["clarification_id"] == pending.clarification_id
+    assert context_ref.get().to_dict()["pending_clarification_id"] is None
+
+
+def test_clarification_send_settlement_preserves_newer_waiting_generation(firestore_fake):
+    import hashlib
+
+    from services.connectors.telegram.models import PendingClarification
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    parent_ref = context_ref.collection("clarifications").document(pending.clarification_id)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+
+    class AdvancingTelegram(_Telegram):
+        async def send_message(self, chat_id, text, *, message_thread_id=None,
+                               reply_markup=None, presentation=None):
+            parent = PendingClarification.from_dict(parent_ref.get().to_dict()).to_dict()
+            parent.update({"generation": 2, "revision": 2,
+                           "updated_at": NOW + timedelta(seconds=1)})
+            parent_ref.set(parent)
+            context = context_ref.get().to_dict()
+            context["pending_clarification_id"] = pending.clarification_id
+            context["clarification_generation"] = 2
+            context_ref.set(context)
+            return await super().send_message(
+                chat_id, text, message_thread_id=message_thread_id,
+                reply_markup=reply_markup, presentation=presentation,
+            )
+
+    telegram = AdvancingTelegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    notification = repository.get_notification(notification_id)
+    assert notification["message_id"] == 901
+    assert notification["question_delivery_evidence"]["generation"] == 1
+    assert PendingClarification.from_dict(parent_ref.get().to_dict()).generation == 2
+    assert context_ref.get().to_dict()["clarification_generation"] == 2
+
+
+def test_terminal_unknown_clarification_delivery_fails_only_waiting_intent(firestore_fake):
+    import hashlib
+
+    from services.connectors.telegram.models import ClarificationState, PendingClarification
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    parent_ref = context_ref.collection("clarifications").document(pending.clarification_id)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    clock = _Clock()
+    telegram = _Telegram(failures=3)
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=clock)
+
+    results = []
+    for _ in range(3):
+        results.append(_run(publisher.publish(notification_id)))
+        clock.advance(100)
+    assert results[-1] == "delivery_unknown"
+    parent = PendingClarification.from_dict(parent_ref.get().to_dict())
+    assert parent.state is ClarificationState.FAILED
+    assert parent.missing_slots == ()
+    assert parent.safe_error == "clarification_prompt_delivery_failed"
+    assert context_ref.get().to_dict()["pending_clarification_id"] is None
+    notification = repository.get_notification(notification_id)
+    assert notification["message_id"] is None
+    assert "question_delivery_evidence" not in notification
+
+
+def test_late_prompt_settlement_never_rewrites_prior_intake_snapshot(firestore_fake):
+    import hashlib
+
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    before_send = repository.accept_command(
+        99002, chat_id=910, user_id=77, thread_id=5,
+        command=parse_command("The second option"), now=NOW + timedelta(seconds=2),
+        transport_timestamp=int((NOW + timedelta(seconds=2)).timestamp()),
+    )
+    before_ref = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "commands").document("99002")
+    before_snapshot = before_ref.get().to_dict()
+    assert before_snapshot["observed_question_delivery_ref"] is None
+
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(
+        repository, telegram, clock=lambda: NOW + timedelta(seconds=10),
+    )
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    assert before_ref.get().to_dict() == before_snapshot
+
+    after_send = repository.accept_command(
+        99003, chat_id=910, user_id=77, thread_id=5,
+        command=parse_command("The second option"), now=NOW + timedelta(seconds=12),
+        transport_timestamp=int((NOW + timedelta(seconds=12)).timestamp()),
+    )
+    after_snapshot = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "commands").document("99003").get().to_dict()
+    evidence = after_snapshot["observed_question_delivery_ref"]
+    assert after_snapshot["observed_clarification_id"] == pending.clarification_id
+    assert after_snapshot["observed_clarification_generation"] == 1
+    assert evidence["notification_id"] == notification_id
+    assert evidence["message_id"] == 901
+    assert after_send.context_id == accepted.context_id
+
+
+@pytest.mark.parametrize("tamper", ["actor", "body", "question_revision", "question_digest"])
+def test_current_clarification_prompt_tampering_fails_before_attempt_budget(
+    firestore_fake, tamper,
+):
+    import hashlib
+
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    notification_ref = client.collection("notification_outbox").document(notification_id)
+    notification = notification_ref.get().to_dict()
+    question_ref = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "clarifications").document(pending.clarification_id).collection("questions").document("1")
+    question = question_ref.get().to_dict()
+    if tamper == "actor":
+        notification["actor_id"] = 78
+        notification_ref.set(notification)
+    elif tamper == "body":
+        notification["body"] += " changed"
+        notification_ref.set(notification)
+    elif tamper == "question_revision":
+        question["prompt_notification_revision"] = 2
+        question_ref.set(question)
+    else:
+        question["prompt_digest"] = "0" * 64
+        question_ref.set(question)
+
+    with pytest.raises(ValueError):
+        repository.reserve_notification_attempt(
+            notification_id, attempt_id=f"attempt-{tamper}", now=NOW,
+        )
+    assert repository.get_notification(notification_id)["send_attempts_started"] == 0
+
+
+@pytest.mark.parametrize("notification_thread_id", [None, 0])
+def test_clarification_route_accepts_only_normalized_no_topic_alias(
+    firestore_fake, notification_thread_id,
+):
+    import hashlib
+
+    from services.connectors.telegram.repository._common import SESSIONS
+    from services.connectors.telegram.commands import parse_command
+
+    client, repository, accepted, pending = _publish_t011_clarification(
+        firestore_fake, thread_id=None,
+    )
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    context_ref.update({"thread_id": 0})
+    notification_ref = client.collection("notification_outbox").document(notification_id)
+    notification_ref.update({"thread_id": notification_thread_id})
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    assert telegram.sent == [(910, "Which destination should I use?", None)]
+    assert repository.get_notification(notification_id)["thread_id"] is None
+    answer_date = NOW + timedelta(seconds=5)
+    answer = repository.accept_command(
+        99031, chat_id=910, user_id=77, thread_id=None,
+        command=parse_command("the answer after delivery"), message_id=99032,
+        transport_timestamp=int(answer_date.timestamp()), now=NOW + timedelta(seconds=10),
+    )
+    command = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "commands",
+    ).document("99031").get().to_dict()
+    proof = command["observed_question_delivery_ref"]
+    assert answer.context_id == accepted.context_id
+    assert proof["notification_id"] == notification_id
+    assert proof["message_id"] == 901
+    assert proof["binding_kind"] == "plain"
+
+
+@pytest.mark.parametrize(
+    ("route_target", "bad_value"),
+    [(target, value) for target in ("context", "notification")
+     for value in (False, True, 0.0, "0")],
+)
+def test_clarification_route_rejects_bool_float_and_string_thread_aliases(
+    firestore_fake, route_target, bad_value,
+):
+    import hashlib
+
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    ref = (client.collection(SESSIONS).document(accepted.context_id)
+           if route_target == "context"
+           else client.collection("notification_outbox").document(notification_id))
+    ref.update({"thread_id": bad_value})
+    with pytest.raises(ValueError):
+        repository.reserve_notification_attempt(
+            notification_id, attempt_id="thread-invalid", now=NOW,
+        )
+    assert repository.get_notification(notification_id)["send_attempts_started"] == 0
+
+
+def test_abandoned_clarification_attempt_budget_exhaustion_fails_exact_waiting_parent(firestore_fake):
+    import hashlib
+
+    from services.connectors.telegram.models import ClarificationState, PendingClarification
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    parent_ref = context_ref.collection("clarifications").document(pending.clarification_id)
+    parent_ref.update({"forward_compatible_metadata": {"keep": True}})
+
+    reservations = [
+        repository.reserve_notification_attempt(
+            notification_id, attempt_id=f"abandoned-{index}",
+            now=NOW + timedelta(seconds=61 * index),
+        )
+        for index in range(3)
+    ]
+    assert all(reservation["reserved"] for reservation in reservations)
+    exhausted = repository.reserve_notification_attempt(
+        notification_id, attempt_id="after-budget", now=NOW + timedelta(seconds=183),
+    )
+
+    assert exhausted["reserved"] is False
+    assert exhausted["state"] == "delivery_unknown"
+    row = repository.get_notification(notification_id)
+    assert row["send_attempts_started"] == 3
+    assert "question_delivery_evidence" not in row
+    parent = parent_ref.get().to_dict()
+    assert parent["state"] == ClarificationState.FAILED.value
+    assert parent["missing_slots"] == []
+    assert parent["forward_compatible_metadata"] == {"keep": True}
+    assert context_ref.get().to_dict()["pending_clarification_id"] is None
+
+
+def test_clarification_attempt_binding_is_stored_and_required_for_settlement(firestore_fake):
+    import copy
+    import hashlib
+
+    client, repository, _accepted, pending = _publish_t011_clarification(firestore_fake)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    reservation = repository.reserve_notification_attempt(
+        notification_id, attempt_id="binding-attempt", now=NOW,
+    )
+    stored = repository.get_notification(notification_id)["attempt_clarification_binding"]
+    original_binding = copy.deepcopy(stored["question_binding"])
+    assert stored["attempt_id"] == "binding-attempt"
+    assert stored["attempt_revision"] == reservation["attempt_revision"]
+    reservation["clarification_binding"]["generation"] = True
+    assert stored["question_binding"] == original_binding
+
+    with pytest.raises(ValueError, match="binding"):
+        repository.settle_notification_attempt(
+            notification_id, attempt_id="binding-attempt", revision=1,
+            outcome="sent", message_id=901, now=NOW,
+        )
+    for altered in (
+        {**original_binding, "generation": True},
+        {**original_binding, "revision": True},
+        {**original_binding, "clarification_revision": True},
+    ):
+        with pytest.raises(ValueError, match="binding"):
+            repository.settle_notification_attempt(
+                notification_id, attempt_id="binding-attempt", revision=1,
+                outcome="sent", message_id=901, now=NOW,
+                clarification_binding=altered,
+            )
+    client.collection("notification_outbox").document(notification_id).update({
+        "attempt_clarification_binding": None,
+    })
+    with pytest.raises(ValueError, match="binding"):
+        repository.settle_notification_attempt(
+            notification_id, attempt_id="binding-attempt", revision=1,
+            outcome="sent", message_id=901, now=NOW,
+            clarification_binding=original_binding,
+        )
+    client.collection("notification_outbox").document(notification_id).update({
+        "attempt_clarification_binding": stored,
+    })
+    settled = repository.settle_notification_attempt(
+        notification_id, attempt_id="binding-attempt", revision=1,
+        outcome="sent", message_id=901, now=NOW,
+        clarification_binding=original_binding,
+    )
+    assert settled["settled"] is True
+    assert settled["question_delivery_evidence"]["message_id"] == 901
+
+
+@pytest.mark.parametrize("advance", ["claimed", "unknown", "new_generation", "new_pointer"])
+def test_terminal_clarification_rejection_preserves_advanced_parent_and_pointer(
+    firestore_fake, advance,
+):
+    import hashlib
+
+    from services.connectors.telegram.models import PendingClarification
+    from services.connectors.telegram.repository._common import SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    parent_ref = context_ref.collection("clarifications").document(pending.clarification_id)
+
+    class AdvancingRejectTelegram(_Telegram):
+        async def send_message(self, chat_id, text, *, message_thread_id=None,
+                               reply_markup=None, presentation=None):
+            parent = PendingClarification.from_dict(parent_ref.get().to_dict()).to_dict()
+            context = context_ref.get().to_dict()
+            if advance in {"claimed", "unknown"}:
+                parent.update({
+                    "state": advance, "missing_slots": [], "revision": 2,
+                    "resolved_parameters": {"doc_id": "doc-a", "destination_id": "folder-a"},
+                    "execution_operation_id": "new-execution",
+                    "execution_plan_ref": (
+                        f"{SESSIONS}/{accepted.context_id}/operations/new-execution/plans/pinned"
+                    ),
+                    "execution_plan_digest": "a" * 64,
+                })
+                if advance == "unknown":
+                    parent["safe_error"] = "effect_outcome_unknown"
+            elif advance == "new_generation":
+                parent.update({"generation": 2, "revision": 2})
+                context["clarification_generation"] = 2
+            else:
+                parent.update({"state": "replaced", "missing_slots": [],
+                               "revision": 2, "safe_error": "replaced_by_new_intent"})
+                context.update({"pending_clarification_id": "new-pending",
+                                "clarification_generation": 2})
+            parent_ref.set(parent)
+            context_ref.set(context)
+            raise TelegramAPIError("forbidden")
+
+    publisher = TelegramNotificationPublisher(
+        repository, AdvancingRejectTelegram(), clock=lambda: NOW,
+    )
+    assert _run(publisher.publish(notification_id)) == "failed"
+    parent = parent_ref.get().to_dict()
+    context = context_ref.get().to_dict()
+    if advance == "claimed":
+        assert PendingClarification.from_dict(parent).state.value == "claimed"
+        assert context["pending_clarification_id"] == pending.clarification_id
+    elif advance == "unknown":
+        assert PendingClarification.from_dict(parent).state.value == "unknown"
+        assert context["pending_clarification_id"] == pending.clarification_id
+    elif advance == "new_generation":
+        assert parent["state"] == "waiting" and parent["generation"] == 2
+        assert context["clarification_generation"] == 2
+    else:
+        assert parent["state"] == "replaced"
+        assert context["pending_clarification_id"] == "new-pending"
+    assert "question_delivery_evidence" not in repository.get_notification(notification_id)
+
+
+def test_clarification_attempt_contention_and_rate_limits_remain_bounded(firestore_fake):
+    import hashlib
+
+    _client, repository, _accepted, pending = _publish_t011_clarification(firestore_fake)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    clock = _Clock()
+    original_reserve = repository.reserve_notification_attempt
+    contention = []
+
+    def on_send_contend():
+        contention.append(original_reserve(
+            notification_id, attempt_id="contender", now=clock.now + timedelta(seconds=1),
+        ))
+
+    class ContendingRateLimitTelegram(_Telegram):
+        async def send_message(self, chat_id, text, *, message_thread_id=None,
+                               reply_markup=None, presentation=None):
+            if not contention:
+                on_send_contend()
+            return await super().send_message(
+                chat_id, text, message_thread_id=message_thread_id,
+                reply_markup=reply_markup, presentation=presentation,
+            )
+
+    telegram = ContendingRateLimitTelegram(
+        failures=3, failure_category="rate_limited", retry_after=5,
+    )
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=clock)
+    assert _run(publisher.publish(notification_id)) == "retry"
+    assert contention[0]["reserved"] is False
+    assert len(telegram.sent) == 1
+    assert _run(publisher.publish(notification_id)) == "busy"
+    clock.advance(4)
+    assert _run(publisher.publish(notification_id)) == "busy"
+    clock.advance(1)
+    assert _run(publisher.publish(notification_id)) == "retry"
+    clock.advance(5)
+    assert _run(publisher.publish(notification_id)) == "failed"
+    row = repository.get_notification(notification_id)
+    assert row["send_attempts_started"] == 3
+    assert len(telegram.sent) == 3
+    assert "question_delivery_evidence" not in row
+
+
+def _prepare_later_generation_clarification(firestore_fake, *, corrupt_scope=False):
+    """Build a metadata-only later prompt produced by a distinct answer operation."""
+    import hashlib
+
+    from services.connectors.telegram.repository._common import (
+        NOTIFICATIONS, SESSIONS, _routing_checkpoint_path,
+    )
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    parent_ref = context_ref.collection("clarifications").document(pending.clarification_id)
+    context = context_ref.get().to_dict()
+    parent = parent_ref.get().to_dict()
+    context["clarification_generation"] = 2
+    parent.update({"generation": 2, "revision": 2, "updated_at": NOW})
+    context_ref.set(context)
+    parent_ref.set(parent)
+
+    body = "Which account should receive the updated request?"
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:2".encode("utf-8")
+    ).hexdigest()
+    producer_operation_id = "answer-operation-2"
+    payload_ref = _routing_checkpoint_path(
+        accepted.context_id, producer_operation_id, "intent",
+    )
+    question_path = (
+        f"{SESSIONS}/{accepted.context_id}/clarifications/{pending.clarification_id}"
+        "/questions/2"
+    )
+    question_payload_ref = payload_ref
+    if corrupt_scope:
+        question_payload_ref = _routing_checkpoint_path(
+            accepted.context_id, "other-answer-operation", "intent",
+        )
+    context_ref.collection("clarifications").document(
+        pending.clarification_id,
+    ).collection("questions").document("2").set({
+        "protocol": "clarification-question-v1",
+        "context_id": accepted.context_id,
+        "actor_id": 77,
+        "clarification_id": pending.clarification_id,
+        "generation": 2,
+        "question_ref": question_path,
+        "created_at": NOW,
+        "prompt_notification_id": notification_id,
+        "prompt_notification_revision": 1,
+        "prompt_digest": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "question_payload_ref": question_payload_ref,
+        "question_payload_digest": hashlib.sha256(b"later intent checkpoint").hexdigest(),
+    })
+    initial_notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode("utf-8")
+    ).hexdigest()
+    notification = repository.get_notification(initial_notification_id)
+    notification.update({
+        "notification_id": notification_id,
+        "producer_operation_id": producer_operation_id,
+        "generation": 2,
+        "revision": 1,
+        "desired_status_revision": 1,
+        "body": body,
+        "message_id": None,
+        "state": "pending",
+        "send_attempts_started": 0,
+        "attempt_revision": 0,
+        "attempt_clarification_binding": None,
+        "in_flight_attempt_id": None,
+        "attempt_expires_at": None,
+        "delivered_at": None,
+        "failed_at": None,
+        "last_error": None,
+        "terminal_failure": None,
+        "retry_not_before": None,
+    })
+    client.collection(NOTIFICATIONS).document(notification_id).set(notification)
+    return client, repository, notification_id, question_path
+
+
+def test_later_clarification_generation_uses_its_own_producer_and_payload_scope(firestore_fake):
+    _client, repository, notification_id, question_path = _prepare_later_generation_clarification(
+        firestore_fake,
+    )
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    notification = repository.get_notification(notification_id)
+    assert telegram.sent == [(910, "Which account should receive the updated request?", 5)]
+    assert notification["question_delivery_evidence"]["generation"] == 2
+    assert notification["question_delivery_evidence"]["question_ref"] == question_path
+    binding = notification["attempt_clarification_binding"]["question_binding"]
+    assert binding["producer_operation_id"] == "answer-operation-2"
+    assert binding["question_payload_ref"].endswith(
+        "/operations/answer-operation-2/routing_checkpoints/intent",
+    )
+
+
+def test_later_clarification_generation_rejects_mismatched_producer_payload_scope(firestore_fake):
+    _client, repository, notification_id, _question_path = _prepare_later_generation_clarification(
+        firestore_fake, corrupt_scope=True,
+    )
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+
+    with pytest.raises(ValueError, match="payload reference"):
+        _run(publisher.publish(notification_id))
+    assert telegram.sent == []
+    notification = repository.get_notification(notification_id)
+    assert notification["send_attempts_started"] == 0
+    assert notification.get("attempt_clarification_binding") is None
+
+
+def test_t011_clarification_delivery_accepts_negative_group_chat_id(firestore_fake):
+    import hashlib
+
+    chat_id = -10042
+    from services.connectors.telegram.repository._common import NOTIFICATIONS, SESSIONS
+
+    client, repository, accepted, pending = _publish_t011_clarification(firestore_fake)
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode("utf-8")
+    ).hexdigest()
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    context = context_ref.get().to_dict()
+    context["chat_id"] = chat_id
+    context_ref.set(context)
+    notification_ref = client.collection(NOTIFICATIONS).document(notification_id)
+    notification = notification_ref.get().to_dict()
+    notification["chat_id"] = chat_id
+    notification_ref.set(notification)
+    telegram = _Telegram()
+    publisher = TelegramNotificationPublisher(repository, telegram, clock=lambda: NOW)
+
+    assert _run(publisher.publish(notification_id)) == "delivered"
+    assert telegram.sent == [(chat_id, "Which destination should I use?", 5)]
+    evidence = repository.get_notification(notification_id)["question_delivery_evidence"]
+    assert evidence["chat_id"] == chat_id
+    assert evidence["message_id"] == 901

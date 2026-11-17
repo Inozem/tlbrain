@@ -58,6 +58,20 @@ class _VerifiedTelegramLifecycle:
     title: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _DeliveryAttempt:
+    """Telegram delivery result plus the context needed for ledger settlement."""
+
+    outcome: str
+    message_id: int | None
+    retry_after: int | None
+    action: str
+    operation_id: str | None
+    revision: int | None
+    known_message: bool
+    known_message_id: int | None
+
+
 def build_lifecycle_body(*, lifecycle: _VerifiedTelegramLifecycle) -> str:
     """Format a previously verified server result without accepting task content."""
     if not isinstance(lifecycle, _VerifiedTelegramLifecycle):
@@ -134,22 +148,9 @@ class TelegramNotificationPublisher:
         now = self.clock()
         attempt_id = "tgnotify-" + uuid4().hex
         if _refresh_receipt:
-            refresh_receipt = getattr(self.repository, "refresh_receipt_card", None)
-            current_card_ids = (
-                await storage_call(
-                    _offload_repository_call, refresh_receipt, notification_id,
-                    diagnostic_notification_id=notification_id,
-                    diagnostic_attempt_id=attempt_id,
-                    phase="refresh", now=now,
-                )
-                if callable(refresh_receipt) else None
-            )
-            if current_card_ids:
-                dispositions = [
-                    await self.publish(card_id, _refresh_receipt=False)
-                    for card_id in current_card_ids
-                ]
-                return next((state for state in dispositions if state != "delivered"), "delivered")
+            refreshed = await self._refresh_receipt_cards(notification_id, attempt_id, now)
+            if refreshed is not None:
+                return refreshed
         reservation = await storage_call(
             _offload_repository_call, self.repository.reserve_notification_attempt,
             notification_id, diagnostic_notification_id=notification_id,
@@ -162,6 +163,35 @@ class TelegramNotificationPublisher:
             state = reservation.get("state")
             return state if state in {"delivered", "failed", "delivery_unknown", "superseded"} else "busy"
 
+        delivery = await self._deliver_attempt(notification_id, attempt_id, reservation)
+        return await self._settle_attempt(notification_id, attempt_id, delivery, reservation)
+
+    async def _refresh_receipt_cards(
+        self, notification_id: str, attempt_id: str, now: datetime,
+    ) -> str | None:
+        """Refresh due receipt cards and publish their replacements in order."""
+        refresh_receipt = getattr(self.repository, "refresh_receipt_card", None)
+        current_card_ids = (
+            await storage_call(
+                _offload_repository_call, refresh_receipt, notification_id,
+                diagnostic_notification_id=notification_id,
+                diagnostic_attempt_id=attempt_id,
+                phase="refresh", now=now,
+            )
+            if callable(refresh_receipt) else None
+        )
+        if current_card_ids:
+            dispositions = [
+                await self.publish(card_id, _refresh_receipt=False)
+                for card_id in current_card_ids
+            ]
+            return next((state for state in dispositions if state != "delivered"), "delivered")
+        return None
+
+    async def _deliver_attempt(
+        self, notification_id: str, attempt_id: str, reservation: dict[str, Any],
+    ) -> _DeliveryAttempt:
+        """Perform one Telegram request and classify its outcome."""
         action = "send" if reservation["is_send"] else "edit"
         operation_id = reservation.get("operation_id")
         revision = reservation.get("attempt_revision")
@@ -230,15 +260,31 @@ class TelegramNotificationPublisher:
             )
             outcome, message_id = "unknown", None
 
+        return _DeliveryAttempt(
+            outcome=outcome, message_id=message_id, retry_after=retry_after,
+            action=action, operation_id=operation_id, revision=revision,
+            known_message=known_message, known_message_id=known_message_id,
+        )
+
+    async def _settle_attempt(
+        self, notification_id: str, attempt_id: str,
+        delivery: _DeliveryAttempt, reservation: dict[str, Any],
+    ) -> str:
+        """Persist the classified attempt outcome and return its disposition."""
+        settlement_kwargs = {
+            "attempt_id": attempt_id, "revision": delivery.revision,
+            "outcome": delivery.outcome, "message_id": delivery.message_id,
+            "now": self.clock(), "retry_after": delivery.retry_after,
+        }
+        if reservation.get("clarification_binding") is not None:
+            settlement_kwargs["clarification_binding"] = reservation["clarification_binding"]
         settled = await storage_call(
             _offload_repository_call, self.repository.settle_notification_attempt,
             notification_id, diagnostic_notification_id=notification_id,
-            diagnostic_attempt_id=attempt_id, diagnostic_operation_id=operation_id,
-            diagnostic_action=action, diagnostic_revision=revision,
-            diagnostic_known_message=known_message, diagnostic_message_id=known_message_id,
-            phase="settlement", attempt_id=attempt_id, revision=revision,
-            outcome=outcome, message_id=message_id, now=self.clock(),
-            retry_after=retry_after,
+            diagnostic_attempt_id=attempt_id, diagnostic_operation_id=delivery.operation_id,
+            diagnostic_action=delivery.action, diagnostic_revision=delivery.revision,
+            diagnostic_known_message=delivery.known_message, diagnostic_message_id=delivery.known_message_id,
+            phase="settlement", **settlement_kwargs,
         )
         if settled is None:
             return "not_found"

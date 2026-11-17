@@ -1827,27 +1827,47 @@ def test_valid_question_proof_wins_over_forged_observation_fields(firestore_fake
 def test_late_delivery_settlement_never_rebinds_replay_but_a_new_message_can_bind(
     firestore_fake, explicit_reply,
 ):
-    repository, client, intake, update, context_ref, _ = _seed_question_case(
-        firestore_fake, update_id=609 if not explicit_reply else 611,
-        notification_overrides={"state": "pending", "message_id": None},
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    helper_module_name = "_telegram_test_notifications_helper"
+    helper_module = sys.modules.get(helper_module_name)
+    if helper_module is None:
+        helper_path = Path(__file__).with_name("test_notifications.py")
+        helper_spec = importlib.util.spec_from_file_location(helper_module_name, helper_path)
+        helper_module = importlib.util.module_from_spec(helper_spec)
+        sys.modules[helper_module_name] = helper_module
+        helper_spec.loader.exec_module(helper_module)
+    client, repository, _accepted, pending = helper_module._publish_t011_clarification(
+        firestore_fake, update_id=99021, chat_id=42, user_id=7, thread_id=None,
     )
+    context_ref = client.collection("telegram_sessions").document("42_default")
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode("utf-8")
+    ).hexdigest()
+    update = _command(609 if not explicit_reply else 611, "a possible clarification answer")
+    update["message"]["date"] = int((NOW + timedelta(seconds=5)).timestamp())
+    intake = _intake(repository, _Publisher(), clock=lambda: NOW + timedelta(seconds=10))
     if explicit_reply:
         update["message"]["reply_to_message"] = {"message_id": 777}
     intake.handle_update(update)
     command_path = f"telegram_sessions/42_default/commands/{update['update_id']}"
     original = _read_doc(client, command_path)
     assert original["observed_clarification_id"] == (
-        None if explicit_reply else "clarify-fixture"
+        None if explicit_reply else pending.clarification_id
     )
     assert original["observed_question_delivery_ref"] is None
 
     reserved = repository.reserve_notification_attempt(
-        "prompt-fixture", attempt_id="fixture-send", now=NOW + timedelta(seconds=11),
+        notification_id, attempt_id="fixture-send", now=NOW + timedelta(seconds=11),
     )
     assert reserved is not None and reserved["reserved"] is True
     settled = repository.settle_notification_attempt(
-        "prompt-fixture", attempt_id="fixture-send", revision=4, outcome="sent",
+        notification_id, attempt_id="fixture-send",
+        revision=reserved["attempt_revision"], outcome="sent",
         message_id=777, now=NOW + timedelta(seconds=12),
+        clarification_binding=reserved["clarification_binding"],
     )
     assert settled is not None and settled["state"] == "delivered"
 
@@ -1866,7 +1886,7 @@ def test_late_delivery_settlement_never_rebinds_replay_but_a_new_message_can_bin
     later_command = _read_doc(
         client, f"telegram_sessions/42_default/commands/{later['update_id']}",
     )
-    assert later_command["observed_question_delivery_ref"]["notification_id"] == "prompt-fixture"
+    assert later_command["observed_question_delivery_ref"]["notification_id"] == notification_id
     assert later_command["observed_question_delivery_ref"]["message_id"] == 777
     assert later_command["observed_question_delivery_ref"]["binding_kind"] == (
         "explicit_reply" if explicit_reply else "plain"
