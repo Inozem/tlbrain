@@ -23,7 +23,7 @@ from services.connectors.telegram.models import (
 SESSIONS = "telegram_sessions"
 ROUTING_PROTOCOL = "context-v2"
 ROUTING_SCHEMA_VERSION = 1
-ROUTING_KINDS = frozenset({"context", "decision", "intent"})
+ROUTING_KINDS = frozenset({"context", "intent"})
 ROUTING_INLINE_CHECKPOINT_BYTES = 4 * 1024
 NOTIFICATIONS = "notification_outbox"
 NOTIFICATION_KINDS = frozenset({"draft_ack", "receipt_card", "unsupported_forward", "queued", "switch_notice", "progress", "final", "error", "clarification"})

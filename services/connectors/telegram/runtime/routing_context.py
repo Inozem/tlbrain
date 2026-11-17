@@ -638,11 +638,8 @@ class RoutingDecision:
     clarification_id: str | None = None
     clarification_generation: int | None = None
     certainty: Certainty = Certainty.UNCERTAIN
-    protocol: str = PROTOCOL
 
     def __post_init__(self) -> None:
-        if self.protocol != PROTOCOL:
-            raise ValueError(f"protocol must be {PROTOCOL!r}")
         object.__setattr__(self, "disposition", _enum(Disposition, self.disposition, "disposition"))
         object.__setattr__(self, "action", _enum(Action, self.action, "action"))
         object.__setattr__(self, "certainty", _enum(Certainty, self.certainty, "certainty"))
@@ -687,7 +684,7 @@ class RoutingDecision:
                 raise ValueError("decision span does not match accepted command")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"protocol": self.protocol, "disposition": self.disposition.value,
+        return {"disposition": self.disposition.value,
                 "action": self.action.value, "substantive_text": self.substantive_text,
                 "document_selector": None if self.document_selector is None else self.document_selector.to_dict(),
                 "folder_selector": None if self.folder_selector is None else self.folder_selector.to_dict(),
@@ -700,10 +697,10 @@ class RoutingDecision:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RoutingDecision":
-        _only_keys(value, {"protocol", "disposition", "action", "substantive_text", "document_selector",
+        _only_keys(value, {"disposition", "action", "substantive_text", "document_selector",
                            "folder_selector", "folder_name", "explicit_references", "missing_slots", "evidence_refs",
                            "clarification_id", "clarification_generation", "certainty"}, "RoutingDecision")
-        return cls(protocol=value.get("protocol"), disposition=value["disposition"], action=value["action"],
+        return cls(disposition=value["disposition"], action=value["action"],
                    substantive_text=value["substantive_text"],
                    document_selector=None if value.get("document_selector") is None else DocumentSelector.from_dict(value["document_selector"]),
                    folder_selector=None if value.get("folder_selector") is None else FolderSelector.from_dict(value["folder_selector"]),

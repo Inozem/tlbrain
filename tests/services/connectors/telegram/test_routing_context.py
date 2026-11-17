@@ -337,6 +337,27 @@ def test_folder_selector_and_missing_slots_are_independent_from_document():
     assert restored.folder_name is None
 
 
+def test_routing_decision_wire_contract_has_no_operation_protocol():
+    decision = RoutingDecision(
+        Disposition.EXECUTE,
+        Action.MOVE_TRANSCRIPT,
+        "move the second item",
+        document_selector=DocumentSelector(
+            kind=DocumentSelectorKind.SHOWN_POSITION, list_id="prices", position=2,
+        ),
+    )
+
+    encoded = decision.to_dict()
+    assert "protocol" not in encoded
+    assert RoutingDecision.from_dict(encoded) == decision
+
+    # The protocol remains a private snapshot/checkpoint tag. It is not a model
+    # decision field, so an obsolete marker cannot silently enter the DTO.
+    encoded["protocol"] = "context-v2"
+    with pytest.raises(ValueError, match="unknown fields"):
+        RoutingDecision.from_dict(encoded)
+
+
 @pytest.mark.parametrize("payload, message", [
     ({"protocol": "context-v1"}, "protocol"),
     ({"schema_version": True}, "schema_version"),

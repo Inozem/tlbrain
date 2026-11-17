@@ -210,7 +210,7 @@ class FirestoreAgentLedger:
     def _check_routing_sibling_scope(
         self, transaction: Any, *, actor_id: int, conversation_id: str,
     ) -> dict[str, Any]:
-        """Read all three canonical headers and ensure one operation scope."""
+        """Read both supported headers and ensure one operation scope."""
         references = {}
         for kind in sorted(ROUTING_KINDS):
             checkpoint_ref = _document_ref(
