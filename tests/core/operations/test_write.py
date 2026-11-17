@@ -410,6 +410,362 @@ def test_shared_write_authorization_allows_registered_live_root_transcript(monke
 
 
 @pytest.mark.offline
+def test_resolved_targets_move_uses_pinned_id_when_intent_path_now_names_another_folder(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from core.operations import registry
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.set_file("pinned-target", name="Renamed", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    harness.set_file("replacement-target", name="Target", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    for folder_id, name in (("pinned-target", "Renamed"), ("replacement-target", "Target")):
+        client.collection("folders").document(folder_id).set({
+            "folder_id": folder_id, "name": name, "parent_id": ROOT_FOLDER_ID,
+        })
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+        "source_file": "Source", "content_hash": "sha256:original",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    base = _context(client, fake_clock, operation_id="resolved-target-pinned-move")
+    args = {"doc_id": "source", "folder_path": ["Target"]}
+    capability = write._new_resolved_write_targets(
+        operation_name="move_transcript", operation_id=base.operation_id,
+        effect_id=base.effect_id, arguments=args, doc_id="source",
+        destination_id="pinned-target", root_id=ROOT_FOLDER_ID, intent_digest="a" * 64,
+    )
+    context = write.WriteContext(
+        base.operation_id, base.effect_id, base.owner, base.fence,
+        client=client, clock=fake_clock, resolved_targets=capability,
+    )
+
+    result = registry.invoke_operation("move_transcript", args, context=context)
+
+    assert result.unassigned_count == 0
+    assert harness.files["source"]["parents"] == ["pinned-target"]
+    assert len(harness.drive_mutations) == len(harness.qdrant_mutations) == 1
+
+    from dataclasses import replace
+    reads_after_confirmation = list(harness.drive_reads)
+    assert registry.invoke_operation("move_transcript", args, context=context).unassigned_count == 0
+    assert harness.drive_reads == reads_after_confirmation
+    effect_ref = (client.collection("dialog_operations").document(context.operation_id)
+                  .collection("effects").document(context.effect_id))
+    effect_ref.update({"state": "unknown"})
+    drive_mutations_after_confirmation = list(harness.drive_mutations)
+    qdrant_mutations_after_confirmation = list(harness.qdrant_mutations)
+    unknown_replay = registry.invoke_operation("move_transcript", args, context=context)
+    assert unknown_replay.unassigned_count == 0
+    assert len(harness.drive_reads) > len(reads_after_confirmation)
+    assert harness.drive_mutations == drive_mutations_after_confirmation
+    assert harness.qdrant_mutations == qdrant_mutations_after_confirmation
+    reads_after_confirmation = list(harness.drive_reads)
+    for drifted in (
+        replace(capability, destination_id="replacement-target"),
+        replace(capability, root_id="different-root"),
+        replace(capability, intent_digest="d" * 64),
+    ):
+        replay_context = replace(context, resolved_targets=drifted)
+        with pytest.raises(write.WritePlanConflict):
+            registry.invoke_operation("move_transcript", args, context=replay_context)
+        assert harness.drive_reads == reads_after_confirmation
+    with pytest.raises(write.WritePlanConflict):
+        registry.invoke_operation("move_transcript", args,
+                                  context=replace(context, resolved_targets=None))
+    assert harness.drive_reads == reads_after_confirmation
+
+
+@pytest.mark.offline
+def test_resolved_target_capability_is_bound_and_never_a_public_registry_argument():
+    from dataclasses import replace
+    from core.operations import registry
+
+    args = {"doc_id": "doc-1", "folder_path": ["Archive"]}
+    capability = write._new_resolved_write_targets(
+        operation_name="move_transcript", operation_id="operation-1", effect_id="effect-1",
+        arguments=args, doc_id="doc-1", destination_id="folder-1", root_id="root-1",
+        intent_digest="b" * 64,
+    )
+    with pytest.raises(registry.OperationValidationError):
+        registry.validate_arguments("move_transcript", {**args, "resolved_targets": capability})
+    with pytest.raises(ValueError, match="malformed"):
+        write._assert_resolved_targets(
+            replace(capability, doc_id="other-doc"), operation_name="move_transcript",
+            operation_id="operation-1", effect_id="effect-1", arguments=args,
+        )
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("case", [
+    "mapping", "unissued", "operation", "effect", "document", "arguments",
+])
+def test_untrusted_or_drifted_capability_is_rejected_before_provider_reads(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock, case,
+):
+    from dataclasses import replace
+    from core.operations import registry
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    context = _context(client, fake_clock, operation_id="resolved-target-reject-" + case)
+    arguments = {"doc_id": "doc-1", "folder_path": ["Archive"]}
+    capability = write._new_resolved_write_targets(
+        operation_name="move_transcript", operation_id=context.operation_id,
+        effect_id=context.effect_id, arguments=arguments, doc_id="doc-1",
+        destination_id="target", root_id="pytest-synthetic-root", intent_digest="9" * 64,
+    )
+    invocation_context = context
+    invocation_arguments = arguments
+    if case == "mapping":
+        invocation_context = replace(context, resolved_targets={
+            "operation_name": "move_transcript", "destination_id": "target",
+        })
+    elif case == "unissued":
+        invocation_context = replace(context, resolved_targets=replace(capability, _token=None))
+    elif case == "operation":
+        invocation_context = replace(context, resolved_targets=replace(
+            capability, operation_name="create_folder",
+        ))
+    elif case == "effect":
+        invocation_context = replace(context, resolved_targets=replace(
+            capability, effect_id="unrelated-effect",
+        ))
+    elif case == "document":
+        invocation_context = replace(context, resolved_targets=replace(
+            capability, doc_id="other-doc",
+        ))
+    else:
+        invocation_context = replace(context, resolved_targets=capability)
+        invocation_arguments = {**arguments, "folder_path": ["Other"]}
+
+    with pytest.raises(write.WritePlanConflict):
+        registry.invoke_operation(
+            "move_transcript", invocation_arguments, context=invocation_context,
+        )
+    assert harness.drive_reads == []
+    assert harness.drive_mutations == harness.qdrant_mutations == []
+
+
+@pytest.mark.offline
+def test_resolved_target_persisted_winner_is_validated_after_a_plan_race(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+    from core.integrations.firestore.write_plans import persist_write_plan
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    harness.set_file("pinned-target", name="Renamed", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    harness.set_file("replacement-target", name="Target", mime_type="application/vnd.google-apps.folder",
+                     parents=[ROOT_FOLDER_ID])
+    for folder_id, name in (("pinned-target", "Renamed"), ("replacement-target", "Target")):
+        client.collection("folders").document(folder_id).set({
+            "folder_id": folder_id, "name": name, "parent_id": ROOT_FOLDER_ID,
+        })
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+        "source_file": "Source",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    context = _context(client, fake_clock, operation_id="resolved-target-plan-winner-race")
+    args = {"doc_id": "source", "folder_path": ["Target"]}
+    capability = write._new_resolved_write_targets(
+        operation_name="move_transcript", operation_id=context.operation_id,
+        effect_id=context.effect_id, arguments=args, doc_id="source",
+        destination_id="pinned-target", root_id=ROOT_FOLDER_ID, intent_digest="e" * 64,
+    )
+    from dataclasses import replace
+    context = replace(context, resolved_targets=capability)
+    injected = False
+
+    def insert_competing_winner(_file_id, _value, _read_number):
+        nonlocal injected
+        if injected:
+            return
+        injected = True
+        winner_targets = replace(capability, destination_id="replacement-target")
+        arguments_digest = write._json_digest(args)
+        competing_plan = {
+            "arguments_digest": arguments_digest,
+            "metadata": {
+                "resolved_targets": write._resolved_targets_projection(winner_targets),
+                "root_id": ROOT_FOLDER_ID, "doc_id": "source",
+                "target_id": "replacement-target", "parent_id": None,
+            },
+            "expected_pre_state": "sha256:" + "f" * 64,
+        }
+        persist_write_plan(
+            client, operation_id=context.operation_id, effect_id=context.effect_id,
+            owner=context.owner, fence=context.fence, now=context.now(),
+            arguments_digest=arguments_digest,
+            plan={"arguments_digest": arguments_digest, "metadata": competing_plan["metadata"],
+                  "expected_pre_state": competing_plan["expected_pre_state"]},
+            clock=context.now,
+        )
+
+    harness.on_drive_read = insert_competing_winner
+    with pytest.raises(write.WritePlanConflict, match="binding changed"):
+        write.move_transcript("source", ["Target"], context=context)
+    assert injected
+    assert harness.drive_mutations == harness.qdrant_mutations == []
+
+
+@pytest.mark.offline
+def test_legacy_create_plan_rejects_resolved_target_upgrade(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from dataclasses import replace
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+    from core.integrations.firestore.write_plans import get_write_plan
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    context = _context(client, fake_clock, operation_id="resolved-target-legacy-upgrade")
+    args = {"name": "Legacy", "parent_path": []}
+    before, _allocation = _seed_create_plan(
+        client, harness, context, ROOT_FOLDER_ID, name="Legacy", parent_id=ROOT_FOLDER_ID,
+        arguments=args,
+    )
+    capability = write._new_resolved_write_targets(
+        operation_name="create_folder", operation_id=context.operation_id,
+        effect_id=context.effect_id, arguments={"name": "Legacy"},
+        parent_id=ROOT_FOLDER_ID, root_id=ROOT_FOLDER_ID, intent_digest="a" * 64,
+    )
+    constrained_context = replace(context, resolved_targets=capability)
+    drive_reads_before = list(harness.drive_reads)
+
+    with pytest.raises(write.WritePlanConflict, match="binding changed"):
+        write.create_folder("Legacy", context=constrained_context)
+
+    assert harness.drive_reads == drive_reads_before
+    assert harness.drive_mutations == []
+    assert get_write_plan(client, context.operation_id, context.effect_id) == before
+
+
+@pytest.mark.offline
+def test_resolved_move_dependency_requires_real_confirmed_create_result(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock,
+):
+    from dataclasses import replace
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+    from core.integrations.firestore.write_plans import get_write_plan
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    folder_id = "dependency-created-folder"
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": [folder_id]})
+    producer = _context(client, fake_clock, operation_id="resolved-target-producer")
+    assert write.create_folder("Produced", context=producer) == folder_id
+    assert get_mutation_effect(client, producer.operation_id, producer.effect_id).state.value == "confirmed"
+
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+        "source_file": "Source", "content_hash": "sha256:source",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    args = {"doc_id": "source", "folder_path": ["Path may now be stale"]}
+    consumer = _context(client, fake_clock, operation_id="resolved-target-dependent-move")
+    capability = write._new_resolved_write_targets(
+        operation_name="move_transcript", operation_id=consumer.operation_id,
+        effect_id=consumer.effect_id, arguments=args, doc_id="source",
+        destination_id=folder_id, root_id=ROOT_FOLDER_ID, intent_digest="b" * 64,
+        dependency_operation_id=producer.operation_id,
+        dependency_effect_id=producer.effect_id, dependency_folder_id=folder_id,
+    )
+    consumer = replace(consumer, resolved_targets=capability)
+
+    result = write.move_transcript("source", args["folder_path"], context=consumer)
+
+    assert result.unassigned_count == 0
+    assert harness.files["source"]["parents"] == [folder_id]
+    assert len(harness.drive_mutations) == 2
+    assert len(harness.qdrant_mutations) == 1
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("damage", [
+    "missing", "unknown", "wrong_result", "wrong_root",
+    "wrong_folder_id", "wrong_result_value",
+    "null_root", "duplicate_tree_guard", "conflicting_tree_guard",
+])
+def test_resolved_move_dependency_rejects_unconfirmed_or_drifted_producer(
+    monkeypatch, firestore_fake, sdk_fakes, fake_clock, damage,
+):
+    from dataclasses import replace
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+    from core.integrations.firestore.write_plans import get_write_plan
+
+    client, harness = _shared_write_authorization_state(monkeypatch, firestore_fake, sdk_fakes, fake_clock)
+    folder_id = "dependency-created-folder"
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": [folder_id]})
+    producer = _context(client, fake_clock, operation_id="resolved-target-producer-" + damage)
+    assert write.create_folder("Produced", context=producer) == folder_id
+    effect_ref = (client.collection("dialog_operations").document(producer.operation_id)
+                  .collection("effects").document(producer.effect_id))
+    if damage == "missing":
+        effect_ref.delete()
+    elif damage == "unknown":
+        effect_ref.update({"state": "unknown"})
+    elif damage == "wrong_result":
+        effect_ref.update({"result": "different-folder"})
+    elif damage in {"wrong_root", "null_root"}:
+        producer_plan = get_write_plan(client, producer.operation_id, producer.effect_id)
+        producer_plan["plan"]["metadata"]["root_id"] = (
+            None if damage == "null_root" else "different-root"
+        )
+        plan_ref = (client.collection("dialog_operations").document(producer.operation_id)
+                    .collection("write_plans").document(producer.effect_id))
+        plan_ref.set(producer_plan)
+    elif damage in {"duplicate_tree_guard", "conflicting_tree_guard"}:
+        producer_plan = get_write_plan(client, producer.operation_id, producer.effect_id)
+        extra = ROOT_FOLDER_ID if damage == "duplicate_tree_guard" else "different-root"
+        producer_plan["plan"]["metadata"]["resources"].append(f"tree:{extra}")
+        plan_ref = (client.collection("dialog_operations").document(producer.operation_id)
+                    .collection("write_plans").document(producer.effect_id))
+        plan_ref.set(producer_plan)
+    else:
+        producer_plan = get_write_plan(client, producer.operation_id, producer.effect_id)
+        field_name = "folder_id" if damage == "wrong_folder_id" else "result_value"
+        producer_plan["plan"]["metadata"][field_name] = "different-folder"
+        plan_ref = (client.collection("dialog_operations").document(producer.operation_id)
+                    .collection("write_plans").document(producer.effect_id))
+        plan_ref.set(producer_plan)
+
+    harness.set_file("source", name="Source", mime_type="application/vnd.google-apps.document",
+                     parents=[ROOT_FOLDER_ID])
+    client.collection("transcript_index").document("source").set({
+        "doc_id": "source", "status": "synced", "parent_id": ROOT_FOLDER_ID,
+        "source_file": "Source",
+    })
+    harness.add_qdrant_parent("source", ROOT_FOLDER_ID)
+    consumer = _context(client, fake_clock, operation_id="resolved-target-consumer-" + damage)
+    args = {"doc_id": "source", "folder_path": ["Ignored"]}
+    capability = write._new_resolved_write_targets(
+        operation_name="move_transcript", operation_id=consumer.operation_id,
+        effect_id=consumer.effect_id, arguments=args, doc_id="source",
+        destination_id=folder_id, root_id=ROOT_FOLDER_ID, intent_digest="c" * 64,
+        dependency_operation_id=producer.operation_id,
+        dependency_effect_id=producer.effect_id, dependency_folder_id=folder_id,
+    )
+    consumer = replace(consumer, resolved_targets=capability)
+    before_drive = list(harness.drive_mutations)
+    before_qdrant = list(harness.qdrant_mutations)
+
+    with pytest.raises(write.WritePlanConflict, match="dependency"):
+        write.move_transcript("source", args["folder_path"], context=consumer)
+
+    assert harness.drive_mutations == before_drive
+    assert harness.qdrant_mutations == before_qdrant
+    assert harness.files["source"]["parents"] == [ROOT_FOLDER_ID]
+
+
+@pytest.mark.offline
 def test_shared_write_authorization_accepts_nested_live_target_and_stale_cached_source_parent(
     monkeypatch, firestore_fake, sdk_fakes, fake_clock,
 ):

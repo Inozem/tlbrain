@@ -39,6 +39,173 @@ class WriteError(RuntimeError):
     """Safe, protocol-neutral failure for a guarded shared write."""
 
 
+_RESOLVED_WRITE_TARGETS_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedWriteTargets:
+    """Opaque server-issued binding between a public write intent and fixed IDs."""
+
+    operation_name: str
+    operation_id: str
+    effect_id: str
+    doc_id: str | None
+    destination_id: str | None
+    parent_id: str | None
+    root_id: str
+    intent_digest: str
+    arguments_digest: str
+    dependency_operation_id: str | None = None
+    dependency_effect_id: str | None = None
+    dependency_folder_id: str | None = None
+    _token: object | None = field(default=None, repr=False, compare=False)
+
+
+def _new_resolved_write_targets(
+    *, operation_name: str, operation_id: str, effect_id: str,
+    arguments: dict[str, Any], root_id: str, intent_digest: str,
+    doc_id: str | None = None, destination_id: str | None = None,
+    parent_id: str | None = None, dependency_operation_id: str | None = None,
+    dependency_effect_id: str | None = None, dependency_folder_id: str | None = None,
+) -> ResolvedWriteTargets:
+    """Issue an internal capability after validating its exact public intent."""
+    from core.operations import registry
+
+    validated = registry.validate_arguments(operation_name, arguments)
+    operation = registry.OPERATIONS[operation_name]
+    effective = {key: value.strip() if key in operation.trim_fields else value
+                 for key, value in validated.items()}
+    if operation_name == "create_folder":
+        effective["parent_path"] = effective.get("parent_path") or []
+    _validate_target_fields(
+        operation_name, operation_id, effect_id, effective, root_id, intent_digest,
+        doc_id, destination_id, parent_id, dependency_operation_id,
+        dependency_effect_id, dependency_folder_id,
+    )
+    return ResolvedWriteTargets(
+        operation_name, operation_id, effect_id, doc_id, destination_id, parent_id,
+        root_id, intent_digest, _json_digest(effective), dependency_operation_id,
+        dependency_effect_id, dependency_folder_id, _RESOLVED_WRITE_TARGETS_TOKEN,
+    )
+
+
+def _valid_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_hex_digest(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value))
+
+
+def _validate_target_fields(
+    operation_name: str, operation_id: str, effect_id: str, arguments: dict[str, Any],
+    root_id: str, intent_digest: str, doc_id: str | None, destination_id: str | None,
+    parent_id: str | None, dependency_operation_id: str | None,
+    dependency_effect_id: str | None, dependency_folder_id: str | None,
+) -> None:
+    if operation_name not in {"move_transcript", "create_folder"}:
+        raise ValueError("resolved write targets are not supported for this operation")
+    if not all(_valid_id(item) for item in (operation_id, effect_id, root_id)):
+        raise ValueError("resolved write target identity is malformed")
+    if not _valid_hex_digest(intent_digest):
+        raise ValueError("resolved write intent digest is malformed")
+    if operation_name == "move_transcript":
+        if (doc_id != arguments.get("doc_id") or not _valid_id(doc_id)
+                or not _valid_id(destination_id) or parent_id is not None):
+            raise ValueError("resolved transcript target is malformed")
+    elif (doc_id is not None or destination_id is not None or not _valid_id(parent_id)):
+        raise ValueError("resolved folder parent is malformed")
+    dependency = (dependency_operation_id, dependency_effect_id, dependency_folder_id)
+    if any(value is not None for value in dependency):
+        if (not all(_valid_id(value) for value in dependency)
+                or dependency_folder_id != destination_id):
+            raise ValueError("resolved target dependency is malformed")
+
+
+def _resolved_targets_projection(targets: ResolvedWriteTargets) -> dict[str, Any]:
+    """Canonical persistence-only representation; the opaque token is never stored."""
+    return {
+        "operation_name": targets.operation_name, "operation_id": targets.operation_id,
+        "effect_id": targets.effect_id, "doc_id": targets.doc_id,
+        "destination_id": targets.destination_id, "parent_id": targets.parent_id,
+        "root_id": targets.root_id, "intent_digest": targets.intent_digest,
+        "arguments_digest": targets.arguments_digest,
+        "dependency_operation_id": targets.dependency_operation_id,
+        "dependency_effect_id": targets.dependency_effect_id,
+        "dependency_folder_id": targets.dependency_folder_id,
+    }
+
+
+def _verify_target_dependency(targets: ResolvedWriteTargets | dict[str, Any], context: WriteContext) -> None:
+    value = (lambda key: targets.get(key) if isinstance(targets, dict) else getattr(targets, key))
+    dependency_operation_id = value("dependency_operation_id")
+    dependency_effect_id = value("dependency_effect_id")
+    dependency_folder_id = value("dependency_folder_id")
+    if dependency_operation_id is None:
+        return
+    from core.integrations.firestore.mutations import get_mutation_effect, get_mutation_result
+    from core.operations.models import EffectState
+
+    try:
+        effect = get_mutation_effect(
+            _client(context), dependency_operation_id, dependency_effect_id,
+        )
+        found, result = get_mutation_result(
+            _client(context), dependency_operation_id, dependency_effect_id,
+        )
+        if isinstance(result, dict):
+            if set(result) == {"tlbrain_mutation_result_v1"}:
+                result = result["tlbrain_mutation_result_v1"]
+            elif set(result) == {"__tlbrain_mutation_result_v1__"}:
+                result = result["__tlbrain_mutation_result_v1__"]
+        producer_plan = get_write_plan(
+            _client(context), dependency_operation_id, dependency_effect_id,
+        )
+        producer_metadata = (producer_plan or {}).get("plan", {}).get("metadata", {})
+        producer_root = _validated_plan_root(producer_metadata)
+    except Exception:
+        raise WritePlanConflict("resolved write dependency is unavailable") from None
+    if (effect is None or effect.operation_id != dependency_operation_id
+            or effect.effect_id != dependency_effect_id or effect.kind != "provider_call"
+            or effect.state != EffectState.CONFIRMED or not found
+            or result != dependency_folder_id
+            or producer_metadata.get("write_type") != "create_folder"
+            or producer_metadata.get("folder_id") != dependency_folder_id
+            or producer_metadata.get("result_value") != dependency_folder_id
+            or producer_root != value("root_id")
+            or not any(resource == f"tree:{value('root_id')}" for resource
+                       in producer_metadata.get("resources", []))):
+        raise WritePlanConflict("resolved write dependency is not confirmed for this target")
+
+
+def _assert_resolved_targets(
+    targets: Any, *, operation_name: str, operation_id: str, effect_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate an opaque capability at adapter boundaries, including cached paths."""
+    if (not isinstance(targets, ResolvedWriteTargets)
+            or targets._token is not _RESOLVED_WRITE_TARGETS_TOKEN):
+        raise ValueError("resolved write targets are not trusted")
+    from core.operations import registry
+    operation = registry.OPERATIONS[operation_name]
+    effective = {key: value.strip() if key in operation.trim_fields else value
+                 for key, value in arguments.items()}
+    if operation_name == "create_folder":
+        effective["parent_path"] = effective.get("parent_path") or []
+    _validate_target_fields(
+        targets.operation_name, targets.operation_id, targets.effect_id, effective,
+        targets.root_id, targets.intent_digest, targets.doc_id, targets.destination_id,
+        targets.parent_id, targets.dependency_operation_id, targets.dependency_effect_id,
+        targets.dependency_folder_id,
+    )
+    if (targets.operation_name != operation_name or targets.operation_id != operation_id
+            or targets.effect_id != effect_id
+            or targets.arguments_digest != _json_digest(effective)):
+        raise ValueError("resolved write targets do not match this operation")
+    return _resolved_targets_projection(targets)
+
+
 @dataclass(frozen=True, slots=True)
 class SystemClock:
     """Default injectable UTC clock."""
@@ -58,6 +225,7 @@ class WriteContext:
     client: Any | None = None
     clock: Any = field(default_factory=SystemClock)
     _internal: bool = False
+    resolved_targets: ResolvedWriteTargets | None = None
 
     def now(self) -> datetime:
         value = self.clock.now() if hasattr(self.clock, "now") else self.clock()
@@ -207,16 +375,61 @@ def _execute(
         raise safe_error from None
 
 
-def _execute_inner(
-    context: WriteContext,
-    arguments: dict[str, Any],
-    prepare: Callable[[], dict[str, Any]],
-) -> Any:
-    """Persist a metadata plan and execute through the callbacks rebuilt from its winner."""
-    arguments_digest = _json_digest(arguments)
+def _bind_resolved_targets(
+    context: WriteContext, arguments: dict[str, Any],
+) -> tuple[ResolvedWriteTargets | None, dict[str, Any] | None]:
+    targets = context.resolved_targets
+    binding = None
+    if targets is not None:
+        try:
+            expected_name = ("move_transcript" if "doc_id" in arguments
+                             and "folder_path" in arguments else "create_folder")
+            binding = _assert_resolved_targets(
+                targets, operation_name=expected_name, operation_id=context.operation_id,
+                effect_id=context.effect_id, arguments=arguments,
+            )
+        except (TypeError, ValueError, KeyError):
+            raise WritePlanConflict("resolved write targets do not match this operation") from None
+    return targets, binding
+
+
+def _validate_target_ids(
+    metadata: dict[str, Any], targets: ResolvedWriteTargets, message: str,
+) -> None:
+    if (metadata.get("root_id") != targets.root_id
+            or metadata.get("doc_id") != targets.doc_id
+            or metadata.get("target_id") != targets.destination_id
+            or metadata.get("parent_id") != targets.parent_id):
+        raise WritePlanConflict(message)
+
+
+def _validate_plan_binding(
+    candidate: dict[str, Any], binding: dict[str, Any] | None,
+    targets: ResolvedWriteTargets | None,
+) -> None:
+    persisted_binding = candidate.get("plan", {}).get("metadata", {}).get("resolved_targets")
+    if persisted_binding != binding:
+        raise WritePlanConflict("resolved write target binding changed on replay")
+    if binding is not None:
+        metadata = candidate["plan"]["metadata"]
+        _validate_target_ids(metadata, targets, "resolved write target IDs changed on replay")
+
+
+def _load_or_create_write_plan(
+    context: WriteContext, arguments_digest: str, prepare: Callable[[], dict[str, Any]],
+    binding: dict[str, Any] | None,
+    targets: ResolvedWriteTargets | None,
+) -> dict[str, Any]:
     planned = _read_plan(context, arguments_digest)
+    if planned is not None:
+        _validate_plan_binding(planned, binding, targets)
     if planned is None:
         prepared_metadata = prepare()
+        if binding is not None:
+            prepared_metadata["resolved_targets"] = binding
+            _validate_target_ids(
+                prepared_metadata, targets, "resolved write target IDs changed during planning",
+            )
         before_digest = prepared_metadata.pop("_expected_pre_state", None) or digest(
             _read_snapshot(prepared_metadata, context)
         )
@@ -230,6 +443,41 @@ def _execute_inner(
             owner=context.owner, fence=context.fence, now=context.now(),
             arguments_digest=arguments_digest, plan=plan, clock=context.now,
         )
+        # persist_write_plan can return a concurrent winner for the same public
+        # arguments. Validate that durable winner before rebuilding any callbacks.
+        _validate_plan_binding(planned, binding, targets)
+    return planned
+
+
+def _result_from_snapshot(
+    snapshot: MutationSnapshot, result_kind: str, desired_digest: str,
+    metadata: dict[str, Any], context: WriteContext,
+) -> Any:
+    if snapshot.state_digest != desired_digest:
+        raise RuntimeError("provider state does not match planned result")
+    if result_kind == "move_transcript":
+        unassigned_id = folder_repository.get_folder_id_by_name("_unassigned", _client(context))
+        unassigned = (transcripts.list_unassigned_transcripts(unassigned_id, _client(context))
+                      if unassigned_id else [])
+        return {"unassigned_transcripts": unassigned}
+    if result_kind == "move_folder":
+        return [metadata["folder_id"], metadata["parent_id"]]
+    if result_kind == "none":
+        return None
+    return metadata.get("result_value")
+
+
+def _execute_inner(
+    context: WriteContext,
+    arguments: dict[str, Any],
+    prepare: Callable[[], dict[str, Any]],
+) -> Any:
+    """Persist a metadata plan and execute through the callbacks rebuilt from its winner."""
+    arguments_digest = _json_digest(arguments)
+    targets, binding = _bind_resolved_targets(context, arguments)
+    planned = _load_or_create_write_plan(
+        context, arguments_digest, prepare, binding, targets,
+    )
     metadata = planned["plan"]["metadata"]
     metadata, read_state, apply = _prepare_from_plan(metadata, arguments, context)
     expected_pre_state = planned["plan"]["expected_pre_state"]
@@ -243,18 +491,7 @@ def _execute_inner(
         return MutationSnapshot(digest(state))
 
     def result_from_snapshot(snapshot: MutationSnapshot) -> Any:
-        if snapshot.state_digest != desired_digest:
-            raise RuntimeError("provider state does not match planned result")
-        if result_kind == "move_transcript":
-            unassigned_id = folder_repository.get_folder_id_by_name("_unassigned", _client(context))
-            unassigned = (transcripts.list_unassigned_transcripts(unassigned_id, _client(context))
-                          if unassigned_id else [])
-            return {"unassigned_transcripts": unassigned}
-        if result_kind == "move_folder":
-            return [metadata["folder_id"], metadata["parent_id"]]
-        if result_kind == "none":
-            return None
-        return metadata.get("result_value")
+        return _result_from_snapshot(snapshot, result_kind, desired_digest, metadata, context)
 
     result = execute_mutation(
             _client(context), operation_id=context.operation_id, effect_id=context.effect_id,
@@ -475,6 +712,8 @@ def _validate_live_shared_targets(metadata: dict[str, Any], context: WriteContex
 def _apply_after_live_preflight(metadata: dict[str, Any], context: WriteContext, apply: Callable):
     """Keep pre-dispatch authorization failures definitely unsent; preserve provider outcomes."""
     try:
+        if metadata.get("resolved_targets") is not None:
+            _verify_target_dependency(metadata["resolved_targets"], context)
         _validate_live_shared_targets(metadata, context)
     except MutationNotSent:
         raise
@@ -523,10 +762,15 @@ def _prepare_from_plan(metadata: dict[str, Any], arguments: dict[str, Any], cont
 def move_transcript(doc_id: str, folder_path: list[str], *, context: WriteContext | None = None):
     arguments = {"doc_id": doc_id, "folder_path": folder_path}
     ctx = _context(context, arguments)
+    targets = ctx.resolved_targets
 
     def prepare():
-        target_id = document_operations.resolve_move_target(folder_path, _client(ctx))
-        root_id = get_root_folder_id()
+        if targets is None:
+            target_id = document_operations.resolve_move_target(folder_path, _client(ctx))
+            root_id = get_root_folder_id()
+        else:
+            target_id, root_id = targets.destination_id, targets.root_id
+            _verify_target_dependency(targets, ctx)
         metadata = {"kind": "parent_move", "write_type": "move_transcript",
                     "result_kind": "move_transcript", "doc_id": doc_id, "target_id": target_id,
                     "root_id": root_id, "resources": [f"document:{doc_id}", f"tree:{root_id}"],
@@ -627,14 +871,25 @@ def rename_folder(folder_path: list[str], new_name: str, *, context: WriteContex
 def create_folder(name: str, parent_path: list[str] | None = None, *, context: WriteContext | None = None) -> str:
     arguments = {"name": name, "parent_path": parent_path or []}
     ctx = _context(context, arguments)
+    targets = ctx.resolved_targets
     def prepare():
-        parent_id = folder_service.prepare_create_folder(name, parent_path, db=_client(ctx))
-        root_id = get_root_folder_id()
+        if targets is None:
+            parent_id = folder_service.prepare_create_folder(name, parent_path, db=_client(ctx))
+            root_id = get_root_folder_id()
+        else:
+            parent_id, root_id = targets.parent_id, targets.root_id
+            if get_root_folder_id() != root_id:
+                raise MutationConflict("configured root changed since write planning")
+            folder_service.validate_folder_name_available(name, parent_id, db=_client(ctx))
         _validate_live_shared_targets({
             "write_type": "create_folder", "root_id": root_id, "parent_id": parent_id,
             "resources": [f"tree:{root_id}"],
         }, ctx)
-        intent = _json_digest({"name": name, "parent_id": parent_id})
+        intent = ("sha256:" + _json_digest({
+            "name": name, "parent_id": parent_id, "root_id": root_id,
+            "intent_digest": targets.intent_digest,
+        }).removeprefix("sha256:") if targets is not None
+                  else _json_digest({"name": name, "parent_id": parent_id}))
         allocation = allocate_folder_id(
             _client(ctx), operation_id=ctx.operation_id, effect_id=ctx.effect_id,
             intent_digest=intent, owner=ctx.owner, fence=ctx.fence, now=ctx.now(),

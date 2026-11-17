@@ -1496,6 +1496,206 @@ def test_confirmed_shared_folder_result_replays_from_checkpoint_without_provider
     assert allocation["resource_id"] == folder_id
     assert sdk_fakes.trace == before_replay
     assert len([event for event in sdk_fakes.trace if event["operation"] == "files.create"]) == 1
+    from core.operations.write import _new_resolved_write_targets
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+    legacy_capability = _new_resolved_write_targets(
+        operation_name="create_folder", operation_id=child_id,
+        effect_id=stable_effect_id(accepted.operation_id, 0),
+        arguments={"name": "Archive"}, parent_id=root_id, root_id=root_id,
+        intent_digest="d" * 64,
+    )
+    with pytest.raises(ValueError, match="binding changed"):
+        replay_executor.execute(
+            name="create_folder", arguments={"name": "Archive"}, call_ordinal=0,
+            resolved_targets=legacy_capability,
+        )
+
+
+def test_telegram_executor_persists_and_checks_private_resolved_target_binding(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from services.connectors.telegram.runtime.tools import TelegramRegistryExecutor, stable_effect_id
+    from core.operations.write import _new_resolved_write_targets
+
+    now = BASE_TIME + timedelta(minutes=4)
+    root_id, folder_id = "t009-target-root", "t009-target-folder"
+    monkeypatch.setenv("ROOT_FOLDER_URL", f"https://drive.google.com/drive/folders/{root_id}")
+    client = firestore_fake.client_class()
+    client.collection("folders").document(root_id).set({
+        "folder_id": root_id, "name": "TLBrain", "parent_id": None,
+    })
+    accepted, _operation, _lease, _repository, executor = _executor_for_folder_write(
+        client, now=now, chat_id=93401, monkeypatch=monkeypatch,
+    )
+    child_id = "telegram-tool-" + hashlib.sha256(
+        f"{accepted.operation_id}\0{0}".encode("utf-8")
+    ).hexdigest()
+    arguments = {"name": "Archive"}
+    capability = _new_resolved_write_targets(
+        operation_name="create_folder", operation_id=child_id,
+        effect_id=stable_effect_id(accepted.operation_id, 0), arguments=arguments,
+        parent_id=root_id, root_id=root_id, intent_digest="c" * 64,
+    )
+    allocator_payload = json.dumps(
+        {"name": "Archive", "parent_id": root_id, "root_id": root_id,
+         "intent_digest": "c" * 64},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    allocator_intent = "sha256:" + hashlib.sha256(allocator_payload.encode("utf-8")).hexdigest()
+    marker = "v1:" + hashlib.sha256(
+        "\0".join((child_id, stable_effect_id(accepted.operation_id, 0),
+                   "drive_folder", allocator_intent)).encode("utf-8")
+    ).hexdigest()
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": [folder_id]})
+    root_metadata = {"id": root_id, "name": "TLBrain",
+                     "mimeType": "application/vnd.google-apps.folder",
+                     "parents": [], "trashed": False}
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
+    sdk_fakes.drive.queue("files.create", response={"id": folder_id})
+    sdk_fakes.drive.queue("files.get", response={
+        "id": folder_id, "name": "Archive",
+        "mimeType": "application/vnd.google-apps.folder", "parents": [root_id],
+        "trashed": False, "appProperties": {"tlbrain_effect_intent": marker},
+    })
+
+    result = executor.execute(
+        name="create_folder", arguments=arguments, call_ordinal=0,
+        resolved_targets=capability,
+    )
+    checkpoint_ref = (client.collection("telegram_sessions").document(accepted.context_id)
+                      .collection("operations").document(accepted.operation_id)
+                      .collection("agent_checkpoints").document("tool-0"))
+    checkpoint = checkpoint_ref.get().to_dict()
+    assert result == folder_id
+    from core.operations.effects import get_effect_allocation
+    allocation = get_effect_allocation(client, child_id, stable_effect_id(accepted.operation_id, 0))
+    assert allocation["resource_id"] == folder_id
+    assert allocation["intent_digest"] == allocator_intent
+    assert checkpoint["validated_input"]["arguments"] == arguments
+    assert checkpoint["resolved_targets_binding"]["parent_id"] == root_id
+    assert "resolved_targets" not in checkpoint["validated_input"]["arguments"]
+
+    replay = TelegramRegistryExecutor(
+        client=client, context=executor.execution_context, save_handler=object(),
+        execution_context=executor.execution_context,
+    )
+    trace = sdk_fakes.trace
+    assert replay.execute(
+        name="create_folder", arguments=arguments, call_ordinal=0,
+        resolved_targets=capability,
+    ) == folder_id
+    assert replay.reconcile(
+        name="create_folder", arguments=arguments, call_ordinal=0,
+        resolved_targets=capability,
+    ) == folder_id
+    assert replay.reconcile(name="create_folder", arguments=arguments,
+                            call_ordinal=0) is None
+    assert sdk_fakes.trace == trace
+    from dataclasses import replace
+    with pytest.raises(ValueError, match="binding changed"):
+        replay.execute(
+            name="create_folder", arguments=arguments, call_ordinal=0,
+            resolved_targets=replace(capability, intent_digest="d" * 64),
+        )
+    with pytest.raises(ValueError, match="not trusted"):
+        replay.execute(
+            name="create_folder", arguments=arguments, call_ordinal=0,
+            resolved_targets={"parent_id": root_id},
+        )
+    from core.operations import registry
+    with pytest.raises(registry.OperationValidationError):
+        replay.execute(
+            name="create_folder", arguments={**arguments, "resolved_targets": {"parent_id": root_id}},
+            call_ordinal=0,
+        )
+    with pytest.raises(ValueError, match="binding changed"):
+        replay.execute(name="create_folder", arguments=arguments, call_ordinal=0)
+    with pytest.raises(ValueError, match="do not match"):
+        replay.execute(
+            name="create_folder", arguments={"name": "Different"}, call_ordinal=0,
+            resolved_targets=capability,
+        )
+    assert sdk_fakes.trace == trace
+
+
+def test_telegram_claim_loser_rechecks_cached_target_binding(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.operations import claim_operation, complete_operation
+    from core.operations.models import OperationResult
+    from core.operations.write import _new_resolved_write_targets
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+    from tests.fixtures.firestore_fake import FakeDocumentReference
+
+    now = BASE_TIME + timedelta(minutes=5)
+    root_id = "t009-race-root"
+    monkeypatch.setenv("ROOT_FOLDER_URL", f"https://drive.google.com/drive/folders/{root_id}")
+    client = firestore_fake.client_class()
+    client.collection("folders").document(root_id).set({
+        "folder_id": root_id, "name": "TLBrain", "parent_id": None,
+    })
+    accepted, _operation, _lease, _repository, executor = _executor_for_folder_write(
+        client, now=now, chat_id=93501, monkeypatch=monkeypatch,
+    )
+    child_id = "telegram-tool-" + hashlib.sha256(
+        f"{accepted.operation_id}\0{0}".encode("utf-8")
+    ).hexdigest()
+    arguments = {"name": "Archive"}
+    effect_id = stable_effect_id(accepted.operation_id, 0)
+    capability = _new_resolved_write_targets(
+        operation_name="create_folder", operation_id=child_id, effect_id=effect_id,
+        arguments=arguments, parent_id=root_id, root_id=root_id, intent_digest="f" * 64,
+    )
+    checkpoint_ref = (client.collection("telegram_sessions").document(accepted.context_id)
+                      .collection("operations").document(accepted.operation_id)
+                      .collection("agent_checkpoints").document("tool-0"))
+    original_get = FakeDocumentReference.get
+    injected = False
+
+    def get_with_racing_checkpoint(reference, *, transaction=None, **kwargs):
+        nonlocal injected
+        snapshot = original_get(reference, transaction=transaction, **kwargs)
+        if reference.path != checkpoint_ref.path or transaction is not None or injected:
+            return snapshot
+        assert not snapshot.exists
+        injected = True
+        from core.integrations.firestore.operations import get_operation
+        child = get_operation(client, child_id)
+        assert child is not None
+        raced = claim_operation(
+            client, child_id, owner="t009-racing-worker", now=now, lease_seconds=120,
+        )
+        assert raced is not None
+        digest = hashlib.sha256(json.dumps(
+            {"name": "create_folder", "arguments": arguments}, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        checkpoint_ref.set({
+            "operation_id": child_id,
+            "validated_input": {"name": "create_folder", "arguments": arguments,
+                                "digest": digest},
+            "resolved_targets_binding": {"operation_name": "create_folder",
+                                          "operation_id": child_id,
+                                          "effect_id": effect_id, "intent_digest": "0" * 64},
+            "result": "racing-result",
+        }, merge=True)
+        complete_operation(
+            client, child_id, owner="t009-racing-worker", fence=raced.fence,
+            result=OperationResult(title="racing-result"), now=now,
+        )
+        return snapshot
+
+    monkeypatch.setattr(FakeDocumentReference, "get", get_with_racing_checkpoint)
+    with pytest.raises(ValueError, match="checkpoint binding changed"):
+        executor.execute(
+            name="create_folder", arguments=arguments, call_ordinal=0,
+            resolved_targets=capability,
+        )
+    assert sdk_fakes.trace == []
+    assert injected
 
 
 def test_unknown_shared_folder_effect_retries_only_readback_and_keeps_identity(
