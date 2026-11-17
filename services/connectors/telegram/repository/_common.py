@@ -132,12 +132,18 @@ def _routing_reference_data(reference: Any) -> dict[str, Any]:
     return data
 
 
-def _read_routing_checkpoint_value(client: Any, reference: Any) -> Any:
+def _read_routing_checkpoint_value(
+    client: Any, reference: Any, *, transaction: Any = None,
+) -> Any:
     """Read and verify the published record and inline or multipart payload envelope."""
     from core.integrations.firestore.input_parts import read_input_parts
 
     ref = _routing_reference_data(reference)
-    row = _document_ref(client, ref["ref"]).get()
+    checkpoint_ref = _document_ref(client, ref["ref"])
+    row = (
+        checkpoint_ref.get() if transaction is None
+        else checkpoint_ref.get(transaction=transaction)
+    )
     if not row.exists:
         raise ValueError("routing checkpoint record is absent")
     record = row.to_dict() or {}
@@ -174,7 +180,10 @@ def _read_routing_checkpoint_value(client: Any, reference: Any) -> Any:
                 or type(stored.get("max_part_bytes")) is not int
                 or stored.get("max_part_bytes") != MAX_PART_BYTES):
             raise ValueError("routing checkpoint input ownership is invalid")
-        payload = read_input_parts(client, expected_input_ref)
+        payload = (
+            read_input_parts(client, expected_input_ref) if transaction is None
+            else read_input_parts(client, expected_input_ref, transaction=transaction)
+        )
         if len(payload) <= ROUTING_INLINE_CHECKPOINT_BYTES:
             raise ValueError("routing checkpoint multipart payload is below threshold")
     if (len(payload) != ref["byte_length"]

@@ -1459,3 +1459,648 @@ def test_processor_exception_releases_matching_lease_and_outbox_has_only_ids(fir
     assert context.get("active_operation_id") is None
     for row in _rows(firestore_fake).values():
         assert "text" not in row and "command" not in row and "message" not in row
+
+
+def test_finish_head_aborts_hook_writes_when_commit_clock_expires_lease(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, _ = _setup(client)
+    lease = claim_head(client, context_ref, owner="worker", now=NOW)
+    assert lease is not None
+    target = client.collection("test_atomicity").document("staged")
+
+    def stage_then_expire(transaction, _next_id, _next_data, _context, _operation):
+        transaction.set(target, {"must_not_commit": True})
+
+    assert complete_head(
+        client, context_ref, operation_id=lease.operation_id, owner=lease.owner,
+        fence=lease.fence, now=NOW, clock=lambda: lease.expires_at,
+        after_advance_with_operation=stage_then_expire,
+    ) is False
+    assert not target.get().exists
+    assert get_operation(context_ref, lease.operation_id).state is QueueOperationState.RUNNING
+
+
+def test_queue_completion_requires_server_prepared_clarification_value():
+    from services.connectors.telegram.queue import TelegramQueueCompletion
+    from services.connectors.telegram.repository._clarifications import PreparedClarificationCompletion
+
+    with pytest.raises(ValueError, match="unsupported"):
+        TelegramQueueCompletion("unknown")
+    with pytest.raises(TypeError, match="prepared"):
+        TelegramQueueCompletion("clarification")
+    forged = object.__new__(PreparedClarificationCompletion)
+    with pytest.raises(TypeError, match="prepared"):
+        TelegramQueueCompletion("clarification", forged)
+    with pytest.raises(TypeError, match="repository-prepared"):
+        TelegramRepository(client=object()).complete_with_clarification(
+            "ctx", "op", owner="owner", fence=1, completion=forged, now=NOW,
+        )
+    assert TelegramQueueCompletion("ordinary").result_type == "ordinary"
+    assert TelegramQueueCompletion("action").result_type == "action"
+    with pytest.raises(ValueError, match="result_type"):
+        TelegramQueueCompletion(1)
+
+
+def test_clarification_request_keeps_large_unicode_question_without_clipping():
+    import hashlib
+
+    from services.connectors.telegram.models import (
+        ClarificationState, PendingClarification, build_clarification_id,
+    )
+    from services.connectors.telegram.repository._clarifications import build_clarification_request
+
+    context_id, operation_id, conversation_id = "42_5", "op-origin", "conversation-1"
+    digest = hashlib.sha256(b"checkpoint").hexdigest()
+    checkpoint_path = (
+        f"telegram_sessions/{context_id}/operations/{operation_id}/routing_checkpoints/context"
+    )
+    reference = {
+        "routing_protocol": "context-v2", "schema_version": 1, "kind": "context",
+        "context_id": context_id, "operation_id": operation_id, "actor_id": 77,
+        "conversation_id": conversation_id, "ref": checkpoint_path,
+        "digest": digest, "byte_length": 100,
+    }
+    clarification_id = build_clarification_id(context_id, operation_id)
+    prefix = f"telegram_sessions/{context_id}/clarifications/{clarification_id}/"
+    pending = PendingClarification(
+        clarification_id=clarification_id, context_id=context_id, actor_id=77,
+        initiating_operation_id=operation_id, origin_conversation_id=conversation_id,
+        original_command_ref=checkpoint_path, original_command_digest=digest,
+        action="move_transcript", resolved_parameters={"doc_id": "doc-1"},
+        missing_slots=("destination",), evidence_snapshot_ref=checkpoint_path,
+        evidence_snapshot_digest=digest, state=ClarificationState.WAITING,
+        created_at=NOW, updated_at=NOW, questions_ref=prefix + "questions",
+        answers_ref=prefix + "answers",
+    )
+    question = {"unicode": "東京🌿" * 10_000, "options": [{"id": i} for i in range(300)]}
+    expected_question = copy.deepcopy(question)
+    prompt = "Уточните назначение: " + "🧭" * 1000
+    request = build_clarification_request(
+        pending, reference, question=question, prompt_body=prompt,
+        presentation="rich_markdown",
+    )
+    question["options"][0]["id"] = "changed-after-build"
+    question["unicode"] = "caller mutation"
+    question["options"].append({"id": "new"})
+    assert request["question"] == expected_question
+    assert request["prompt"]["body"] == prompt
+    with pytest.raises(ValueError, match="4096"):
+        build_clarification_request(
+            pending, reference, question=question, prompt_body="x" * 4097,
+        )
+
+
+def test_clarification_commit_retry_returns_cached_result_after_pointer_changes(firestore_fake):
+    import hashlib
+
+    from core.integrations.firestore.operation_queue import get_operation
+    from services.connectors.telegram.models import (
+        ClarificationState, PendingClarification, build_clarification_id,
+    )
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.routing_context import BoundRef, RoutingContextSnapshot
+    from services.connectors.telegram.repository._clarifications import build_clarification_request
+    from services.connectors.telegram.repository._common import _document_ref
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client)
+    command = parse_command("Move the conversation to Archive")
+    accepted = repository.accept_command(
+        91001, chat_id=910, user_id=77, thread_id=5,
+        command=command, now=NOW,
+    )
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    next_accepted = repository.accept_command(
+        91002, chat_id=910, user_id=77, thread_id=5,
+        command=parse_command("Another command"), now=NOW + timedelta(seconds=1),
+    )
+    context_data = context_ref.get().to_dict()
+    context_data.update({
+        "pending_save_operation_id": accepted.operation_id,
+        "active_conversation_id": "conversation-preserved",
+        "selected_dialog_number": 3, "selection_sequence": 7,
+        "active_draft_id": "draft-preserved", "last_doc_id": "doc-preserved",
+    })
+    context_ref.set(context_data)
+    lease = claim_head(client, context_ref, owner="clarifier", now=NOW)
+    assert lease is not None
+    operation = get_operation(context_ref, accepted.operation_id)
+    conversation_id = "source-conversation-1"
+    command_ref = BoundRef(
+        ref=operation.input_ref, digest=hashlib.sha256(command.text.encode()).hexdigest(),
+        context_id=accepted.context_id, actor_id=77, conversation_id=conversation_id,
+        operation_id=accepted.operation_id,
+    )
+    history_ref = BoundRef(
+        ref="history-checkpoint-" + ("h" * 5000),
+        digest=hashlib.sha256(b"history").hexdigest(),
+        context_id=accepted.context_id, actor_id=77, conversation_id=conversation_id,
+        operation_id="history-operation",
+    )
+    snapshot = RoutingContextSnapshot(
+        context_id=accepted.context_id, actor_id=77, operation_id=accepted.operation_id,
+        selected_conversation_id=conversation_id, selected_conversation_kind="chat",
+        accepted_command=command.text, accepted_command_ref=command_ref,
+        full_history_ref=history_ref,
+    )
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: NOW,
+    )
+    context_checkpoint = ledger.save_routing_checkpoint(
+        "context", actor_id=77, conversation_id=conversation_id, value=snapshot.to_dict(),
+    )
+    clarification_id = build_clarification_id(accepted.context_id, accepted.operation_id)
+    prefix = f"telegram_sessions/{accepted.context_id}/clarifications/{clarification_id}/"
+    pending = PendingClarification(
+        clarification_id=clarification_id, context_id=accepted.context_id, actor_id=77,
+        initiating_operation_id=accepted.operation_id, origin_conversation_id=conversation_id,
+        original_command_ref=context_checkpoint["ref"],
+        original_command_digest=context_checkpoint["digest"], action="move_transcript",
+        resolved_parameters={"doc_id": "doc-a"}, missing_slots=("destination",),
+        evidence_snapshot_ref=context_checkpoint["ref"],
+        evidence_snapshot_digest=context_checkpoint["digest"],
+        state=ClarificationState.WAITING, created_at=NOW, updated_at=NOW,
+        questions_ref=prefix + "questions", answers_ref=prefix + "answers",
+    )
+    request = build_clarification_request(
+        pending, context_checkpoint,
+        question={"text": "Which Archive folder?", "options": ["A", "B"],
+                  "full_evidence": "東京🌿" * 5000},
+        prompt_body="Which Archive folder should I use?",
+    )
+    intent_checkpoint = ledger.save_routing_checkpoint(
+        "intent", actor_id=77, conversation_id=conversation_id, value=request,
+    )
+    from services.connectors.telegram.queue import _ensure_wakeup_in_transaction
+
+    def prepare_next_wakeup(transaction, next_id, _next_data, updated_context):
+        wake_now = NOW
+        wake_writes = []
+        _ensure_wakeup_in_transaction(
+            client, transaction, updated_context, context_id=accepted.context_id,
+            operation_id=next_id, schedule_at=wake_now, now=wake_now,
+            prepared_writes=wake_writes,
+        )
+        return wake_writes
+
+    checkpoint_operation = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "operations").document(accepted.operation_id).collection(
+        "routing_checkpoints")
+    intent_document = checkpoint_operation.document("intent")
+    context_document = checkpoint_operation.document("context")
+    original_intent_row = intent_document.get().to_dict()
+    original_context_row = context_document.get().to_dict()
+    intent_row = original_intent_row
+    input_ref = intent_row["payload"]["_input_ref"]
+    input_parts = input_ref.split("/")
+    part_ref = client.collection(input_parts[0]).document(input_parts[1]).collection(
+        input_parts[2]).document("part-000000")
+    original_part = part_ref.get().to_dict()
+    intent_document.delete()
+    docs_without_intent = copy.deepcopy(firestore_fake.documents)
+    with pytest.raises(ValueError):
+        repository.prepare_clarification_completion(intent_checkpoint)
+    assert firestore_fake.documents == docs_without_intent
+    intent_document.set(original_intent_row)
+
+    context_input_ref = original_context_row["payload"]["_input_ref"].split("/")
+    context_part_ref = client.collection(context_input_ref[0]).document(
+        context_input_ref[1]).collection(context_input_ref[2]).document("part-000000")
+    original_context_part = context_part_ref.get().to_dict()
+    context_part_ref.delete()
+    docs_without_context_part = copy.deepcopy(firestore_fake.documents)
+    with pytest.raises(ValueError):
+        repository.prepare_clarification_completion(intent_checkpoint)
+    assert firestore_fake.documents == docs_without_context_part
+    context_part_ref.set(original_context_part)
+    part_ref.set({**original_part, "payload": b"tampered-before-prepare"})
+    with pytest.raises(ValueError):
+        repository.prepare_clarification_completion(intent_checkpoint)
+    part_ref.set(original_part)
+    prepared = repository.prepare_clarification_completion(intent_checkpoint)
+    assert prepared.request["question"]["full_evidence"] == "東京🌿" * 5000
+    intent_document.delete()
+    docs_without_intent = copy.deepcopy(firestore_fake.documents)
+    with pytest.raises(ValueError):
+        repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        )
+    assert firestore_fake.documents == docs_without_intent
+    intent_document.set(original_intent_row)
+
+    context_part_ref.delete()
+    docs_without_context_part = copy.deepcopy(firestore_fake.documents)
+    with pytest.raises(ValueError):
+        repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        )
+    assert firestore_fake.documents == docs_without_context_part
+    context_part_ref.set(original_context_part)
+
+    part_ref.set({**original_part, "payload": b"tampered"})
+    with pytest.raises(ValueError):
+        repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        )
+    assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+    assert not client.collection(SESSIONS).document(accepted.context_id).collection(
+        "clarifications").document(clarification_id).get().exists
+    part_ref.set(original_part)
+
+    with pytest.raises(ValueError, match="wakeup preparer"):
+        repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+        )
+    assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+    with pytest.raises(ValueError, match="scope"):
+        repository.complete_with_clarification(
+            "foreign-context", accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW,
+        )
+
+    free_context = context_ref.get().to_dict()
+    occupied_context = dict(free_context, pending_clarification_id="other-clarification")
+    context_ref.set(occupied_context)
+    with pytest.raises(ValueError, match="lease or free slot"):
+        repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        )
+    assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+    assert not context_ref.collection("clarifications").document(clarification_id).get().exists
+    context_ref.set(free_context)
+
+    for bad_owner, bad_fence in (("foreign-owner", lease.fence), (lease.owner, lease.fence + 1)):
+        assert repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=bad_owner,
+            fence=bad_fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        ) is False
+        assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+        assert not context_ref.collection("clarifications").document(clarification_id).get().exists
+
+    for field, invalid_value in (("thread_id", True), ("chat_id", "910")):
+        invalid_context = dict(free_context, **{field: invalid_value})
+        context_ref.set(invalid_context)
+        with pytest.raises(ValueError, match="routing"):
+            repository.complete_with_clarification(
+                accepted.context_id, accepted.operation_id, owner=lease.owner,
+                fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+                prepare_wakeup=prepare_next_wakeup,
+            )
+        assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+        assert not context_ref.collection("clarifications").document(clarification_id).get().exists
+        context_ref.set(free_context)
+
+    late_clock = [NOW]
+
+    def expire_lease_after_wakeup_reads(transaction, next_id, next_data, updated_context):
+        writes = prepare_next_wakeup(transaction, next_id, next_data, updated_context)
+        late_clock[0] = lease.expires_at
+        return writes
+
+    before_late_expiry = copy.deepcopy(firestore_fake.documents)
+    assert repository.complete_with_clarification(
+        accepted.context_id, accepted.operation_id, owner=lease.owner,
+        fence=lease.fence, completion=prepared, now=NOW,
+        clock=lambda: late_clock[0], prepare_wakeup=expire_lease_after_wakeup_reads,
+    ) is False
+    assert firestore_fake.documents == before_late_expiry
+    assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+
+    question_doc = context_ref.collection("clarifications").document(clarification_id).collection(
+        "questions").document("1")
+    question_doc.set({"partial": True})
+    collision_snapshot = copy.deepcopy(firestore_fake.documents)
+    with pytest.raises(ValueError, match="publication target"):
+        repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        )
+    assert firestore_fake.documents == collision_snapshot
+    question_doc.delete()
+
+    command_document = _document_ref(client, operation.input_ref)
+    accepted_command_row = command_document.get().to_dict()
+    command_document.set({**accepted_command_row, "user_id": 78})
+    with pytest.raises(ValueError, match="lease or free slot"):
+        repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        )
+    command_document.set(accepted_command_row)
+    operation_doc = context_ref.collection("operations").document(accepted.operation_id)
+    accepted_operation_row = operation_doc.get().to_dict()
+    operation_doc.set({**accepted_operation_row, "identity_digest": "0" * 64})
+    with pytest.raises(ValueError, match="accepted command changed"):
+        repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        )
+    operation_doc.set(accepted_operation_row)
+    assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+    assert not context_ref.collection("clarifications").document(clarification_id).get().exists
+
+    from tests.fixtures.firestore_fake import FakeFirestoreClient
+
+    def finish_identical():
+        return repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW, clock=lambda: NOW,
+            prepare_wakeup=prepare_next_wakeup,
+        )
+
+    prompt_id = "tgclarif-" + hashlib.sha256(
+        f"{clarification_id}:1".encode(),
+    ).hexdigest()
+    FakeFirestoreClient.fail_next(
+        "commit", path=f"notification_outbox/{prompt_id}", phase="before",
+        exception=RuntimeError("commit rejected before publication"),
+    )
+    with pytest.raises(RuntimeError, match="commit rejected before publication"):
+        finish_identical()
+    assert not client.collection("notification_outbox").document(prompt_id).get().exists
+    assert not context_ref.collection("clarifications").document(clarification_id).get().exists
+    assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.RUNNING
+    FakeFirestoreClient.fail_next(
+        "commit", path=f"notification_outbox/{prompt_id}", phase="after",
+        exception=RuntimeError("lost commit acknowledgement"),
+    )
+    from google.api_core.exceptions import Aborted
+
+    FakeFirestoreClient.fail_next(
+        "commit", path=f"notification_outbox/{prompt_id}", phase="before",
+        exception=Aborted("synthetic transaction conflict"),
+    )
+    with pytest.raises(RuntimeError, match="lost commit acknowledgement"):
+        finish_identical()
+    # The fault fires after commit, so the immutable certificate and all
+    # publication rows exist despite one caller losing the acknowledgement.
+    assert client.collection("notification_outbox").document(prompt_id).get().exists
+    assert finish_identical() is True
+    completed = get_operation(context_ref, accepted.operation_id)
+    assert completed.state is QueueOperationState.COMPLETED
+    assert context_ref.get().to_dict()["reserved_operation_id"] == next_accepted.operation_id
+    finished_context = context_ref.get().to_dict()
+    assert "pending_save_operation_id" not in finished_context
+    assert finished_context["active_conversation_id"] == "conversation-preserved"
+    assert finished_context["selected_dialog_number"] == 3
+    assert finished_context["selection_sequence"] == 7
+    assert finished_context["active_draft_id"] == "draft-preserved"
+    assert finished_context["last_doc_id"] == "doc-preserved"
+    from services.connectors.telegram.queue import resolve_current_head_wakeup
+    next_wakeup = resolve_current_head_wakeup(client, accepted.context_id)
+    assert next_wakeup is not None
+    processed_next = []
+
+    async def process_next(_context_id, operation, _lease):
+        processed_next.append(operation.operation_id)
+        return QueueOperationState.COMPLETED
+
+    next_worker = TelegramQueueWorker(
+        client, process_next, clock=lambda: NOW, owner_factory=lambda: "next-worker",
+    )
+    assert _run(next_worker.handle_task(task_payload(next_wakeup))) is True
+    assert processed_next == [next_accepted.operation_id]
+    assert context_ref.get().to_dict()["pending_clarification_id"] == clarification_id
+    assert completed  # durable operation is the replay certificate owner
+    first = copy.deepcopy(firestore_fake.documents)
+    operation_doc = context_ref.collection("operations").document(accepted.operation_id)
+    committed_operation = operation_doc.get().to_dict()
+    for field, altered in (("result", {"clarification_id": "tampered"}),
+                           ("identity_digest", "0" * 64),
+                           ("input_ref", "foreign/command/ref")):
+        corrupt = dict(committed_operation)
+        corrupt[field] = altered
+        operation_doc.set(corrupt)
+        assert repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=prepared, now=NOW,
+            clock=lambda: NOW, prepare_wakeup=prepare_next_wakeup,
+        ) is False
+        operation_doc.set(committed_operation)
+    parent_path = f"{SESSIONS}/{accepted.context_id}/clarifications/{clarification_id}"
+    parent = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "clarifications").document(clarification_id)
+    changed_parent = parent.get().to_dict()
+    changed_parent["state"] = "claimed"
+    parent.set(changed_parent)
+    changed_context = context_ref.get().to_dict()
+    changed_context["pending_clarification_id"] = None
+    context_ref.set(changed_context)
+    before_retry = copy.deepcopy(firestore_fake.documents)
+
+    # This is the lost-ack retry: durable completion remains authoritative even
+    # after the waiting pointer and record have legitimately advanced.
+    assert repository.complete_with_clarification(
+        accepted.context_id, accepted.operation_id, owner=lease.owner,
+        fence=lease.fence, completion=prepared, now=NOW + timedelta(minutes=1),
+        clock=lambda: NOW,
+        prepare_wakeup=prepare_next_wakeup,
+    )
+    assert firestore_fake.documents == before_retry
+    assert first[parent_path]["state"] == "waiting"
+    assert context_ref.get().to_dict()["pending_clarification_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("has_next", "save_pointer"),
+    [(False, "producer"), (False, "other"), (True, "producer"), (True, "other")],
+)
+def test_worker_settles_prepared_clarification_and_advances_head(
+    firestore_fake, has_next, save_pointer,
+):
+    import hashlib
+
+    from services.connectors.telegram.models import (
+        ClarificationState, PendingClarification, build_clarification_id,
+    )
+    from services.connectors.telegram.queue import TelegramQueueCompletion
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.routing_context import BoundRef, RoutingContextSnapshot
+    from services.connectors.telegram.repository._clarifications import build_clarification_request
+    from services.connectors.telegram.repository._common import _document_ref
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client)
+    command = parse_command("Move that conversation")
+    accepted = repository.accept_command(
+        92001, chat_id=920, user_id=77, command=command, now=NOW,
+    )
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    next_accepted = None
+    if has_next:
+        next_accepted = repository.accept_command(
+            92002, chat_id=920, user_id=77, command=parse_command("Next command"),
+            now=NOW + timedelta(seconds=1),
+        )
+    preserved_context = context_ref.get().to_dict()
+    preserved_context.update({
+        "pending_save_operation_id": (
+            accepted.operation_id if save_pointer == "producer" else "another-save"
+        ),
+        "active_conversation_id": "conversation-preserved",
+        "selected_dialog_number": 4, "selection_sequence": 9,
+        "active_draft_id": "draft-preserved", "last_doc_id": "doc-preserved",
+    })
+    context_ref.set(preserved_context)
+    captured = {}
+
+    async def processor(context_id, operation, lease):
+        conversation_id = "worker-conversation"
+        command_ref = BoundRef(
+            ref=operation.input_ref, digest=hashlib.sha256(command.text.encode()).hexdigest(),
+            context_id=context_id, actor_id=77, conversation_id=conversation_id,
+            operation_id=operation.operation_id,
+        )
+        history_ref = BoundRef(
+            ref="worker-history", digest=hashlib.sha256(b"history").hexdigest(),
+            context_id=context_id, actor_id=77, conversation_id=conversation_id,
+            operation_id="history-operation",
+        )
+        snapshot = RoutingContextSnapshot(
+            context_id=context_id, actor_id=77, operation_id=operation.operation_id,
+            selected_conversation_id=conversation_id, selected_conversation_kind="chat",
+            accepted_command=command.text, accepted_command_ref=command_ref,
+            full_history_ref=history_ref,
+        )
+        ledger = FirestoreAgentLedger(
+            client, context_id=context_id, operation_id=operation.operation_id,
+            owner=lease.owner, fence=lease.fence, clock=lambda: NOW,
+        )
+        context_checkpoint = ledger.save_routing_checkpoint(
+            "context", actor_id=77, conversation_id=conversation_id, value=snapshot.to_dict(),
+        )
+        clarification_id = build_clarification_id(context_id, operation.operation_id)
+        prefix = f"telegram_sessions/{context_id}/clarifications/{clarification_id}/"
+        pending = PendingClarification(
+            clarification_id=clarification_id, context_id=context_id, actor_id=77,
+            initiating_operation_id=operation.operation_id,
+            origin_conversation_id=conversation_id,
+            original_command_ref=context_checkpoint["ref"],
+            original_command_digest=context_checkpoint["digest"], action="move_transcript",
+            resolved_parameters={"doc_id": "doc-a"}, missing_slots=("destination",),
+            evidence_snapshot_ref=context_checkpoint["ref"],
+            evidence_snapshot_digest=context_checkpoint["digest"],
+            state=ClarificationState.WAITING, created_at=NOW, updated_at=NOW,
+            questions_ref=prefix + "questions", answers_ref=prefix + "answers",
+        )
+        request = build_clarification_request(
+            pending, context_checkpoint, question={"slot": "destination", "options": ["A", "B"]},
+            prompt_body="Which destination should I use?",
+        )
+        intent_checkpoint = ledger.save_routing_checkpoint(
+            "intent", actor_id=77, conversation_id=conversation_id, value=request,
+        )
+        command_document = _document_ref(client, operation.input_ref)
+        accepted_command_row = command_document.get().to_dict()
+        accepted_command_row["candidate"] = ""
+        command_document.set(accepted_command_row)
+        prepared = repository.prepare_clarification_completion(intent_checkpoint)
+        captured["prepared"] = prepared
+        return TelegramQueueCompletion("clarification", prepared)
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW, owner_factory=lambda: "worker")
+    queued = get_outbox_record(client, accepted.outbox_id)
+    assert queued is not None
+    assert _run(worker.handle_task(task_payload(queued))) is True
+    operation = get_operation(client.collection(SESSIONS).document(accepted.context_id), accepted.operation_id)
+    assert operation.state is QueueOperationState.COMPLETED
+    assert operation and client.collection(SESSIONS).document(accepted.context_id).get().to_dict()[
+        "active_operation_id"] is None
+    context_data = client.collection(SESSIONS).document(accepted.context_id).get().to_dict()
+    assert context_data["pending_clarification_id"] == captured["prepared"].pending.clarification_id
+    assert context_data["reserved_operation_id"] == (
+        next_accepted.operation_id if next_accepted is not None else None
+    )
+    if save_pointer == "producer":
+        assert "pending_save_operation_id" not in context_data
+    else:
+        assert context_data["pending_save_operation_id"] == "another-save"
+    assert context_data["active_conversation_id"] == "conversation-preserved"
+    assert context_data["selected_dialog_number"] == 4
+    assert context_data["selection_sequence"] == 9
+    assert context_data["active_draft_id"] == "draft-preserved"
+    assert context_data["last_doc_id"] == "doc-preserved"
+    operation_row = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "operations").document(accepted.operation_id).get().to_dict()
+    assert operation_row["result_type"] == "clarification"
+    assert "Which destination should I use?" not in str(operation_row["result"])
+    question = client.collection(SESSIONS).document(accepted.context_id).collection(
+        "clarifications").document(captured["prepared"].pending.clarification_id).collection(
+        "questions").document("1").get().to_dict()
+    notification = client.collection("notification_outbox").document(
+        question["prompt_notification_id"]).get().to_dict()
+    assert question["prompt_digest"] == hashlib.sha256(
+        notification["body"].encode("utf-8")
+    ).hexdigest()
+    assert question["prompt_notification_revision"] == notification["revision"] == 1
+    assert len([path for path in firestore_fake.documents
+                if path.startswith("notification_outbox/")
+                and firestore_fake.documents[path].get("kind") == "clarification"]) == 1
+    if next_accepted is not None:
+        from services.connectors.telegram.queue import resolve_current_head_wakeup
+
+        next_wakeup = resolve_current_head_wakeup(client, accepted.context_id)
+        assert next_wakeup is not None
+        processed = []
+
+        async def process_next(_context_id, next_operation, _lease):
+            processed.append(next_operation.operation_id)
+            return QueueOperationState.COMPLETED
+
+        next_worker = TelegramQueueWorker(
+            client, process_next, clock=lambda: NOW, owner_factory=lambda: "worker-next",
+        )
+        assert _run(next_worker.handle_task(task_payload(next_wakeup))) is True
+        assert processed == [next_accepted.operation_id]
+        assert get_operation(context_ref, accepted.operation_id).state is QueueOperationState.COMPLETED
+        assert context_ref.get().to_dict()["pending_clarification_id"] == (
+            captured["prepared"].pending.clarification_id
+        )
+
+
+@pytest.mark.parametrize("result_type", ["ordinary", "action"])
+def test_worker_records_explicit_ordinary_and_action_result_types(firestore_fake, result_type):
+    from services.connectors.telegram.queue import TelegramQueueCompletion
+
+    client = firestore_fake.client_class()
+    context_id = f"typed-{result_type}"
+    context_ref, payloads = _setup(client, context_id=context_id, operation_ids=("op-a",))
+
+    async def processor(_context_id, _operation, _lease):
+        return TelegramQueueCompletion(result_type)
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW, owner_factory=lambda: "typed")
+    assert _run(worker.handle_task(payloads["op-a"])) is True
+    operation = get_operation(context_ref, "op-a")
+    row = context_ref.collection("operations").document("op-a").get().to_dict()
+    assert operation.state is QueueOperationState.COMPLETED
+    assert row["result_type"] == result_type
+    assert row.get("result") is None
+
+
+def test_worker_legacy_enum_result_keeps_legacy_operation_shape(firestore_fake):
+    client = firestore_fake.client_class()
+    context_ref, payloads = _setup(client, context_id="legacy", operation_ids=("op-a",))
+
+    async def processor(_context_id, _operation, _lease):
+        return QueueOperationState.COMPLETED
+
+    worker = TelegramQueueWorker(client, processor, clock=lambda: NOW, owner_factory=lambda: "legacy")
+    assert _run(worker.handle_task(payloads["op-a"])) is True
+    row = context_ref.collection("operations").document("op-a").get().to_dict()
+    assert row["state"] == QueueOperationState.COMPLETED.value
+    assert "result_type" not in row

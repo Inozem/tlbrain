@@ -412,10 +412,11 @@ def complete_head(
     client: Any,
     context_ref: Any, *, operation_id: str, owner: str, fence: int, now: datetime,
     after_advance: Any = None, after_advance_with_operation: Any = None,
+    clock: Any = None,
 ) -> bool:
     return _finish_head(client, context_ref, operation_id=operation_id, owner=owner, fence=fence, now=now,
                         state=QueueOperationState.COMPLETED, after_advance=after_advance,
-                        after_advance_with_operation=after_advance_with_operation)
+                        after_advance_with_operation=after_advance_with_operation, clock=clock)
 
 
 def fail_head(
@@ -432,9 +433,12 @@ def _finish_head(
     client: Any,
     context_ref: Any, *, operation_id: str, owner: str, fence: int, now: datetime,
     state: QueueOperationState, after_advance: Any = None,
-    after_advance_with_operation: Any = None,
+    after_advance_with_operation: Any = None, clock: Any = None,
 ) -> bool:
     now = _aware(now)
+
+    class _FinishLeaseExpired(Exception):
+        pass
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction) -> bool:
@@ -442,6 +446,7 @@ def _finish_head(
         if not context_snapshot.exists:
             return False
         context = context_snapshot.to_dict() or {}
+        original_context = dict(context)
         expiry = context.get("lock_expires_at")
         if not _valid_lease(context, operation_id, owner, fence, now, expiry):
             return False
@@ -472,11 +477,26 @@ def _finish_head(
             after_advance(transaction, next_id, next_data, context)
         if after_advance_with_operation is not None:
             after_advance_with_operation(transaction, next_id, next_data, context, operation)
+        if clock is not None:
+            commit_now = _aware(clock())
+            if not _valid_lease(
+                original_context, operation_id, owner, fence, commit_now,
+                original_context.get("lock_expires_at"),
+            ):
+                raise _FinishLeaseExpired()
         transaction.set(operation_ref, operation)
         transaction.set(context_ref, context)
         return True
 
-    return _txn(client.transaction())
+    if clock is None:
+        return _txn(client.transaction())
+
+    # A callback may stage related writes before the final fence sample. Raising
+    # aborts those writes atomically; catch only outside Firestore's transaction.
+    try:
+        return _txn(client.transaction())
+    except _FinishLeaseExpired:
+        return False
 
 
 def _valid_lease(
