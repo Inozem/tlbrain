@@ -3,9 +3,17 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from services.connectors.telegram.models import PreparedUtterance
+from services.connectors.telegram.models import (
+    ClarificationState,
+    PendingClarification,
+    PreparedUtterance,
+    build_clarification_id,
+)
 from services.connectors.telegram.repository import TelegramRepository
 from services.connectors.telegram.save import TelegramCompletionCertificate
+from services.connectors.telegram.commands import TelegramCommand
+from core.integrations.firestore.operation_queue import claim_head, complete_head
+from google.cloud import firestore
 
 
 NOW = datetime(2026, 10, 22, tzinfo=timezone.utc)
@@ -699,3 +707,481 @@ def test_cleanup_child_page_methods_cap_reads_and_writes_at_four_hundred(firesto
     remaining_source, _ = repo.list_manifest_pages(draft_id, context_id=context_id, limit=999)
     remaining_prepared = repo.list_prepared_pages(context_id, draft_id, limit=999)
     assert len(remaining_source) == len(remaining_prepared) == 5
+
+
+def _pending_clarification(context_id="42_5", operation_id="op-origin", **overrides):
+    clarification_id = build_clarification_id(context_id, operation_id)
+    prefix = f"telegram_sessions/{context_id}/clarifications/{clarification_id}/"
+    data = {
+        "clarification_id": clarification_id,
+        "context_id": context_id,
+        "actor_id": 77,
+        "initiating_operation_id": operation_id,
+        "origin_conversation_id": f"{context_id}-1",
+        "original_command_ref": f"telegram_sessions/{context_id}/commands/command-1",
+        "original_command_digest": hashlib.sha256(b"command").hexdigest(),
+        "action": "move_transcript",
+        "resolved_parameters": {"doc_id": "doc-1"},
+        "missing_slots": ("destination",),
+        "evidence_snapshot_ref": f"telegram_sessions/{context_id}/operations/{operation_id}/evidence",
+        "evidence_snapshot_digest": hashlib.sha256(b"evidence").hexdigest(),
+        "generation": 1,
+        "revision": 1,
+        "state": ClarificationState.WAITING,
+        "execution_operation_id": None,
+        "execution_plan_ref": None,
+        "execution_plan_digest": None,
+        "result_ref": None,
+        "safe_error": None,
+        "questions_ref": prefix + "questions",
+        "answers_ref": prefix + "answers",
+        "created_at": NOW,
+        "updated_at": NOW,
+        "protocol": "clarification-v1",
+    }
+    data.update(overrides)
+    return PendingClarification(**data)
+
+
+def test_pending_clarification_validates_roundtrips_and_freezes_parameters():
+    mutable_path = ["Archive", "2026"]
+    clarification = _pending_clarification(
+        action="create_then_move",
+        resolved_parameters={"doc_id": "doc-1", "parent_path": mutable_path, "name": "  "},
+        missing_slots=("folder_name",),
+    )
+    mutable_path.append("mutated")
+    assert clarification.resolved_parameters["parent_path"] == ("Archive", "2026")
+    with pytest.raises(TypeError):
+        clarification.resolved_parameters["doc_id"] = "doc-2"
+    encoded = clarification.to_dict()
+    encoded["resolved_parameters"]["parent_path"].append("outside")
+    assert clarification.resolved_parameters["parent_path"] == ("Archive", "2026")
+    assert PendingClarification.from_dict(clarification.to_dict()) == clarification
+    assert clarification.to_dict()["resolved_parameters"] == {
+        "doc_id": "doc-1", "parent_path": ["Archive", "2026"],
+    }
+    assert build_clarification_id("42_5", "op-origin") == clarification.clarification_id
+    with pytest.raises(ValueError, match="resolved_parameters"):
+        _pending_clarification(
+            resolved_parameters={"doc_id": "doc-1"},
+            missing_slots=("document", "destination"),
+        )
+    missing_name = _pending_clarification(
+        action="create_folder", resolved_parameters={"parent_id": "folder-parent", "name": None},
+        missing_slots=(),
+    )
+    assert missing_name.missing_slots == ("folder_name",)
+    assert "name" not in missing_name.resolved_parameters
+
+
+@pytest.mark.parametrize("change", [
+    {"actor_id": True},
+    {"context_id": "foreign/context"},
+    {"original_command_digest": "A" * 64},
+    {"missing_slots": ("unknown",)},
+    {"state": "waiting", "missing_slots": ()},
+    {"updated_at": NOW - timedelta(seconds=1)},
+    {"original_command_ref": "telegram_sessions/other/commands/command-1"},
+    {"action": "create_folder", "resolved_parameters": {"doc_id": "doc-1"}},
+    {"execution_operation_id": "op-origin", "execution_plan_ref": "plan/1",
+     "execution_plan_digest": hashlib.sha256(b"plan").hexdigest()},
+])
+def test_pending_clarification_rejects_invalid_fields(change):
+    with pytest.raises(ValueError, match="invalid clarification"):
+        _pending_clarification(**change)
+
+
+def test_pending_clarification_requires_tagged_v1_and_explicit_persisted_counters():
+    data = _pending_clarification().to_dict()
+    with pytest.raises(ValueError, match="protocol"):
+        PendingClarification.from_dict({key: value for key, value in data.items() if key != "protocol"})
+    with pytest.raises(ValueError, match="protocol"):
+        PendingClarification.from_dict({**data, "protocol": "clarification-v2"})
+    for field in ("generation", "revision"):
+        with pytest.raises(ValueError, match="fields"):
+            PendingClarification.from_dict({key: value for key, value in data.items() if key != field})
+
+
+def test_pending_clarification_execution_binding_requires_fixed_write_parameters():
+    plan_digest = hashlib.sha256(b"plan").hexdigest()
+    with pytest.raises(ValueError, match="resolved_parameters"):
+        _pending_clarification(
+            state=ClarificationState.CLAIMED,
+            missing_slots=(), resolved_parameters={"doc_id": "doc-1"},
+            execution_operation_id="answer-op", execution_plan_ref="plan/answer-op",
+            execution_plan_digest=plan_digest,
+        )
+    resolved = _pending_clarification(
+        action="create_folder", state=ClarificationState.CLAIMED, missing_slots=(),
+        resolved_parameters={"parent_id": "folder-parent", "name": "Archive"},
+        execution_operation_id="answer-op", execution_plan_ref="plan/answer-op",
+        execution_plan_digest=plan_digest,
+    )
+    assert resolved.execution_operation_id == "answer-op"
+
+
+@pytest.mark.parametrize("state", list(ClarificationState))
+def test_pending_clarification_state_binding_rules(state):
+    digest = hashlib.sha256(b"plan").hexdigest()
+    binding = {
+        "execution_operation_id": "answer-op",
+        "execution_plan_ref": "plan/answer-op",
+        "execution_plan_digest": digest,
+    }
+    params = {"doc_id": "doc-1", "destination_id": "folder-1"}
+    if state is ClarificationState.WAITING:
+        record = _pending_clarification()
+        assert record.execution_operation_id is None
+    elif state in {ClarificationState.CANCELLED, ClarificationState.REPLACED}:
+        record = _pending_clarification(state=state, missing_slots=())
+        with pytest.raises(ValueError, match="execution_binding"):
+            _pending_clarification(state=state, missing_slots=(), **binding)
+    elif state is ClarificationState.FAILED:
+        before_claim = _pending_clarification(state=state, missing_slots=())
+        after_claim = _pending_clarification(
+            state=state, missing_slots=(), resolved_parameters=params, **binding,
+        )
+        assert before_claim.execution_operation_id is None
+        assert after_claim.execution_operation_id == "answer-op"
+        record = after_claim
+    else:
+        record = _pending_clarification(
+            state=state, missing_slots=(), resolved_parameters=params, **binding,
+        )
+    assert record.state is state
+    if state in {ClarificationState.CLAIMED, ClarificationState.COMPLETED,
+                 ClarificationState.UNKNOWN}:
+        with pytest.raises(ValueError, match="execution_binding"):
+            _pending_clarification(state=state, missing_slots=())
+        with pytest.raises(ValueError, match="execution_operation_id"):
+            _pending_clarification(
+                state=state, missing_slots=(), resolved_parameters=params,
+                **{**binding, "execution_operation_id": "op-origin"},
+            )
+
+
+def test_pending_clarification_constructor_and_optional_persisted_defaults():
+    raw = _pending_clarification(state=ClarificationState.CANCELLED, missing_slots=()).to_dict()
+    for field in ("generation", "revision", "execution_operation_id", "execution_plan_ref",
+                  "execution_plan_digest", "result_ref", "safe_error", "questions_ref", "answers_ref"):
+        raw.pop(field)
+    raw.pop("protocol")
+    constructed = PendingClarification(**raw)
+    assert constructed.generation == constructed.revision == 1
+    assert constructed.execution_operation_id is None
+    assert constructed.questions_ref.endswith("/questions")
+    assert constructed.answers_ref.endswith("/answers")
+
+    persisted = _pending_clarification(state=ClarificationState.CANCELLED, missing_slots=()).to_dict()
+    for field in ("execution_operation_id", "execution_plan_ref", "execution_plan_digest",
+                  "result_ref", "safe_error", "questions_ref", "answers_ref"):
+        persisted.pop(field)
+    restored = PendingClarification.from_dict(persisted)
+    assert restored.generation == restored.revision == 1
+    assert restored.execution_operation_id is None
+
+
+def test_pending_clarification_safe_error_and_utc_timestamp_validation():
+    from datetime import timedelta as _timedelta
+
+    offset = timezone(_timedelta(hours=3))
+    record = _pending_clarification(
+        safe_error="Папка недоступна для изменения",
+        created_at=NOW.astimezone(offset), updated_at=NOW.astimezone(offset),
+    )
+    assert record.safe_error == "Папка недоступна для изменения"
+    assert record.created_at.utcoffset() == timedelta(0)
+    for value in ("", " \t ", "x" * 501):
+        with pytest.raises(ValueError, match="safe_error"):
+            _pending_clarification(safe_error=value)
+    for field in ("generation", "revision"):
+        with pytest.raises(ValueError, match=field):
+            _pending_clarification(**{field: True})
+    with pytest.raises(ValueError, match="digest"):
+        _pending_clarification(evidence_snapshot_digest="a" * 63)
+    with pytest.raises(ValueError, match="timestamps"):
+        _pending_clarification(created_at=NOW.replace(tzinfo=None))
+
+
+def test_clarification_addressed_read_uses_pointer_and_legacy_defaults(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    assert repo.get_context("42_5") is None
+    assert repo.get_pending_clarification("42_5", actor_id=77) is None
+    context_ref = client.collection("telegram_sessions").document("42_5")
+    context_ref.set({"chat_id": 42, "thread_id": 5})
+    assert repo.get_context("42_5")["pending_clarification_id"] is None
+    assert repo.get_context("42_5")["clarification_generation"] == 0
+    assert repo.get_pending_clarification("42_5", actor_id=77) is None
+
+    clarification = _pending_clarification()
+    context_ref.update({"pending_clarification_id": clarification.clarification_id,
+                        "clarification_generation": clarification.generation})
+    context_ref.collection("clarifications").document(clarification.clarification_id).set(
+        clarification.to_dict(),
+    )
+    assert repo.get_pending_clarification("42_5", actor_id=77) == clarification
+    assert repo.get_clarification("42_5", clarification.clarification_id, actor_id=77) == clarification
+    assert repo.get_clarification("42_5", clarification.clarification_id, actor_id=88) is None
+    assert repo.get_clarification("foreign", clarification.clarification_id, actor_id=77) is None
+    assert repo.get_clarification("42_5", "untagged", actor_id=77) is None
+    context_ref.collection("clarifications").document("untagged").set({"context_id": "42_5"})
+    context_ref.update({"clarification_generation": 2})
+    assert repo.get_pending_clarification("42_5", actor_id=77) is None
+
+
+@pytest.mark.parametrize("state", [
+    ClarificationState.CLAIMED, ClarificationState.COMPLETED,
+    ClarificationState.CANCELLED, ClarificationState.REPLACED,
+    ClarificationState.FAILED, ClarificationState.UNKNOWN,
+])
+def test_addressed_clarification_reader_returns_terminal_records(firestore_fake, state):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    context_id = f"42_{state.value}"
+    operation_id = f"origin-{state.value}"
+    binding = {}
+    params = {"doc_id": "doc-1", "destination_id": "folder-1"}
+    if state in {ClarificationState.CLAIMED, ClarificationState.COMPLETED,
+                 ClarificationState.UNKNOWN}:
+        binding = {
+            "execution_operation_id": f"answer-{state.value}",
+            "execution_plan_ref": f"plan/answer-{state.value}",
+            "execution_plan_digest": hashlib.sha256(b"plan").hexdigest(),
+        }
+    record = _pending_clarification(
+        context_id=context_id, operation_id=operation_id, state=state,
+        missing_slots=(), resolved_parameters=params if binding else {}, **binding,
+    )
+    ref = client.collection("telegram_sessions").document(context_id)
+    ref.set({"pending_clarification_id": record.clarification_id,
+             "clarification_generation": record.generation})
+    ref.collection("clarifications").document(record.clarification_id).set(record.to_dict())
+    assert repo.get_clarification(context_id, record.clarification_id, actor_id=77) == record
+    assert repo.get_pending_clarification(context_id, actor_id=77) is None
+
+
+def test_addressed_clarification_reader_fails_closed_for_tagged_rows(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    valid = _pending_clarification()
+    row = client.collection("telegram_sessions").document(valid.context_id).collection(
+        "clarifications",
+    ).document(valid.clarification_id)
+    malformed = valid.to_dict()
+    malformed.pop("revision")
+    row.set(malformed)
+    with pytest.raises(ValueError, match="fields"):
+        repo.get_clarification(valid.context_id, valid.clarification_id, actor_id=77)
+    row.set({**valid.to_dict(), "protocol": "clarification-v9"})
+    with pytest.raises(ValueError, match="protocol"):
+        repo.get_clarification(valid.context_id, valid.clarification_id, actor_id=77)
+    row.set({"context_id": valid.context_id, "clarification_id": valid.clarification_id,
+             "actor_id": 77})
+    assert repo.get_clarification(valid.context_id, valid.clarification_id, actor_id=77) is None
+
+
+def test_pending_clarifications_are_independent_across_contexts(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    records = [
+        _pending_clarification(context_id="42_5", operation_id="op-one"),
+        _pending_clarification(context_id="42_6", operation_id="op-two"),
+    ]
+    for record in records:
+        context = client.collection("telegram_sessions").document(record.context_id)
+        context.set({"pending_clarification_id": record.clarification_id,
+                     "clarification_generation": record.generation})
+        context.collection("clarifications").document(record.clarification_id).set(
+            record.to_dict(),
+        )
+    assert repo.get_pending_clarification("42_5", actor_id=77) == records[0]
+    assert repo.get_pending_clarification("42_6", actor_id=77) == records[1]
+    client.collection("telegram_sessions").document("42_6").update(
+        {"clarification_generation": 2},
+    )
+    assert repo.get_pending_clarification("42_6", actor_id=77) is None
+    assert repo.get_pending_clarification("42_5", actor_id=77) == records[0]
+
+
+def _running_accepted_command(repo, client, *, actor_id=77):
+    accepted = repo.accept_command(
+        1, chat_id=42, user_id=actor_id, thread_id=5,
+        command=TelegramCommand("freeform", "move the discussed transcript"), now=NOW,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="clarification-worker", now=NOW)
+    assert lease is not None and lease.operation_id == accepted.operation_id
+    return accepted, context_ref, lease
+
+
+def _run_clarification_guard(repo, client, *, context_id, operation_id, actor_id=77,
+                             owner="clarification-worker", fence=1, now=NOW,
+                             clarification_id=None, generation=None, revision=None):
+    @firestore.transactional
+    def _read(transaction):
+        return repo._read_clarification_guard(
+            transaction, context_id=context_id, operation_id=operation_id,
+            actor_id=actor_id, owner=owner, fence=fence, now=now,
+            clarification_id=clarification_id, expected_generation=generation,
+            expected_revision=revision,
+        )
+    return _read(client.transaction())
+
+
+def test_clarification_guard_reads_real_running_command_without_writes(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted, context_ref, lease = _running_accepted_command(repo, client)
+    context_ref.update({"clarification_generation": 5})
+    before = dict(firestore_fake.documents)
+    creation_guard = _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        fence=lease.fence,
+    )
+    assert creation_guard is not None
+    assert creation_guard.clarification is None
+    assert creation_guard.accepted_command["user_id"] == 77
+    assert creation_guard.context["clarification_generation"] == 5
+    assert firestore_fake.documents == before
+
+    clarification = _pending_clarification(operation_id=accepted.operation_id)
+    context_ref.update({"pending_clarification_id": clarification.clarification_id,
+                        "clarification_generation": clarification.generation})
+    context_ref.collection("clarifications").document(clarification.clarification_id).set(
+        clarification.to_dict(),
+    )
+    guarded = _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        fence=lease.fence, clarification_id=clarification.clarification_id,
+        generation=1, revision=1,
+    )
+    assert guarded is not None and guarded.clarification == clarification
+    assert _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        actor_id=88, fence=lease.fence,
+    ) is None
+    assert _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        fence=lease.fence + 1,
+    ) is None
+    assert _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        fence=lease.fence, clarification_id=clarification.clarification_id,
+        generation=2, revision=1,
+    ) is None
+    assert _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        fence=lease.fence, clarification_id=clarification.clarification_id,
+        generation=1, revision=2,
+    ) is None
+
+    for kwargs in (
+        {"owner": "other-worker"},
+        {"operation_id": "operation-not-current"},
+    ):
+        before_failure = dict(firestore_fake.documents)
+        assert _run_clarification_guard(
+            repo, client, context_id=accepted.context_id,
+            operation_id=kwargs.get("operation_id", accepted.operation_id),
+            owner=kwargs.get("owner", "clarification-worker"), fence=lease.fence,
+            clarification_id=clarification.clarification_id, generation=1, revision=1,
+        ) is None
+        assert firestore_fake.documents == before_failure
+
+    operation = context_ref.collection("operations").document(accepted.operation_id).get().to_dict()
+    command_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    command_ref = command_ref.collection("commands").document(operation["input_ref"].split("/")[-1])
+    command_ref.update({"user_id": 88})
+    before_actor_failure = dict(firestore_fake.documents)
+    assert _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        fence=lease.fence,
+    ) is None
+    assert firestore_fake.documents == before_actor_failure
+
+
+def test_clarification_guard_requires_transaction(firestore_fake):
+    repo = TelegramRepository(firestore_fake.client_class())
+    with pytest.raises(ValueError, match="requires a transaction"):
+        repo._read_clarification_guard(
+            None, context_id="42_5", operation_id="op-1", actor_id=77,
+            owner="worker", fence=1, now=NOW,
+        )
+
+
+def test_clarification_guard_preserves_non_identifier_queue_owner(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted = repo.accept_command(
+        1, chat_id=42, user_id=77, thread_id=5,
+        command=TelegramCommand("freeform", "move the discussed transcript"), now=NOW,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="worker:one", now=NOW)
+    assert lease is not None
+    guard = _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner="worker:one", fence=lease.fence,
+    )
+    assert guard is not None
+    assert _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner="worker:other", fence=lease.fence,
+    ) is None
+
+
+def test_answer_guard_runs_after_real_question_operation_completion(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    original = repo.accept_command(
+        1, chat_id=42, user_id=77, thread_id=5,
+        command=TelegramCommand("freeform", "move the discussed transcript"), now=NOW,
+    )
+    context_ref = client.collection("telegram_sessions").document(original.context_id)
+    original_lease = claim_head(client, context_ref, owner="clarification-worker", now=NOW)
+    assert original_lease is not None
+    assert complete_head(
+        client, context_ref, operation_id=original.operation_id,
+        owner=original_lease.owner, fence=original_lease.fence, now=NOW,
+    )
+    clarification = _pending_clarification(operation_id=original.operation_id)
+    context_ref.update({"pending_clarification_id": clarification.clarification_id,
+                        "clarification_generation": clarification.generation})
+    context_ref.collection("clarifications").document(clarification.clarification_id).set(
+        clarification.to_dict(),
+    )
+    answer = repo.accept_command(
+        2, chat_id=42, user_id=77, thread_id=5,
+        command=TelegramCommand("freeform", "the second option"), now=NOW,
+    )
+    answer_lease = claim_head(
+        client, context_ref, owner="clarification-worker", now=NOW,
+    )
+    assert answer_lease is not None and answer_lease.operation_id == answer.operation_id
+    before = dict(firestore_fake.documents)
+    guarded = _run_clarification_guard(
+        repo, client, context_id=answer.context_id, operation_id=answer.operation_id,
+        fence=answer_lease.fence, clarification_id=clarification.clarification_id,
+        generation=clarification.generation, revision=clarification.revision,
+    )
+    assert guarded is not None and guarded.clarification == clarification
+    assert firestore_fake.documents == before
+
+
+def test_clarification_guard_rejects_expired_lease_and_existing_waiting_slot(firestore_fake):
+    client = firestore_fake.client_class()
+    repo = TelegramRepository(client)
+    accepted, context_ref, lease = _running_accepted_command(repo, client)
+    assert _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        fence=lease.fence, now=lease.expires_at,
+    ) is None
+    clarification = _pending_clarification(operation_id=accepted.operation_id)
+    context_ref.update({"pending_clarification_id": clarification.clarification_id,
+                        "clarification_generation": clarification.generation})
+    assert _run_clarification_guard(
+        repo, client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        fence=lease.fence,
+    ) is None
