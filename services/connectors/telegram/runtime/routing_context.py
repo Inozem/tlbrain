@@ -6,6 +6,8 @@ reference and digest still need to be resolved and verified by the caller.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -97,6 +99,13 @@ def _only_keys(value: Mapping[str, Any], allowed: set[str], name: str) -> None:
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"{name} contains unknown fields: {sorted(unknown)}")
+
+
+def json_digest(value: Any) -> str:
+    """Return a stable digest for a JSON-safe scoped projection."""
+    encoded = json.dumps(_thaw_json(value), ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class SourceKind(StrEnum):
@@ -312,7 +321,12 @@ class DocumentEvidence:
             if self.source not in predecessor_refs:
                 raise ValueError("confirmed save source is not an accepted predecessor ref")
         elif self.conversation_id not in conversation_ids:
-            raise ValueError("evidence conversation is outside captured context")
+            if not (self.source_kind is SourceKind.LOCAL_NUMBER
+                    and self._has_canonical_local_binding(context_id)):
+                raise ValueError("evidence conversation is outside captured context")
+        if self.source_kind is SourceKind.LOCAL_NUMBER:
+            if self.source.payload is not None and not self._has_canonical_local_binding(context_id):
+                raise ValueError("local-number evidence lacks its addressed dialog binding")
         if self.source_kind is SourceKind.ACTIVE_DOCUMENT and self.doc_id != selected_doc_id:
             raise ValueError("active_document evidence must match selected_doc_id")
         if self.source_kind in (SourceKind.EXPLICIT_REFERENCE, SourceKind.LOCAL_NUMBER):
@@ -328,6 +342,22 @@ class DocumentEvidence:
             if (ref.context_id != context_id or ref.actor_id != actor_id
                     or ref.conversation_id not in conversation_ids):
                 raise ValueError("fragment ref crosses captured scope")
+
+    def _has_canonical_local_binding(self, context_id: str) -> bool:
+        """Validate the explicit addressed-dialog anchor used by capture."""
+        number = self.command_span.parsed_value if self.command_span else None
+        payload = self.source.payload
+        return bool(
+            type(number) is int
+            and self.source.ref == f"telegram_sessions/{context_id}/dialogs/{number}"
+            and isinstance(payload, Mapping)
+            and set(payload) == {"dialog_number", "conversation_id", "doc_id"}
+            and type(payload.get("dialog_number")) is int
+            and payload.get("dialog_number") == number
+            and payload.get("conversation_id") == self.conversation_id
+            and payload.get("doc_id") == self.doc_id
+            and json_digest(payload) == self.source.digest
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {"doc_id": self.doc_id, "source_kind": self.source_kind.value,
