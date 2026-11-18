@@ -3576,3 +3576,607 @@ def test_trusted_legacy_search_pin_replays_canonical_cards_without_model(
     assert state.value == "completed"
     assert model.calls == []
     assert bot.sent and "Known result" in bot.sent[0][1]
+# T016: single-runtime replay must consult durable pins before mutable catalogs.
+def test_t016_pinned_runtime_replay_reads_saved_pin_before_mutable_catalog(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    import hashlib
+
+    from core.integrations.firestore.mutations import get_mutation_effect
+    from core.integrations.firestore.operations import get_operation
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+    from tests.fixtures.telegram_contextual import guard_firestore_enumeration
+
+    client = firestore_fake.client_class()
+    now = datetime.now(timezone.utc)
+    accepted, operation, lease, repository, runtime, bot_http, _provider, _sent = (
+        _t016_default_move_runtime(client, monkeypatch, sdk_fakes, now=now)
+    )
+    command = parse_command("Move document doc-b to Archive")
+    _t016_native_move_response(sdk_fakes, doc_id="doc-b")
+    first = asyncio.run(runtime(
+        accepted.context_id, operation, lease, command=command,
+    ))
+    assert first.value == "completed"
+    pinned = repository.get_route_control(accepted.context_id, accepted.operation_id)
+    assert isinstance(pinned, Mapping) and pinned["status"] == "ok"
+    assert pinned["tool_choice"]["name"] == "move_transcript"
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    checkpoint_conversation = ledger.checkpoint_conversation_id(accepted.operation_id)
+    before_turn = ledger.load_turn(checkpoint_conversation, accepted.operation_id)
+    assert isinstance(before_turn, Mapping)
+    app_pin = before_turn["application_route"]
+    assert isinstance(app_pin, Mapping)
+    expected_child_id = "telegram-tool-" + hashlib.sha256(
+        f"{accepted.operation_id}\0{0}".encode("utf-8")
+    ).hexdigest()
+    expected_effect_id = stable_effect_id(accepted.operation_id, 0)
+    child_before = get_operation(client, expected_child_id)
+    effect_before = get_mutation_effect(client, expected_child_id, expected_effect_id)
+    assert child_before is not None and effect_before is not None
+    assert app_pin["ordinal"] == 0 and app_pin["name"] == "move_transcript"
+    assert app_pin["call_id"] == f"application-{accepted.operation_id}-0"
+    assert app_pin["arguments"] == {"doc_id": "doc-b", "folder_path": ["Archive"]}
+    assert app_pin["target_doc_id"] == "doc-b"
+    drive_mutations_before_replay = list(_provider.drive_mutations)
+    qdrant_mutations_before_replay = list(_provider.qdrant_mutations)
+    drive_reads_before_replay = list(_provider.drive_reads)
+    model_trace_before_replay = list(sdk_fakes.trace)
+    from tests.fixtures.firestore_fake import FakeDocumentReference, FakeQuery
+
+    events = []
+    installed_get = FakeDocumentReference.get
+    installed_stream = FakeQuery.stream
+
+    def record_get(reference, *args, **kwargs):
+        snapshot = installed_get(reference, *args, **kwargs)
+        value = snapshot.to_dict() if snapshot.exists else None
+        if isinstance(value, Mapping) and value.get("route_control") == pinned:
+            events.append(("pin", reference.path))
+        elif isinstance(value, Mapping):
+            events.append(("get", reference.path))
+        return snapshot
+
+    def record_stream(query, **kwargs):
+        events.append(("stream", query.collection))
+        return installed_stream(query, **kwargs)
+
+    monkeypatch.setattr(FakeDocumentReference, "get", record_get)
+    monkeypatch.setattr(FakeQuery, "stream", record_stream)
+
+    try:
+        with guard_firestore_enumeration(
+            blocked_collections=("transcript_index", "dialogs"), allow=True,
+        ) as scans:
+            replay = asyncio.run(runtime(
+                accepted.context_id, operation, lease, command=command,
+            ))
+    finally:
+        asyncio.run(bot_http.aclose())
+
+    pin_reads = [index for index, event in enumerate(events) if event[0] == "pin"]
+    first_pin = min(pin_reads) if pin_reads else None
+    mutable_reads = [
+        index for index, event in enumerate(events)
+        if ((event[0] == "stream" and event[1].endswith(
+                ("transcript_index", "dialogs", "folders"),
+             ))
+            or (event[0] == "get" and any(token in f"/{event[1]}/" for token in (
+                "/transcript_index/", "/dialogs/", "/folders/", "/conversations/",
+                "/turns/", "/history/",
+            ))))
+    ]
+    assert pin_reads, ("the durable successful summary was never read", events, scans)
+    assert all(index > first_pin for index in mutable_reads), (
+        "a mutable history/catalog read happened before the durable pin", events,
+    )
+    assert replay.value == "completed"
+    assert repository.get_route_control(accepted.context_id, accepted.operation_id) == pinned
+    after_turn = ledger.load_turn(checkpoint_conversation, accepted.operation_id)
+    assert after_turn["application_route"] == app_pin
+    assert after_turn["tool_calls"] == before_turn["tool_calls"]
+    assert after_turn.get("tool_results", {}) == before_turn.get("tool_results", {})
+    child_after = get_operation(client, expected_child_id)
+    effect_after = get_mutation_effect(client, expected_child_id, expected_effect_id)
+    assert child_after == child_before and effect_after == effect_before
+    assert _provider.drive_mutations == drive_mutations_before_replay
+    assert _provider.qdrant_mutations == qdrant_mutations_before_replay
+    assert _provider.drive_reads == drive_reads_before_replay
+    assert sdk_fakes.trace == model_trace_before_replay
+    assert _sent
+
+
+def _t016_native_move_response(sdk_fakes, *, doc_id="doc-b"):
+    from google.genai import types
+
+    route = {
+        "kind": "substantive", "target_ref": doc_id,
+        "target_operation_id": None, "dialog_number": None, "result_refs": [],
+        "substantive_text": "Move the selected transcript to Archive.",
+        "tool_choice": {
+            "name": "move_transcript",
+            "arguments": {"doc_id": doc_id, "folder_path": ["Archive"]},
+        },
+        "certainty": "certain",
+    }
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            function_call=types.FunctionCall(name="route_command", args=route),
+        )]))],
+    ))
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text="Moved the selected transcript to Archive.",
+        )]))],
+    ))
+
+
+def _t016_default_move_runtime(client, monkeypatch, sdk_fakes, *, now):
+    import json
+    import httpx
+    from core.integrations.firestore.client import COLLECTION_NAME, FOLDERS_COLLECTION
+    from core.integrations.firestore.operation_queue import claim_head
+    from services.connectors.telegram.client import TelegramClient
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+    from services.connectors.telegram.runtime.saving import TelegramSaveRuntime
+    from tests.fixtures.shared_write_authorization import (
+        ROOT_FOLDER_ID, SharedWriteAuthorizationHarness,
+    )
+    from tests.fixtures.sdk_fakes import FakeGeminiClient
+    from core.integrations.gemini.agent import GeminiAgent
+
+    sent = []
+
+    def telegram_boundary(request):
+        sent.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 88100 + len(sent)}})
+
+    bot_http = httpx.AsyncClient(transport=httpx.MockTransport(telegram_boundary))
+    bot = TelegramClient("synthetic-test-token", http_client=bot_http)
+    provider = SharedWriteAuthorizationHarness(monkeypatch, sdk_fakes)
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "synthetic-refresh-token")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "synthetic-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "synthetic-client-secret")
+    client.collection(FOLDERS_COLLECTION).document(ROOT_FOLDER_ID).set({
+        "folder_id": ROOT_FOLDER_ID, "name": "TLBrain", "parent_id": None,
+    })
+    client.collection(FOLDERS_COLLECTION).document("t016-archive").set({
+        "folder_id": "t016-archive", "name": "Archive", "parent_id": ROOT_FOLDER_ID,
+    })
+    client.collection(COLLECTION_NAME).document("doc-a").set({
+        "doc_id": "doc-a", "meeting_id": "meeting-a", "source_file": "A",
+        "parent_id": ROOT_FOLDER_ID, "dialog_date": "2026-04-01", "status": "synced",
+    })
+    client.collection(COLLECTION_NAME).document("doc-b").set({
+        "doc_id": "doc-b", "meeting_id": "meeting-b", "source_file": "B",
+        "parent_id": ROOT_FOLDER_ID, "dialog_date": "2026-04-02", "status": "synced",
+    })
+    provider.set_file(ROOT_FOLDER_ID, name="TLBrain",
+                      mime_type="application/vnd.google-apps.folder", parents=[])
+    provider.set_file("t016-archive", name="Archive",
+                      mime_type="application/vnd.google-apps.folder", parents=[ROOT_FOLDER_ID])
+    provider.set_file("doc-a", name="Synthetic A",
+                      mime_type="application/vnd.google-apps.document", parents=[ROOT_FOLDER_ID])
+    provider.set_file("doc-b", name="Synthetic B",
+                      mime_type="application/vnd.google-apps.document", parents=[ROOT_FOLDER_ID])
+    provider.add_qdrant_parent("doc-a", ROOT_FOLDER_ID, ROOT_FOLDER_ID)
+    provider.add_qdrant_parent("doc-b", ROOT_FOLDER_ID, ROOT_FOLDER_ID)
+
+    repository = TelegramRepository(client=client)
+    accepted = repository.accept_command(
+        99016, chat_id=42017, thread_id=73, user_id=17,
+        command=parse_command("Move document doc-b to Archive"), now=now,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="t016-runtime-worker", now=now)
+    assert lease is not None
+    operation = context_ref.collection("operations").document(accepted.operation_id).get().to_dict()
+    dialog_number = repository.bind_document(
+        accepted.context_id, "doc-b", "t016-document-b",
+        metadata={"title": "Synthetic B", "source_file": "B",
+                  "parent_id": ROOT_FOLDER_ID},
+        now=now, operation_id=accepted.operation_id, owner=lease.owner,
+        fence=lease.fence, ensure_document_conversation=True,
+    )
+    repository.ensure_conversation(
+        accepted.context_id, "t016-document-b", kind="document", doc_id="doc-b",
+        dialog_number=dialog_number, queue_operation_id=accepted.operation_id,
+        queue_owner=lease.owner, queue_fence=lease.fence,
+        select_if_unselected=True, now=now,
+    )
+    runtime = TelegramCommandRuntime(
+        repository=repository, save_handler=TelegramSaveRuntime(repository=repository),
+        client=bot,
+        model=GeminiAgent(client=FakeGeminiClient(api_key="synthetic-t016-key")),
+        clock=lambda: now, root_folder_id=ROOT_FOLDER_ID,
+    )
+    return accepted, operation, lease, repository, runtime, bot_http, provider, sent
+
+
+def test_t016_default_runtime_publishes_rich_fixed_move_before_effect(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.operations.queue import QueueOperationState
+
+    client = firestore_fake.client_class()
+    now = datetime.now(timezone.utc)
+    case = _t016_default_move_runtime(client, monkeypatch, sdk_fakes, now=now)
+    accepted, operation, lease, repository, runtime, bot_http, provider, _sent = case
+    from services.connectors.telegram.commands import parse_command
+
+    _t016_native_move_response(sdk_fakes, doc_id="doc-b")
+    from tests.fixtures import sdk_fakes as sdk_module
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    import hashlib
+
+    before_effect = []
+    installed_sdk_execute = sdk_module._Request.execute
+
+    def observe_joint_state_before_drive_effect(request, **kwargs):
+        if (request.boundary == "drive" and request.operation == "files.update"
+                and request.args.get("fileId") == "doc-b" and not before_effect):
+            ledger = FirestoreAgentLedger(
+                client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+                owner=lease.owner, fence=lease.fence, clock=lambda: now,
+            )
+            target_conversation = ledger.checkpoint_conversation_id(accepted.operation_id)
+            turn = ledger.load_turn(target_conversation, accepted.operation_id)
+            child_id = "telegram-tool-" + hashlib.sha256(
+                f"{accepted.operation_id}\0{0}".encode("utf-8")
+            ).hexdigest()
+            child = client.collection("dialog_operations").document(child_id).get()
+            tool_checkpoint = client.collection("telegram_sessions").document(
+                accepted.context_id,
+            ).collection("operations").document(accepted.operation_id).collection(
+                "agent_checkpoints",
+            ).document("tool-0").get()
+            before_effect.append({
+                "summary": repository.get_route_control(accepted.context_id, accepted.operation_id),
+                "turn": turn,
+                "checkpoint_conversation": target_conversation,
+                "child": child.to_dict() if child.exists else None,
+                "binding_checkpoint": tool_checkpoint.to_dict() if tool_checkpoint.exists else None,
+            })
+        return installed_sdk_execute(request, **kwargs)
+
+    monkeypatch.setattr(
+        sdk_module._Request, "execute", observe_joint_state_before_drive_effect,
+    )
+    try:
+        state = asyncio.run(
+            runtime(
+                accepted.context_id, operation, lease,
+                command=parse_command("Move document doc-b to Archive"),
+            ),
+        )
+    finally:
+        asyncio.run(bot_http.aclose())
+
+    assert state == QueueOperationState.COMPLETED, (
+        state, repository.get_route_control(accepted.context_id, accepted.operation_id),
+        sdk_fakes.trace, provider.drive_mutations, provider.qdrant_mutations,
+    )
+    assert len(provider.drive_mutations) == 1
+    assert provider.drive_mutations[0]["fileId"] == "doc-b"
+    assert provider.files["doc-a"]["parents"] == ["pytest-synthetic-root"]
+    assert provider.files["doc-b"]["parents"] == ["t016-archive"]
+    assert len(before_effect) == 1, "pre-effect observation was not reached"
+    observed = before_effect[0]
+    assert isinstance(observed["summary"], Mapping)
+    assert isinstance(observed["turn"].get("application_route"), Mapping)
+    observed_route = observed["turn"]["application_route"]
+    assert isinstance(
+        observed_route.get("contextual"), Mapping,
+    ), "fresh app route must be rich before the first provider effect"
+    contextual = observed_route["contextual"]
+    assert contextual["summary"] == observed["summary"]
+    assert observed_route["name"] == "move_transcript"
+    assert observed_route["arguments"] == {"doc_id": "doc-b", "folder_path": ["Archive"]}
+    assert observed_route["ordinal"] == 0
+    assert observed_route["target_doc_id"] == "doc-b"
+    assert contextual["context_id"] == accepted.context_id
+    assert contextual["operation_id"] == accepted.operation_id
+    assert contextual["actor_id"] == 17
+    assert contextual["accepted_command"] == "Move document doc-b to Archive"
+    assert contextual["source_conversation_id"] != observed["checkpoint_conversation"]
+    assert contextual["checkpoint_conversation_id"] == observed["checkpoint_conversation"]
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.routing_context import BoundRef, RoutingDecision
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    context_checkpoint = ledger.load_routing_checkpoint(
+        "context", actor_id=17, conversation_id=contextual["source_conversation_id"],
+    )
+    assert context_checkpoint is not None
+    assert context_checkpoint["reference"]["ref"] == contextual["context_ref"]
+    assert context_checkpoint["reference"]["digest"] == contextual["context_digest"]
+    assert context_checkpoint["value"]["selected_conversation_id"] == contextual[
+        "source_conversation_id"
+    ]
+    decision = RoutingDecision.from_dict(contextual["decision"])
+    assert decision.to_dict() == contextual["decision"]
+    decision.validate_command_spans(contextual["accepted_command"])
+    command_ref = BoundRef.from_dict(contextual["accepted_command_ref"])
+    history_ref = BoundRef.from_dict(contextual["full_history_ref"])
+    assert command_ref.context_id == accepted.context_id
+    assert command_ref.actor_id == 17 and command_ref.operation_id == accepted.operation_id
+    assert command_ref.payload == {"text": contextual["accepted_command"]}
+    assert command_ref.ref == operation["input_ref"]
+    command_ref_segments = command_ref.ref.split("/")
+    assert len(command_ref_segments) == 4
+    command_record = client.collection(command_ref_segments[0]).document(
+        command_ref_segments[1],
+    ).collection(command_ref_segments[2]).document(command_ref_segments[3]).get().to_dict()
+    assert command_record["candidate"] == contextual["accepted_command"]
+    assert history_ref.context_id == accepted.context_id
+    assert history_ref.conversation_id == contextual["source_conversation_id"]
+    assert isinstance(history_ref.payload, Mapping) and "turns" in history_ref.payload
+    assert observed["checkpoint_conversation"] != accepted.context_id
+    assert isinstance(observed["binding_checkpoint"], Mapping)
+    binding = observed["binding_checkpoint"].get("resolved_targets_binding")
+    assert isinstance(binding, Mapping)
+    fixed_plan = contextual["fixed_plan"]
+    assert len(fixed_plan["steps"]) == 1
+    step = fixed_plan["steps"][0]
+    assert step["ordinal"] == 0 and step["name"] == "move_transcript"
+    assert step["arguments"] == observed_route["arguments"]
+    assert step["target_doc_id"] == "doc-b"
+    assert step["operation_id"] == observed["child"]["operation_id"]
+    assert step["effect_id"] == binding["effect_id"]
+    for key, expected in {
+        "doc_id": "doc-b", "destination_id": "t016-archive",
+        "root_id": "pytest-synthetic-root",
+    }.items():
+        assert step["resolved_targets"][key] == expected
+        assert binding[key] == expected
+    assert step["resolved_targets"]["intent_digest"] == binding["intent_digest"]
+    assert observed["child"]["operation_id"] == (
+        "telegram-tool-" + hashlib.sha256(
+            f"{accepted.operation_id}\0{0}".encode("utf-8")
+        ).hexdigest()
+    )
+    assert binding["operation_name"] == "move_transcript"
+    assert binding["operation_id"] == observed["child"]["operation_id"]
+    assert binding["effect_id"] == stable_effect_id(accepted.operation_id, 0)
+    assert binding["doc_id"] == "doc-b"
+    assert binding["destination_id"] == "t016-archive"
+    assert binding["root_id"] == "pytest-synthetic-root"
+    assert binding["intent_digest"]
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("agent_checkpoints").document("tool-0").get()
+    assert checkpoint.exists
+    row = checkpoint.to_dict()
+    route = repository.get_route_control(accepted.context_id, accepted.operation_id)
+    assert isinstance(route, Mapping) and route["target_doc_id"] == "doc-b"
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    checkpoint_conversation = ledger.checkpoint_conversation_id(accepted.operation_id)
+    assert checkpoint_conversation
+    restored_turn = ledger.load_turn(checkpoint_conversation, accepted.operation_id)
+    rich_route = restored_turn.get("application_route") if restored_turn else None
+
+    assert isinstance(rich_route, Mapping) and isinstance(rich_route.get("contextual"), Mapping)
+    assert rich_route["name"] == "move_transcript"
+    assert rich_route["arguments"] == {"doc_id": "doc-b", "folder_path": ["Archive"]}
+    assert row.get("resolved_targets_binding") is not None, (
+        "the default governed runtime must carry its fixed trusted target into the real executor"
+    )
+
+
+def test_t016_default_runtime_confirmed_replay_skips_provider_and_catalog_lookups(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.operations.queue import QueueOperationState
+    from services.connectors.telegram.commands import parse_command
+    from tests.fixtures.telegram_contextual import guard_firestore_enumeration
+
+    client = firestore_fake.client_class()
+    now = datetime.now(timezone.utc)
+    accepted, operation, lease, _repository, runtime, bot_http, provider, _sent = (
+        _t016_default_move_runtime(client, monkeypatch, sdk_fakes, now=now)
+    )
+    _t016_native_move_response(sdk_fakes, doc_id="doc-b")
+    command = parse_command("Move document doc-b to Archive")
+    try:
+        first = asyncio.run(runtime(
+            accepted.context_id, operation, lease, command=command,
+        ))
+        assert first == QueueOperationState.COMPLETED
+        assert provider.files["doc-b"]["parents"] == ["t016-archive"]
+        trace = list(sdk_fakes.trace)
+        from tests.fixtures.firestore_fake import FakeDocumentReference
+
+        firestore_reads = []
+        installed_get = FakeDocumentReference.get
+
+        def record_firestore_get(reference, *args, **kwargs):
+            firestore_reads.append(reference.path)
+            return installed_get(reference, *args, **kwargs)
+
+        monkeypatch.setattr(FakeDocumentReference, "get", record_firestore_get)
+        drive_writes = list(provider.drive_mutations)
+        qdrant_writes = list(provider.qdrant_mutations)
+        drive_reads = list(provider.drive_reads)
+        with guard_firestore_enumeration(
+            blocked_collections=("folders", "transcript_index", "dialogs", "conversations"),
+            allow=True,
+        ) as scans:
+            replay = asyncio.run(runtime(
+                accepted.context_id, operation, lease, command=command,
+            ))
+    finally:
+        asyncio.run(bot_http.aclose())
+    assert replay == QueueOperationState.COMPLETED
+    assert not scans, "CONFIRMED runtime replay enumerated mutable resources or history"
+    blocked_read_tokens = (
+        "/folders/", "/transcript_index/", "/dialogs/", "/conversations/",
+        "/turns/", "/history/",
+    )
+    assert not [path for path in firestore_reads if any(
+        token in f"/{path}/" for token in blocked_read_tokens
+    )], f"CONFIRMED runtime replay read mutable resources/history: {firestore_reads!r}"
+    assert sdk_fakes.trace == trace
+    assert provider.drive_mutations == drive_writes
+    assert provider.qdrant_mutations == qdrant_writes
+    assert provider.drive_reads == drive_reads
+
+
+def test_t016_default_runtime_unknown_move_retries_only_readback(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from copy import deepcopy
+    import hashlib
+
+    from core.operations.queue import QueueOperationState
+    from core.operations.models import EffectState
+    from core.integrations.firestore.mutations import get_mutation_effect
+    from core.integrations.firestore.operations import get_operation
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+
+    client = firestore_fake.client_class()
+    now = datetime.now(timezone.utc)
+    accepted, operation, lease, repository, runtime, bot_http, provider, _sent = (
+        _t016_default_move_runtime(client, monkeypatch, sdk_fakes, now=now)
+    )
+    _t016_native_move_response(sdk_fakes, doc_id="doc-b")
+    from tests.fixtures import sdk_fakes as sdk_module
+
+    installed_sdk_execute = sdk_module._Request.execute
+    lost_ack = []
+
+    def lose_ack_after_real_drive_move(request, **kwargs):
+        result = installed_sdk_execute(request, **kwargs)
+        if (request.boundary == "drive" and request.operation == "files.update"
+                and request.args.get("fileId") == "doc-b" and not lost_ack):
+            lost_ack.append(True)
+            raise TimeoutError("synthetic lost Drive acknowledgement after committed update")
+        return result
+
+    monkeypatch.setattr(sdk_module._Request, "execute", lose_ack_after_real_drive_move)
+    command = parse_command("Move document doc-b to Archive")
+    try:
+        first = asyncio.run(runtime(
+            accepted.context_id, operation, lease, command=command,
+        ))
+        assert lost_ack == [True], "the injected post-mutation SDK fault was not reached"
+        assert len(provider.drive_mutations) == 1
+        assert provider.files["doc-b"]["parents"] == ["t016-archive"]
+        assert provider.files["doc-a"]["parents"] == ["pytest-synthetic-root"]
+        child_id = "telegram-tool-" + hashlib.sha256(
+            f"{accepted.operation_id}\0{0}".encode("utf-8")
+        ).hexdigest()
+        effect_id = stable_effect_id(accepted.operation_id, 0)
+        child = get_operation(client, child_id)
+        effect = get_mutation_effect(client, child_id, effect_id)
+        assert child is not None
+        assert effect is not None and effect.state == EffectState.UNKNOWN
+        before_retry = firestore_fake.documents
+        before_child_effect_ids = {
+            path for path in before_retry
+            if path.startswith((
+                "dialog_operations/telegram-tool-", "dialog_operations/telegram-effect-",
+            )) or effect_id in path
+        }
+        before_drive_parents = {
+            key: value.get("parents") for key, value in provider.files.items()
+        }
+        from core.integrations.firestore.client import COLLECTION_NAME
+
+        registry_before_retry = client.collection(COLLECTION_NAME).document("doc-b").get().to_dict()
+        assert registry_before_retry["parent_id"] == "pytest-synthetic-root"
+        before_qdrant_points = deepcopy(provider.qdrant_points)
+        reads_before_retry = len(provider.drive_reads)
+        gemini_calls_before_retry = [
+            row for row in sdk_fakes.trace
+            if row.get("boundary") == "gemini" and row.get("operation") == "generate_content"
+        ]
+        retry = asyncio.run(runtime(
+            accepted.context_id, operation, lease, command=command,
+        ))
+    finally:
+        asyncio.run(bot_http.aclose())
+
+    assert first in {QueueOperationState.FAILED, QueueOperationState.RUNNING}
+    assert retry in {QueueOperationState.FAILED, QueueOperationState.RUNNING}
+    assert len(provider.drive_mutations) == 1
+    assert len(provider.qdrant_mutations) == 0
+    after_retry = firestore_fake.documents
+    after_child_effect_ids = {
+        path for path in after_retry
+        if path.startswith((
+            "dialog_operations/telegram-tool-", "dialog_operations/telegram-effect-",
+        )) or effect_id in path
+    }
+    assert after_child_effect_ids == before_child_effect_ids
+    assert {key: value.get("parents") for key, value in provider.files.items()} == before_drive_parents
+    assert provider.qdrant_points == before_qdrant_points
+    assert len(provider.drive_reads) > reads_before_retry
+    assert provider.files["doc-b"]["parents"] == ["t016-archive"]
+    assert provider.files["doc-a"]["parents"] == ["pytest-synthetic-root"]
+    registry_after_retry = client.collection(COLLECTION_NAME).document("doc-b").get().to_dict()
+    assert registry_after_retry["parent_id"] == registry_before_retry["parent_id"]
+    assert registry_after_retry["parent_id"] == "pytest-synthetic-root"
+    assert [
+        row for row in sdk_fakes.trace
+        if row.get("boundary") == "gemini" and row.get("operation") == "generate_content"
+    ] == gemini_calls_before_retry
+    assert get_mutation_effect(client, child_id, effect_id).state == EffectState.UNKNOWN
+    assert repository.get_route_control(accepted.context_id, accepted.operation_id) is not None
+
+
+def test_t016_application_checkpoint_commit_fault_blocks_write_effect(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    client = firestore_fake.client_class()
+    now = datetime.now(timezone.utc)
+    accepted, operation, lease, repository, runtime, bot_http, provider, _sent = (
+        _t016_default_move_runtime(client, monkeypatch, sdk_fakes, now=now)
+    )
+    _t016_native_move_response(sdk_fakes, doc_id="doc-b")
+    from services.connectors.telegram.commands import parse_command
+
+    checkpoint_path = (
+        f"telegram_sessions/{accepted.context_id}/operations/{accepted.operation_id}"
+        "/agent_checkpoints/turn"
+    )
+    firestore_fake.fail_next(
+        "commit", path=checkpoint_path, phase="before",
+        exception=RuntimeError("T016 application checkpoint commit fault"),
+    )
+    try:
+        state = asyncio.run(
+            runtime(
+                accepted.context_id, operation, lease,
+                command=parse_command("Move document doc-b to Archive"),
+            ),
+        )
+    finally:
+        asyncio.run(bot_http.aclose())
+
+    assert not provider.drive_mutations
+    assert not provider.qdrant_mutations
+    assert any(row.get("path") == checkpoint_path and row.get("outcome") == "failed"
+               for row in firestore_fake.trace()), "the injected checkpoint fault was not reached"
+    assert repository.get_route_control(accepted.context_id, accepted.operation_id) is None
+    checkpoint = client.collection("telegram_sessions").document(accepted.context_id).collection(
+        "operations",
+    ).document(accepted.operation_id).collection("agent_checkpoints").document("turn").get()
+    assert not checkpoint.exists
+    assert state.value in {"failed", "running"}

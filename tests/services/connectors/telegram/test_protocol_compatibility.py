@@ -1600,3 +1600,1351 @@ def test_unknown_shared_folder_effect_retries_only_readback_and_keeps_identity(
     new_gets = [event for event in final_trace[len(before_reconcile):]
                 if event["boundary"] == "drive" and event["operation"] == "files.get"]
     assert new_gets
+# T016: metadata-only contextual checkpoints are decisions, not executed tools.
+def _t016_context_snapshot(repository, accepted, command, *, actor_id, conversation_id):
+    import hashlib
+    from services.connectors.telegram.context import build_conversation_history
+    from services.connectors.telegram.runtime.routing_context import (
+        BoundRef, RoutingContextSnapshot,
+    )
+
+    operation = repository.client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id).get().to_dict()
+    command_ref = BoundRef(
+        ref=operation["input_ref"],
+        digest=hashlib.sha256(command.text.encode("utf-8")).hexdigest(),
+        context_id=accepted.context_id, actor_id=actor_id,
+        conversation_id=conversation_id, operation_id=accepted.operation_id,
+        payload={"text": command.text},
+    )
+    canonical_turns = repository.list_turns(accepted.context_id, conversation_id)
+    projected_history = build_conversation_history(
+        canonical_turns, conversation_id=conversation_id,
+        omit_operation_id=accepted.operation_id,
+    )
+    history_bytes = json.dumps(
+        projected_history, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    history_ref = BoundRef(
+        ref=(f"telegram_sessions/{accepted.context_id}/conversations/"
+             f"{conversation_id}/turns"),
+        digest=hashlib.sha256(history_bytes).hexdigest(),
+        context_id=accepted.context_id, actor_id=actor_id,
+        conversation_id=conversation_id, operation_id=accepted.operation_id,
+        payload={"turns": projected_history},
+    )
+    snapshot = RoutingContextSnapshot(
+        context_id=accepted.context_id, actor_id=actor_id,
+        operation_id=accepted.operation_id,
+        selected_conversation_id=conversation_id,
+        selected_conversation_kind="chat", accepted_command=command.text,
+        accepted_command_ref=command_ref, full_history_ref=history_ref,
+    )
+    snapshot_value = history_ref.to_dict()["payload"]
+    assert snapshot_value == {"turns": projected_history}
+    assert snapshot.accepted_command_ref.payload == {"text": command.text}
+    parts = operation["input_ref"].split("/")
+    assert len(parts) == 4 and parts[:3] == [
+        "telegram_sessions", accepted.context_id, "commands",
+    ]
+    command_record = (
+        repository.client.collection(parts[0]).document(parts[1])
+        .collection(parts[2]).document(parts[3]).get()
+    ).to_dict()
+    assert command_record is not None
+    assert command_record.get("candidate") == command.text
+    assert snapshot.full_history_ref.ref == (
+        f"telegram_sessions/{accepted.context_id}/conversations/{conversation_id}/turns"
+    )
+    assert snapshot.full_history_ref.digest == hashlib.sha256(history_bytes).hexdigest()
+    return snapshot
+
+
+def test_t016_metadata_only_application_route_has_no_synthetic_tool_result(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.operation_queue import claim_head
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.agent import TelegramAgent
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.routing_context import (
+        Action, Certainty, Disposition, RoutingDecision,
+    )
+    from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+    client = firestore_fake.client_class()
+    scenario = make_contextual_scenario(unrelated_count=0)
+    repository = TelegramRepository(client=client)
+    command = parse_command("Explain the current discussion")
+    accepted = repository.accept_command(
+        99106, chat_id=scenario.chat.chat_id, thread_id=scenario.topic.thread_id,
+        user_id=scenario.actor.user_id, command=command, now=BASE_TIME,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="t016-metadata-worker", now=BASE_TIME)
+    assert lease is not None
+    source_conversation = "t016-source-conversation"
+    checkpoint_conversation = "t016-fixed-checkpoint-conversation"
+    repository.ensure_conversation(
+        accepted.context_id, source_conversation, kind="chat",
+        queue_operation_id=accepted.operation_id, queue_owner=lease.owner,
+        queue_fence=lease.fence, select_if_unselected=True, now=BASE_TIME,
+    )
+    repository.append_turn(
+        accepted.context_id, source_conversation, turn_id="t016-input",
+        operation_id=accepted.operation_id, role="user", parts=[{"text": command.text}],
+        now=BASE_TIME, queue_operation_id=accepted.operation_id,
+        queue_owner=lease.owner, queue_fence=lease.fence,
+    )
+    snapshot = _t016_context_snapshot(
+        repository, accepted, command, actor_id=scenario.actor.user_id,
+        conversation_id=source_conversation,
+    )
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: BASE_TIME,
+    )
+    context_checkpoint = ledger.save_routing_checkpoint(
+        "context", actor_id=scenario.actor.user_id,
+        conversation_id=source_conversation, value=snapshot.to_dict(),
+    )
+    decision = RoutingDecision(
+        disposition=Disposition.DELEGATE, action=Action.SUBSTANTIVE,
+        substantive_text=command.text, certainty=Certainty.CERTAIN,
+    )
+    ordinary_summary = {"status": "ok", "kind": "substantive"}
+    assert repository.persist_route(
+        accepted.operation_id, ordinary_summary,
+        context_id=accepted.context_id, owner=lease.owner, fence=lease.fence,
+        now=BASE_TIME,
+    )
+    persisted_summary = repository.get_route_control(
+        accepted.context_id, accepted.operation_id,
+    )
+    metadata_route = {"contextual": {
+        "schema_version": 1, "context_ref": context_checkpoint["ref"],
+        "context_digest": context_checkpoint["digest"],
+        "context_id": accepted.context_id, "operation_id": accepted.operation_id,
+        "actor_id": scenario.actor.user_id, "accepted_command": command.text,
+        "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+        "full_history_ref": snapshot.full_history_ref.to_dict(),
+        "source_conversation_id": source_conversation,
+        "checkpoint_conversation_id": checkpoint_conversation,
+        "decision": decision.to_dict(), "resolved": {}, "fixed_plan": None,
+        "summary": persisted_summary,
+    }}
+    ledger.save_application_route(
+        checkpoint_conversation, accepted.operation_id, route=metadata_route,
+        tool_calls=[], application_route_round=None,
+    )
+
+    from google.genai import types
+    from services.connectors.telegram.runtime.tools import TelegramRegistryExecutor
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+            text="The discussion is about the quoted price.",
+        )]))],
+    ))
+    model = GeminiAgent(client=FakeGeminiClient(api_key="synthetic-t016-metadata-key"))
+    executor_context = {
+        "context_id": accepted.context_id, "operation_id": accepted.operation_id,
+        "owner": lease.owner, "fence": lease.fence, "lease": lease,
+        "clock": lambda: BASE_TIME,
+    }
+    executor = TelegramRegistryExecutor(
+        client=client, context=executor_context, save_handler=object(),
+        execution_context=executor_context,
+    )
+    agent = TelegramAgent(model=model, ledger=ledger, tool_executor=executor)
+    before = ledger.load_turn(checkpoint_conversation, accepted.operation_id)
+    assert before["model_response"] is None
+    assert before["tool_calls"] == []
+    assert before.get("tool_results", {}) == {}
+    try:
+        result = agent.run(
+            conversation_id=checkpoint_conversation,
+            delivery_id=accepted.operation_id,
+            history=[{"role": "user", "parts": [{"text": command.text}]}],
+        )
+    except Exception as error:
+        pytest.fail(f"metadata-only checkpoint was treated as an executed tool: {error!r}")
+
+    restored = ledger.load_turn(checkpoint_conversation, accepted.operation_id)
+    assert result["status"] == "ok"
+    assert result["answer"] == "The discussion is about the quoted price."
+    assert sdk_fakes.trace and not any(
+        row.get("operation") in {"files.create", "files.update"}
+        for row in sdk_fakes.trace
+    )
+    assert restored["application_route"] == metadata_route
+    assert restored["model_response"] is not None
+    assert restored["model_response"]["_telegram_tool_loop_rounds"] == 1
+    assert len(restored["model_response"]["rounds"]) == 1
+    answer_round = restored["model_response"]["rounds"][0]
+    assert answer_round["call_start"] == 0 and answer_round["call_count"] == 0
+    answer_response = answer_round["response"]
+    assert len(answer_response["candidates"]) == 1
+    answer_parts = answer_response["candidates"][0]["content"]["parts"]
+    assert len(answer_parts) == 1
+    answer_part = answer_parts[0]
+    assert answer_part.get("text") == result["answer"]
+    assert not any("function_call" in part or "function_response" in part for part in answer_parts)
+    sdk_payloads = [
+        row for row in sdk_fakes.trace
+        if row.get("boundary") == "gemini" and row.get("operation") == "generate_content"
+    ]
+    assert len(sdk_payloads) == 1
+    sdk_contents = repr(sdk_payloads[0].get("arguments", {}).get("contents", ()))
+    assert "function_response" not in sdk_contents
+    assert "<application-tool-result-data>" not in sdk_contents
+    assert "function_response" not in repr(restored["model_response"])
+    assert "<application-tool-result-data>" not in repr(restored["model_response"])
+    assert restored["tool_calls"] == []
+    assert restored.get("tool_results", {}) == {}
+
+
+def _t016_seed_prepared_clarification(firestore_fake, *, complete):
+    from core.integrations.firestore.operation_queue import claim_head
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.models import (
+        ClarificationState, PendingClarification, build_clarification_id,
+    )
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.repository._clarifications import build_clarification_request
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.routing_context import (
+        Action, Certainty, Disposition, FolderSelector,
+        RoutingDecision,
+    )
+    from tests.fixtures.telegram_contextual import make_contextual_scenario
+
+    client = firestore_fake.client_class()
+    scenario = make_contextual_scenario(unrelated_count=0)
+    command = parse_command("Please create a folder")
+    repository = TelegramRepository(client=client)
+    accepted = repository.accept_command(
+        99116, chat_id=scenario.chat.chat_id, thread_id=scenario.topic.thread_id,
+        user_id=scenario.actor.user_id, command=command, now=BASE_TIME,
+    )
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    lease = claim_head(client, context_ref, owner="t016-clarification-worker", now=BASE_TIME)
+    assert lease is not None
+    source_conversation = "t016-source-chat"
+    target_checkpoint = "t016-fixed-checkpoint-conversation"
+    repository.ensure_conversation(
+        accepted.context_id, source_conversation, kind="chat",
+        queue_operation_id=accepted.operation_id, queue_owner=lease.owner,
+        queue_fence=lease.fence, select_if_unselected=True, now=BASE_TIME,
+    )
+    repository.append_turn(
+        accepted.context_id, source_conversation, turn_id="t016-source-command",
+        operation_id=accepted.operation_id, role="user", parts=[{"text": command.text}],
+        now=BASE_TIME, queue_operation_id=accepted.operation_id,
+        queue_owner=lease.owner, queue_fence=lease.fence,
+    )
+    operation = context_ref.collection("operations").document(accepted.operation_id).get().to_dict()
+    snapshot = _t016_context_snapshot(
+        repository, accepted, command, actor_id=scenario.actor.user_id,
+        conversation_id=source_conversation,
+    )
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: BASE_TIME,
+    )
+    context_checkpoint = ledger.save_routing_checkpoint(
+        "context", actor_id=scenario.actor.user_id, conversation_id=source_conversation,
+        value=snapshot.to_dict(),
+    )
+    clarification_id = build_clarification_id(accepted.context_id, accepted.operation_id)
+    prefix = f"telegram_sessions/{accepted.context_id}/clarifications/{clarification_id}/"
+    pending = PendingClarification(
+        clarification_id=clarification_id, context_id=accepted.context_id,
+        actor_id=scenario.actor.user_id, initiating_operation_id=accepted.operation_id,
+        origin_conversation_id=source_conversation,
+        original_command_ref=context_checkpoint["ref"],
+        original_command_digest=context_checkpoint["digest"], action="create_folder",
+        resolved_parameters={"parent_id": "pytest-synthetic-root"},
+        missing_slots=("folder_name",),
+        evidence_snapshot_ref=context_checkpoint["ref"],
+        evidence_snapshot_digest=context_checkpoint["digest"],
+        state=ClarificationState.WAITING, created_at=BASE_TIME, updated_at=BASE_TIME,
+        questions_ref=prefix + "questions", answers_ref=prefix + "answers",
+    )
+    request = build_clarification_request(
+        pending, context_checkpoint,
+        question={"slot": "folder_name", "text": "\u041a\u0430\u043a \u043d\u0430\u0437\u0432\u0430\u0442\u044c \u043f\u0430\u043f\u043a\u0443?", "options": []},
+        prompt_body="Как назвать папку?",
+    )
+    intent_checkpoint = ledger.save_routing_checkpoint(
+        "intent", actor_id=scenario.actor.user_id, conversation_id=source_conversation,
+        value=request,
+    )
+    decision = RoutingDecision(
+        disposition=Disposition.CLARIFY, action=Action.CREATE_FOLDER,
+        substantive_text=command.text,
+        folder_selector=FolderSelector(kind="root_default"),
+        missing_slots=("folder_name",), certainty=Certainty.UNCERTAIN,
+    )
+    ordinary_summary = {"status": "uncertain", "kind": "substantive"}
+    assert repository.persist_route(
+        accepted.operation_id, ordinary_summary,
+        context_id=accepted.context_id, owner=lease.owner, fence=lease.fence,
+        now=BASE_TIME,
+    )
+    persisted_summary = repository.get_route_control(
+        accepted.context_id, accepted.operation_id,
+    )
+    # This is valid fixture state, not evidence that the production publisher
+    # currently writes the route summary and application checkpoint atomically.
+    metadata_route = {"contextual": {
+        "schema_version": 1,
+        "context_ref": context_checkpoint["ref"],
+        "context_digest": context_checkpoint["digest"],
+        "context_id": accepted.context_id,
+        "operation_id": accepted.operation_id,
+        "actor_id": scenario.actor.user_id,
+        "accepted_command": command.text,
+        "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+        "full_history_ref": snapshot.full_history_ref.to_dict(),
+        "source_conversation_id": source_conversation,
+        "checkpoint_conversation_id": target_checkpoint,
+        "decision": decision.to_dict(),
+        "resolved": {"parent_id": "pytest-synthetic-root"},
+        "fixed_plan": None,
+        "intent_ref": intent_checkpoint["ref"],
+        "intent_digest": intent_checkpoint["digest"],
+        "summary": persisted_summary,
+    }}
+    ledger.save_application_route(
+        target_checkpoint, accepted.operation_id, route=metadata_route,
+        tool_calls=[], application_route_round=None,
+    )
+    completion = repository.prepare_clarification_completion(intent_checkpoint)
+    if complete:
+        assert repository.complete_with_clarification(
+            accepted.context_id, accepted.operation_id, owner=lease.owner,
+            fence=lease.fence, completion=completion, now=BASE_TIME,
+            clock=lambda: BASE_TIME,
+        )
+    return (client, repository, accepted, operation, lease, completion,
+            metadata_route, intent_checkpoint)
+
+
+def _t016_clarification_publication_snapshot(client, accepted, durable_documents):
+    import hashlib
+
+    from services.connectors.telegram.repository._common import NOTIFICATIONS
+    from core.integrations.firestore.outbox import OUTBOX_COLLECTION
+
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    operation = context_ref.collection("operations").document(accepted.operation_id).get().to_dict()
+    result = operation["result"]
+
+    def read_path(path):
+        segments = path.split("/")
+        assert len(segments) >= 2 and len(segments) % 2 == 0
+        reference = client.collection(segments[0]).document(segments[1])
+        for index in range(2, len(segments), 2):
+            reference = reference.collection(segments[index]).document(segments[index + 1])
+        return reference.get().to_dict()
+
+    question = read_path(result["question_ref"])
+    notification = client.collection(NOTIFICATIONS).document(
+        result["prompt_notification_id"],
+    ).get().to_dict()
+    outbox = client.collection(OUTBOX_COLLECTION).document(
+        result["prompt_outbox_id"],
+    ).get().to_dict()
+    assert question["question_ref"] == result["question_ref"]
+    assert question["question_payload_digest"] == result["request_digest"]
+    assert notification["body"] == "Как назвать папку?"
+    assert question["prompt_digest"] == hashlib.sha256(
+        notification["body"].encode("utf-8")
+    ).hexdigest()
+    assert question.get("message_id") is None
+    assert notification.get("message_id") is None
+    assert notification.get("operation_id") is None
+    assert outbox.get("message_id") is None
+    assert outbox.get("delivery_id") is None
+    clarification_id = result["clarification_id"]
+    question_prefix = (
+        f"telegram_sessions/{accepted.context_id}/clarifications/"
+        f"{clarification_id}/questions/"
+    )
+    question_paths = sorted(
+        path for path in durable_documents if path.startswith(question_prefix)
+    )
+    notification_rows = {
+        path: value for path, value in durable_documents.items()
+        if path.startswith(f"{NOTIFICATIONS}/")
+        and value.get("context_id") == accepted.context_id
+        and value.get("clarification_id") == clarification_id
+    }
+    notification_ids = {
+        value.get("notification_id") for value in notification_rows.values()
+    }
+    outbox_rows = {
+        path: value for path, value in durable_documents.items()
+        if path.startswith(f"{OUTBOX_COLLECTION}/")
+        and value.get("notification_id") in notification_ids
+    }
+    assert len(question_paths) == 1, question_paths
+    assert len(notification_rows) == 1, notification_rows
+    assert len(outbox_rows) == 1, outbox_rows
+    return {
+        "result": operation["result"], "question": question,
+        "notification": notification, "outbox": outbox,
+        "question_paths": question_paths,
+        "notification_paths": sorted(notification_rows),
+        "outbox_paths": sorted(outbox_rows),
+    }
+
+
+@pytest.mark.parametrize("completed_before_restart", [False, True])
+def test_t016_clarification_restart_reuses_prepared_question_without_model(
+    firestore_fake, sdk_fakes, completed_before_restart,
+):
+    import asyncio
+    import httpx
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.client import TelegramClient
+    from services.connectors.telegram.runtime.saving import TelegramSaveRuntime
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+    from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+    (client, repository, accepted, operation, lease, completion,
+     metadata_route, intent_checkpoint) = _t016_seed_prepared_clarification(
+        firestore_fake, complete=completed_before_restart,
+    )
+    async def telegram_handler(_request):
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 99117}})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(telegram_handler))
+    runtime = TelegramCommandRuntime(
+        repository=repository, save_handler=TelegramSaveRuntime(repository=repository),
+        client=TelegramClient("synthetic-t016-token", http_client=http_client),
+        model=GeminiAgent(client=FakeGeminiClient(api_key="synthetic-t016-clarification-key")),
+        clock=lambda: BASE_TIME + (timedelta(days=3) if completed_before_restart
+                                   else timedelta(seconds=1)),
+    )
+    model_trace_before_restart = list(sdk_fakes.trace)
+    operation_row = client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id).get().to_dict()
+    before_completion_snapshot = (
+        _t016_clarification_publication_snapshot(
+            client, accepted, firestore_fake.documents,
+        )
+        if completed_before_restart else None
+    )
+    try:
+        if completed_before_restart:
+            # T011 already committed the real queue result. A duplicate update
+            # must reuse that terminal outcome without reviving its old lease.
+            from services.connectors.telegram.commands import parse_command
+
+            context_row = client.collection("telegram_sessions").document(
+                accepted.context_id,
+            ).get().to_dict()
+            duplicate = repository.accept_command(
+                99116,
+                chat_id=context_row["chat_id"],
+                thread_id=context_row.get("thread_id"),
+                user_id=17,
+                command=parse_command("Please create a folder"),
+                now=BASE_TIME + timedelta(days=3),
+            )
+            assert duplicate.operation_id == accepted.operation_id
+            assert operation_row["state"] == "completed"
+            assert operation_row["result_type"] == "clarification"
+            restored = repository.prepare_clarification_completion(intent_checkpoint)
+            assert restored.request == completion.request
+            assert restored.pending.clarification_id == completion.pending.clarification_id
+            assert before_completion_snapshot["result"] == operation_row["result"]
+            assert sdk_fakes.trace == model_trace_before_restart
+        else:
+            from services.connectors.telegram.queue import TelegramQueueCompletion
+
+            result = asyncio.run(
+                runtime(accepted.context_id, operation, lease, command=None),
+            )
+            assert isinstance(result, TelegramQueueCompletion), (
+                "a pre-completion restart must return the same trusted prepared outcome"
+            )
+            assert result.clarification.request == completion.request
+            assert result.clarification.pending.clarification_id == completion.pending.clarification_id
+            assert sdk_fakes.trace == model_trace_before_restart
+            # Simulate the generic queue's actual T011 completion boundary only
+            # after the processor has returned the prepared repository value.
+            assert repository.complete_with_clarification(
+                accepted.context_id, accepted.operation_id, owner=lease.owner,
+                fence=lease.fence, completion=result.clarification,
+                now=BASE_TIME + timedelta(seconds=2), clock=lambda: BASE_TIME + timedelta(seconds=2),
+            )
+    finally:
+        asyncio.run(http_client.aclose())
+
+    completed_row = client.collection("telegram_sessions").document(
+        accepted.context_id,
+    ).collection("operations").document(accepted.operation_id).get().to_dict()
+    assert completed_row["state"] == "completed"
+    assert completed_row["result_type"] == "clarification"
+    assert repository.get_route_control(accepted.context_id, accepted.operation_id) is not None
+    assert metadata_route["contextual"]["intent_ref"] == intent_checkpoint["ref"]
+    after_completion_snapshot = _t016_clarification_publication_snapshot(
+        client, accepted, firestore_fake.documents,
+    )
+    if completed_before_restart:
+        assert after_completion_snapshot == before_completion_snapshot
+    assert after_completion_snapshot["result"] == completed_row["result"]
+    contextual = metadata_route["contextual"]
+    assert contextual["source_conversation_id"] != contextual["checkpoint_conversation_id"]
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: BASE_TIME,
+    )
+    fixed_turn = ledger.load_turn(
+        contextual["checkpoint_conversation_id"], accepted.operation_id,
+    )
+    assert fixed_turn["application_route"] == metadata_route
+
+
+def test_t016_governed_cached_success_cannot_drop_a_trusted_target_binding(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    import json
+    from types import SimpleNamespace
+
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryGovernor
+    from core.operations.write import _new_resolved_write_targets
+    from services.connectors.telegram.runtime.runtime import _GovernedExecutor
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+
+    now = BASE_TIME + timedelta(minutes=8)
+    root_id, folder_id = "t016-cache-root", "t016-cache-folder"
+    monkeypatch.setenv("ROOT_FOLDER_URL", f"https://drive.google.com/drive/folders/{root_id}")
+    client = firestore_fake.client_class()
+    client.collection(FOLDERS_COLLECTION).document(root_id).set({
+        "folder_id": root_id, "name": "TLBrain", "parent_id": None,
+    })
+    accepted, _operation, lease, repository, inner = _executor_for_folder_write(
+        client, now=now, chat_id=93616, monkeypatch=monkeypatch,
+    )
+    operation_id = accepted.operation_id
+    child_id = "telegram-tool-" + hashlib.sha256(
+        f"{operation_id}\0{0}".encode("utf-8")
+    ).hexdigest()
+    effect_id = stable_effect_id(operation_id, 0)
+    arguments = {"name": "Archive"}
+    capability = _new_resolved_write_targets(
+        operation_name="create_folder", operation_id=child_id,
+        effect_id=effect_id, arguments=arguments,
+        parent_id=root_id, root_id=root_id, intent_digest="a" * 64,
+    )
+    allocator_payload = json.dumps(
+        {"name": "Archive", "parent_id": root_id, "root_id": root_id,
+         "intent_digest": "a" * 64},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    allocator_intent = "sha256:" + hashlib.sha256(allocator_payload.encode("utf-8")).hexdigest()
+    marker = "v1:" + hashlib.sha256(
+        "\0".join((child_id, effect_id, "drive_folder", allocator_intent)).encode("utf-8")
+    ).hexdigest()
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": [folder_id]})
+    root_metadata = {"id": root_id, "name": "TLBrain",
+                     "mimeType": "application/vnd.google-apps.folder",
+                     "parents": [], "trashed": False}
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
+    sdk_fakes.drive.queue("files.create", response={"id": folder_id})
+    sdk_fakes.drive.queue("files.get", response={
+        "id": folder_id, "name": "Archive",
+        "mimeType": "application/vnd.google-apps.folder", "parents": [root_id],
+        "trashed": False, "appProperties": {"tlbrain_effect_intent": marker},
+    })
+
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(client, context_ref),
+    )
+    actual = governor.run_stage(
+        operation_id, "telegram-tool-00",
+        lambda: inner.execute(
+            name="create_folder", arguments=arguments, call_ordinal=0,
+            resolved_targets=capability,
+        ),
+        now=now, owner=lease.owner, fence=lease.fence,
+    )
+    assert actual == folder_id
+    child_checkpoint = context_ref.collection("operations").document(operation_id).collection(
+        "agent_checkpoints",
+    ).document("tool-0").get().to_dict()
+    assert child_checkpoint["resolved_targets_binding"]["parent_id"] == root_id
+
+    governed = _GovernedExecutor(
+        inner, governor, operation_id, lease, lambda: now, lambda: True,
+    )
+    trace = list(sdk_fakes.trace)
+    # The ordinary governed caller has no typed capability to prove it is the
+    # same fixed target. It must not inherit the cached success produced under
+    # capability A without revalidating that binding.
+    from core.operations.retries import ReconciledStageFailure, UnknownOutcome
+
+    try:
+        cached = governed.execute(
+            name="create_folder", arguments=arguments, call_ordinal=0,
+        )
+    except (PermissionError, ValueError, UnknownOutcome, ReconciledStageFailure):
+        cached = None
+    assert sdk_fakes.trace == trace
+    assert repository.get_route_control(accepted.context_id, operation_id) is None
+
+    # A legacy None-to-None child remains a positive reconciliation control.
+    second_folder = "t016-cache-folder-reconcile"
+    child_id = "telegram-tool-" + hashlib.sha256(
+        f"{operation_id}\0{1}".encode("utf-8")
+    ).hexdigest()
+    effect_id = stable_effect_id(operation_id, 1)
+    second_arguments = {"name": "Archive-Reconcile"}
+    legacy_intent = "sha256:" + hashlib.sha256(json.dumps(
+        {"name": "Archive-Reconcile", "parent_id": root_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    marker = "v1:" + hashlib.sha256(
+        "\0".join((child_id, effect_id, "drive_folder", legacy_intent)).encode("utf-8")
+    ).hexdigest()
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": [second_folder]})
+    sdk_fakes.drive.queue("files.get", response={
+        "id": root_id, "name": "TLBrain",
+        "mimeType": "application/vnd.google-apps.folder", "parents": [], "trashed": False,
+    })
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", response={
+        "id": root_id, "name": "TLBrain",
+        "mimeType": "application/vnd.google-apps.folder", "parents": [], "trashed": False,
+    })
+    sdk_fakes.drive.queue("files.create", response={"id": second_folder})
+    sdk_fakes.drive.queue("files.get", response={
+        "id": second_folder, "name": "Archive-Reconcile",
+        "mimeType": "application/vnd.google-apps.folder", "parents": [root_id],
+        "trashed": False, "appProperties": {"tlbrain_effect_intent": marker},
+    })
+
+    def lose_ack_after_real_child_write():
+        result = inner.execute(
+            name="create_folder", arguments=second_arguments, call_ordinal=1,
+        )
+        assert result == second_folder
+        raise UnknownOutcome("synthetic lost acknowledgement after confirmed child")
+
+    with pytest.raises(UnknownOutcome):
+        governor.run_stage(
+            operation_id, "telegram-tool-01", lose_ack_after_real_child_write,
+            now=now, owner=lease.owner, fence=lease.fence,
+        )
+    before_reconcile = list(sdk_fakes.trace)
+    try:
+        reconciled = governed.execute(
+            name="create_folder", arguments=second_arguments, call_ordinal=1,
+        )
+    except Exception as error:
+        pytest.fail(
+            "governed reconciliation failed to recover the saved trusted binding: "
+            f"{type(error).__name__}"
+        )
+    assert reconciled == second_folder
+    assert sdk_fakes.trace == before_reconcile
+    second_checkpoint = context_ref.collection("operations").document(operation_id).collection(
+        "agent_checkpoints",
+    ).document("tool-1").get().to_dict()
+    assert second_checkpoint.get("resolved_targets_binding") is None
+    assert cached is None, "unbound governor invocation adopted a typed-target success"
+
+
+def _t016_seed_real_folder_application(
+    firestore_fake, sdk_fakes, monkeypatch, *, seed_completed=True,
+):
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+    from core.integrations.firestore.operation_queue import claim_head
+    from core.operations.write import _new_resolved_write_targets
+    from services.connectors.telegram.agent import TelegramAgent
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.routing_context import (
+        Action, Certainty, Disposition,
+        FolderSelector, FolderSelectorKind, RoutingContextSnapshot, RoutingDecision,
+    )
+    from services.connectors.telegram.runtime.tools import (
+        TelegramRegistryExecutor, stable_effect_id,
+    )
+
+    now = BASE_TIME + timedelta(minutes=9)
+    root_id, folder_id = "t016-agent-root", "t016-agent-folder"
+    monkeypatch.setenv("ROOT_FOLDER_URL", f"https://drive.google.com/drive/folders/{root_id}")
+    client = firestore_fake.client_class()
+    client.collection(FOLDERS_COLLECTION).document(root_id).set({
+        "folder_id": root_id, "name": "TLBrain", "parent_id": None,
+    })
+    accepted, _operation, lease, repository, executor = _executor_for_folder_write(
+        client, now=now, chat_id=93617, monkeypatch=monkeypatch,
+    )
+    command = parse_command("Create the folder Archive")
+    context_ref = client.collection("telegram_sessions").document(accepted.context_id)
+    repository.ensure_conversation(
+        accepted.context_id, "t016-source-chat", kind="chat",
+        queue_operation_id=accepted.operation_id, queue_owner=lease.owner,
+        queue_fence=lease.fence, select_if_unselected=True, now=now,
+    )
+    repository.append_turn(
+        accepted.context_id, "t016-source-chat", turn_id="t016-agent-input",
+        operation_id=accepted.operation_id, role="user",
+        parts=[{"text": command.text}], now=now,
+        queue_operation_id=accepted.operation_id, queue_owner=lease.owner,
+        queue_fence=lease.fence,
+    )
+    snapshot = _t016_context_snapshot(
+        repository, accepted, command, actor_id=17, conversation_id="t016-source-chat",
+    )
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    context_checkpoint = ledger.save_routing_checkpoint(
+        "context", actor_id=17, conversation_id="t016-source-chat",
+        value=snapshot.to_dict(),
+    )
+    decision = RoutingDecision(
+        disposition=Disposition.EXECUTE, action=Action.CREATE_FOLDER,
+        substantive_text=command.text,
+        folder_selector=FolderSelector(kind=FolderSelectorKind.ROOT_DEFAULT),
+        folder_name="Archive",
+        certainty=Certainty.CERTAIN,
+    )
+    decision.validate_command_spans(command.text)
+    assert RoutingContextSnapshot.from_dict(snapshot.to_dict()) == snapshot
+    assert RoutingDecision.from_dict(decision.to_dict()) == decision
+    summary = {
+        "status": "ok", "kind": "substantive",
+        "tool_choice": {
+            "name": "create_folder", "arguments": {"name": "Archive"},
+            "link_requested": False,
+        },
+    }
+    if seed_completed:
+        assert repository.persist_route(
+            accepted.operation_id, summary, context_id=accepted.context_id,
+            owner=lease.owner, fence=lease.fence, now=now,
+        )
+        persisted_summary = repository.get_route_control(
+            accepted.context_id, accepted.operation_id,
+        )
+    else:
+        persisted_summary = repository._route_control_data(summary)
+        assert repository._route_control_data(persisted_summary) == persisted_summary
+    child_id = "telegram-tool-" + hashlib.sha256(
+        f"{accepted.operation_id}\0{0}".encode("utf-8")
+    ).hexdigest()
+    effect_id = stable_effect_id(accepted.operation_id, 0)
+    arguments = {"name": "Archive"}
+    intent_digest = "b" * 64
+    capability = _new_resolved_write_targets(
+        operation_name="create_folder", operation_id=child_id,
+        effect_id=effect_id, arguments=arguments, parent_id=root_id,
+        root_id=root_id, intent_digest=intent_digest,
+    )
+    allocator_payload = json.dumps(
+        {"name": "Archive", "parent_id": root_id, "root_id": root_id,
+         "intent_digest": intent_digest},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    allocator_intent = "sha256:" + hashlib.sha256(allocator_payload.encode("utf-8")).hexdigest()
+    marker = "v1:" + hashlib.sha256(
+        "\0".join((child_id, effect_id, "drive_folder", allocator_intent)).encode("utf-8")
+    ).hexdigest()
+    folder_result = None
+    if seed_completed:
+        sdk_fakes.drive.queue("files.generateIds", response={"ids": [folder_id]})
+        root_metadata = {"id": root_id, "name": "TLBrain",
+                         "mimeType": "application/vnd.google-apps.folder",
+                         "parents": [], "trashed": False}
+        sdk_fakes.drive.queue("files.get", response=root_metadata)
+        sdk_fakes.drive.queue("files.get", error=_http_404())
+        sdk_fakes.drive.queue("files.get", error=_http_404())
+        sdk_fakes.drive.queue("files.get", response=root_metadata)
+        sdk_fakes.drive.queue("files.create", response={"id": folder_id})
+        sdk_fakes.drive.queue("files.get", response={
+            "id": folder_id, "name": "Archive",
+            "mimeType": "application/vnd.google-apps.folder", "parents": [root_id],
+            "trashed": False, "appProperties": {"tlbrain_effect_intent": marker},
+        })
+        folder_result = executor.execute(
+            name="create_folder", arguments=arguments, call_ordinal=0,
+            resolved_targets=capability,
+        )
+        assert folder_result == folder_id
+
+    checkpoint_conversation = "t016-fixed-agent-checkpoint"
+    application_route = {
+        "name": "create_folder", "arguments": arguments, "ordinal": 0,
+        "target_doc_id": None, "call_id": f"application-{accepted.operation_id}-0",
+        "contextual": {
+            "schema_version": 1, "context_ref": context_checkpoint["ref"],
+            "context_digest": context_checkpoint["digest"], "actor_id": 17,
+            "context_id": accepted.context_id, "operation_id": accepted.operation_id,
+            "accepted_command": command.text,
+            "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+            "full_history_ref": snapshot.full_history_ref.to_dict(),
+            "source_conversation_id": "t016-source-chat",
+            "checkpoint_conversation_id": checkpoint_conversation,
+            "decision": decision.to_dict(),
+            "resolved": {"parent_id": root_id, "root_id": root_id,
+                         "intent_digest": intent_digest},
+            "summary": persisted_summary,
+            "fixed_plan": {"steps": [{
+                "ordinal": 0, "name": "create_folder", "arguments": arguments,
+                "target_doc_id": None, "operation_id": child_id, "effect_id": effect_id,
+                "resolved_targets": {"parent_id": root_id, "root_id": root_id,
+                                      "intent_digest": intent_digest},
+            }]},
+        },
+    }
+    application_call = {
+        "id": application_route["call_id"], "name": "create_folder",
+        "arguments": arguments, "ordinal": 0, "round": -1,
+    }
+    if seed_completed:
+        ledger.save_application_route(
+            checkpoint_conversation, accepted.operation_id, route=application_route,
+            tool_calls=[application_call], application_route_round=None,
+        )
+        ledger.save_tool_result(
+            checkpoint_conversation, accepted.operation_id, 0, folder_result,
+        )
+        assert repository.get_route_control(accepted.context_id, accepted.operation_id) == (
+            persisted_summary
+        )
+    agent = TelegramAgent(model=None, ledger=ledger, tool_executor=executor)
+    return agent, ledger, executor, repository, (
+        accepted.operation_id, checkpoint_conversation, application_route,
+        arguments, folder_result, persisted_summary, capability,
+    )
+
+
+def test_t016_saved_application_dispatch_requires_exact_action_arguments_and_target(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.client import COLLECTION_NAME
+
+    agent, ledger, executor, _repository, seeded = _t016_seed_real_folder_application(
+        firestore_fake, sdk_fakes, monkeypatch,
+    )
+    operation_id, conversation_id, _route, arguments, folder_id, _summary, _capability = seeded
+    executor.client.collection(COLLECTION_NAME).document("doc-b").set({
+        "doc_id": "doc-b", "meeting_id": "t016-meeting-b",
+        "source_file": "T016 target B", "parent_id": "t016-agent-root",
+        "status": "synced",
+    })
+    trace = list(sdk_fakes.trace)
+    assert agent.dispatch_tool_choice(
+        name="create_folder", arguments=arguments, target_doc_id=None,
+        conversation_id=conversation_id, delivery_id=operation_id,
+        executor_factory=lambda _target, _delivery, _context: executor,
+    ) == folder_id
+    assert sdk_fakes.trace == trace
+    with pytest.raises(ValueError, match="persisted tool choice"):
+        agent.dispatch_tool_choice(
+            name="create_folder", arguments={"name": "Different"}, target_doc_id=None,
+            conversation_id=conversation_id, delivery_id=operation_id,
+            executor_factory=lambda _target, _delivery, _context: executor,
+        )
+    rejected_action = False
+    try:
+        agent.dispatch_tool_choice(
+            name="move_transcript",
+            arguments={"doc_id": "doc-b", "folder_path": ["Archive"]},
+            target_doc_id="doc-b",
+            conversation_id=conversation_id, delivery_id=operation_id,
+            executor_factory=lambda _target, _delivery, _context: executor,
+        )
+    except ValueError as error:
+        rejected_action = "persisted tool choice" in str(error)
+    rejected_target = False
+    try:
+        agent.dispatch_tool_choice(
+            name="create_folder", arguments=arguments, target_doc_id="doc-b",
+            conversation_id=conversation_id, delivery_id=operation_id,
+            executor_factory=lambda _target, _delivery, _context: executor,
+        )
+    except ValueError as error:
+        rejected_target = "persisted tool choice" in str(error)
+    new_drive_mutations = [
+        row for row in sdk_fakes.trace[len(trace):]
+        if row.get("boundary") == "drive"
+        and row.get("operation") in {"files.create", "files.update"}
+    ]
+    assert not new_drive_mutations
+    assert rejected_action, "a different registered action escaped the saved application plan"
+    assert rejected_target, "a different fixed target escaped the saved application plan"
+    assert agent.dispatch_tool_choice(
+        name="create_folder", arguments=arguments, target_doc_id=None,
+        conversation_id=conversation_id, delivery_id=operation_id,
+        executor_factory=lambda _target, _delivery, _context: executor,
+    ) == folder_id
+
+
+def test_t016_saved_application_write_rejects_extra_native_ordinal_before_child_allocation(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from google.genai import types
+    from core.integrations.gemini.agent import GeminiAgent
+    from core.integrations.google_drive.folder_service import FolderNameConflict
+    from core.integrations.firestore.client import COLLECTION_NAME
+    from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+    agent, ledger, executor, _repository, seeded = _t016_seed_real_folder_application(
+        firestore_fake, sdk_fakes, monkeypatch,
+    )
+    operation_id, conversation_id, _route, arguments, _folder_id, _summary, _capability = seeded
+    executor.client.collection(COLLECTION_NAME).document("doc-b").set({
+        "doc_id": "doc-b", "meeting_id": "t016-meeting-b",
+        "source_file": "T016 target B", "parent_id": "t016-agent-root",
+        "status": "synced",
+    })
+
+    trace_before_extra = list(sdk_fakes.trace)
+    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(role="model", parts=[types.Part(
+            function_call=types.FunctionCall(
+                id="t016-extra-ordinal", name="create_folder", args=arguments,
+            ),
+        )]))],
+    ))
+    agent.model = GeminiAgent(client=FakeGeminiClient(api_key="synthetic-t016-extra-key"))
+    result = None
+    failure = None
+    try:
+        result = agent.run(
+            conversation_id=conversation_id, delivery_id=operation_id,
+            history=[{"role": "user", "parts": [{"text": "Create the folder Archive"}]}],
+            target_doc_id=None,
+        )
+    except (ValueError, PermissionError, FolderNameConflict) as caught:
+        failure = caught
+    new_drive_mutations = [
+        row for row in sdk_fakes.trace[len(trace_before_extra):]
+        if row.get("boundary") == "drive"
+        and row.get("operation") in {"files.create", "files.update"}
+    ]
+    assert not new_drive_mutations
+    from core.integrations.firestore.operations import get_operation
+    from core.integrations.firestore.mutations import get_mutation_effect
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+
+    extra_child_id = "telegram-tool-" + hashlib.sha256(
+        f"{operation_id}\0{1}".encode("utf-8")
+    ).hexdigest()
+    extra_child = get_operation(executor.client, extra_child_id)
+    assert extra_child is None, (
+        "the unapproved ordinal allocated a child before its saved-plan rejection; "
+        f"result={result!r}, original_failure={failure!r}"
+    )
+    assert get_mutation_effect(
+        executor.client, extra_child_id, stable_effect_id(operation_id, 1),
+    ) is None
+    if failure is None:
+        assert result is not None and result["status"] in {"ok", "failed"}
+
+
+def test_t016_governed_typed_execute_reconcile_and_cache_preserve_exact_binding(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    import inspect
+    import json
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    from core.operations.retries import RetryGovernor, UnknownOutcome
+    from core.operations.write import _new_resolved_write_targets
+    from services.connectors.telegram.runtime.runtime import _GovernedExecutor
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+
+    _agent, ledger, inner, repository, seeded = _t016_seed_real_folder_application(
+        firestore_fake, sdk_fakes, monkeypatch,
+    )
+    operation_id, _conversation, _route, arguments, folder_id, _summary, capability = seeded
+    context_ref = repository.client.collection("telegram_sessions").document(ledger.context_id)
+    now = BASE_TIME + timedelta(minutes=9)
+    governor = RetryGovernor(
+        repository.client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(repository.client, context_ref),
+    )
+    governed = _GovernedExecutor(
+        inner, governor, operation_id, SimpleNamespace(owner=ledger.owner, fence=ledger.fence),
+        lambda: now, lambda: True,
+    )
+    assert "resolved_targets" in inspect.signature(governed.execute).parameters, (
+        "governed execution must preserve the inner executor's trusted target capability"
+    )
+    trace = list(sdk_fakes.trace)
+    assert governed.execute(
+        name="create_folder", arguments=arguments, call_ordinal=0,
+        resolved_targets=capability,
+    ) == folder_id
+    assert governed.execute(
+        name="create_folder", arguments=arguments, call_ordinal=0,
+        resolved_targets=capability,
+    ) == folder_id
+    assert sdk_fakes.trace == trace
+    with pytest.raises(ValueError, match="binding changed"):
+        governed.execute(
+            name="create_folder", arguments=arguments, call_ordinal=0,
+            resolved_targets=replace(capability, intent_digest="d" * 64),
+        )
+    assert sdk_fakes.trace == trace
+
+    # Seed a real typed child through the governor, lose only its ACK, then
+    # require the same typed binding for the governed reconciliation readback.
+    root_id, reconciled_folder = "t016-agent-root", "t016-agent-reconciled-folder"
+    child_id = "telegram-tool-" + hashlib.sha256(
+        f"{operation_id}\0{1}".encode("utf-8")
+    ).hexdigest()
+    effect_id = stable_effect_id(operation_id, 1)
+    arguments_1 = {"name": "Archive-Reconcile"}
+    capability_1 = _new_resolved_write_targets(
+        operation_name="create_folder", operation_id=child_id,
+        effect_id=effect_id, arguments=arguments_1, parent_id=root_id,
+        root_id=root_id, intent_digest="c" * 64,
+    )
+    allocator_payload = json.dumps(
+        {"name": "Archive-Reconcile", "parent_id": root_id, "root_id": root_id,
+         "intent_digest": "c" * 64},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    allocator_intent = "sha256:" + hashlib.sha256(allocator_payload.encode("utf-8")).hexdigest()
+    marker = "v1:" + hashlib.sha256(
+        "\0".join((child_id, effect_id, "drive_folder", allocator_intent)).encode("utf-8")
+    ).hexdigest()
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": [reconciled_folder]})
+    root_metadata = {"id": root_id, "name": "TLBrain",
+                     "mimeType": "application/vnd.google-apps.folder",
+                     "parents": [], "trashed": False}
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
+    sdk_fakes.drive.queue("files.create", response={"id": reconciled_folder})
+    sdk_fakes.drive.queue("files.get", response={
+        "id": reconciled_folder, "name": "Archive-Reconcile",
+        "mimeType": "application/vnd.google-apps.folder", "parents": [root_id],
+        "trashed": False, "appProperties": {"tlbrain_effect_intent": marker},
+    })
+
+    def write_then_lose_ack():
+        result = inner.execute(
+            name="create_folder", arguments=arguments_1, call_ordinal=1,
+            resolved_targets=capability_1,
+        )
+        assert result == reconciled_folder
+        raise UnknownOutcome("synthetic ACK loss after committed typed child")
+
+    with pytest.raises(UnknownOutcome):
+        governor.run_stage(
+            operation_id, "telegram-tool-01", write_then_lose_ack,
+            now=now, owner=ledger.owner, fence=ledger.fence,
+        )
+    before_reconcile = list(sdk_fakes.trace)
+    assert governed.execute(
+        name="create_folder", arguments=arguments_1, call_ordinal=1,
+        resolved_targets=capability_1,
+    ) == reconciled_folder
+    assert sdk_fakes.trace == before_reconcile
+
+
+def _t016_save_real_native_round(sdk_fakes, ledger, conversation_id, operation_id):
+    from google.genai import types
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.runtime.runtime import _GovernedModel
+    from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+    native_round = types.GenerateContentResponse(candidates=[types.Candidate(
+        content=types.Content(role="model", parts=[types.Part(
+            text="Previously accepted native round.",
+            thought_signature=b"opaque-t016-signature",
+        )]),
+    )])
+    sdk_fakes.gemini.queue("generate_content", response=native_round)
+    serialized = _GovernedModel(
+        GeminiAgent(client=FakeGeminiClient(api_key="synthetic-t016-native-key")),
+        None, operation_id, None,
+        lambda: BASE_TIME + timedelta(minutes=10), lambda: True,
+    ).generate(
+        contents=[{"role": "user", "parts": [{"text": "Create the folder Archive"}]}],
+        mode="tool_loop",
+    )
+    model_rounds = {
+        "_telegram_tool_loop_rounds": 1,
+        "rounds": [{"response": serialized, "call_start": 0, "call_count": 0}],
+    }
+    ledger.save_turn(
+        conversation_id, operation_id, model_response=model_rounds, tool_calls=[],
+    )
+    restored = ledger.load_turn(conversation_id, operation_id)
+    assert restored["model_response"] == model_rounds
+    assert restored["tool_calls"] == []
+    return model_rounds
+
+
+@pytest.mark.parametrize(
+    "failure_boundary", [
+        "checkpoint_commit", "lease_loss", "projection_conflict", "partial_multipart",
+    ],
+)
+def test_t016_joint_publication_fault_preserves_native_round_and_neither_half(
+    firestore_fake, sdk_fakes, monkeypatch, failure_boundary,
+):
+    from core.integrations.firestore.input_parts import MAX_PART_BYTES
+
+    _agent, ledger, _executor, repository, seeded = _t016_seed_real_folder_application(
+        firestore_fake, sdk_fakes, monkeypatch, seed_completed=False,
+    )
+    operation_id, conversation_id, application_route, _arguments, _folder_id, summary, _capability = seeded
+    accepted_context = ledger.context_id
+    if failure_boundary == "partial_multipart":
+        from dataclasses import replace
+        from services.connectors.telegram.runtime.routing_context import RoutingDecision
+
+        decision = RoutingDecision.from_dict(application_route["contextual"]["decision"])
+        large_decision = replace(
+            decision, substantive_text=decision.substantive_text + " "
+            + "x" * (MAX_PART_BYTES + 8192),
+        )
+        application_route = {
+            **application_route,
+            "contextual": {
+                **application_route["contextual"],
+                "decision": large_decision.to_dict(),
+            },
+        }
+    assert application_route["contextual"]["summary"] == summary
+    assert repository._route_control_data(summary) == summary
+    serialized_native_round = _t016_save_real_native_round(
+        sdk_fakes, ledger, conversation_id, operation_id,
+    )
+    prepare = getattr(ledger, "prepare_application_route", None)
+    assert callable(prepare), (
+        "joint publication requires the planned trusted prepared application checkpoint"
+    )
+    partial_part_path = None
+    if failure_boundary == "partial_multipart":
+        route_digest = hashlib.sha256(ledger._json_bytes(application_route)).hexdigest()
+        data_operation = "telegram-ledger-" + hashlib.sha256(
+            f"{accepted_context}\0{operation_id}\0application-route\0{route_digest}".encode()
+        ).hexdigest()
+        partial_part_path = (
+            f"dialog_operations/{data_operation}/input_parts/part-000001"
+        )
+        firestore_fake.fail_next(
+            "commit", path=partial_part_path, phase="before",
+            exception=RuntimeError("T016 partial application-route multipart fault"),
+        )
+        with pytest.raises(RuntimeError, match="partial application-route multipart fault"):
+            prepare(
+                conversation_id, operation_id, route=application_route,
+                tool_calls=[{
+                    "id": application_route["call_id"], "name": application_route["name"],
+                    "arguments": application_route["arguments"], "ordinal": 0, "round": -1,
+                }],
+                application_route_round=None,
+            )
+        assert firestore_fake.documents.get(
+            partial_part_path.rsplit("/", 1)[0] + "/part-000000",
+        ) is not None
+        assert partial_part_path not in firestore_fake.documents
+        assert partial_part_path.rsplit("/", 1)[0] + "/manifest" not in firestore_fake.documents
+        assert any(
+            row.get("path") == partial_part_path and row.get("operation") == "commit"
+            and row.get("phase") == "before"
+            and row.get("outcome") == "failed"
+            for row in firestore_fake.trace()
+        ), "partial multipart commit fault was not reached"
+        assert repository.get_route_control(accepted_context, operation_id) is None
+        restored = ledger.load_turn(conversation_id, operation_id)
+        assert restored["application_route"] is None
+        assert restored["model_response"] == serialized_native_round
+        assert restored["model_response"]["rounds"][0]["call_start"] == 0
+        assert restored["model_response"]["rounds"][0]["call_count"] == 0
+        return
+    prepared = prepare(
+        conversation_id, operation_id, route=application_route,
+        tool_calls=[{
+            "id": application_route["call_id"], "name": application_route["name"],
+            "arguments": application_route["arguments"], "ordinal": 0, "round": -1,
+        }],
+        application_route_round=None,
+    )
+    checkpoint_path = (
+        f"telegram_sessions/{accepted_context}/operations/{operation_id}"
+        "/agent_checkpoints/turn"
+    )
+    if failure_boundary == "checkpoint_commit":
+        firestore_fake.fail_next(
+            "commit", path=checkpoint_path, phase="before",
+            exception=RuntimeError("T016 joint publication checkpoint fault"),
+        )
+        with pytest.raises(RuntimeError, match="joint publication checkpoint fault"):
+            repository.persist_route(
+                operation_id, summary,
+                context_id=accepted_context, owner=ledger.owner, fence=ledger.fence,
+                now=BASE_TIME + timedelta(minutes=10), application_checkpoint=prepared,
+            )
+    elif failure_boundary == "lease_loss":
+        from core.integrations.firestore.operation_queue import release_head
+
+        context_ref = repository.client.collection("telegram_sessions").document(
+            accepted_context,
+        )
+        assert release_head(
+            repository.client, context_ref, operation_id=operation_id,
+            owner=ledger.owner, fence=ledger.fence,
+            now=BASE_TIME + timedelta(minutes=10),
+        )
+        try:
+            published = repository.persist_route(
+                operation_id, summary,
+                context_id=accepted_context, owner=ledger.owner, fence=ledger.fence,
+                now=BASE_TIME + timedelta(minutes=10), application_checkpoint=prepared,
+            )
+        except (PermissionError, ValueError):
+            published = False
+        assert published is False, "lost queue lease published a contextual route pair"
+    else:
+        mismatched_summary = {
+            **summary,
+            "tool_choice": {"name": "create_folder", "arguments": {"name": "Other"}},
+        }
+        try:
+            repository.persist_route(
+                operation_id, mismatched_summary,
+                context_id=accepted_context, owner=ledger.owner, fence=ledger.fence,
+                now=BASE_TIME + timedelta(minutes=10), application_checkpoint=prepared,
+            )
+        except (ValueError, PermissionError):
+            pass
+        else:
+            assert repository.get_route_control(accepted_context, operation_id) is None
+    assert repository.get_route_control(accepted_context, operation_id) is None
+    restored = ledger.load_turn(conversation_id, operation_id)
+    assert restored["application_route"] is None
+    assert restored["tool_calls"] == []
+    assert restored["model_response"] == serialized_native_round
+    assert restored["model_response"]["rounds"][0]["call_start"] == 0
+    assert restored["model_response"]["rounds"][0]["call_count"] == 0
+    assert restored["model_response"]["rounds"][0]["response"]["candidates"][0][
+        "content"]["parts"][0]["thought_signature"] == "b3BhcXVlLXQwMTYtc2lnbmF0dXJl"
+
+
+def test_t016_joint_publication_success_retains_native_round_and_full_pin(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    _agent, ledger, _executor, repository, seeded = _t016_seed_real_folder_application(
+        firestore_fake, sdk_fakes, monkeypatch, seed_completed=False,
+    )
+    operation_id, conversation_id, route, arguments, _folder, summary, _capability = seeded
+    native = _t016_save_real_native_round(sdk_fakes, ledger, conversation_id, operation_id)
+    prepare = getattr(ledger, "prepare_application_route", None)
+    assert callable(prepare), (
+        "joint publication requires the planned trusted prepared application checkpoint"
+    )
+    prepared = prepare(
+        conversation_id, operation_id, route=route,
+        tool_calls=[{
+            "id": route["call_id"], "name": route["name"],
+            "arguments": arguments, "ordinal": 0, "round": -1,
+        }],
+        application_route_round=None,
+    )
+    context_id = ledger.context_id
+    application_calls = [{
+        "id": route["call_id"], "name": route["name"],
+        "arguments": arguments, "ordinal": 0, "round": -1,
+    }]
+    assert repository.persist_route(
+        operation_id, summary, context_id=context_id,
+        owner=ledger.owner, fence=ledger.fence,
+        now=BASE_TIME + timedelta(minutes=10), application_checkpoint=prepared,
+    )
+    published_summary = repository.get_route_control(context_id, operation_id)
+    restored = ledger.load_turn(conversation_id, operation_id)
+    assert published_summary == summary
+    assert restored["application_route"] == route
+    assert restored["application_route_round"] is None
+    assert restored["model_response"] == native
+    assert restored["tool_calls"] == application_calls
+    assert restored.get("tool_results", {}) == {}
+    native_round = restored["model_response"]["rounds"][0]
+    assert native_round["call_start"] == 0 and native_round["call_count"] == 0
+    assert native_round["response"]["candidates"][0]["content"]["parts"][0][
+        "thought_signature"
+    ] == "b3BhcXVlLXQwMTYtc2lnbmF0dXJl"
+    assert route["contextual"]["checkpoint_conversation_id"] == conversation_id
+    assert route["contextual"]["source_conversation_id"] != conversation_id
+    ledger.save_turn(
+        conversation_id, operation_id, model_response=native,
+        tool_calls=application_calls,
+    )
+    after_native_round = ledger.load_turn(conversation_id, operation_id)
+    assert after_native_round["application_route"] == route
+    assert after_native_round["model_response"] == native
+    assert after_native_round["tool_calls"] == application_calls
+    assert after_native_round["model_response"]["rounds"][0]["call_count"] == 0
+
+
+def test_t016_legacy_summary_pin_is_never_enriched_by_prepared_route(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    _agent, ledger, _executor, repository, seeded = _t016_seed_real_folder_application(
+        firestore_fake, sdk_fakes, monkeypatch, seed_completed=False,
+    )
+    operation_id, conversation_id, route, arguments, _folder, summary, _capability = seeded
+    legacy_pin = {"status": "ok", "kind": "substantive", "target_doc_id": "doc-b"}
+    assert repository.persist_route(
+        operation_id, legacy_pin, context_id=ledger.context_id,
+        owner=ledger.owner, fence=ledger.fence, now=BASE_TIME + timedelta(minutes=10),
+    )
+    prepare = getattr(ledger, "prepare_application_route", None)
+    assert callable(prepare), (
+        "legacy pins require the planned trusted prepared application checkpoint"
+    )
+    prepared = prepare(
+        conversation_id, operation_id, route=route,
+        tool_calls=[{
+            "id": route["call_id"], "name": route["name"],
+            "arguments": arguments, "ordinal": 0, "round": -1,
+        }],
+        application_route_round=None,
+    )
+    try:
+        published = repository.persist_route(
+            operation_id, summary, context_id=ledger.context_id,
+            owner=ledger.owner, fence=ledger.fence,
+            now=BASE_TIME + timedelta(minutes=10), application_checkpoint=prepared,
+        )
+    except (ValueError, PermissionError):
+        published = False
+    assert published is False
+    assert repository.get_route_control(ledger.context_id, operation_id) == legacy_pin
+    legacy_turn = ledger.load_turn(conversation_id, operation_id)
+    assert legacy_turn is None or legacy_turn.get("application_route") is None
