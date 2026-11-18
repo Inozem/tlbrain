@@ -14,6 +14,7 @@ AGENT_MODEL = "gemini-3.5-flash-lite"
 _THINKING_LEVELS = {
     "routing": types.ThinkingLevel.MINIMAL,
     "tool_loop": types.ThinkingLevel.MEDIUM,
+    "tool_loop_presented": types.ThinkingLevel.MEDIUM,
 }
 
 
@@ -43,7 +44,7 @@ class GeminiAgent:
             tools=sdk_tools,
             tool_config=(types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(mode="ANY")
-            ) if mode == "routing" and sdk_tools else None),
+            ) if mode in ("routing", "tool_loop_presented") and sdk_tools else None),
             http_options=(json_response_options(response_json_schema)
                           if response_json_schema is not None else None),
         )

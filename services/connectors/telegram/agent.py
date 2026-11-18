@@ -7,6 +7,7 @@ from copy import deepcopy
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import inspect
 import json
 import logging
@@ -18,6 +19,11 @@ from core.operations import registry
 from services.connectors.telegram.tools import get_tool_catalog
 
 _PERSISTED_ROUNDS = "_telegram_tool_loop_rounds"
+_PRESENT_SEARCH_ANSWER = "present_search_answer"
+_PRESENTATION_READ_TOOLS = frozenset({
+    "query", "get_transcript", "list_recent_transcripts", "list_folders",
+})
+_PRESENTATION_FAILURE = "The requested search presentation could not be validated."
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -128,14 +134,85 @@ def _aggregate_usage(rounds: list[dict[str, Any]]) -> dict[str, int]:
     return totals
 
 
-def _rounds_from_record(record: Any) -> list[dict[str, Any]]:
+def _rounds_from_record(record: Any) -> tuple[list[dict[str, Any]], bool]:
     response = _field(record, "model_response")
     if response is None:
-        return []
-    if isinstance(response, Mapping) and response.get(_PERSISTED_ROUNDS) == 1:
-        return list(response.get("rounds", ()))
+        return [], False
     calls = list(_field(record, "tool_calls", ()) or ())
-    return [{"response": response, "call_start": 0, "call_count": len(calls)}]
+    if isinstance(response, Mapping) and _PERSISTED_ROUNDS in response:
+        if (type(response.get(_PERSISTED_ROUNDS)) is not int
+                or response[_PERSISTED_ROUNDS] != 1
+                or set(response) != {_PERSISTED_ROUNDS, "rounds"}
+                or not isinstance(response.get("rounds"), list)
+                or not response["rounds"]):
+            return [], True
+        rounds = response["rounds"]
+    else:
+        response_calls = _calls_from(response)
+        if (len(response_calls) != len(calls)
+                or any(call.get("name") == _PRESENT_SEARCH_ANSWER
+                       for call in response_calls)):
+            return [], True
+        rounds = [{"response": response, "call_start": 0, "call_count": len(calls)}]
+
+    # A server-dispatched application route occupies ordinal zero without a
+    # corresponding model round. Adopted legacy native routes keep their
+    # original round/call entry and therefore start at zero.
+    route = _field(record, "application_route")
+    route_round = _field(record, "application_route_round")
+    expected_start = 1 if isinstance(route, Mapping) and route_round is None else 0
+    terminal_indexes = []
+    for index, saved_round in enumerate(rounds):
+        if (not isinstance(saved_round, Mapping)
+                or set(saved_round) not in (
+                    {"response", "call_start", "call_count"},
+                    {"response", "call_start", "call_count", "terminal"},
+                )
+                or "response" not in saved_round
+                or type(saved_round.get("call_start")) is not int
+                or type(saved_round.get("call_count")) is not int
+                or saved_round["call_start"] != expected_start
+                or saved_round["call_count"] < 0):
+            return [], True
+        call_count = saved_round["call_count"]
+        native_calls = _calls_from(saved_round["response"])
+        if "terminal" in saved_round:
+            terminal = saved_round["terminal"]
+            if not isinstance(terminal, Mapping):
+                return [], True
+            status = terminal.get("status")
+            failed_shape = {"status", "round_index", "arguments_sha256"}
+            success_shape = {*failed_shape, "manifest_sha256", "manifest"}
+            if (type(terminal.get("round_index")) is not int
+                    or terminal["round_index"] != index
+                    or type(terminal.get("round_index")) is bool
+                    or (status == "ok" and set(terminal) != success_shape)
+                    or (status == "failed" and set(terminal) != failed_shape)
+                    or status not in {"ok", "failed"}
+                    or call_count != 0):
+                return [], True
+            arg_digest = terminal.get("arguments_sha256")
+            if arg_digest is not None and not _is_sha256(arg_digest):
+                return [], True
+            if status == "ok":
+                if (not _is_sha256(terminal.get("manifest_sha256"))
+                        or not isinstance(terminal.get("manifest"), Mapping)
+                        or len(native_calls) != 1
+                        or native_calls[0].get("name") != _PRESENT_SEARCH_ANSWER):
+                    return [], True
+            terminal_indexes.append(index)
+        elif (len(native_calls) != call_count
+              or any(call.get("name") == _PRESENT_SEARCH_ANSWER for call in native_calls)):
+            return [], True
+        expected_start += call_count
+    if expected_start != len(calls) or (terminal_indexes and terminal_indexes != [len(rounds) - 1]):
+        return [], True
+    return [dict(saved_round) for saved_round in rounds], False
+
+
+def _is_sha256(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value))
 
 
 @dataclass
@@ -145,6 +222,7 @@ class _ToolLoopState:
     tool_results: dict[int, Any] = field(default_factory=dict)
     application_route: dict[str, Any] | None = None
     application_route_round: int | None = None
+    checkpoint_failure: bool = False
 
     @property
     def usage(self) -> dict[str, int]:
@@ -173,8 +251,49 @@ class TelegramAgent:
         executor_factory: Callable[[str, str, Any], Any] | None = None,
         execution_context: Any = None,
         allowed_tools: set[str] | frozenset[str] | None = None,
+        presentation_scope: Mapping[str, Any] | None = None,
+        presentation_sources: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         """Run one operation with an optional per-invocation pinned executor."""
+        presentation_requested = presentation_scope is not None or presentation_sources is not None
+        if isinstance(presentation_scope, Mapping):
+            presentation_scope = dict(presentation_scope)
+
+        state = self._load_state(conversation_id, delivery_id)
+        if state.checkpoint_failure:
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+
+        # Immutable terminal and completed prose checkpoints are replayed before
+        # requiring a fresh presentation capability or constructing collaborators.
+        terminal_replay = self._replay_terminal(
+            state, presentation_scope=presentation_scope,
+            delivery_id=delivery_id, ledger=self.ledger,
+        )
+        if terminal_replay is not None:
+            return terminal_replay
+        if (state.application_route is None and not state.calls and self._has_final_answer(state)
+                and not any("terminal" in row for row in state.rounds)):
+            return self._final_answer(state)
+        if (presentation_requested and self._has_final_answer(state)
+                and all(int(call.get("ordinal", -1)) in state.tool_results
+                        for call in state.calls)):
+            return self._final_answer(state)
+
+        presentation_enabled = presentation_scope is not None or presentation_sources is not None
+        if presentation_enabled:
+            scope_failure = self._validate_presentation_scope(
+                presentation_scope, presentation_sources,
+                delivery_id=delivery_id, ledger=self.ledger,
+            )
+            if scope_failure is not None:
+                return self._failure(scope_failure, state.usage)
+        effective_allowed_tools = allowed_tools
+        if presentation_enabled:
+            effective_allowed_tools = (
+                _PRESENTATION_READ_TOOLS if allowed_tools is None
+                else _PRESENTATION_READ_TOOLS.intersection(allowed_tools)
+            )
+
         if target_doc_id is not None and (not isinstance(target_doc_id, str) or not target_doc_id):
             return self._failure("The operation target is invalid.", {})
         if target_doc_id is not None and executor_factory is None:
@@ -190,7 +309,6 @@ class TelegramAgent:
         if not callable(getattr(executor, "execute", None)):
             return self._failure("The operation tool executor is unavailable.", {})
         contents = list(history)
-        state = self._load_state(conversation_id, delivery_id)
         if state.application_route is not None:
             if state.application_route.get("target_doc_id") not in (None, target_doc_id):
                 return self._failure("The persisted application target changed.", state.usage)
@@ -200,7 +318,9 @@ class TelegramAgent:
             self._append_application_context(contents, state.application_route, application_result)
         replay_failure = self._replay_saved_rounds(
             contents, state, conversation_id=conversation_id, delivery_id=delivery_id,
-            executor=executor, target_doc_id=target_doc_id, allowed_tools=allowed_tools,
+            executor=executor, target_doc_id=target_doc_id,
+            allowed_tools=effective_allowed_tools,
+            allow_completed_disallowed=presentation_enabled,
         )
         if replay_failure:
             return replay_failure
@@ -210,7 +330,10 @@ class TelegramAgent:
         while state.model_round_count < self.max_rounds:
             result = self._run_model_round(
                 contents, state, conversation_id=conversation_id, delivery_id=delivery_id,
-                executor=executor, target_doc_id=target_doc_id, allowed_tools=allowed_tools,
+                executor=executor, target_doc_id=target_doc_id,
+                allowed_tools=effective_allowed_tools,
+                presentation_scope=presentation_scope if presentation_enabled else None,
+                presentation_sources=presentation_sources if presentation_enabled else None,
             )
             if result is not None:
                 return result
@@ -300,10 +423,24 @@ class TelegramAgent:
         if record is None:
             return _ToolLoopState()
 
+        raw_calls = _field(record, "tool_calls", [])
+        if raw_calls is None or raw_calls == ():
+            raw_calls = []
+        if not isinstance(raw_calls, (list, tuple)):
+            return _ToolLoopState(checkpoint_failure=True)
+        rounds, checkpoint_failure = _rounds_from_record(record)
+        if checkpoint_failure:
+            return _ToolLoopState(checkpoint_failure=True)
+
         state = _ToolLoopState(
-            rounds=_rounds_from_record(record),
-            calls=list(_field(record, "tool_calls", ()) or ()),
+            rounds=rounds,
+            calls=list(raw_calls),
         )
+        if any(not isinstance(call, Mapping)
+               or type(call.get("ordinal")) is not int
+               or call.get("name") == _PRESENT_SEARCH_ANSWER
+               for call in state.calls):
+            return _ToolLoopState(checkpoint_failure=True)
         route = _field(record, "application_route")
         if isinstance(route, Mapping):
             state.application_route = dict(route)
@@ -315,11 +452,166 @@ class TelegramAgent:
                                   for ordinal, result in saved_results.items()}
         return state
 
+    @staticmethod
+    def _validate_presentation_scope(
+        scope: Mapping[str, Any] | None, sources: Callable[[], Any] | None, *,
+        delivery_id: str, ledger: Any,
+    ) -> str | None:
+        required = {
+            "context_id", "conversation_id", "producing_operation_id",
+            "presentation_id", "answer_turn_id",
+        }
+        if not isinstance(scope, Mapping) or not callable(sources) or set(scope) != required:
+            return "The search presentation capability is incomplete."
+        if any(not isinstance(scope.get(key), str) or not scope[key].strip()
+               for key in required):
+            return "The search presentation capability is invalid."
+        if scope["producing_operation_id"] != delivery_id:
+            return "The search presentation operation binding changed."
+        ledger_context_id = getattr(ledger, "context_id", None)
+        if isinstance(ledger_context_id, str) and ledger_context_id != scope["context_id"]:
+            return "The search presentation context binding changed."
+        return None
+
+    @staticmethod
+    def _presentation_tool_declaration() -> dict[str, Any]:
+        selector = {
+            "type": "object",
+            "properties": {
+                "doc_id": {"type": "string"},
+                "source_id": {"type": "string"},
+                "operation_id": {"type": "string"},
+                "checkpoint_conversation_id": {"type": "string"},
+                "call_id": {"type": "string"},
+                "ordinal": {"type": "integer", "minimum": 0},
+                "order_index": {"type": "integer", "minimum": 0},
+                "range_start": {"type": "integer", "minimum": 0},
+                "range_end": {"type": "integer", "minimum": 0},
+                "reference": {"type": "object"},
+            },
+            "required": ["doc_id"], "additionalProperties": False,
+        }
+        source_refs = {"type": "array", "items": deepcopy(selector)}
+        return {
+            "name": _PRESENT_SEARCH_ANSWER,
+            "description": (
+                "Finish a search answer using only verified read evidence. "
+                "Choose ordered paragraph, document_list, and exact quote blocks."
+            ),
+            "parameters_json_schema": {
+                "type": "object",
+                "properties": {
+                    "blocks": {
+                        "type": "array", "minItems": 1,
+                        "items": {
+                            "oneOf": [
+                                {"type": "object", "properties": {
+                                    "type": {"const": "paragraph"},
+                                    "text": {"type": "string"},
+                                    "source_refs": deepcopy(source_refs),
+                                }, "required": ["type", "text", "source_refs"],
+                                 "additionalProperties": False},
+                                {"type": "object", "properties": {
+                                    "type": {"const": "document_list"},
+                                    "list_id": {"type": "string"},
+                                    "entries": {"type": "array", "minItems": 1,
+                                        "items": {"type": "object", "properties": {
+                                            "doc_id": {"type": "string"},
+                                            "label": {"type": "string"},
+                                            "source_refs": deepcopy(source_refs),
+                                            "position": {"type": "integer", "minimum": 1},
+                                        }, "required": ["doc_id", "label", "source_refs"],
+                                         "additionalProperties": False}},
+                                }, "required": ["type", "list_id", "entries"],
+                                 "additionalProperties": False},
+                                {"type": "object", "properties": {
+                                    "type": {"const": "quote"},
+                                    "text": {"type": "string"},
+                                    "doc_id": {"type": "string"},
+                                    "source_refs": deepcopy(source_refs),
+                                }, "required": ["type", "text", "doc_id", "source_refs"],
+                                 "additionalProperties": False},
+                            ],
+                        },
+                    },
+                },
+                "required": ["blocks"], "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
+    def _presentation_digest(value: Any) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _replay_terminal(
+        self, state: _ToolLoopState, *, presentation_scope: Mapping[str, Any] | None,
+        delivery_id: str, ledger: Any,
+    ) -> dict[str, Any] | None:
+        terminals = [(index, saved) for index, saved in enumerate(state.rounds)
+                     if "terminal" in saved]
+        if not terminals:
+            return None
+        if len(terminals) != 1 or terminals[0][0] != len(state.rounds) - 1:
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        index, saved_round = terminals[0]
+        terminal = saved_round["terminal"]
+        if (not isinstance(terminal, Mapping)
+                or type(saved_round.get("call_count")) is not int
+                or saved_round.get("call_count") != 0
+                or type(saved_round.get("call_start")) is not int
+                or saved_round.get("call_start") != len(state.calls)
+                or type(terminal.get("round_index")) is not int
+                or terminal.get("round_index") != index
+                or any(type(call.get("ordinal")) is not int
+                       or call.get("ordinal") not in state.tool_results
+                       for call in state.calls)):
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        native_calls = _calls_from(saved_round.get("response"))
+        terminal_calls = [call for call in native_calls
+                          if call.get("name") == _PRESENT_SEARCH_ANSWER]
+        try:
+            arguments_digest = (self._presentation_digest(terminal_calls[0].get("arguments"))
+                                if terminal_calls else None)
+        except (TypeError, ValueError):
+            arguments_digest = None
+        if terminal.get("arguments_sha256") != arguments_digest:
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        status = terminal.get("status")
+        if status == "failed":
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        if status != "ok":
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        if (len(native_calls) != 1 or len(terminal_calls) != 1
+                or terminal_calls[0] is not native_calls[0]):
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        manifest = terminal.get("manifest")
+        try:
+            from services.connectors.telegram.runtime.presentation import validate_presentation_manifest
+
+            if self._presentation_digest(manifest) != terminal.get("manifest_sha256"):
+                raise ValueError("presentation manifest digest does not match")
+            validated = validate_presentation_manifest(
+                manifest, expected_scope=presentation_scope,
+            ).to_dict()
+            if (validated.get("producing_operation_id") != delivery_id
+                    or (isinstance(getattr(ledger, "context_id", None), str)
+                        and validated.get("context_id") != ledger.context_id)):
+                raise ValueError("presentation scope does not match its checkpoint")
+        except (TypeError, ValueError):
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        return {
+            "status": "ok", "answer": validated["body"], "usage": state.usage,
+            "tool_results": dict(state.tool_results), "presentation_manifest": validated,
+        }
+
     def _replay_saved_rounds(
         self, contents: list[Any], state: _ToolLoopState, *,
         conversation_id: str, delivery_id: str, executor: Any,
         target_doc_id: str | None,
         allowed_tools: set[str] | frozenset[str] | None = None,
+        allow_completed_disallowed: bool = False,
     ) -> dict[str, Any] | None:
         for round_index, saved_round in enumerate(state.rounds):
             if round_index == state.application_route_round:
@@ -331,7 +623,11 @@ class TelegramAgent:
             if not round_calls and _calls_from(response):
                 return self._failure("The persisted tool request is incomplete.", state.usage)
             if allowed_tools is not None and any(
-                    call.get("name") not in allowed_tools for call in round_calls):
+                    call.get("name") not in allowed_tools
+                    and not (allow_completed_disallowed
+                             and type(call.get("ordinal")) is int
+                             and call["ordinal"] in state.tool_results)
+                    for call in round_calls):
                 return self._failure("The persisted tool request is not allowed.", state.usage)
 
             self._append_model_response(contents, response)
@@ -348,7 +644,12 @@ class TelegramAgent:
     def _has_final_answer(state: _ToolLoopState) -> bool:
         model_rounds = [saved_round for index, saved_round in enumerate(state.rounds)
                         if index != state.application_route_round]
-        return bool(model_rounds and int(model_rounds[-1].get("call_count", 0)) == 0)
+        if not model_rounds:
+            return False
+        last = model_rounds[-1]
+        return ("terminal" not in last
+                and type(last.get("call_count")) is int and last.get("call_count") == 0
+                and not _calls_from(last.get("response")))
 
     @staticmethod
     def _final_answer(state: _ToolLoopState) -> dict[str, Any]:
@@ -363,13 +664,45 @@ class TelegramAgent:
         conversation_id: str, delivery_id: str, executor: Any,
         target_doc_id: str | None,
         allowed_tools: set[str] | frozenset[str] | None = None,
+        presentation_scope: Mapping[str, Any] | None = None,
+        presentation_sources: Callable[[], Any] | None = None,
     ) -> dict[str, Any] | None:
         catalog = self._scoped_tool_catalog(target_doc_id)
+        mode = "tool_loop"
+        if presentation_scope is not None and presentation_sources is not None:
+            mode = "tool_loop_presented"
+            catalog = [tool for tool in catalog if tool["name"] in _PRESENTATION_READ_TOOLS]
         if allowed_tools is not None:
             catalog = [tool for tool in catalog if tool["name"] in allowed_tools]
+        if mode == "tool_loop_presented":
+            catalog.append(self._presentation_tool_declaration())
         response = self.model.generate(
-            contents=contents, mode="tool_loop", tools=catalog,
+            contents=contents, mode=mode, tools=catalog,
         )
+        native_calls = _calls_from(response)
+        terminal_calls = [call for call in native_calls
+                          if call.get("name") == _PRESENT_SEARCH_ANSWER]
+        if terminal_calls and mode == "tool_loop_presented":
+            if len(native_calls) != 1 or len(terminal_calls) != 1:
+                self._persist_terminal_failure(
+                    response, terminal_calls[0].get("arguments"), state,
+                    conversation_id, delivery_id,
+                )
+                return self._failure(_PRESENTATION_FAILURE, state.usage)
+            return self._complete_terminal(
+                response, terminal_calls[0], state, conversation_id=conversation_id,
+                delivery_id=delivery_id, presentation_scope=presentation_scope,
+                presentation_sources=presentation_sources,
+            )
+        if mode == "tool_loop_presented" and any(
+                call.get("name") not in _PRESENTATION_READ_TOOLS for call in native_calls):
+            self._persist_model_round(response, [], state, conversation_id, delivery_id)
+            return self._failure("The requested tool operation was invalid.", state.usage)
+        if mode == "tool_loop_presented" and not native_calls:
+            self._persist_terminal_failure(
+                response, None, state, conversation_id, delivery_id,
+            )
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
         try:
             calls = self._validate_calls(response, state, target_doc_id=target_doc_id,
                                          allowed_tools=allowed_tools)
@@ -397,6 +730,62 @@ class TelegramAgent:
         if not calls:
             return self._final_answer(state)
         return None
+
+    def _persist_terminal_failure(
+        self, response: Any, arguments: Any, state: _ToolLoopState,
+        conversation_id: str, delivery_id: str,
+    ) -> None:
+        try:
+            arguments_sha256 = self._presentation_digest(arguments)
+        except (TypeError, ValueError):
+            arguments_sha256 = None
+        self._persist_model_round(
+            response, [], state, conversation_id, delivery_id,
+            terminal={"status": "failed", "round_index": len(state.rounds),
+                      "arguments_sha256": arguments_sha256},
+        )
+
+    def _complete_terminal(
+        self, response: Any, call: Mapping[str, Any], state: _ToolLoopState, *,
+        conversation_id: str, delivery_id: str,
+        presentation_scope: Mapping[str, Any] | None,
+        presentation_sources: Callable[[], Any] | None,
+    ) -> dict[str, Any]:
+        arguments = call.get("arguments")
+        if (not isinstance(arguments, Mapping) or set(arguments) != {"blocks"}
+                or presentation_scope is None or presentation_sources is None):
+            self._persist_terminal_failure(
+                response, arguments, state, conversation_id, delivery_id,
+            )
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        if callable(presentation_sources):
+            verified_exchanges = presentation_sources()
+        else:
+            verified_exchanges = None
+        try:
+            from services.connectors.telegram.runtime.presentation import build_presentation_manifest
+
+            manifest = build_presentation_manifest(
+                scope=presentation_scope, blocks=arguments["blocks"],
+                verified_exchanges=verified_exchanges,
+            ).to_dict()
+        except (TypeError, ValueError):
+            self._persist_terminal_failure(
+                response, arguments, state, conversation_id, delivery_id,
+            )
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+
+        self._persist_model_round(
+            response, [], state, conversation_id, delivery_id,
+            terminal={"status": "ok", "round_index": len(state.rounds),
+                      "arguments_sha256": self._presentation_digest(arguments),
+                      "manifest_sha256": self._presentation_digest(manifest),
+                      "manifest": manifest},
+        )
+        return {
+            "status": "ok", "answer": manifest["body"], "usage": state.usage,
+            "tool_results": dict(state.tool_results), "presentation_manifest": manifest,
+        }
 
     @staticmethod
     def _scoped_tool_catalog(target_doc_id: str | None) -> list[dict[str, Any]]:
@@ -435,16 +824,21 @@ class TelegramAgent:
     def _persist_model_round(
         self, response: Any, calls: list[dict[str, Any]], state: _ToolLoopState,
         conversation_id: str, delivery_id: str,
+        *, terminal: Mapping[str, Any] | None = None,
     ) -> Any:
         serialized = _serialize_response(response)
-        all_rounds = state.rounds + [{
+        new_round = {
             "response": serialized,
             "call_start": len(state.calls),
             "call_count": len(calls),
-        }]
+        }
+        if terminal is not None:
+            new_round["terminal"] = deepcopy(dict(terminal))
+        all_rounds = state.rounds + [new_round]
         self.ledger.save_turn(
             conversation_id, delivery_id,
             model_response=(serialized if not state.rounds and state.application_route is None
+                            and terminal is None
                             else self._persisted_response(all_rounds)),
             tool_calls=state.calls + calls,
             application_route=state.application_route,
