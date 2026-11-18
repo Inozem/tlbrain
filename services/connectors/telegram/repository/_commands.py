@@ -247,6 +247,7 @@ def _command_data(
     reply_to_message_id: int | None,
     observed_clarification_id: str | None = None,
     observed_clarification_generation: int | None = None,
+    observed_presentation_id: str | None = None,
     observed_question_delivery_ref: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create the command candidate record without copying draft content."""
@@ -261,7 +262,7 @@ def _command_data(
         "reply_to_message_id": reply_to_message_id,
         "observed_clarification_id": observed_clarification_id,
         "observed_clarification_generation": observed_clarification_generation,
-        "observed_presentation_id": None,
+        "observed_presentation_id": observed_presentation_id,
         "observed_question_delivery_ref": (
             dict(observed_question_delivery_ref)
             if observed_question_delivery_ref is not None else None
@@ -1188,6 +1189,15 @@ class _TelegramCommandMixin:
             message_id=message_id,
             message_date=_trusted_transport_date(transport_timestamp),
             reply_to_message_id=reply_to_message_id,
+        )
+        # Capture a single trusted addressed presentation hint only after the
+        # duplicate receipt fast path above.  It is never a selector or write
+        # authority; later routing validates its causal meaning.
+        state.command_data["observed_presentation_id"] = (
+            self.observe_published_presentation_in_transaction(
+                transaction, context_id=identity.context_id,
+                context=state.context, actor_id=user_id, now=now,
+            )
         )
         message_date = _trusted_transport_date(transport_timestamp)
         observed_id, observed_generation, delivery_ref = _recorded_question_observation(

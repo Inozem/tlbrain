@@ -61,9 +61,29 @@ class ConversationRecord:
     search_filters: Any
     created_at: datetime
     last_substantive_at: datetime | None = None
+    last_presented_list_id: str | None = None
+    last_presentation_id: str | None = None
+
+    def _serialized_presentation_fields(self) -> dict[str, str]:
+        """Keep optional presentation IDs out of the historic stored shape."""
+        if (self.last_presented_list_id is not None
+                and (not isinstance(self.last_presented_list_id, str)
+                     or not self.last_presented_list_id.strip())):
+            raise ValueError("last_presented_list_id must be a nonempty opaque ID")
+        if self.last_presentation_id is not None:
+            _identifier(self.last_presentation_id, "last_presentation_id")
+        if self.last_presented_list_id is not None and self.last_presentation_id is None:
+            raise ValueError("last_presented_list_id requires last_presentation_id")
+        fields: dict[str, str] = {}
+        if self.last_presented_list_id is not None:
+            fields["last_presented_list_id"] = self.last_presented_list_id
+        if self.last_presentation_id is not None:
+            fields["last_presentation_id"] = self.last_presentation_id
+        return fields
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        presentation_fields = self._serialized_presentation_fields()
+        value = {
             "conversation_id": self.conversation_id,
             "kind": self.kind.value,
             "draft_id": self.draft_id,
@@ -74,9 +94,20 @@ class ConversationRecord:
             "last_substantive_at": self.last_substantive_at,
             "last_turn_sequence": 0,
         }
+        value.update(presentation_fields)
+        return value
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ConversationRecord":
+        last_list_id = value.get("last_presented_list_id")
+        last_presentation_id = value.get("last_presentation_id")
+        if last_list_id is not None:
+            if not isinstance(last_list_id, str) or not last_list_id.strip():
+                raise ValueError("last_presented_list_id must be a nonempty opaque ID")
+        if last_presentation_id is not None:
+            last_presentation_id = _identifier(last_presentation_id, "last_presentation_id")
+        if last_list_id is not None and last_presentation_id is None:
+            raise ValueError("last_presented_list_id requires last_presentation_id")
         return cls(
             conversation_id=value["conversation_id"],
             kind=ConversationKind(value["kind"]),
@@ -86,6 +117,8 @@ class ConversationRecord:
             search_filters=_json_value(value.get("search_filters"), "search_filters"),
             created_at=value["created_at"],
             last_substantive_at=value.get("last_substantive_at"),
+            last_presented_list_id=last_list_id,
+            last_presentation_id=last_presentation_id,
         )
 
 

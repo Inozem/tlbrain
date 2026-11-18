@@ -168,14 +168,14 @@ class FirestoreAgentLedger:
         return {"_input_ref": input_ref, "sha256": digest,
                 "byte_length": len(payload), "max_part_bytes": MAX_PART_BYTES}
 
-    def _load_payload(self, stored: Any) -> Any:
+    def _load_payload(self, stored: Any, *, transaction: Any = None) -> Any:
         if not isinstance(stored, Mapping):
             return stored
         if "_inline" in stored:
             return deepcopy(stored["_inline"])
         input_ref = stored.get("_input_ref")
         if isinstance(input_ref, str):
-            payload = read_input_parts(self.client, input_ref)
+            payload = read_input_parts(self.client, input_ref, transaction=transaction)
             if (hashlib.sha256(payload).hexdigest() != stored.get("sha256")
                     or len(payload) != stored.get("byte_length")):
                 raise ValueError("agent payload parts do not verify")
@@ -408,14 +408,17 @@ class FirestoreAgentLedger:
     def load_search_exchange(
         self, reference: Any, *, conversation_id: str, operation_id: str,
         checkpoint_conversation_id: str, call_id: str, ordinal: int,
+        transaction: Any = None,
     ) -> dict[str, Any]:
         """Hydrate an immutable search exchange after verifying every binding."""
-        if (not isinstance(reference, Mapping) or reference.get("version") != 1
+        if (not isinstance(reference, Mapping) or type(reference.get("version")) is not int
+                or reference.get("version") != 1
                 or reference.get("context_id") != self.context_id
                 or reference.get("conversation_id") != conversation_id
                 or reference.get("operation_id") != operation_id
                 or reference.get("checkpoint_conversation_id") != checkpoint_conversation_id
                 or reference.get("call_id") != call_id
+                or type(reference.get("ordinal")) is not int
                 or reference.get("ordinal") != ordinal):
             raise ValueError("search history reference binding is invalid")
         kind = reference.get("payload_kind")
@@ -435,7 +438,7 @@ class FirestoreAgentLedger:
             ).hexdigest()
             if input_ref != f"dialog_operations/{data_operation}/input_parts/manifest":
                 raise ValueError("search history payload reference is not bound")
-        value = self._load_payload(payload_ref)
+        value = self._load_payload(payload_ref, transaction=transaction)
         encoded = self._json_bytes(value)
         if hashlib.sha256(encoded).hexdigest() != digest or len(encoded) != byte_length:
             raise ValueError("search history payload integrity check failed")
