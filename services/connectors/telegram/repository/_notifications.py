@@ -703,6 +703,8 @@ class _TelegramNotificationMixin:
         context_data: Mapping[str, Any], existing_data: Mapping[str, Any] | None = None,
         dialog_number: int | None = None, operation_id: str | None = None,
         presentation: str | None = None,
+        presentation_id: str | None = None,
+        presentation_conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate/build a notification row after its context and ledger reads."""
         notification_id = _identifier(notification_id, "notification_id")
@@ -719,6 +721,13 @@ class _TelegramNotificationMixin:
             operation_id = _identifier(operation_id, "operation_id")
         if presentation not in (None, "rich_markdown"):
             raise ValueError("presentation is invalid")
+        if (presentation_id is None) != (presentation_conversation_id is None):
+            raise ValueError("presentation notification binding is incomplete")
+        if presentation_id is not None:
+            presentation_id = _identifier(presentation_id, "presentation_id")
+            presentation_conversation_id = _identifier(
+                presentation_conversation_id, "presentation_conversation_id",
+            )
         now = _aware(now, "now")
         chat_id = context_data.get("chat_id")
         if type(chat_id) is not int:
@@ -736,6 +745,10 @@ class _TelegramNotificationMixin:
             expected = (context_id, kind, body, chat_id, thread_id, dialog_number, operation_id)
             if identity != expected:
                 raise ValueError("notification ID already belongs to a different identity")
+            if presentation_id is not None and (
+                    existing_data.get("presentation_id") != presentation_id
+                    or existing_data.get("presentation_conversation_id") != presentation_conversation_id):
+                raise ValueError("notification ID already belongs to another presentation")
             return dict(existing_data)
         row = {
             "notification_id": notification_id, "context_id": context_id, "kind": kind,
@@ -750,7 +763,54 @@ class _TelegramNotificationMixin:
         }
         if presentation is not None:
             row["presentation"] = presentation
+        if presentation_id is not None:
+            row["presentation_id"] = presentation_id
+            row["presentation_conversation_id"] = presentation_conversation_id
         return row
+
+    def _presentation_notification_is_ready_in_transaction(
+        self, transaction: Any, notification: Mapping[str, Any],
+    ) -> bool:
+        """Require an immutable addressed header before reserving a linked send."""
+        context_id = notification.get("context_id")
+        conversation_id = notification.get("presentation_conversation_id")
+        presentation_id = notification.get("presentation_id")
+        if (not isinstance(context_id, str) or not isinstance(conversation_id, str)
+                or not isinstance(presentation_id, str)):
+            return False
+        conversation_ref = self._conversation_ref(context_id, conversation_id)
+        conversation_snapshot = conversation_ref.get(transaction=transaction)
+        header_ref = conversation_ref.collection("presentations").document(presentation_id)
+        header_snapshot = header_ref.get(transaction=transaction)
+        if not conversation_snapshot.exists or not header_snapshot.exists:
+            return False
+        header = header_snapshot.to_dict() or {}
+        scope = self._presentation_scope(header)
+        if (scope["context_id"] != context_id
+                or scope["conversation_id"] != conversation_id
+                or scope["presentation_id"] != presentation_id
+                or scope["producing_operation_id"] != notification.get("operation_id")):
+            return False
+        manifest = self._read_presentation_manifest_in_transaction(
+            transaction, context_id=context_id, conversation_id=conversation_id,
+            presentation_id=presentation_id,
+        )
+        if not isinstance(manifest, Mapping):
+            return False
+        prepared = manifest.get("notification_refs")
+        if not isinstance(prepared, list):
+            return False
+        refs = [ref for ref in prepared if isinstance(ref, Mapping)
+                and ref.get("notification_id") == notification.get("notification_id")
+                and ref.get("revision") == notification.get("revision")]
+        if len(refs) != 1:
+            return False
+        chunks, _list_spans = self._presentation_chunk_plan(manifest)
+        ref_index = next((index for index, ref in enumerate(prepared)
+                          if isinstance(ref, Mapping)
+                          and ref.get("notification_id") == notification.get("notification_id")), None)
+        return (type(ref_index) is int and ref_index < len(chunks)
+                and notification.get("body") == chunks[ref_index])
 
 
     def reserve_notification_attempt(
@@ -768,6 +828,12 @@ class _TelegramNotificationMixin:
             if not snap.exists:
                 return None
             data = snap.to_dict() or {}
+            if (data.get("presentation_id") is not None
+                    and data.get("state") not in {"delivered", "failed", "delivery_unknown"}
+                    and not self._presentation_notification_is_ready_in_transaction(
+                        transaction, data,
+                    )):
+                return {**data, "reserved": False, "state": "busy"}
             if data.get("state") in {"delivered", "failed", "delivery_unknown"}:
                 return {**data, "reserved": False}
             clarification_binding = None

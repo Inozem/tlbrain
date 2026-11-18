@@ -407,6 +407,17 @@ def test_search_agent_presents_native_ordered_list_and_bound_quote_through_runti
                     "turns").stream()]
                 snapshot["presentations"] = [row.to_dict() for row in producer_conversation.collection(
                     "presentations").stream()]
+                if snapshot["presentations"]:
+                    header = snapshot["presentations"][0]
+                    manifest = repository.get_presentation_manifest(
+                        accepted.context_id, active_id, header["presentation_id"],
+                    )
+                    snapshot["manifest"] = manifest
+                    first_ref = manifest["notification_refs"][0]
+                    snapshot["notification_id"] = first_ref["notification_id"]
+                    snapshot["notification"] = repository.get_notification(
+                        first_ref["notification_id"],
+                    )
             operation_ref = (client_db.collection("telegram_sessions").document(accepted.context_id)
                              .collection("operations").document(accepted.operation_id))
             operation_data = operation_ref.get().to_dict() or {}
@@ -468,18 +479,25 @@ def test_search_agent_presents_native_ordered_list_and_bound_quote_through_runti
                    and any(part.get("text") == expected_body for part in turn.get("parts", []))
                    for turn in producer_snapshot["turns"])
         pre_manifest, = producer_snapshot["presentations"]
-        assert pre_manifest["body"] == expected_body
-        assert pre_manifest["body_sha256"] == hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
+        assert "body" not in pre_manifest
+        assert pre_manifest["body_ref"]["body_sha256"] == hashlib.sha256(
+            expected_body.encode("utf-8"),
+        ).hexdigest()
         pre_notification = producer_snapshot["notification"]
         assert pre_notification["body"] == expected_body
-        assert pre_notification["revision"] == pre_manifest["notification_refs"][0]["revision"]
+        manifest = producer_snapshot["manifest"]
+        assert manifest["body"] == expected_body
+        assert pre_notification["revision"] == manifest["notification_refs"][0]["revision"]
         assert pre_notification["state"] in {"pending", "sending"}
         assert pre_notification.get("message_id") is None
         assert [row.get("text") for row in bot._test_sent if row.get("text") is not None] == [expected_body]
         presentation_rows = list(conversation_ref.collection("presentations").stream())
         assert len(presentation_rows) == 1
-        assert presentation_rows[0].to_dict()["body"] == expected_body
-        manifest = presentation_rows[0].to_dict()
+        header = presentation_rows[0].to_dict()
+        assert "body" not in header
+        assert header["body_ref"]["body_sha256"] == hashlib.sha256(
+            expected_body.encode("utf-8"),
+        ).hexdigest()
         assert manifest["body_sha256"] == hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
         entries = manifest["blocks"][1]["entries"]
         assert [(row["position"], row["doc_id"], row["label"])
@@ -488,12 +506,15 @@ def test_search_agent_presents_native_ordered_list_and_bound_quote_through_runti
                                        (3, "doc-c", "Gamma")]
         quote = manifest["blocks"][2]
         assert quote["text"] == "The exact verified sentence."
-        quote_refs = quote.get("evidence_refs", quote.get("source_refs", []))
-        assert quote_refs and any(ref.get("doc_id") == "doc-b"
-                                  and ref.get("call_id") == actual_exchange["call"]["id"]
-                                  for ref in quote_refs)
-        assert all(ref.get("reference") == exchange_parts[-1]["reference"]
-                   for ref in quote_refs)
+        quote_refs = quote.get("evidence_refs", [])
+        assert quote_refs and all(ref.get("doc_id") == "doc-b" for ref in quote_refs)
+        source_by_id = {source["source_id"]: source for source in manifest["sources"]}
+        quote_sources = [source_by_id[ref["source_id"]] for ref in quote_refs]
+        assert any(source.get("call_id") == actual_exchange["call"]["id"]
+                   for source in quote_sources)
+        assert all(source["reference"]["payload"]["sha256"]
+                   == exchange_parts[-1]["reference"]["payload"]["sha256"]
+                   for source in quote_sources)
         notification_refs = manifest["notification_refs"]
         assert notification_refs
         for ref in notification_refs:

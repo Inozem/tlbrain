@@ -2010,6 +2010,11 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
                {"speaker": "Pavel K", "text": long_source, "order_index": 4},
                {"speaker": "Maya", "text": "Pavel K was also mentioned in a later note.", "order_index": 5},
            ]}]}], {"total_matches": 2, "returned_segments": 2, "truncated": False}),
+        ([{"doc_id": "doc-launch", "folder_path": ["Client"],
+           "dialog_date": "2026-05-15", "segments": [{"range": [4, 5], "dialog": [
+               {"speaker": "Pavel K", "text": long_source, "order_index": 4},
+               {"speaker": "Maya", "text": "Pavel K was also mentioned in a later note.", "order_index": 5},
+           ]}]}], {"total_matches": 2, "returned_segments": 2, "truncated": False}),
     ]
     tool_calls = []
     original_invoke = registry.invoke_operation
@@ -2078,6 +2083,7 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
             assert long_source in serialized_contents
             assert {item["name"] for item in declarations} == {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
+                "present_search_answer",
             }
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
@@ -2092,11 +2098,36 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
         if tool_loop_count == 2:
             assert long_source in serialized_contents
             assert "functionResponse" in serialized_contents
+            assert "The launch date remains May 15." in serialized_contents
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"id": "read-call-2", "name": "query",
+                                     "args": first_route["tool_choice"]["arguments"]},
+                    "thoughtSignature": "c3ludGhldGljLXNlYXJjaC1yZWFk",
+                }],
+            }}]})
+        if tool_loop_count == 3:
+            assert long_source in serialized_contents
+            assert "functionResponse" in serialized_contents
             answer = "Pavel K was a participant and contributed the May 15 date."
-        elif tool_loop_count == 3:
+        elif tool_loop_count == 4:
             answer = "Pavel K again appears as a participant in the same source evidence."
         else:
             raise AssertionError("unexpected model generation")
+        if any(item.get("name") == "present_search_answer" for item in declarations):
+            refs = ([{"doc_id": "doc-launch", "order_index": 4,
+                      "call_id": "read-call-2", "ordinal": 2}]
+                    if tool_loop_count == 3 else [])
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"id": f"presented-{tool_loop_count}",
+                                     "name": "present_search_answer", "args": {
+                        "blocks": [{"type": "paragraph", "text": answer,
+                                    "source_refs": refs}],
+                    }},
+                    "thoughtSignature": "c3ludGhldGljLXByZXNlbnQ=",
+                }],
+            }}]})
         return httpx.Response(200, json={"candidates": [{"content": {
             "role": "model", "parts": [{"text": answer}],
         }}]})
@@ -2151,14 +2182,41 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
     assert first_control["tool_choice"]["arguments"] == first_route["tool_choice"]["arguments"]
     assert first_control["search_protocol"] == "agent-v1"
     assert first_control["search_session_id"] == search_session_id
+    first_presentation_id = "search-presentation-" + hashlib.sha256(
+        first_dispatch["operation_id"].encode(),
+    ).hexdigest()
+    first_manifest = repository.get_presentation_manifest(
+        context_id, search_session_id, first_presentation_id,
+    )
+    in_agent_source = next(
+        source for source in first_manifest["sources"]
+        if source["call_id"] == "read-call-2"
+    )
+    assert in_agent_source["ordinal"] == 2
+    first_header = (db.collection("telegram_sessions").document(context_id)
+                    .collection("conversations").document(search_session_id)
+                    .collection("presentations").document(first_presentation_id)
+                    .get().to_dict())
+    anchored_turn_id = first_header["source_turn_refs"][in_agent_source["source_id"]]
+    in_agent_turn = next(
+        turn for turn in repository.list_turns(context_id, search_session_id)
+        if turn["turn_id"] == anchored_turn_id
+    )
+    in_agent_exchange_ref = next(
+        part["reference"] for part in in_agent_turn["parts"]
+        if part.get("type") == "search_exchange_ref"
+    )
+    assert in_agent_turn["operation_id"] == first_dispatch["operation_id"]
+    assert in_agent_exchange_ref["payload"]["sha256"] == in_agent_source["reference"]["payload"]["sha256"]
 
     second_dispatch = deliver_command(25002, 182, "And Pavel K?")
     assert second_dispatch["operation_id"] != first_dispatch["operation_id"]
-    assert len(wire_requests) == 5, (tool_calls, sent)
+    assert len(wire_requests) == 6, (tool_calls, sent)
     assert [call[0:2] for call in tool_calls] == [
         ("query", first_route["tool_choice"]["arguments"]),
         ("get_transcript", {"doc_id": "doc-launch", "folder_path": ["Client"],
                             "date_from": "2026-01-01", "date_to": "2026-12-31"}),
+        ("query", first_route["tool_choice"]["arguments"]),
         ("query", second_route["tool_choice"]["arguments"]),
     ]
     assert all(call[2] is not None for call in tool_calls)
@@ -2171,7 +2229,7 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
     ]
     turns = repository.list_turns(context_id, search_session_id)
     assert [turn["role"] for turn in turns if turn["operation_id"] == first_dispatch["operation_id"]] == [
-        "user", "tool", "tool", "tool", "model",
+        "user", "tool", "tool", "tool", "tool", "tool", "model",
     ]
     first_tool = next(turn for turn in turns if turn["operation_id"] == first_dispatch["operation_id"]
                       and turn.get("role") == "tool"
@@ -2894,6 +2952,7 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
             assert "application-tool-result-data" in serialized_contents
             assert {item["name"] for item in payload["tools"][0]["functionDeclarations"]} == {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
+                "present_search_answer",
             }
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
@@ -2920,6 +2979,7 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
             assert "application-tool-result-data" in serialized_contents
             assert {item["name"] for item in payload["tools"][0]["functionDeclarations"]} == {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
+                "present_search_answer",
             }
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
@@ -2939,6 +2999,18 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
                   "Pavel K's confirmed transcript evidence is the June 12 milestone."
                   if route_count == 2 else
                   "I found no matching schedule notes in the selected evidence.")
+        if any(item.get("name") == "present_search_answer" for item in
+               payload.get("tools", [{}])[0].get("functionDeclarations", [])):
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"id": f"presented-{route_count}",
+                                     "name": "present_search_answer", "args": {
+                        "blocks": [{"type": "paragraph", "text": answer,
+                                    "source_refs": []}],
+                    }},
+                    "thoughtSignature": "c3ludGhldGljLXByZXNlbnQ=",
+                }],
+            }}]})
         return httpx.Response(200, json={"candidates": [{"content": {
             "role": "model", "parts": [{"text": answer}],
         }}]})

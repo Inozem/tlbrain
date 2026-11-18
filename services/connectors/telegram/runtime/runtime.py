@@ -388,9 +388,125 @@ class _DurableCommandReplies:
                 else f"{self.operation_id}:{kind}:{index}")
         return "telegram-command-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
+    async def prepare_presentation(
+        self, body: str, *, presentation: str, presentation_id: str,
+        presentation_conversation_id: str,
+    ) -> list[dict[str, Any]]:
+        """Prepare every deterministic answer chunk before its immutable header."""
+        context_ref = self.repository.client.collection("telegram_sessions").document(self.context_id)
+        operation_ref = context_ref.collection("operations").document(self.operation_id)
+        initial = operation_ref.get().to_dict() or {}
+        action = initial.get("typed_action")
+        if ((isinstance(action, Mapping) and action.get("action") == "receipt_save")
+                or isinstance(initial.get("receipt_card_notification_id"), str)):
+            raise ValueError("search presentation cannot be bound to a receipt card")
+        chunk_work = _command_reply_chunks(body, kind="final", bound_receipt_card=False)
+        safe_rich_chunks = rich_markdown_safe_chunk_indices(
+            (index, chunk) for index, chunk, _chunk_kind in chunk_work
+        )
+        prepared: list[dict[str, Any]] = []
+        for index, chunk, chunk_kind in chunk_work:
+            chunk_presentation = (
+                "rich_markdown" if presentation == "rich_markdown" and index in safe_rich_chunks
+                else None
+            )
+            notification_id = self.notification_id(chunk_kind, index)
+            notification_ref = self.repository.client.collection("notification_outbox").document(
+                notification_id,
+            )
+            transaction = self.repository.client.transaction()
+
+            @firestore.transactional
+            def persist(tx: Any) -> str | _DeliveryStatus:
+                context_snapshot = context_ref.get(transaction=tx)
+                operation_snapshot = operation_ref.get(transaction=tx)
+                context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
+                operation = operation_snapshot.to_dict() or {} if operation_snapshot.exists else {}
+                now = self.clock()
+                if (not context_snapshot.exists or not operation_snapshot.exists
+                        or operation.get("state") != "running"
+                        or not validate_context_queue_lease(
+                            context, self.operation_id, owner=self.owner, fence=self.fence,
+                            now=now, expiry=context.get("lock_expires_at"))):
+                    return _DeliveryStatus("stale")
+                snapshot = notification_ref.get(transaction=tx)
+                existing = snapshot.to_dict() or {} if snapshot.exists else None
+                row = self.repository.prepare_notification_in_transaction(
+                    notification_ref.id, context_id=self.context_id, kind=chunk_kind,
+                    body=chunk, now=now, context_data=context, existing_data=existing,
+                    operation_id=self.operation_id, presentation=chunk_presentation,
+                    presentation_id=presentation_id,
+                    presentation_conversation_id=presentation_conversation_id,
+                )
+                if not snapshot.exists:
+                    tx.set(notification_ref, row)
+                if index == len(chunk_work) - 1:
+                    tx.update(operation_ref, {"notification_id": notification_ref.id})
+                return notification_ref.id
+
+            result = persist(transaction)
+            if not isinstance(result, str):
+                return []
+            row = self.repository.get_notification(result)
+            if (not isinstance(row, Mapping) or row.get("presentation_id") != presentation_id
+                    or row.get("presentation_conversation_id") != presentation_conversation_id
+                    or row.get("body") != chunk or row.get("kind") != chunk_kind
+                    or row.get("operation_id") != self.operation_id):
+                raise ValueError("prepared presentation notification identity changed")
+            prepared.append({"notification_id": result, "revision": row.get("revision")})
+        return prepared
+
+    async def deliver_prepared(
+        self, body: str, *, prepared_notifications: Mapping[str, Any],
+        presentation: str = "rich_markdown",
+    ) -> _DeliveryStatus:
+        """Publish exactly the immutable chunk revisions already linked by a manifest."""
+        presentation_id = prepared_notifications.get("presentation_id")
+        conversation_id = prepared_notifications.get("conversation_id")
+        refs = prepared_notifications.get("notification_refs")
+        if (not isinstance(presentation_id, str) or not isinstance(conversation_id, str)
+                or not isinstance(refs, list)):
+            return _DeliveryStatus("terminal")
+        chunk_work = _command_reply_chunks(body, kind="final", bound_receipt_card=False)
+        safe_rich_chunks = rich_markdown_safe_chunk_indices(
+            (index, chunk) for index, chunk, _chunk_kind in chunk_work
+        )
+        if len(refs) != len(chunk_work):
+            return _DeliveryStatus("terminal")
+        for (index, chunk, chunk_kind), ref in zip(chunk_work, refs):
+            if (not isinstance(ref, Mapping) or set(ref) != {"notification_id", "revision"}
+                    or type(ref.get("revision")) is not int or ref["revision"] < 1):
+                return _DeliveryStatus("terminal")
+            expected_id = self.notification_id(chunk_kind, index)
+            if ref.get("notification_id") != expected_id:
+                return _DeliveryStatus("terminal")
+            notification = self.repository.get_notification(expected_id)
+            if (not isinstance(notification, Mapping)
+                    or notification.get("context_id") != self.context_id
+                    or notification.get("operation_id") != self.operation_id
+                    or notification.get("presentation_id") != presentation_id
+                    or notification.get("presentation_conversation_id") != conversation_id
+                    or notification.get("revision") != ref["revision"]
+                    or notification.get("kind") != chunk_kind
+                    or notification.get("body") != chunk):
+                return _DeliveryStatus("terminal")
+            result = await self.publisher.publish(expected_id)
+            if result != "delivered":
+                disposition = "terminal" if result in {
+                    "failed", "delivery_unknown", "superseded", "not_found", "stale",
+                } else "pending"
+                return _DeliveryStatus(disposition)
+        return _DeliveryStatus("delivered")
+
     async def deliver(
         self, body: str, *, kind: str = "final", presentation: str = "plain",
+        prepared_notifications: Mapping[str, Any] | None = None,
     ) -> _DeliveryStatus:
+        if prepared_notifications is not None:
+            return await self.deliver_prepared(
+                body, prepared_notifications=prepared_notifications,
+                presentation=presentation,
+            )
         context_ref = self.repository.client.collection("telegram_sessions").document(self.context_id)
         operation_ref = context_ref.collection("operations").document(self.operation_id)
         initial_operation = operation_ref.get().to_dict() or {}
@@ -1505,13 +1621,20 @@ class _CommandExecution(SearchAgentMixin):
 
     async def finish_reply(self, body: str, *, kind: str = "final",
                            presentation: str = "plain",
-                           failure_final: bool = False) -> QueueOperationState:
+                           failure_final: bool = False,
+                           prepared_notifications: Mapping[str, Any] | None = None
+                           ) -> QueueOperationState:
         """Settle queue state only after every deterministic reply chunk is handled."""
         if presentation == "plain":
             status = await self.replies.deliver(body, kind=kind)
+        elif prepared_notifications is None:
+            status = await self.replies.deliver(
+                body, kind=kind, presentation=presentation,
+            )
         else:
             status = await self.replies.deliver(
                 body, kind=kind, presentation=presentation,
+                prepared_notifications=prepared_notifications,
             )
         if status == "delivered":
             return QueueOperationState.FAILED if failure_final else QueueOperationState.COMPLETED

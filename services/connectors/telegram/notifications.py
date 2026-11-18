@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +28,7 @@ _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-notification")
 _SYNC_WAIT_SECONDS = 15.0
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
+_LOGGER = logging.getLogger(__name__)
 
 
 async def _offload_repository_call(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
@@ -161,6 +164,8 @@ class TelegramNotificationPublisher:
             return "not_found"
         if not reservation.get("reserved"):
             state = reservation.get("state")
+            if state == "delivered" and reservation.get("presentation_id") is not None:
+                return await self._publish_presentation_delivery(reservation)
             return state if state in {"delivered", "failed", "delivery_unknown", "superseded"} else "busy"
 
         delivery = await self._deliver_attempt(notification_id, attempt_id, reservation)
@@ -290,7 +295,46 @@ class TelegramNotificationPublisher:
             return "not_found"
         if not settled.get("settled"):
             return "stale"
-        return str(settled["state"])
+        state = str(settled["state"])
+        if state == "delivered" and settled.get("presentation_id") is not None:
+            return await self._publish_presentation_delivery(settled)
+        return state
+
+    async def _publish_presentation_delivery(self, notification: dict[str, Any]) -> str:
+        """Link one actual delivered row revision to its prepared manifest."""
+        context_id = notification.get("context_id")
+        conversation_id = notification.get("presentation_conversation_id")
+        presentation_id = notification.get("presentation_id")
+        notification_id = notification.get("notification_id")
+        revision = notification.get("revision")
+        body = notification.get("body")
+        message_id = notification.get("message_id")
+        delivered_at = notification.get("delivered_at")
+        if (not isinstance(context_id, str) or not isinstance(conversation_id, str)
+                or not isinstance(presentation_id, str) or not isinstance(notification_id, str)
+                or type(revision) is not int or not isinstance(body, str)
+                or type(message_id) is not int or not isinstance(delivered_at, datetime)):
+            return "busy"
+        try:
+            confirmed = await storage_call(
+                _offload_repository_call, self.repository.publish_presentation_delivery,
+                context_id, conversation_id, presentation_id,
+                notification_id=notification_id, revision=revision, body=body,
+                body_sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                message_id=message_id, delivered_at=delivered_at, now=self.clock(),
+                diagnostic_notification_id=notification_id,
+                diagnostic_operation_id=notification.get("operation_id"),
+                diagnostic_revision=revision, phase="presentation_delivery_proof",
+            )
+        except Exception as error:
+            _LOGGER.warning(
+                "telegram presentation delivery proof failed",
+                extra={"operation_id": notification.get("operation_id"),
+                       "phase": "presentation_delivery_proof", "code": "proof_failed",
+                       "exception_class": type(error).__name__},
+            )
+            return "busy"
+        return "delivered" if confirmed is True else "busy"
 
     async def send_switch_notice(
         self, *, context_id: str, operation_id: str, notification_id: str,

@@ -624,7 +624,7 @@ def _runtime_queue_item(client, *, operation_id="op-runtime"):
         })
     client.collection("telegram_sessions").document(context_id).collection(
         "commands").document("9").set({
-            "context_id": context_id, "operation_id": operation_id,
+            "context_id": context_id, "operation_id": operation_id, "user_id": 7,
             "kind": "freeform", "text": "private request",
         })
     operation = {"operation_id": operation_id, "context_id": context_id,
@@ -655,6 +655,13 @@ class _RuntimeModel:
         if mode == "routing":
             return {"parts": [{"function_call": {
                 "name": "route_command", "args": self.route_value,
+            }}]}
+        if mode == "tool_loop_presented":
+            return {"parts": [{"function_call": {
+                "name": "present_search_answer",
+                "args": {"blocks": [{
+                    "type": "paragraph", "text": self.answer, "source_refs": [],
+                }]},
             }}]}
         return {"text": self.answer, "parts": [{"text": self.answer}]}
 
@@ -1060,7 +1067,7 @@ def test_no_document_list_folders_uses_validated_registry_executor(firestore_fak
                          loop_factory=_selector_loop)
 
     assert result.value == "completed"
-    assert [row[0] for row in model.calls] == ["routing", "tool_loop"]
+    assert [row[0] for row in model.calls] == ["routing", "tool_loop_presented"]
     assert len(bot.sent) == 1
     assert repository.get_conversation(context_id, "search-existing").kind.value == "search"
     route_prompt = json.loads(model.calls[0][1][0]["parts"][0]["text"])
@@ -1778,7 +1785,7 @@ def test_search_route_is_governed_replayable_and_isolated(monkeypatch, firestore
     assert first.value == replay.value == "completed"
     assert len(calls) == 1
     model_contents = next(contents for mode, contents, _tools in model.calls
-                          if mode == "tool_loop")
+                          if mode == "tool_loop_presented")
     application_data = next(part["text"] for turn in model_contents
                             if turn.get("role") == "user"
                             for part in turn.get("parts", [])

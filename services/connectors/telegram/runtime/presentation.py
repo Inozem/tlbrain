@@ -179,8 +179,12 @@ def _validated_exchange_input(
     call = envelope["call"]
     if not isinstance(call, Mapping) or not {"name", "arguments"}.issubset(call):
         raise ValueError("search call is incomplete")
-    if set(call) - {"id", "name", "arguments", "ordinal", "round"}:
+    if set(call) - {"id", "name", "arguments", "ordinal", "round", "thought_signature"}:
         raise ValueError("search call has unknown fields")
+    thought_signature = call.get("thought_signature")
+    if ("thought_signature" in call and thought_signature is not None
+            and not isinstance(thought_signature, str)):
+        raise ValueError("search call thought signature must be a string or null")
     if type(call.get("ordinal")) is not int or call["ordinal"] != envelope["ordinal"]:
         raise ValueError("search call ordinal is contradictory")
     native_id = call.get("id")
