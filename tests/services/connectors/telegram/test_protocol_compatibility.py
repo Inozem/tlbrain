@@ -1800,13 +1800,25 @@ def test_t016_metadata_only_application_route_has_no_synthetic_tool_result(
     sdk_contents = repr(sdk_payloads[0].get("arguments", {}).get("contents", ()))
     assert "function_response" not in sdk_contents
     assert "<application-tool-result-data>" not in sdk_contents
+    assert "accepted_command_ref" not in sdk_contents
+    assert "full_history_ref" not in sdk_contents
+    assert "saved-routing-decision" not in sdk_contents.lower()
     assert "function_response" not in repr(restored["model_response"])
     assert "<application-tool-result-data>" not in repr(restored["model_response"])
     assert restored["tool_calls"] == []
     assert restored.get("tool_results", {}) == {}
+    with pytest.raises(ValueError, match="metadata route cannot become"):
+        agent.dispatch_tool_choice(
+            name="query", arguments={"query": "new executable choice"},
+            target_doc_id=None, conversation_id=checkpoint_conversation,
+            delivery_id=accepted.operation_id,
+            executor_factory=lambda *_args: executor,
+        )
 
 
-def _t016_seed_prepared_clarification(firestore_fake, *, complete):
+def _t016_seed_prepared_clarification(
+    firestore_fake, *, complete, joint=False, resolved_parameters=None,
+):
     from core.integrations.firestore.operation_queue import claim_head
     from services.connectors.telegram.commands import parse_command
     from services.connectors.telegram.models import (
@@ -1866,7 +1878,8 @@ def _t016_seed_prepared_clarification(firestore_fake, *, complete):
         origin_conversation_id=source_conversation,
         original_command_ref=context_checkpoint["ref"],
         original_command_digest=context_checkpoint["digest"], action="create_folder",
-        resolved_parameters={"parent_id": "pytest-synthetic-root"},
+        resolved_parameters=(resolved_parameters if resolved_parameters is not None
+                             else {"parent_id": "pytest-synthetic-root"}),
         missing_slots=("folder_name",),
         evidence_snapshot_ref=context_checkpoint["ref"],
         evidence_snapshot_digest=context_checkpoint["digest"],
@@ -1889,14 +1902,17 @@ def _t016_seed_prepared_clarification(firestore_fake, *, complete):
         missing_slots=("folder_name",), certainty=Certainty.UNCERTAIN,
     )
     ordinary_summary = {"status": "uncertain", "kind": "substantive"}
-    assert repository.persist_route(
-        accepted.operation_id, ordinary_summary,
-        context_id=accepted.context_id, owner=lease.owner, fence=lease.fence,
-        now=BASE_TIME,
-    )
-    persisted_summary = repository.get_route_control(
-        accepted.context_id, accepted.operation_id,
-    )
+    if joint:
+        persisted_summary = repository._route_control_data(ordinary_summary)
+    else:
+        assert repository.persist_route(
+            accepted.operation_id, ordinary_summary,
+            context_id=accepted.context_id, owner=lease.owner, fence=lease.fence,
+            now=BASE_TIME,
+        )
+        persisted_summary = repository.get_route_control(
+            accepted.context_id, accepted.operation_id,
+        )
     # This is valid fixture state, not evidence that the production publisher
     # currently writes the route summary and application checkpoint atomically.
     metadata_route = {"contextual": {
@@ -1912,16 +1928,27 @@ def _t016_seed_prepared_clarification(firestore_fake, *, complete):
         "source_conversation_id": source_conversation,
         "checkpoint_conversation_id": target_checkpoint,
         "decision": decision.to_dict(),
-        "resolved": {"parent_id": "pytest-synthetic-root"},
+        "resolved": pending.to_dict()["resolved_parameters"],
         "fixed_plan": None,
         "intent_ref": intent_checkpoint["ref"],
         "intent_digest": intent_checkpoint["digest"],
         "summary": persisted_summary,
     }}
-    ledger.save_application_route(
-        target_checkpoint, accepted.operation_id, route=metadata_route,
-        tool_calls=[], application_route_round=None,
-    )
+    if joint:
+        prepared = ledger.prepare_application_route(
+            target_checkpoint, accepted.operation_id, route=metadata_route,
+            tool_calls=[], application_route_round=None,
+        )
+        assert repository.persist_route(
+            accepted.operation_id, ordinary_summary,
+            context_id=accepted.context_id, owner=lease.owner, fence=lease.fence,
+            now=BASE_TIME, application_checkpoint=prepared,
+        )
+    else:
+        ledger.save_application_route(
+            target_checkpoint, accepted.operation_id, route=metadata_route,
+            tool_calls=[], application_route_round=None,
+        )
     completion = repository.prepare_clarification_completion(intent_checkpoint)
     if complete:
         assert repository.complete_with_clarification(
@@ -1931,6 +1958,65 @@ def _t016_seed_prepared_clarification(firestore_fake, *, complete):
         )
     return (client, repository, accepted, operation, lease, completion,
             metadata_route, intent_checkpoint)
+
+
+def test_joint_clarification_preserves_frozen_known_folder_path(
+    firestore_fake, sdk_fakes,
+):
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    (client, _repository, accepted, _operation, lease, _completion,
+     route, _intent_reference) = _t016_seed_prepared_clarification(
+        firestore_fake, complete=False, joint=True,
+        resolved_parameters={
+            "parent_id": "pytest-synthetic-root",
+            "folder_path": ["Projects", "Archive"],
+        },
+    )
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: BASE_TIME,
+    )
+    restored = ledger.load_turn(
+        "t016-fixed-checkpoint-conversation", accepted.operation_id,
+    )
+    assert restored["application_route"]["contextual"]["resolved"] == {
+        "parent_id": "pytest-synthetic-root",
+        "folder_path": ["Projects", "Archive"],
+    }
+    assert restored["tool_calls"] == []
+
+
+def test_t016_stored_clarification_without_intent_fails_before_agent_execution(
+    firestore_fake, sdk_fakes,
+):
+    from services.connectors.telegram.agent import TelegramAgent
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    (client, _repository, accepted, _operation, lease, _completion,
+     route, _intent_reference) = _t016_seed_prepared_clarification(
+        firestore_fake, complete=False,
+    )
+    route["contextual"].pop("intent_ref")
+    route["contextual"].pop("intent_digest")
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: BASE_TIME,
+    )
+    turn_ref = ledger._ref(accepted.operation_id)
+    turn = turn_ref.get().to_dict()
+    turn["application_route"] = ledger._store_payload("application-route", route)
+    turn_ref.set(turn)
+    constructed = []
+    agent = TelegramAgent(model=object(), ledger=ledger, tool_executor=object())
+    with pytest.raises(ValueError, match="persisted application checkpoint is invalid"):
+        agent.dispatch_tool_choice(
+            name="query", arguments={"query": "must not run"}, target_doc_id=None,
+            conversation_id="t016-fixed-checkpoint-conversation",
+            delivery_id=accepted.operation_id,
+            executor_factory=lambda *_args: constructed.append(True),
+        )
+    assert constructed == []
 
 
 def _t016_clarification_publication_snapshot(client, accepted, durable_documents):

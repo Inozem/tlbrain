@@ -833,6 +833,163 @@ def _semantic_write_tool(
     return None
 
 
+def _validate_stored_joint_projection(
+    application_route: Mapping[str, Any], summary: Mapping[str, Any],
+) -> None:
+    """Cross-check a persisted semantic decision against its ordinary route projection."""
+    contextual, decision, resolved, selector, resolved_doc = _stored_joint_projection_facts(
+        application_route, summary,
+    )
+    resolved_operation = resolved.get("target_operation_id")
+    summary_operation = summary.get("target_operation_id")
+    _validate_stored_selector_projection(
+        summary, selector, resolved_doc, resolved_operation, summary_operation,
+    )
+    _validate_stored_disposition_projection(
+        application_route, summary, contextual, decision, resolved,
+    )
+
+
+def _stored_joint_projection_facts(
+    application_route: Mapping[str, Any], summary: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], RoutingDecision, Mapping[str, Any], Any, Any]:
+    """Parse stored semantic data and verify its kind and frozen operation binding."""
+    contextual = application_route.get("contextual")
+    if not isinstance(contextual, Mapping):
+        raise ValueError("contextual application decision is absent")
+    decision = RoutingDecision.from_dict(contextual.get("decision"))
+    resolved = contextual.get("resolved")
+    if not isinstance(resolved, Mapping):
+        raise ValueError("resolved semantic parameters are malformed")
+    ordinary_kind = {
+        Action.MOVE_TRANSCRIPT: "substantive", Action.CREATE_FOLDER: "substantive",
+        Action.CREATE_THEN_MOVE: "substantive",
+    }.get(decision.action, decision.action.value)
+    if summary.get("kind") != ordinary_kind:
+        raise ValueError("semantic action conflicts with ordinary route kind")
+    selector = decision.document_selector
+    resolved_doc = resolved.get("doc_id")
+    if resolved_doc is not None and (not isinstance(resolved_doc, str) or not resolved_doc):
+        raise ValueError("resolved document target is malformed")
+    resolved_operation = resolved.get("target_operation_id")
+    summary_operation = summary.get("target_operation_id")
+    if resolved_operation is not None or summary_operation is not None:
+        bound_ref = contextual.get("accepted_command_ref")
+        payload = bound_ref.get("payload") if isinstance(bound_ref, Mapping) else None
+        hints = set()
+        if isinstance(payload, Mapping):
+            for key in ("predecessor_operation_id", "pending_save_candidate_operation_id"):
+                candidate = payload.get(key)
+                if isinstance(candidate, str) and candidate:
+                    hints.add(candidate)
+        if (not isinstance(resolved_operation, str) or not resolved_operation
+                or summary_operation != resolved_operation
+                or resolved_operation not in hints):
+            raise ValueError("ordinary operation target lacks a frozen accepted-command binding")
+    return contextual, decision, resolved, selector, resolved_doc
+
+
+def _validate_stored_selector_projection(
+    summary: Mapping[str, Any], selector: Any, resolved_doc: Any,
+    resolved_operation: Any, summary_operation: Any,
+) -> None:
+    """Check frozen selector bindings against the ordinary route summary."""
+    if selector is None:
+        if ((resolved_operation is None and summary_operation is not None)
+                or (resolved_operation is not None and summary_operation != resolved_operation)):
+            raise ValueError("ordinary route has no verified operation target")
+        if resolved_doc is not None and summary.get("target_ref") not in (None, resolved_doc):
+            raise ValueError("ordinary document target conflicts with resolved binding")
+    elif selector.kind is DocumentSelectorKind.EXPLICIT_REFERENCE:
+        from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+        expected_ref = TelegramRuntimeStore._reference_value(selector.span)
+        if not isinstance(expected_ref, str) or not expected_ref:
+            raise ValueError("literal document selector has no canonical reference")
+        if summary.get("target_ref") != expected_ref:
+            raise ValueError("ordinary route target conflicts with literal selector")
+        if resolved_doc is not None and resolved_doc != expected_ref:
+            raise ValueError("resolved document conflicts with literal selector")
+    elif selector.kind is DocumentSelectorKind.DIALOG_NUMBER:
+        if (summary.get("dialog_number") != selector.dialog_number
+                or (resolved_doc is not None and summary.get("target_ref") != resolved_doc)):
+            raise ValueError("ordinary route target conflicts with dialog selector")
+    elif selector.kind is DocumentSelectorKind.LAST_SAVED:
+        if summary.get("target_ref") != "last":
+            raise ValueError("ordinary route target conflicts with last-saved selector")
+    elif selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
+        if resolved_doc is not None and summary.get("target_ref") != resolved_doc:
+            raise ValueError("ordinary route target conflicts with active-document binding")
+    elif selector.kind in {DocumentSelectorKind.EVIDENCE,
+                           DocumentSelectorKind.SHOWN_POSITION}:
+        if resolved_doc is not None and summary.get("target_ref") != resolved_doc:
+            raise ValueError("ordinary route target conflicts with resolved evidence")
+
+
+def _validate_stored_disposition_projection(
+    application_route: Mapping[str, Any], summary: Mapping[str, Any],
+    contextual: Mapping[str, Any], decision: RoutingDecision,
+    resolved: Mapping[str, Any],
+) -> None:
+    """Check disposition policy, metadata-only routes, and executable tool choice."""
+    disposition = decision.disposition
+    if disposition is Disposition.CLARIFY:
+        if (summary.get("status") != "uncertain" or not decision.missing_slots
+                or decision.certainty is not Certainty.UNCERTAIN
+                or contextual.get("fixed_plan") is not None
+                or summary.get("tool_choice") is not None
+                or any(key in application_route for key in (
+                    "name", "arguments", "ordinal", "target_doc_id",
+                ))):
+            raise ValueError("clarification projection is inconsistent")
+        return
+    if (disposition not in {Disposition.EXECUTE, Disposition.DELEGATE}
+            or summary.get("status") not in {"ok", "success"}
+            or decision.certainty is not Certainty.CERTAIN or decision.missing_slots):
+        raise ValueError("saved decision is not executable or delegated")
+    executable = {"name", "arguments", "ordinal", "target_doc_id"}.issubset(application_route)
+    if not executable:
+        if contextual.get("fixed_plan") is not None:
+            raise ValueError("metadata route contains an executable projection")
+        if (decision.action in {Action.MOVE_TRANSCRIPT, Action.CREATE_FOLDER,
+                                Action.CREATE_THEN_MOVE}
+                or isinstance(summary.get("tool_choice"), Mapping)
+                and OPERATIONS[summary["tool_choice"].get("name")].write):
+            raise ValueError("metadata route omits a required executable write")
+        return
+    if "name" not in application_route or application_route["name"] not in OPERATIONS:
+        raise ValueError("saved tool is unsupported")
+    if disposition is Disposition.DELEGATE and OPERATIONS[application_route["name"]].write:
+        raise ValueError("delegated decisions cannot authorize writes")
+    projected_route = {
+        "target_ref": resolved.get("doc_id", application_route.get("target_doc_id")),
+    }
+    generated = _semantic_write_tool(decision, projected_route,
+                                     last_doc_id=resolved.get("doc_id"))
+    choice = summary.get("tool_choice")
+    if generated is not None:
+        normalized = dict(choice) if isinstance(choice, Mapping) else choice
+        if isinstance(normalized, Mapping):
+            args = dict(normalized.get("arguments", {}))
+            if normalized.get("name") == "create_folder" and args.get("parent_path") == []:
+                args.pop("parent_path")
+            normalized["arguments"] = args
+        if normalized != generated:
+            raise ValueError("semantic decision conflicts with ordinary tool choice")
+    elif choice is not None:
+        if not isinstance(choice, Mapping) or choice.get("name") != application_route["name"]:
+            raise ValueError("ordinary tool choice conflicts with semantic action")
+    elif OPERATIONS[application_route["name"]].write:
+        raise ValueError("write tool is absent from the ordinary route projection")
+
+    selector = decision.document_selector
+    if (selector is not None and selector.kind is DocumentSelectorKind.EXPLICIT_REFERENCE):
+        from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+        explicit_id = TelegramRuntimeStore._reference_value(selector.span)
+        resolved_doc = resolved.get("doc_id")
+        if not isinstance(resolved_doc, str) or resolved_doc != explicit_id:
+            raise ValueError("explicit document reference conflicts with resolved target")
+
+
 def _valid_response(
     response: Any, *, accepted_command: str,
     operation_candidates: Any = (), active_doc_id: str | None = None,

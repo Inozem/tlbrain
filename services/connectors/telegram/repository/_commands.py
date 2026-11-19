@@ -32,6 +32,10 @@ from services.connectors.telegram.repository._common import (
     _receipt_result,
     _aware,
     _context_defaults,
+    _read_routing_checkpoint_value,
+    _routing_json_bytes,
+    _routing_reference_data,
+    _routing_checkpoint_path,
 )
 
 @dataclass(slots=True)
@@ -759,6 +763,603 @@ class _TelegramCommandMixin:
     """Persist idempotent command acceptance and operation registration."""
 
     @staticmethod
+    def _validate_joint_contextual_shape(
+        application_route: Any, *, context_id: str, operation_id: str,
+        checkpoint_conversation_id: str,
+    ) -> tuple[Mapping[str, Any], bool]:
+        """Share the contextual DTO and tool-shape checks across prepare/read paths."""
+        if not isinstance(application_route, Mapping) or "contextual" not in application_route:
+            raise ValueError("contextual application route is absent")
+        _routing_json_bytes(application_route)
+        executable_fields = {"name", "arguments", "ordinal", "target_doc_id"}
+        present = executable_fields.intersection(application_route)
+        executable = present == executable_fields
+        expected_top = {"contextual"}
+        if executable:
+            expected_top |= executable_fields
+            if "call_id" in application_route:
+                expected_top.add("call_id")
+        if set(application_route) != expected_top:
+            raise ValueError("contextual application route shape is invalid")
+        contextual = application_route.get("contextual")
+        required = {
+            "schema_version", "context_ref", "context_digest", "context_id",
+            "operation_id", "actor_id", "accepted_command", "accepted_command_ref",
+            "full_history_ref", "source_conversation_id", "checkpoint_conversation_id",
+            "decision", "resolved", "summary", "fixed_plan",
+        }
+        if (not isinstance(contextual, Mapping)
+                or set(contextual) not in (required, required | {"intent_ref", "intent_digest"})
+                or ("intent_ref" in contextual) != ("intent_digest" in contextual)
+                or type(contextual.get("schema_version")) is not int
+                or contextual.get("schema_version") != 1
+                or contextual.get("context_id") != context_id
+                or contextual.get("operation_id") != operation_id
+                or type(contextual.get("actor_id")) is not int
+                or contextual.get("actor_id") <= 0
+                or contextual.get("checkpoint_conversation_id") != checkpoint_conversation_id
+                or not isinstance(contextual.get("source_conversation_id"), str)
+                or not contextual.get("source_conversation_id")
+                or not isinstance(contextual.get("accepted_command"), str)):
+            raise ValueError("contextual application route binding is invalid")
+        return contextual, executable
+
+    @staticmethod
+    def _validate_joint_intent_binding(
+        client: Any, contextual: Mapping[str, Any], snapshot: Any,
+        context_reference: Mapping[str, Any], *, transaction: Any = None,
+    ) -> None:
+        """Read and verify a complete T011 clarification request for both joint paths."""
+        from services.connectors.telegram.runtime.routing_context import RoutingDecision
+
+        decision = RoutingDecision.from_dict(contextual.get("decision"))
+        has_intent = "intent_ref" in contextual
+        if (decision.disposition.value == "clarify") != has_intent:
+            raise ValueError("clarification route requires its complete intent binding")
+        if not has_intent:
+            return
+        context_id = snapshot.context_id
+        operation_id = snapshot.operation_id
+        intent_path = _routing_checkpoint_path(context_id, operation_id, "intent")
+        if contextual.get("intent_ref") != intent_path:
+            raise ValueError("contextual intent path is invalid")
+        intent_header = _document_ref(client, intent_path).get(transaction=transaction)
+        header = intent_header.to_dict() or {} if intent_header.exists else {}
+        intent_reference = _routing_reference_data({key: header.get(key) for key in (
+            "routing_protocol", "schema_version", "kind", "context_id", "operation_id",
+            "actor_id", "conversation_id", "ref", "digest", "byte_length",
+        )})
+        if (intent_reference["kind"] != "intent"
+                or intent_reference["ref"] != intent_path
+                or intent_reference["context_id"] != context_id
+                or intent_reference["operation_id"] != operation_id
+                or type(intent_reference["actor_id"]) is not int
+                or intent_reference["actor_id"] != snapshot.actor_id
+                or intent_reference["conversation_id"] != snapshot.selected_conversation_id
+                or intent_reference["digest"] != contextual.get("intent_digest")):
+            raise ValueError("contextual intent header scope changed")
+        request = _read_routing_checkpoint_value(
+            client, intent_reference, transaction=transaction,
+        )
+        if (not isinstance(request, Mapping)
+                or set(request) != {
+                    "protocol", "clarification", "context_reference", "question", "prompt",
+                }
+                or _routing_json_bytes(request.get("context_reference"))
+                != _routing_json_bytes(context_reference)):
+            raise ValueError("contextual clarification request is malformed")
+        from services.connectors.telegram.repository._clarifications import (
+            _decode_clarification_checkpoint,
+        )
+        _decoded_context_ref, pending, _decoded_snapshot, _prompt = (
+            _decode_clarification_checkpoint(
+                intent_reference, request, snapshot.to_dict(),
+            )
+        )
+        resolved = contextual.get("resolved")
+        if (pending.action != decision.action.value
+                or tuple(pending.missing_slots) != tuple(decision.missing_slots)
+                or not isinstance(resolved, Mapping)
+                or _routing_json_bytes(
+                    pending.to_dict()["resolved_parameters"]
+                )
+                != _routing_json_bytes(resolved)):
+            raise ValueError("contextual intent does not match its decision")
+
+    @staticmethod
+    def _validate_joint_routing_snapshot(
+        snapshot: Any, *, client: Any, context_id: str, operation_id: str,
+        actor_id: int, input_ref: str, operation: Mapping[str, Any],
+        command: Mapping[str, Any], conversation_id: str,
+    ) -> None:
+        """Validate legacy minimal refs or the exact frozen T017 capture projection."""
+        accepted = snapshot.accepted_command_ref
+        history = snapshot.full_history_ref
+        if (accepted.ref != input_ref
+                or accepted.context_id != context_id or type(accepted.actor_id) is not int
+                or accepted.actor_id != actor_id
+                or accepted.conversation_id != conversation_id
+                or accepted.operation_id != operation_id
+                or history.ref != f"{SESSIONS}/{context_id}/conversations/{conversation_id}/turns"
+                or history.context_id != context_id or type(history.actor_id) is not int
+                or history.actor_id != actor_id or history.conversation_id != conversation_id
+                or history.operation_id != operation_id):
+            raise ValueError("contextual bound-reference scope is invalid")
+        minimal_legacy = (
+            accepted.payload == {"text": snapshot.accepted_command}
+            and isinstance(history.payload, Mapping)
+            and set(history.payload) == {"turns"}
+        )
+        if minimal_legacy:
+            if (accepted.digest != hashlib.sha256(
+                    snapshot.accepted_command.encode("utf-8")).hexdigest()
+                    or not isinstance(history.payload["turns"], (list, tuple))
+                    or history.digest != hashlib.sha256(_routing_json_bytes(
+                        history.to_dict()["payload"]["turns"])).hexdigest()):
+                raise ValueError("minimal contextual bound-reference digest is invalid")
+            return
+        from services.connectors.telegram.repository import TelegramRepository
+        from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+
+        validator = TelegramRuntimeStore(
+            TelegramRepository(client=client), context_id=context_id,
+            operation_id=operation_id,
+        )
+        validator._validate_captured_snapshot(
+            snapshot, actor_id=actor_id, input_ref=input_ref, operation=operation,
+            command=command, conversation_id=conversation_id,
+        )
+
+    def _load_joint_payload(
+        self, stored: Any, kind: str, context_id: str, operation_id: str, transaction: Any,
+    ) -> Any:
+        from core.integrations.firestore.input_parts import MAX_PART_BYTES, read_input_parts
+        from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+        if not isinstance(stored, Mapping):
+            raise ValueError("prepared application payload is malformed")
+        digest, byte_length = stored.get("sha256"), stored.get("byte_length")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or type(byte_length) is not int or byte_length < 0):
+            raise ValueError("prepared application payload metadata is invalid")
+        if set(stored) == {"_inline", "sha256", "byte_length"}:
+            value = stored["_inline"]
+            payload = FirestoreAgentLedger._json_bytes(value)
+            if len(payload) > 4096:
+                raise ValueError("prepared application inline payload is oversized")
+        elif set(stored) == {"_input_ref", "sha256", "byte_length", "max_part_bytes"}:
+            data_operation = "telegram-ledger-" + hashlib.sha256(
+                f"{context_id}\0{operation_id}\0{kind}\0{digest}".encode()
+            ).hexdigest()
+            expected_ref = f"dialog_operations/{data_operation}/input_parts/manifest"
+            if (stored.get("_input_ref") != expected_ref
+                    or type(stored.get("max_part_bytes")) is not int
+                    or stored.get("max_part_bytes") != MAX_PART_BYTES
+                    or byte_length <= 4096):
+                raise ValueError("prepared application parts are not operation-owned")
+            payload = read_input_parts(self.client, expected_ref, transaction=transaction)
+            value = FirestoreAgentLedger._json_value(payload)
+        else:
+            raise ValueError("prepared application payload mode is invalid")
+        if len(payload) != byte_length or hashlib.sha256(payload).hexdigest() != digest:
+            raise ValueError("prepared application payload integrity failed")
+        return value
+
+    @staticmethod
+    def _validate_joint_folder_binding(
+        selector: Any, *, target_id: Any, root_id: Any, label: str,
+    ) -> None:
+        from services.connectors.telegram.runtime.routing_context import FolderSelectorKind
+
+        if selector is None or selector.kind is FolderSelectorKind.ROOT_DEFAULT:
+            if target_id != root_id:
+                raise ValueError(f"default {label} is not the captured root")
+        elif (selector.kind is FolderSelectorKind.EXPLICIT_ID
+              and selector.value != target_id):
+            raise ValueError(f"explicit {label} conflicts with resolved identity")
+
+    @staticmethod
+    def _validate_joint_application_projection(
+        application_route: Mapping[str, Any], summary: Mapping[str, Any],
+    ) -> None:
+        from services.connectors.telegram.sessions import _validate_stored_joint_projection
+        from services.connectors.telegram.runtime.routing_context import (
+            Action, FolderSelectorKind, RoutingDecision,
+        )
+
+        _validate_stored_joint_projection(application_route, summary)
+        _TelegramCommandMixin._validate_joint_application_projection_fields(
+            application_route, summary,
+        )
+
+    @staticmethod
+    def _validate_joint_application_projection_fields(
+        application_route: Mapping[str, Any], summary: Mapping[str, Any],
+    ) -> None:
+        from services.connectors.telegram.runtime.routing_context import (
+            Action, RoutingDecision,
+        )
+
+        contextual = application_route.get("contextual")
+        if not isinstance(contextual, Mapping):
+            raise ValueError("contextual application decision is absent")
+        decision = RoutingDecision.from_dict(contextual.get("decision"))
+        choice = summary.get("tool_choice")
+        executable_fields = {"name", "arguments", "ordinal", "target_doc_id"}
+        present = executable_fields.intersection(application_route)
+        if present and present != executable_fields:
+            raise ValueError("contextual executable application route is partial")
+        fixed_plan = contextual.get("fixed_plan")
+        resolved = contextual.get("resolved")
+        if not isinstance(resolved, Mapping):
+            raise ValueError("resolved contextual parameters are malformed")
+        if not present:
+            if fixed_plan is not None or choice is not None:
+                raise ValueError("metadata-only route contains an executable plan")
+            return
+        if (not isinstance(choice, Mapping)
+                and decision.action is not Action.CREATE_THEN_MOVE):
+            raise ValueError("application tool choice conflicts with summary")
+        if (isinstance(choice, Mapping)
+                and (application_route.get("name") != choice.get("name")
+                     or application_route.get("arguments") != choice.get("arguments"))):
+            raise ValueError("application tool choice conflicts with summary")
+        if (type(application_route.get("ordinal")) is not int
+                or application_route["ordinal"] < 0):
+            raise ValueError("application ordinal is invalid")
+        if application_route.get("target_doc_id") != summary.get("target_doc_id"):
+            raise ValueError("application target conflicts with summary")
+        if application_route.get("name") == "move_transcript":
+            resolved_doc = resolved.get("doc_id")
+            if (not isinstance(resolved_doc, str) or not resolved_doc
+                    or application_route.get("arguments", {}).get("doc_id") != resolved_doc
+                    or application_route.get("target_doc_id") != resolved_doc
+                    or summary.get("target_doc_id") != resolved_doc):
+                raise ValueError("move document target conflicts with resolved identity")
+        if application_route.get("name") == "create_folder" and (
+            application_route.get("target_doc_id") is not None
+            or summary.get("target_doc_id") is not None
+        ):
+            raise ValueError("folder creation cannot carry a document target")
+        action_to_tool = {
+            "move_transcript": {"move_transcript"},
+            "create_folder": {"create_folder"},
+            "create_then_move": {"create_folder", "move_transcript"},
+        }
+        expected = action_to_tool.get(decision.action.value)
+        if expected is not None and application_route["name"] not in expected:
+            raise ValueError("application tool conflicts with semantic action")
+        is_write = OPERATIONS[application_route["name"]].write
+        if fixed_plan is None:
+            if is_write:
+                raise ValueError("mutating contextual route has no fixed plan")
+            return
+        _TelegramCommandMixin._validate_joint_fixed_application_plan(
+            application_route, contextual, decision, fixed_plan, resolved,
+        )
+
+    @staticmethod
+    def _validate_joint_fixed_application_plan(
+        application_route: Mapping[str, Any], contextual: Mapping[str, Any],
+        decision: Any, fixed_plan: Any, resolved: Mapping[str, Any],
+    ) -> None:
+        from services.connectors.telegram.runtime.routing_context import Action
+
+        if not isinstance(fixed_plan, Mapping) or set(fixed_plan) != {"steps"}:
+            raise ValueError("fixed application plan shape is invalid")
+        steps = fixed_plan.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("fixed application plan is incomplete")
+        if decision.action is Action.CREATE_THEN_MOVE or len(steps) != 1:
+            raise ValueError("composite application plans are not supported")
+        expected_plan_names = {
+            "create_folder": ["create_folder"],
+            "move_transcript": ["move_transcript"],
+            "create_then_move": ["create_folder", "move_transcript"],
+        }.get(decision.action.value)
+        if expected_plan_names is not None and [
+            step.get("name") if isinstance(step, Mapping) else None for step in steps
+        ] != expected_plan_names:
+            raise ValueError("fixed mutation plan shape does not match semantic action")
+        if expected_plan_names is None and (
+            len(steps) != 1 or not isinstance(steps[0], Mapping)
+            or steps[0].get("name") != application_route["name"]
+        ):
+            raise ValueError("fixed operation plan does not match its application tool")
+        parent_operation = contextual.get("operation_id")
+        for candidate in steps:
+            _TelegramCommandMixin._validate_joint_application_step(
+                candidate, parent_operation=parent_operation,
+                expected_ordinal=application_route["ordinal"],
+                decision=decision, resolved=resolved,
+            )
+        _TelegramCommandMixin._validate_joint_application_step_projection(
+            application_route, steps,
+        )
+
+    @staticmethod
+    def _validate_joint_application_step(
+        candidate: Any, *, parent_operation: Any, expected_ordinal: int,
+        decision: Any, resolved: Mapping[str, Any],
+    ) -> None:
+        if (not isinstance(candidate, Mapping)
+                or type(candidate.get("ordinal")) is not int
+                or set(candidate) != {
+                    "ordinal", "name", "arguments", "target_doc_id",
+                    "operation_id", "effect_id", "resolved_targets",
+                }
+                or candidate.get("ordinal") != expected_ordinal
+                or not isinstance(candidate.get("name"), str)
+                or not isinstance(candidate.get("arguments"), Mapping)
+                or not isinstance(candidate.get("operation_id"), str)
+                or not isinstance(candidate.get("effect_id"), str)
+                or not isinstance(candidate.get("resolved_targets"), Mapping)):
+            raise ValueError("fixed application plan contains an incomplete step")
+        try:
+            validate_arguments(candidate["name"], candidate["arguments"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fixed application step arguments are invalid") from exc
+        child_digest = hashlib.sha256(
+            f"{parent_operation}\0{expected_ordinal}".encode("utf-8")
+        ).hexdigest()
+        effect_digest = hashlib.sha256(
+            f"{parent_operation}\0{expected_ordinal}".encode("utf-8")
+        ).hexdigest()
+        if (candidate["operation_id"] != "telegram-tool-" + child_digest
+                or candidate["effect_id"] != "telegram-effect-" + effect_digest):
+            raise ValueError("fixed application step identity is not deterministic")
+        if candidate["name"] not in OPERATIONS:
+            raise ValueError("fixed application step tool is unsupported")
+        if OPERATIONS[candidate["name"]].write:
+            _TelegramCommandMixin._validate_joint_resolved_step_targets(
+                candidate, decision=decision, resolved=resolved,
+            )
+
+    @staticmethod
+    def _validate_joint_resolved_step_targets(
+        candidate: Mapping[str, Any], *, decision: Any,
+        resolved: Mapping[str, Any],
+    ) -> None:
+        step_targets = candidate["resolved_targets"]
+        if candidate["name"] == "create_folder":
+            target_keys = {"parent_id", "root_id", "intent_digest"}
+            if (not target_keys.issubset(step_targets)
+                    or any(not isinstance(step_targets.get(key), str)
+                           or not step_targets[key] for key in target_keys)
+                    or step_targets.get("root_id") != resolved.get("root_id")
+                    or step_targets.get("parent_id") != resolved.get("parent_id")
+                    or step_targets.get("intent_digest") != resolved.get("intent_digest")
+                    or len(step_targets.get("intent_digest", "")) != 64
+                    or any(ch not in "0123456789abcdef"
+                           for ch in step_targets.get("intent_digest", ""))
+                    or candidate["arguments"].get("name") != resolved.get("folder_name", candidate["arguments"].get("name"))):
+                raise ValueError("folder plan targets conflict with resolved parameters")
+            _TelegramCommandMixin._validate_joint_folder_binding(
+                decision.folder_selector, target_id=step_targets.get("parent_id"),
+                root_id=step_targets.get("root_id"), label="folder parent",
+            )
+        elif candidate["name"] == "move_transcript":
+            target_keys = {"doc_id", "destination_id", "root_id", "intent_digest"}
+            if (not target_keys.issubset(step_targets)
+                    or any(not isinstance(step_targets.get(key), str)
+                           or not step_targets[key] for key in target_keys)
+                    or candidate["arguments"].get("doc_id") != step_targets.get("doc_id")
+                    or step_targets.get("doc_id") != resolved.get("doc_id")
+                    or step_targets.get("destination_id") != resolved.get("destination_id")
+                    or step_targets.get("root_id") != resolved.get("root_id")
+                    or step_targets.get("intent_digest") != resolved.get("intent_digest")
+                    or len(step_targets.get("intent_digest", "")) != 64
+                    or any(ch not in "0123456789abcdef"
+                           for ch in step_targets.get("intent_digest", ""))):
+                raise ValueError("move plan targets conflict with resolved parameters")
+            _TelegramCommandMixin._validate_joint_folder_binding(
+                decision.folder_selector,
+                target_id=step_targets.get("destination_id"),
+                root_id=step_targets.get("root_id"), label="move destination",
+            )
+
+    @staticmethod
+    def _validate_joint_application_step_projection(
+        application_route: Mapping[str, Any], steps: list[Any],
+    ) -> None:
+        matching = [step for step in steps if isinstance(step, Mapping)
+                    and step.get("ordinal") == application_route["ordinal"]]
+        if len(matching) != 1:
+            raise ValueError("fixed plan does not bind application ordinal")
+        step = matching[0]
+        if (step.get("name") != application_route["name"]
+                or step.get("arguments") != application_route["arguments"]
+                or step.get("target_doc_id") != application_route.get("target_doc_id")
+                or not isinstance(step.get("operation_id"), str)
+                or not isinstance(step.get("effect_id"), str)
+                or not isinstance(step.get("resolved_targets"), Mapping)):
+            raise ValueError("fixed application step conflicts with executable route")
+
+    def _read_joint_source_context(
+        self, transaction: Any, checkpoint: Any, *, context_id: str,
+        operation_id: str, actor_id: int, command_ref: Any,
+        command: Mapping[str, Any], operation: Mapping[str, Any],
+        safe_route: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        """Validate source identity, frozen routing input, intent and summary in-transaction."""
+        from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+        from services.connectors.telegram.runtime.routing_context import (
+            RoutingContextSnapshot, RoutingDecision,
+        )
+
+        if hashlib.sha256(checkpoint.route_payload).hexdigest() != checkpoint.route_digest:
+            raise ValueError("prepared application route digest changed")
+        application_route = FirestoreAgentLedger._json_value(checkpoint.route_payload)
+        contextual, _executable = self._validate_joint_contextual_shape(
+            application_route, context_id=context_id, operation_id=operation_id,
+            checkpoint_conversation_id=checkpoint.conversation_id,
+        )
+        accepted_text = contextual.get("accepted_command")
+        if ("candidate" in command and command.get("candidate") != accepted_text):
+            raise ValueError("prepared accepted command text changed")
+        command_digest = hashlib.sha256(json.dumps({
+            "kind": command.get("kind"), "text": accepted_text,
+            "action_metadata": command.get("action_metadata"),
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if (operation.get("identity_digest") != command_digest
+                or operation.get("input_ref") != command_ref.path):
+            raise ValueError("accepted command identity changed")
+        context_path = _routing_checkpoint_path(context_id, operation_id, "context")
+        if contextual.get("context_ref") != context_path:
+            raise ValueError("prepared source context path is invalid")
+        if contextual.get("actor_id") != actor_id:
+            raise PermissionError("contextual actor does not match accepted command")
+        context_header = _document_ref(self.client, context_path).get(transaction=transaction)
+        header = context_header.to_dict() or {} if context_header.exists else {}
+        context_reference = _routing_reference_data({key: header.get(key) for key in (
+            "routing_protocol", "schema_version", "kind", "context_id", "operation_id",
+            "actor_id", "conversation_id", "ref", "digest", "byte_length",
+        )})
+        if (context_reference.get("kind") != "context"
+                or context_reference.get("context_id") != context_id
+                or context_reference.get("operation_id") != operation_id
+                or context_reference.get("actor_id") != actor_id
+                or context_reference.get("conversation_id") != contextual.get("source_conversation_id")
+                or context_reference.get("digest") != contextual.get("context_digest")):
+            raise ValueError("prepared source context reference is invalid")
+        snapshot = RoutingContextSnapshot.from_dict(_read_routing_checkpoint_value(
+            self.client, context_reference, transaction=transaction,
+        ))
+        if (snapshot.context_id != context_id or type(snapshot.actor_id) is not int
+                or snapshot.actor_id != actor_id or snapshot.operation_id != operation_id
+                or snapshot.accepted_command != accepted_text
+                or snapshot.selected_conversation_id != contextual.get("source_conversation_id")
+                or _routing_json_bytes(snapshot.accepted_command_ref.to_dict())
+                != _routing_json_bytes(contextual.get("accepted_command_ref"))
+                or _routing_json_bytes(snapshot.full_history_ref.to_dict())
+                != _routing_json_bytes(contextual.get("full_history_ref"))):
+            raise ValueError("prepared contextual snapshot binding is invalid")
+        self._validate_joint_routing_snapshot(
+            snapshot, client=self.client, context_id=context_id,
+            operation_id=operation_id, actor_id=actor_id,
+            input_ref=command_ref.path, operation=operation, command=command,
+            conversation_id=contextual["source_conversation_id"],
+        )
+        decision = RoutingDecision.from_dict(contextual.get("decision"))
+        decision.validate_command_spans(accepted_text)
+        self._validate_joint_intent_binding(
+            self.client, contextual, snapshot, context_reference,
+            transaction=transaction,
+        )
+        summary = contextual.get("summary")
+        if (not isinstance(summary, Mapping)
+                or self._route_control_data(summary) != dict(safe_route)):
+            raise ValueError("prepared contextual summary projection conflicts")
+        self._validate_joint_application_projection(application_route, summary)
+        return application_route, contextual
+
+    @staticmethod
+    def _prepared_lease_is_current(
+        context: Mapping[str, Any], operation_id: str, owner: str, fence: int,
+        checkpoint: Any,
+    ) -> bool:
+        late_now = checkpoint._clock()
+        return validate_context_queue_lease(
+            context, operation_id, owner=owner, fence=fence, now=late_now,
+            expiry=context.get("lock_expires_at"),
+        )
+
+    def _read_joint_route_scope(
+        self, transaction: Any, *, context_ref: Any, operation_ref: Any,
+        context_id: str, operation_id: str, owner: str, fence: int, now: datetime,
+    ) -> tuple[dict[str, Any], dict[str, Any], Any, dict[str, Any]] | None:
+        """Read the lease and accepted command scope before planning joint writes."""
+        context_snapshot = context_ref.get(transaction=transaction)
+        operation_snapshot = operation_ref.get(transaction=transaction)
+        if not context_snapshot.exists or not operation_snapshot.exists:
+            return None
+        context = context_snapshot.to_dict() or {}
+        operation = operation_snapshot.to_dict() or {}
+        existing_route = operation.get("route_control")
+        if isinstance(existing_route, Mapping):
+            _reject_unsupported_route_metadata(existing_route)
+        if (operation.get("operation_id") != operation_id
+                or operation.get("state") != "running"
+                or not validate_context_queue_lease(
+                    context, operation_id, owner=owner, fence=fence, now=now,
+                    expiry=context.get("lock_expires_at"),
+                )):
+            return None
+        command_ref, command = self._command_for_operation(
+            transaction, context_id=context_id,
+            operation_id=operation_id, operation=operation,
+        )
+        return context, operation, command_ref, command
+
+    def _validate_joint_native_state(
+        self, turn: Mapping[str, Any], *, prepared_route: Mapping[str, Any],
+        prepared_calls: list[Any], checkpoint: Any, context_id: str,
+        operation_id: str, transaction: Any,
+    ) -> None:
+        """Verify immutable route/call prefixes without changing native rounds or results."""
+        existing_stored_route = turn.get("application_route")
+        existing_app = None
+        if existing_stored_route is not None:
+            existing_app = self._load_joint_payload(
+                existing_stored_route, "application-route", context_id,
+                operation_id, transaction,
+            )
+            if existing_app != prepared_route:
+                raise ValueError("persisted application route is immutable")
+        existing_calls = []
+        if turn.get("tool_calls") is not None:
+            existing_calls = self._load_joint_payload(
+                turn.get("tool_calls"), "calls", context_id, operation_id, transaction,
+            )
+            if (existing_app is None
+                    and existing_calls != prepared_calls[:len(existing_calls)]) or (
+                    existing_app is not None
+                    and prepared_calls != existing_calls[:len(prepared_calls)]):
+                raise ValueError("persisted agent calls are immutable")
+        if ("application_route_round" in turn
+                and turn.get("application_route_round") != checkpoint.route_round):
+            raise ValueError("persisted application route is immutable")
+        from services.connectors.telegram.agent import _contextual_call_provenance_valid
+        model_response = (None if turn.get("model_response") is None else
+                          self._load_joint_payload(
+                              turn.get("model_response"), "model", context_id,
+                              operation_id, transaction,
+                          ))
+        calls_to_validate = (
+            existing_calls if existing_app is not None
+            and isinstance(existing_app.get("contextual"), Mapping)
+            else prepared_calls
+        )
+        if not _contextual_call_provenance_valid({
+            "application_route": prepared_route,
+            "application_route_round": checkpoint.route_round,
+            "model_response": model_response, "tool_calls": calls_to_validate,
+            "delivery_id": operation_id,
+        }):
+            raise ValueError("prepared calls lack native or declared application provenance")
+
+    @staticmethod
+    def _write_joint_route_plan(
+        transaction: Any, *, turn_ref: Any, operation_ref: Any,
+        turn: Mapping[str, Any], operation_id: str, safe_route: Mapping[str, Any],
+        now: datetime, checkpoint: Any = None,
+    ) -> None:
+        """Apply the already validated native and summary write plan atomically."""
+        if checkpoint is not None:
+            transaction.set(turn_ref, {
+                **turn,
+                "conversation_id": checkpoint.conversation_id,
+                "delivery_id": operation_id,
+                "application_route": checkpoint.stored_route,
+                "application_route_round": checkpoint.route_round,
+                "tool_calls": checkpoint.stored_calls,
+            }, merge=False)
+        transaction.update(operation_ref, {
+            "route_control": dict(safe_route),
+            "route_control_recorded_at": now,
+        })
+
+    @staticmethod
     def _route_control_data(route: Mapping[str, Any]) -> dict[str, Any]:
         """Project route state to metadata safe for the operation ledger."""
         _reject_unsupported_route_metadata(route)
@@ -964,7 +1565,7 @@ class _TelegramCommandMixin:
 
     def persist_route(
         self, operation_id: str, route: Mapping[str, Any], *, context_id: str,
-        owner: str, fence: int, now: datetime,
+        owner: str, fence: int, now: datetime, application_checkpoint: Any = None,
     ) -> bool:
         """Persist sanitized route state only under the current operation lease."""
         context_id = _identifier(context_id, "context_id")
@@ -976,31 +1577,123 @@ class _TelegramCommandMixin:
         fence = _integer(fence, "fence", minimum=1)
         now = _aware(now, "now")
         safe_route = self._route_control_data(route)
+        prepared_type = None
+        if application_checkpoint is not None:
+            from services.connectors.telegram.runtime.ledger import (
+                PreparedApplicationRoute, _PREPARED_APPLICATION_ROUTE_TOKEN,
+            )
+            prepared_type = PreparedApplicationRoute
+            if (type(application_checkpoint) is not prepared_type
+                    or getattr(application_checkpoint, "_token", None)
+                    is not _PREPARED_APPLICATION_ROUTE_TOKEN):
+                raise TypeError("application checkpoint must be server-prepared")
+            if (application_checkpoint.context_id != context_id
+                    or application_checkpoint.operation_id != operation_id
+                    or application_checkpoint.delivery_id != operation_id
+                    or application_checkpoint.owner != owner
+                    or application_checkpoint.fence != fence
+                    or application_checkpoint._client is not self.client):
+                raise ValueError("prepared application checkpoint scope changed")
         context_ref = self.client.collection(SESSIONS).document(context_id)
         operation_ref = context_ref.collection("operations").document(operation_id)
 
         @firestore.transactional
         def _txn(transaction: Any) -> bool:
-            context_snapshot = context_ref.get(transaction=transaction)
-            operation_snapshot = operation_ref.get(transaction=transaction)
-            if not context_snapshot.exists or not operation_snapshot.exists:
-                return False
-            context = context_snapshot.to_dict() or {}
-            operation = operation_snapshot.to_dict() or {}
-            existing_route = operation.get("route_control")
-            if isinstance(existing_route, Mapping):
-                _reject_unsupported_route_metadata(existing_route)
-            if (operation.get("operation_id") != operation_id
-                    or operation.get("state") != "running"
-                    or not validate_context_queue_lease(
-                        context, operation_id, owner=owner, fence=fence, now=now,
-                        expiry=context.get("lock_expires_at"),
-                    )):
-                return False
-            _, command = self._command_for_operation(
-                transaction, context_id=context_id,
-                operation_id=operation_id, operation=operation,
+            scope = self._read_joint_route_scope(
+                transaction, context_ref=context_ref, operation_ref=operation_ref,
+                context_id=context_id, operation_id=operation_id,
+                owner=owner, fence=fence, now=now,
             )
+            if scope is None:
+                return False
+            context, operation, command_ref, command = scope
+            turn_ref = request_ref = None
+            turn_snapshot = request_snapshot = None
+            turn = request = {}
+            prepared_route = None
+            prepared_calls = None
+            if application_checkpoint is not None:
+                checkpoint = application_checkpoint
+                if (checkpoint._token is None
+                        or checkpoint.delivery_id != operation_id
+                        or checkpoint.owner != owner or checkpoint.fence != fence
+                        or checkpoint._client is not self.client
+                        or type(checkpoint.route_round) is not (int if checkpoint.route_round is not None else type(None))):
+                    raise ValueError("prepared application checkpoint is invalid")
+                if command is None:
+                    return False
+                actor_id = command.get("user_id")
+                if type(actor_id) is not int or actor_id <= 0:
+                    raise PermissionError("accepted command actor is invalid")
+                contextual, context_data = self._read_joint_source_context(
+                    transaction, checkpoint, context_id=context_id,
+                    operation_id=operation_id, actor_id=actor_id,
+                    command_ref=command_ref, command=command, operation=operation,
+                    safe_route=safe_route,
+                )
+                turn_ref = (self.client.collection(SESSIONS).document(context_id)
+                            .collection("operations").document(operation_id)
+                            .collection("agent_checkpoints").document("turn"))
+                request_ref = (self.client.collection(SESSIONS).document(context_id)
+                               .collection("operations").document(operation_id)
+                               .collection("agent_requests").document("request"))
+                turn_snapshot = turn_ref.get(transaction=transaction)
+                request_snapshot = request_ref.get(transaction=transaction)
+                turn = turn_snapshot.to_dict() or {} if turn_snapshot.exists else {}
+                request = request_snapshot.to_dict() or {} if request_snapshot.exists else {}
+                if (turn.get("conversation_id") not in (None, checkpoint.conversation_id)
+                        or request.get("conversation_id") not in (None, checkpoint.conversation_id)):
+                    raise ValueError("agent checkpoint conversation binding changed")
+                if turn.get("delivery_id") not in (None, operation_id) or request.get("delivery_id") not in (None, operation_id):
+                    raise ValueError("agent checkpoint operation binding changed")
+                if request.get("request") is not None:
+                    self._load_joint_payload(request.get("request"), "request", context_id,
+                                             operation_id, transaction)
+                stored_route = checkpoint.stored_route
+                route_value = self._load_joint_payload(stored_route, "application-route", context_id,
+                                                       operation_id, transaction)
+                if route_value != contextual:
+                    raise ValueError("prepared application route payload changed")
+                prepared_route = route_value
+                prepared_calls = self._load_joint_payload(
+                    checkpoint.stored_calls, "calls", context_id, operation_id, transaction,
+                )
+                if not isinstance(prepared_calls, list):
+                    raise ValueError("prepared application calls are invalid")
+                for expected_ordinal, call in enumerate(prepared_calls):
+                    if (not isinstance(call, Mapping)
+                            or type(call.get("ordinal")) is not int
+                            or call.get("ordinal") != expected_ordinal):
+                        raise ValueError("prepared application call ordinals are invalid")
+                if {"name", "arguments", "ordinal", "target_doc_id"}.issubset(prepared_route):
+                    matches = [call for call in prepared_calls
+                               if call.get("ordinal") == prepared_route["ordinal"]]
+                    expected_call_id = prepared_route.get("call_id")
+                    if (len(matches) != 1
+                            or matches[0].get("name") != prepared_route.get("name")
+                            or matches[0].get("arguments") != prepared_route.get("arguments")
+                            or (expected_call_id is not None
+                                and matches[0].get("id") != expected_call_id)):
+                        raise ValueError("prepared call does not match application route")
+                self._validate_joint_native_state(
+                    turn, prepared_route=prepared_route, prepared_calls=prepared_calls,
+                    checkpoint=checkpoint, context_id=context_id,
+                    operation_id=operation_id, transaction=transaction,
+                )
+                if (turn.get("application_route") is not None
+                        and isinstance(prepared_route.get("contextual"), Mapping)
+                        and (not isinstance(operation.get("route_control"), Mapping)
+                             or dict(operation["route_control"]) != safe_route)):
+                    # An existing contextual half is immutable authority only
+                    # as a complete pair; never finish or upgrade an orphan.
+                    return False
+            if (application_checkpoint is not None
+                    and isinstance(operation.get("route_control"), Mapping)
+                    and dict(operation["route_control"]) == safe_route
+                    and turn.get("application_route") is not None):
+                return self._prepared_lease_is_current(
+                    context, operation_id, owner, fence, application_checkpoint,
+                )
             if command is None:
                 existing_route = operation.get("route_control")
                 if (not isinstance(existing_route, Mapping)
@@ -1014,11 +1707,31 @@ class _TelegramCommandMixin:
             existing_route = operation.get("route_control")
             if isinstance(existing_route, Mapping):
                 if existing_route.get("status") in {"ok", "success"}:
-                    return dict(existing_route) == safe_route
-            transaction.update(operation_ref, {
-                "route_control": safe_route,
-                "route_control_recorded_at": now,
-            })
+                    same_summary = dict(existing_route) == safe_route
+                    if application_checkpoint is None:
+                        return same_summary
+                    if not same_summary or not turn.get("application_route"):
+                        return False
+                    if (application_checkpoint is not None
+                            and not self._prepared_lease_is_current(
+                                context, operation_id, owner, fence, application_checkpoint,
+                            )):
+                        return False
+                    return True
+            if application_checkpoint is not None:
+                if ("contextual" not in prepared_route
+                        or turn.get("application_route") is not None
+                        and turn.get("application_route") != checkpoint.stored_route):
+                    raise ValueError("joint application route checkpoint conflicts")
+                if not self._prepared_lease_is_current(
+                    context, operation_id, owner, fence, checkpoint,
+                ):
+                    return False
+            self._write_joint_route_plan(
+                transaction, turn_ref=turn_ref, operation_ref=operation_ref,
+                turn=turn, operation_id=operation_id, safe_route=safe_route,
+                now=now, checkpoint=application_checkpoint,
+            )
             return True
 
         return _txn(self.client.transaction(max_attempts=5))
