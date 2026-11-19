@@ -318,6 +318,21 @@ def test_local_dialog_number_and_shown_position_are_distinct_typed_selectors():
         DocumentSelector(DocumentSelectorKind.SHOWN_POSITION, list_id="list-1", position=True)
 
 
+def test_explicit_last_saved_is_distinct_and_round_trips_with_exact_span():
+    raw = "последний сохранённый диалог"
+    start = raw.index("последний")
+    token = raw[start:start + len("последний")]
+    span = CommandSpan(ExplicitReferenceKind.LAST_SAVED, start, start + len(token),
+                       token, token)
+    selector = DocumentSelector(DocumentSelectorKind.LAST_SAVED, span=span)
+    assert DocumentSelector.from_dict(selector.to_dict()) == selector
+    shown_last = DocumentSelector(DocumentSelectorKind.SHOWN_POSITION,
+                                  list_id="opaque-list", position="last")
+    assert shown_last != selector
+    with pytest.raises(ValueError, match="last-saved selector"):
+        CommandSpan(ExplicitReferenceKind.LAST_SAVED, 0, 4, "last", "other")
+
+
 def test_folder_selector_and_missing_slots_are_independent_from_document():
     parent = FolderSelector(FolderSelectorKind.EXPLICIT_ID, "folder-parent")
     decision = RoutingDecision(

@@ -17,6 +17,13 @@ import pytest
 pytestmark = pytest.mark.offline
 
 
+def _fresh_http_route_fixture(route, contents):
+    """Adapt a legacy fake route only at its real HTTP request boundary."""
+    from tests.fixtures.semantic_routing import legacy_route_fixture_from_prompt
+
+    return legacy_route_fixture_from_prompt(route, contents)
+
+
 def test_create_app_selects_lazy_managed_default_without_provider_construction():
     from services.connectors.telegram.app.main import create_app
 
@@ -1537,9 +1544,12 @@ def test_default_app_later_annotation_targets_accepted_draft_independent_of_focu
     requested_number = (number if selector == "correct_number" else
                         number + 30 if selector == "unknown_number" else None)
     runtime.route_response("annotation", dialog_number=requested_number, substantive_text=note_text)
+    clarification_text = "I mean the forwarded conversation, not those search results."
+    if selector == "unknown_number":
+        clarification_text += f" Use local dialog #{requested_number}."
     response = asyncio.run(runtime.webhook({"update_id": 11020, "message": {
         **common, "message_id": 12020, "date": 1793320600,
-        "text": "I mean the forwarded conversation, not those search results.",
+        "text": clarification_text,
     }}))
     assert response.status_code == 200, response.text
     dispatch = next(item["body"] for item in reversed(runtime.task_requests)
@@ -1763,7 +1773,7 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
     route = {
         "kind": "substantive", "target_ref": "doc-selected",
         "target_operation_id": None, "dialog_number": number, "result_refs": [],
-        "substantive_text": "What is the milestone date in the saved notes?",
+        "substantive_text": "What is the milestone date in the saved notes for doc-selected?",
         "tool_choice": {
             "name": "list_recent_transcripts", "arguments": {"folder_path": ["Client"]},
         },
@@ -1787,10 +1797,11 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
             assert "An unrelated prior question." in serialized_contents
             assert "An unrelated prior answer." in serialized_contents
             assert "They moved the launch to May." not in serialized_contents
-            assert "What is the milestone date in the saved notes?" in serialized_contents
+            assert "What is the milestone date in the saved notes" in serialized_contents
+            fresh_route = _fresh_http_route_fixture(route, payload["contents"])
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
-                    "functionCall": {"name": "route_command", "args": route},
+                    "functionCall": {"name": "route_command", "args": fresh_route},
                     "thoughtSignature": "c3ludGhldGljLXJvdXRlLXNpZw==",
                 }],
             }}]})
@@ -2070,7 +2081,7 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
                 history_text = json.dumps(route_prompt["conversation_history"], ensure_ascii=False)
                 assert long_source in history_text
                 assert "search_exchange_ref" not in history_text
-            route = routes[route_index]
+            route = _fresh_http_route_fixture(routes[route_index], payload["contents"])
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
                     "functionCall": {"name": "route_command", "args": route},
@@ -2325,7 +2336,8 @@ def test_default_asgi_malformed_route_error_survives_delivery_replay_and_uncerta
     def gemini_response(request):
         wire_requests.append(request)
         assert route_responses, "unexpected extra Gemini generation"
-        route = route_responses.pop(0)
+        payload = json.loads(request.content)
+        route = _fresh_http_route_fixture(route_responses.pop(0), payload["contents"])
         return httpx.Response(200, json={"candidates": [{"content": {
             "role": "model", "parts": [{"functionCall": {
                 "name": "route_command", "args": route,
@@ -2602,9 +2614,10 @@ def test_default_asgi_selected_document_routes_query_then_answers_over_real_gemi
         if generation_requests == 1:
             assert payload["tools"][0]["functionDeclarations"][0]["name"] == "route_command"
             assert payload["generationConfig"]["thinkingConfig"]["thinking_level"] == "MINIMAL"
+            fresh_route = _fresh_http_route_fixture(route, payload["contents"])
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
-                    "functionCall": {"name": "route_command", "args": route},
+                    "functionCall": {"name": "route_command", "args": fresh_route},
                     "thoughtSignature": "c3ludGhldGljLXJvdXRlLXNpZw==",
                 }],
             }}]})
@@ -2941,9 +2954,10 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
             else:
                 assert "The milestone date is June 12." in serialized_contents
             assert payload["generationConfig"]["thinkingConfig"]["thinking_level"] == "MINIMAL"
+            fresh_route = _fresh_http_route_fixture(routes[route_count - 1], payload["contents"])
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
-                    "functionCall": {"name": "route_command", "args": routes[route_count - 1]},
+                    "functionCall": {"name": "route_command", "args": fresh_route},
                     "thoughtSignature": "c3ludGhldGljLXJvdXRlLXNpZw==",
                 }],
             }}]})

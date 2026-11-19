@@ -64,10 +64,12 @@ def test_router_uses_structured_gemini_call_and_all_route_fields():
     from services.connectors.telegram.runtime.routing import GeminiCommandRouter
 
     route = {
-        "kind": "substantive", "target_ref": None,
-        "target_operation_id": None, "dialog_number": None,
-        "result_refs": [], "substantive_text": "Summarize the decision.",
-        "tool_choice": None, "certainty": "certain",
+        "disposition": "execute", "action": "substantive",
+        "substantive_text": "Summarize the decision.",
+        "document_selector": None, "folder_selector": None, "folder_name": None,
+        "explicit_references": [], "missing_slots": [], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "target_operation_id": None, "tool_choice": None, "certainty": "certain",
     }
 
     class Model:
@@ -87,8 +89,10 @@ def test_router_uses_structured_gemini_call_and_all_route_fields():
     declaration = model.calls[0]["tools"][0]
     assert declaration["name"] == "route_command"
     assert set(declaration["parameters_json_schema"]["required"]) == {
-        "kind", "target_ref", "target_operation_id", "dialog_number",
-        "result_refs", "substantive_text", "tool_choice", "certainty",
+        "disposition", "action", "substantive_text", "document_selector",
+        "folder_selector", "folder_name", "explicit_references", "missing_slots",
+        "evidence_refs", "clarification_id", "clarification_generation",
+        "target_operation_id", "tool_choice", "certainty",
     }
 
 
@@ -170,7 +174,14 @@ def test_router_reads_real_gemini_candidate_envelope_and_governor_replays_it(fir
     context_id, operation, lease, _command = _runtime_queue_item(client)
     now = datetime.now(timezone.utc)
     calls = []
-    route = _route()
+    route = {
+        "disposition": "execute", "action": "substantive",
+        "substantive_text": "Summarize the decision.",
+        "document_selector": None, "folder_selector": None, "folder_name": None,
+        "explicit_references": [], "missing_slots": [], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "target_operation_id": None, "tool_choice": None, "certainty": "certain",
+    }
 
     class SDKModel:
         def generate(self, **kwargs):
@@ -601,7 +612,7 @@ def test_failed_write_releases_child_lease_for_immediate_retry(monkeypatch, fire
     assert calls == ["create_folder", "create_folder"]
 
 
-def _runtime_queue_item(client, *, operation_id="op-runtime"):
+def _runtime_queue_item(client, *, operation_id="op-runtime", text="private request"):
     from services.connectors.telegram.commands import TelegramCommand
 
     now = datetime.now(timezone.utc)
@@ -625,12 +636,12 @@ def _runtime_queue_item(client, *, operation_id="op-runtime"):
     client.collection("telegram_sessions").document(context_id).collection(
         "commands").document("9").set({
             "context_id": context_id, "operation_id": operation_id, "user_id": 7,
-            "kind": "freeform", "text": "private request",
+            "kind": "freeform", "text": text,
         })
     operation = {"operation_id": operation_id, "context_id": context_id,
                  "sequence": 1, "dependency_operation_id": None}
     lease = SimpleNamespace(operation_id=operation_id, owner="worker", fence=1)
-    return context_id, operation, lease, TelegramCommand("freeform", "private request")
+    return context_id, operation, lease, TelegramCommand("freeform", text)
 
 
 class _Bot:
@@ -653,8 +664,11 @@ class _RuntimeModel:
     def generate(self, *, contents, mode, tools=None):
         self.calls.append((mode, contents, tools))
         if mode == "routing":
+            from tests.fixtures.semantic_routing import legacy_route_fixture_from_prompt
             return {"parts": [{"function_call": {
-                "name": "route_command", "args": self.route_value,
+                "name": "route_command", "args": legacy_route_fixture_from_prompt(
+                    self.route_value, contents,
+                ),
             }}]}
         if mode == "tool_loop_presented":
             return {"parts": [{"function_call": {
@@ -1240,16 +1254,17 @@ def test_current_draft_question_and_followup_use_full_history_and_ephemeral_sour
     class ConversationModel:
         def generate(self, *, contents, mode, tools=None):
             if mode == "routing":
+                from tests.fixtures.semantic_routing import legacy_route_fixture_from_prompt
                 prompt = json.loads(contents[0]["parts"][0]["text"])
                 route_rows.append(prompt)
                 return {"parts": [{"function_call": {
-                    "name": "route_command", "args": {
+                    "name": "route_command", "args": legacy_route_fixture_from_prompt({
                         "kind": "substantive", "target_ref": None,
                         "target_operation_id": None,
                         "dialog_number": accepted.dialog_number,
                         "result_refs": [], "substantive_text": prompt["command"],
                         "tool_choice": None, "certainty": "certain",
-                    },
+                    }, contents),
                 }}]}
             tool_inputs.append(contents)
             response = "The kickoff is April 17." if len(tool_inputs) == 1 else "That date is April 17."
@@ -1510,8 +1525,11 @@ def test_global_tool_loop_provider_failure_uses_persisted_three_attempt_budget(f
         def generate(self, **kwargs):
             self.calls += 1
             if kwargs.get("mode") == "routing":
+                from tests.fixtures.semantic_routing import legacy_route_fixture_from_prompt
                 return {"parts": [{"function_call": {
-                    "name": "route_command", "args": _route(),
+                    "name": "route_command", "args": legacy_route_fixture_from_prompt(
+                        _route(), kwargs.get("contents"),
+                    ),
                 }}]}
             raise RuntimeError("private global provider failure")
 
@@ -1658,8 +1676,11 @@ def test_ungoverned_tool_loop_exception_delivers_safe_failure(firestore_fake, ca
         def generate(self, **kwargs):
             self.calls += 1
             if kwargs.get("mode") == "routing":
+                from tests.fixtures.semantic_routing import legacy_route_fixture_from_prompt
                 return {"parts": [{"function_call": {
-                    "name": "route_command", "args": _route(),
+                    "name": "route_command", "args": legacy_route_fixture_from_prompt(
+                        _route(), kwargs.get("contents"),
+                    ),
                 }}]}
             raise RuntimeError("private answer provider text")
 
@@ -2575,7 +2596,9 @@ def test_document_route_publishes_notice_then_answer_and_replays_saved_history(
 
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
-    context_id, operation, lease, command = _runtime_queue_item(client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text='Summarize doc-1',
+    )
     client.collection("transcript_index").document("doc-1").set({
         "meeting_id": "meeting-1", "source_file": "Planning", "parent_id": "root-1",
         "dialog_date": "2026-01-02", "status": "synced",
@@ -2646,7 +2669,9 @@ def test_selected_document_blank_or_failed_answer_is_a_safe_failed_reply(
 
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
-    context_id, operation, lease, command = _runtime_queue_item(client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text='Summarize doc-1',
+    )
     client.collection("transcript_index").document("doc-1").set({
         "meeting_id": "meeting-1", "source_file": "Planning", "parent_id": "root-1",
         "dialog_date": "2026-01-02", "status": "synced",
@@ -2687,7 +2712,9 @@ def test_document_answer_persistence_interruption_replays_checkpointed_answer(
 
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
-    context_id, operation, lease, command = _runtime_queue_item(client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text='Summarize doc-1',
+    )
     client.collection("transcript_index").document("doc-1").set({
         "meeting_id": "meeting-1", "source_file": "Planning", "parent_id": "root-1",
         "dialog_date": "2026-01-02", "status": "synced",
@@ -2814,7 +2841,9 @@ def test_explicit_document_tool_target_uses_pinned_session_executor(monkeypatch,
 
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
-    context_id, operation, lease, command = _runtime_queue_item(client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text='Summarize doc-1',
+    )
     client.collection("transcript_index").document("doc-1").set({
         "source_file": "Planning", "parent_id": "root-1",
     })
@@ -2843,6 +2872,43 @@ def test_explicit_document_tool_target_uses_pinned_session_executor(monkeypatch,
     assert repository.get_context(context_id)["last_doc_id"] == "doc-b"
 
 
+def test_folder_only_create_runs_globally_without_document_and_replays_once(
+    monkeypatch, firestore_fake,
+):
+    """A semantic folder action routes through the real command runtime with no focus."""
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    calls = []
+    monkeypatch.setattr(
+        "services.connectors.telegram.runtime.tools.invoke_tool",
+        lambda name, arguments, **kwargs: calls.append((name, arguments, kwargs))
+        or {"folder_id": "folder-new", "name": arguments["name"]},
+    )
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text="create Archive",
+    )
+    route = _route(tool_choice={"name": "create_folder", "arguments": {"name": "Archive"}})
+    route.update({"substantive_text": "create Archive"})
+    bot, model = _Bot(), _RuntimeModel(route)
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model,
+                                     root_folder_id="pytest-root")
+
+    first = asyncio.run(runtime(context_id, operation, lease, command=command),
+                        loop_factory=_selector_loop)
+    second = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert first.value == "completed" and second.value == "completed"
+    assert len(calls) == 1
+    assert calls[0][0] == "create_folder"
+    assert calls[0][1] == {"name": "Archive"}
+    assert calls[0][2]["context"]["target_doc_id"] is None
+
+
 def test_runtime_pure_switch_acknowledges_without_appending_turns(firestore_fake, monkeypatch):
     from services.connectors.telegram.repository import TelegramRepository
     from services.connectors.telegram.runtime import TelegramCommandRuntime
@@ -2850,7 +2916,9 @@ def test_runtime_pure_switch_acknowledges_without_appending_turns(firestore_fake
                         _polling_offload)
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
-    context_id, operation, lease, command = _runtime_queue_item(client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text='open doc-switch',
+    )
     client.collection("transcript_index").document("doc-switch").set({
         "source_file": "Planning", "parent_id": "root-switch",
     })
@@ -2883,7 +2951,7 @@ def _same_target_switch_runtime(client, *, operation_id="op-same-switch"):
 
     repository = TelegramRepository(client=client)
     context_id, operation, lease, command = _runtime_queue_item(
-        client, operation_id=operation_id,
+        client, operation_id=operation_id, text="open dialog 1",
     )
     client.collection("transcript_index").document("doc-same").set({
         "source_file": "Same target", "parent_id": "root-same",
@@ -2974,7 +3042,9 @@ def test_unknown_explicit_document_tool_target_fails_closed(firestore_fake, monk
 
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
-    context_id, operation, lease, command = _runtime_queue_item(client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text="Summarize foreign-doc",
+    )
     route = _route(tool_choice={"name": "get_transcript", "arguments": {"doc_id": "foreign-doc"}})
     route.update({"target_ref": "foreign-doc", "substantive_text": "Summarize this document."})
     bot, model = _Bot(), _RuntimeModel(route, "must not run")
@@ -3701,10 +3771,23 @@ def test_t016_pinned_runtime_replay_reads_saved_pin_before_mutable_catalog(
 def _t016_native_move_response(sdk_fakes, *, doc_id="doc-b"):
     from google.genai import types
 
+    accepted_command = f"Move document {doc_id} to Archive"
+    start = accepted_command.index(doc_id)
+    span = {
+        "kind": "id", "start": start, "end": start + len(doc_id),
+        "raw_text": doc_id, "parsed_value": doc_id,
+    }
     route = {
-        "kind": "substantive", "target_ref": doc_id,
-        "target_operation_id": None, "dialog_number": None, "result_refs": [],
+        "disposition": "execute", "action": "move_transcript",
         "substantive_text": "Move the selected transcript to Archive.",
+        "document_selector": {
+            "kind": "explicit_reference", "raw_value": doc_id, "span": span,
+        },
+        "folder_selector": {"kind": "explicit_path", "value": "Archive",
+                             "parent": None}, "folder_name": None,
+        "explicit_references": [span], "missing_slots": [], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "certainty": "certain", "target_operation_id": None,
         "tool_choice": {
             "name": "move_transcript",
             "arguments": {"doc_id": doc_id, "folder_path": ["Archive"]},
@@ -4134,7 +4217,12 @@ def test_t016_default_runtime_unknown_move_retries_only_readback(
     assert after_child_effect_ids == before_child_effect_ids
     assert {key: value.get("parents") for key, value in provider.files.items()} == before_drive_parents
     assert provider.qdrant_points == before_qdrant_points
-    assert len(provider.drive_reads) > reads_before_retry
+    assert len(provider.drive_reads) > reads_before_retry, (
+        retry, repository.get_route_control(accepted.context_id, accepted.operation_id),
+        firestore_fake.documents.get(
+            f"telegram_sessions/{accepted.context_id}/operations/{accepted.operation_id}"
+        ),
+    )
     assert provider.files["doc-b"]["parents"] == ["t016-archive"]
     assert provider.files["doc-a"]["parents"] == ["pytest-synthetic-root"]
     registry_after_retry = client.collection(COLLECTION_NAME).document("doc-b").get().to_dict()

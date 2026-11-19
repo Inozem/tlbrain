@@ -246,14 +246,6 @@ class _GovernedExecutor:
         return value
 
 
-class _PrecomputedRouteModel:
-    def __init__(self, decision: Mapping[str, Any]):
-        self.decision = dict(decision)
-
-    async def route(self, **kwargs: Any) -> dict[str, Any]:
-        return dict(self.decision)
-
-
 class _CapturingAgent:
     def __init__(self, agent: TelegramAgent):
         self.agent = agent
@@ -1122,7 +1114,8 @@ class _CommandExecution(SearchAgentMixin):
     async def _select_route(self) -> None:
         """Load safe candidates and replay or persist the model-only routing decision."""
         from services.connectors.telegram.sessions import (
-            _candidate_cards, _safe_save_candidates, _valid_response,
+            _active_doc_id, _candidate_cards, _safe_save_candidates, _valid_persisted_route,
+            _valid_response,
         )
         runtime = self.runtime
         self.cards = await _offload(_candidate_cards, self.store)
@@ -1167,6 +1160,7 @@ class _CommandExecution(SearchAgentMixin):
                            self.operation_id)
         )
         self.raw_decision = self._pinned_decision() if self._has_pinned_decision() else None
+        self.route_from_pin = self.raw_decision is not None
         if (isinstance(self.pinned, Mapping)
                 and self.pinned.get("kind") == "annotation"
                 and isinstance(self.pinned.get("annotation_payload"), Mapping)):
@@ -1217,7 +1211,14 @@ class _CommandExecution(SearchAgentMixin):
                 refreshed_context, refreshed_binding = await self._routing_context_metadata()
                 was_unbound = not self._ingress_source_is_bound(initial_binding)
                 is_now_bound = self._ingress_source_is_bound(refreshed_binding)
-                initial_decision, initial_status = _valid_response(self.raw_decision)
+                initial_decision, initial_status = _valid_response(
+                    self.raw_decision,
+                    accepted_command=(self.command.text if self.command is not None else ""),
+                    operation_candidates=self.save_candidates,
+                    active_doc_id=_active_doc_id(self.cards, self.context),
+                    last_doc_id=getattr(self.context, "last_doc_id", None),
+                    candidates=self.cards,
+                )
                 needs_source_aware_refresh = (
                     initial_status == "ok" and isinstance(initial_decision, Mapping)
                     and initial_decision.get("kind") in {"search", "substantive"}
@@ -1232,7 +1233,21 @@ class _CommandExecution(SearchAgentMixin):
                            "code": "route_selection_failed",
                            "exception_class": type(error).__name__},
                 )
-        self.decision, self.decision_status = _valid_response(self.raw_decision)
+        if self.route_from_pin:
+            self.decision, self.decision_status = _valid_persisted_route(self.raw_decision)
+        else:
+            self.decision, self.decision_status = _valid_response(
+                self.raw_decision,
+                accepted_command=(self.command.text if self.command is not None else ""),
+                operation_candidates=self.save_candidates,
+                active_doc_id=_active_doc_id(self.cards, self.context),
+                last_doc_id=getattr(self.context, "last_doc_id", None),
+                candidates=self.cards,
+            )
+        self.semantic_decision = (
+            self.decision.get("semantic_decision")
+            if isinstance(self.decision, Mapping) else None
+        )
 
     @staticmethod
     def _ingress_source_is_bound(binding: Any) -> bool:
@@ -1684,7 +1699,7 @@ class _CommandExecution(SearchAgentMixin):
                      and decision.get("tool_choice", {}).get("name") == "get_transcript"))
             and decision.get("tool_choice", {}).get("name") in {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
-                "sync_status", "sync_changes", "add_dialog",
+                "sync_status", "sync_changes", "add_dialog", "create_folder",
             }
         )
         pinned_global = bool(
@@ -1817,9 +1832,20 @@ class _CommandExecution(SearchAgentMixin):
                     ).hexdigest()
                 target_ref = decision.get("target_ref")
                 requested_number = decision.get("dialog_number")
-                if isinstance(target_ref, str):
+                if record["status"] != "ok":
+                    # An uncertain fresh selector cannot inherit an accepted
+                    # draft/document binding during publication.
+                    pass
+                elif isinstance(target_ref, str):
+                    semantic = decision.get("semantic_decision")
+                    selector = (semantic.get("document_selector")
+                                if isinstance(semantic, Mapping) else None)
+                    semantic_last = (isinstance(selector, Mapping)
+                                     and selector.get("kind") == "last_saved")
                     target_doc_id = (
-                        self.context.last_doc_id if target_ref == "last" else target_ref
+                        self.context.last_doc_id
+                        if target_ref == "last" and semantic_last
+                        else target_ref
                     )
                     card = next((row for row in self.cards
                                  if isinstance(row, Mapping)
@@ -2633,14 +2659,18 @@ class _CommandExecution(SearchAgentMixin):
         return await self._finish_processing_error()
 
     async def _route_callback(self, **kwargs: Any) -> Any:
-        """Pass the pinned model decision through the established session resolver."""
-        from services.connectors.telegram.sessions import route_message
-        return await route_message(
-            text=kwargs["text"], context=kwargs["context"],
-            model=_PrecomputedRouteModel(self.raw_decision), store=self.store,
-            search=self.search, notices=_NoopNotice(), actions=_NoopAction(),
+        """Consume the already validated projection without re-entering model validation."""
+        from services.connectors.telegram.sessions import (
+            _consume_validated_route, _safe_save_candidates,
+        )
+        return await _consume_validated_route(
+            self.decision, self.decision_status, text=kwargs["text"],
+            context=kwargs["context"], store=self.store, search=self.search,
+            notices=_NoopNotice(), actions=_NoopAction(),
             operation_id=self.operation_id, owner=self.owner, fence=self.fence,
-            now=self.runtime.clock(), save_candidates=self.save_candidates,
+            now=self.runtime.clock(), cards=tuple(self.cards),
+            operation_candidates=_safe_save_candidates(self.save_candidates),
+            notify_switch=True,
         )
 
     async def _selection_callback(self, pinned_operation_id: str, *,

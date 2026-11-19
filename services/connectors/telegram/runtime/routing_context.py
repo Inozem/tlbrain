@@ -121,6 +121,7 @@ class ExplicitReferenceKind(StrEnum):
     ID = "id"
     URL = "url"
     LOCAL_NUMBER = "local_number"
+    LAST_SAVED = "last_saved"
 
 
 class Disposition(StrEnum):
@@ -159,6 +160,7 @@ class Certainty(StrEnum):
 class DocumentSelectorKind(StrEnum):
     EXPLICIT_REFERENCE = "explicit_reference"
     DIALOG_NUMBER = "dialog_number"
+    LAST_SAVED = "last_saved"
     ACTIVE_DOCUMENT = "active_document"
     EVIDENCE = "evidence"
     SHOWN_POSITION = "shown_position"
@@ -243,6 +245,9 @@ class CommandSpan:
             raise ValueError("raw_text must be non-empty")
         if self.kind is ExplicitReferenceKind.LOCAL_NUMBER:
             _positive_int(self.parsed_value, "parsed local number")
+        elif self.kind is ExplicitReferenceKind.LAST_SAVED:
+            if not isinstance(self.parsed_value, str) or self.parsed_value != self.raw_text:
+                raise ValueError("last-saved selector must preserve its exact command text")
         elif not isinstance(self.parsed_value, str) or not self.parsed_value:
             raise ValueError("parsed ID/URL must be non-empty text")
 
@@ -590,6 +595,14 @@ class DocumentSelector:
                 raise ValueError("dialog_number must match its exact command span")
             if any(x is not None for x in (self.raw_value, self.doc_id, self.list_id, self.position)) or self.evidence_refs:
                 raise ValueError("dialog_number contains unrelated selector fields")
+        elif kind is DocumentSelectorKind.LAST_SAVED:
+            if not isinstance(self.span, CommandSpan) or self.span.kind is not ExplicitReferenceKind.LAST_SAVED:
+                raise ValueError("last_saved requires an exact last-saved command span")
+            if self.span.parsed_value != self.span.raw_text:
+                raise ValueError("last_saved must preserve its exact command span")
+            if any(x is not None for x in (self.raw_value, self.dialog_number, self.doc_id,
+                                            self.list_id, self.position)) or self.evidence_refs:
+                raise ValueError("last_saved contains unrelated selector fields")
         elif kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
             if any(x is not None for x in (self.raw_value, self.span, self.dialog_number, self.doc_id, self.list_id, self.position)) or self.evidence_refs:
                 raise ValueError("active_document takes no caller-supplied target")

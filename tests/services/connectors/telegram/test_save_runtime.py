@@ -2396,7 +2396,7 @@ def test_default_asgi_leading_context_accepts_six_forwards_while_dispatch_routes
         worker.join(8)
 
     repository = TelegramRepository(runtime.db)
-    assert route_results and route_results[0].get("kind") == "annotation", route_results
+    assert route_results and route_results[0].get("action") == "annotation", route_results
     assert len(route_results) == 1, "a valid pinned annotation should resume without reclassification"
     operation = (runtime.db.collection("telegram_sessions").document(dispatch["context_id"])
                  .collection("operations").document(dispatch["operation_id"]).get().to_dict())
@@ -2572,6 +2572,10 @@ def test_default_router_later_context_attaches_to_current_saved_dialog(
         "77_default", conversation_id, kind="document", doc_id=doc_id,
         dialog_number=number, now=runtime.clock(),
     )
+    runtime.db.collection("telegram_sessions").document("77_default").update({
+        "active_conversation_id": conversation_id,
+        "selected_dialog_number": number,
+    })
     note = "Dmitry uses ‘the project’ to mean Project Jupiter."
     runtime.route_response(
         "annotation", target_ref=doc_id, dialog_number=number, substantive_text=note,

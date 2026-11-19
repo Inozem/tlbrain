@@ -168,6 +168,10 @@ class TelegramRuntimeStore:
             if match is None or int(match.group(1)) != span.parsed_value:
                 raise ValueError("local dialog number does not match its accepted span")
             return span.parsed_value
+        if span.kind is ExplicitReferenceKind.LAST_SAVED:
+            if span.parsed_value != span.raw_text or not span.raw_text.strip():
+                raise ValueError("last-saved selector does not match its accepted span")
+            return None
         if span.parsed_value != span.raw_text:
             raise ValueError("explicit URL does not match its accepted span")
         parsed = urlsplit(span.raw_text)

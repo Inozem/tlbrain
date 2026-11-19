@@ -19,9 +19,23 @@ from services.connectors.telegram.context import build_document_context
 from services.connectors.telegram.conversations import TurnRole
 from services.connectors.telegram.save import TelegramSavePending
 from services.connectors.telegram.errors import TelegramDirectSaveInterrupted
+from services.connectors.telegram.runtime.routing_context import (
+    Action, Certainty, CommandSpan, Disposition, DocumentSelector,
+    DocumentSelectorKind, ExplicitReferenceKind, MissingSlot, RoutingDecision,
+)
 
 
 _ROUTE_KINDS = frozenset({"pure_switch", "search", "substantive", "save", "retry", "annotation"})
+_FRESH_FIELDS = frozenset({
+    "disposition", "action", "substantive_text", "document_selector",
+    "folder_selector", "folder_name", "explicit_references", "missing_slots",
+    "evidence_refs", "clarification_id", "clarification_generation",
+    "certainty", "tool_choice", "target_operation_id",
+})
+_LEGACY_FIELDS = frozenset({
+    "kind", "target_ref", "dialog_number", "result_refs", "substantive_text",
+    "tool_choice", "certainty", "target_operation_id",
+})
 
 
 def _failure(status: str, *, kind: str | None = None) -> dict[str, Any]:
@@ -31,13 +45,11 @@ def _failure(status: str, *, kind: str | None = None) -> dict[str, Any]:
     return result
 
 
-def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
+def _valid_persisted_route(response: Any) -> tuple[dict[str, Any] | None, str]:
+    """Validate a server-owned legacy route projection; never use for fresh model data."""
     if not isinstance(response, Mapping):
         return None, "invalid_route"
-    if set(response) != {
-        "kind", "target_ref", "dialog_number", "result_refs",
-        "substantive_text", "tool_choice", "certainty", "target_operation_id",
-    }:
+    if set(response) != _LEGACY_FIELDS:
         return None, "invalid_route"
     kind = response.get("kind")
     if not isinstance(kind, str) or kind not in _ROUTE_KINDS:
@@ -114,6 +126,766 @@ def _valid_response(response: Any) -> tuple[dict[str, Any] | None, str]:
         "substantive_text": text if kind in {"substantive", "search", "annotation"} else None,
         "tool_choice": tool_choice,
     }, "ok"
+
+
+def _response_span(span: CommandSpan, accepted_command: str) -> bool:
+    if span.end > len(accepted_command) or accepted_command[span.start:span.end] != span.raw_text:
+        return False
+    if span.kind is ExplicitReferenceKind.LOCAL_NUMBER:
+        from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+        try:
+            return TelegramRuntimeStore._reference_value(span) == span.parsed_value
+        except (TypeError, ValueError):
+            return False
+    if span.kind is ExplicitReferenceKind.ID:
+        from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+        try:
+            return TelegramRuntimeStore._reference_value(span) == span.parsed_value
+        except (TypeError, ValueError):
+            return False
+    if span.kind is ExplicitReferenceKind.URL:
+        from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+        try:
+            return TelegramRuntimeStore._reference_value(span) is not None
+        except (TypeError, ValueError):
+            return False
+    return span.kind is ExplicitReferenceKind.LAST_SAVED and span.parsed_value == span.raw_text
+
+
+def _strict_fresh_shapes(response: Mapping[str, Any]) -> bool:
+    """Match the native schema's closed selector/span variants before DTO decoding."""
+    span_fields = {"kind", "start", "end", "raw_text", "parsed_value"}
+    selector_fields = {
+        "explicit_reference": {"kind", "raw_value", "span"},
+        "dialog_number": {"kind", "dialog_number", "span"},
+        "last_saved": {"kind", "span"},
+        "active_document": {"kind"},
+        "evidence": {"kind", "doc_id", "evidence_refs"},
+        "shown_position": {"kind", "list_id", "position"},
+    }
+    selector = response.get("document_selector")
+    if selector is not None:
+        if not isinstance(selector, Mapping):
+            return False
+        kind = selector.get("kind")
+        if kind not in selector_fields or set(selector) != selector_fields[kind]:
+            return False
+        expected_span_kind = {
+            "explicit_reference": {ExplicitReferenceKind.ID.value, ExplicitReferenceKind.URL.value},
+            "dialog_number": {ExplicitReferenceKind.LOCAL_NUMBER.value},
+            "last_saved": {ExplicitReferenceKind.LAST_SAVED.value},
+        }.get(kind)
+        if expected_span_kind is not None:
+            span = selector.get("span")
+            if not isinstance(span, Mapping) or span.get("kind") not in expected_span_kind:
+                return False
+    if (not isinstance(response.get("explicit_references"), list)
+            or not isinstance(response.get("missing_slots"), list)
+            or not isinstance(response.get("evidence_refs"), list)):
+        return False
+    evidence_selector = selector if isinstance(selector, Mapping) and selector.get("kind") == "evidence" else None
+    if evidence_selector is not None and not evidence_selector.get("evidence_refs"):
+        return False
+    spans = list(response["explicit_references"])
+    if selector is not None and isinstance(selector, Mapping) and "span" in selector:
+        spans.append(selector["span"])
+    for span in spans:
+        if not isinstance(span, Mapping) or set(span) != span_fields:
+            return False
+        kind = span.get("kind")
+        parsed = span.get("parsed_value")
+        if kind == ExplicitReferenceKind.LOCAL_NUMBER.value:
+            if type(parsed) is not int or parsed < 1:
+                return False
+        elif kind in {item.value for item in ExplicitReferenceKind}:
+            if not isinstance(parsed, str) or not parsed:
+                return False
+        else:
+            return False
+    def folder_shape(folder: Any, depth: int = 0) -> bool:
+        if folder is None:
+            return True
+        if not isinstance(folder, Mapping) or set(folder) != {"kind", "value", "parent"}:
+            return False
+        if depth > 1 or folder.get("kind") == "create_step_output":
+            return False
+        kind, value, parent = folder.get("kind"), folder.get("value"), folder.get("parent")
+        if kind == "root_default":
+            return value is None and parent is None
+        if kind not in {"explicit_path", "explicit_id", "name"}:
+            return False
+        if not isinstance(value, str) or not value:
+            return False
+        if parent is not None:
+            if depth != 0 or not isinstance(parent, Mapping):
+                return False
+            if set(parent) != {"kind", "value", "parent"} or parent.get("parent") is not None:
+                return False
+            p_kind, p_value = parent.get("kind"), parent.get("value")
+            if p_kind == "root_default":
+                return p_value is None
+            return p_kind in {"explicit_path", "explicit_id", "name"} and isinstance(p_value, str) and bool(p_value)
+        return True
+    return folder_shape(response.get("folder_selector"))
+
+
+@dataclass(frozen=True)
+class _SemanticConflictFacts:
+    """Resolved literal and local-number signals used by conflict checks."""
+
+    explicit_ids: set[str]
+    unresolved_urls: bool
+    local_numbers: set[int]
+    number_bindings: dict[int, set[str]]
+    bound_local_ids: set[str]
+    unresolved_local: bool
+    last_signals: bool
+
+
+def _semantic_conflict_facts(
+    decision: RoutingDecision, candidates: Any,
+) -> _SemanticConflictFacts:
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+    spans = decision.explicit_references
+    explicit_ids: set[str] = set()
+    unresolved_urls = False
+    for span in decision.explicit_references:
+        if span.kind in (ExplicitReferenceKind.ID, ExplicitReferenceKind.URL):
+            try:
+                value = TelegramRuntimeStore._reference_value(span)
+            except (TypeError, ValueError):
+                value = None
+            if isinstance(value, str):
+                explicit_ids.add(value)
+            else:
+                unresolved_urls = True
+    local_numbers = {span.parsed_value for span in spans
+                     if span.kind is ExplicitReferenceKind.LOCAL_NUMBER}
+    number_bindings: dict[int, set[str]] = {}
+    if isinstance(candidates, (tuple, list)):
+        for card in candidates:
+            if (isinstance(card, Mapping) and type(card.get("dialog_number")) is int
+                    and card["dialog_number"] > 0 and isinstance(card.get("doc_id"), str)):
+                number_bindings.setdefault(card["dialog_number"], set()).add(card["doc_id"])
+    bound_local_ids = {
+        next(iter(number_bindings[number])) for number in local_numbers
+        if len(number_bindings.get(number, ())) == 1
+    }
+    unresolved_local = any(len(number_bindings.get(number, ())) != 1 for number in local_numbers)
+    last_signals = any(
+        span.kind is ExplicitReferenceKind.LAST_SAVED
+        for span in decision.explicit_references
+    )
+    return _SemanticConflictFacts(
+        explicit_ids=explicit_ids,
+        unresolved_urls=unresolved_urls,
+        local_numbers=local_numbers,
+        number_bindings=number_bindings,
+        bound_local_ids=bound_local_ids,
+        unresolved_local=unresolved_local,
+        last_signals=last_signals,
+    )
+
+
+def _conflicts_between_explicit_signals(
+    facts: _SemanticConflictFacts, decision: RoutingDecision,
+    tool_choice: Mapping[str, Any] | None, last_doc_id: str | None,
+    target_doc_id: str | None,
+) -> bool:
+    selector = decision.document_selector
+    explicit_ids = facts.explicit_ids
+    local_numbers = facts.local_numbers
+    bound_local_ids = facts.bound_local_ids
+    last_signals = facts.last_signals
+    if facts.unresolved_urls or len(explicit_ids) > 1 or len(local_numbers) > 1:
+        return True
+    if facts.unresolved_local and (explicit_ids or last_signals or selector is not None
+                                   and selector.kind is not DocumentSelectorKind.DIALOG_NUMBER
+                                   or (tool_choice is not None
+                                       and isinstance(tool_choice.get("arguments", {}).get("doc_id"), str))):
+        return True
+    if explicit_ids and bound_local_ids and explicit_ids != bound_local_ids:
+        return True
+    if explicit_ids and local_numbers and not bound_local_ids:
+        return True
+    if last_signals and (not isinstance(last_doc_id, str) or not last_doc_id):
+        return True
+    all_literal_ids = set(explicit_ids) | set(bound_local_ids)
+    if last_signals and all_literal_ids and all_literal_ids != {last_doc_id}:
+        return True
+    if last_signals and isinstance(target_doc_id, str) and target_doc_id != last_doc_id:
+        return True
+    if last_signals and selector is None:
+        return True
+    return False
+
+
+def _selector_conflicts_with_signals(
+    facts: _SemanticConflictFacts, decision: RoutingDecision,
+    active_doc_id: str | None, last_doc_id: str | None, target_doc_id: str | None,
+) -> bool:
+    selector = decision.document_selector
+    if selector is None:
+        return bool(facts.explicit_ids or facts.local_numbers) and (
+            not isinstance(target_doc_id, str) or not target_doc_id
+            or (facts.explicit_ids and facts.explicit_ids != {target_doc_id})
+            or (facts.bound_local_ids and facts.bound_local_ids != {target_doc_id})
+        ) or facts.last_signals
+
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+    if selector.kind is DocumentSelectorKind.EXPLICIT_REFERENCE:
+        selected = TelegramRuntimeStore._reference_value(selector.span)
+        if facts.explicit_ids and facts.explicit_ids != {selected}:
+            return True
+        if facts.last_signals and selected != last_doc_id:
+            return True
+    elif selector.kind is DocumentSelectorKind.DIALOG_NUMBER:
+        if facts.local_numbers and facts.local_numbers != {selector.dialog_number}:
+            return True
+        bound = facts.number_bindings.get(selector.dialog_number, set())
+        if len(bound) > 1 or (facts.explicit_ids and bound and facts.explicit_ids != bound):
+            return True
+        if facts.last_signals and (len(bound) != 1 or bound != {last_doc_id}):
+            return True
+    elif selector.kind is DocumentSelectorKind.LAST_SAVED:
+        if ((facts.explicit_ids and facts.explicit_ids != {last_doc_id})
+                or (facts.bound_local_ids and facts.bound_local_ids != {last_doc_id})):
+            return True
+    elif selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
+        if (facts.explicit_ids and (not isinstance(active_doc_id, str)
+                                    or facts.explicit_ids != {active_doc_id})) or (
+                facts.bound_local_ids and facts.bound_local_ids != {active_doc_id}):
+            return True
+        if facts.last_signals and active_doc_id != last_doc_id:
+            return True
+    elif selector.kind in {DocumentSelectorKind.EVIDENCE,
+                           DocumentSelectorKind.SHOWN_POSITION}:
+        if facts.explicit_ids or facts.local_numbers or facts.last_signals:
+            return True
+    return False
+
+
+def _tool_choice_conflicts_with_selector(
+    facts: _SemanticConflictFacts, decision: RoutingDecision,
+    tool_choice: Mapping[str, Any], active_doc_id: str | None,
+    last_doc_id: str | None, target_doc_id: str | None,
+) -> bool:
+    selector = decision.document_selector
+    argument_doc_id = tool_choice.get("arguments", {}).get("doc_id")
+    if isinstance(argument_doc_id, str) and facts.explicit_ids:
+        if facts.explicit_ids != {argument_doc_id}:
+            return True
+    if isinstance(argument_doc_id, str) and selector is not None:
+        if selector.kind is DocumentSelectorKind.EXPLICIT_REFERENCE:
+            from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+            selected = TelegramRuntimeStore._reference_value(selector.span)
+            if selected != argument_doc_id:
+                return True
+        elif selector.kind is DocumentSelectorKind.DIALOG_NUMBER:
+            bound = facts.number_bindings.get(selector.dialog_number, set())
+            if len(bound) != 1 or argument_doc_id not in bound:
+                return True
+        elif selector.kind in {DocumentSelectorKind.SHOWN_POSITION,
+                               DocumentSelectorKind.EVIDENCE}:
+            # Equality requires resolving an independently scoped binding.
+            return True
+        elif selector.kind is DocumentSelectorKind.LAST_SAVED:
+            if not isinstance(last_doc_id, str) or argument_doc_id != last_doc_id:
+                return True
+        elif selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
+            if not isinstance(active_doc_id, str) or argument_doc_id != active_doc_id:
+                return True
+    elif isinstance(argument_doc_id, str) and selector is None:
+        if ((OPERATIONS[tool_choice["name"]].write or target_doc_id is not None)
+                and argument_doc_id != target_doc_id):
+            return True
+    return False
+
+
+def _semantic_conflict(
+    decision: RoutingDecision, tool_choice: Mapping[str, Any] | None, *,
+    active_doc_id: str | None = None, last_doc_id: str | None = None,
+    candidates: Any = (), target_doc_id: str | None = None,
+) -> bool:
+    """Detect explicit contradictions that do not need resource lookup to prove."""
+    facts = _semantic_conflict_facts(decision, candidates)
+    if _conflicts_between_explicit_signals(
+        facts, decision, tool_choice, last_doc_id, target_doc_id
+    ):
+        return True
+    if _selector_conflicts_with_signals(
+        facts, decision, active_doc_id, last_doc_id, target_doc_id
+    ):
+        return True
+    if tool_choice is not None and _tool_choice_conflicts_with_selector(
+        facts, decision, tool_choice, active_doc_id, last_doc_id, target_doc_id
+    ):
+        return True
+    return False
+
+
+def _unique_candidate_for_number(candidates: Any, number: int) -> str | None:
+    matches = {
+        card.get("doc_id") for card in candidates
+        if isinstance(card, Mapping) and type(card.get("dialog_number")) is int
+        and card.get("dialog_number") == number
+        and isinstance(card.get("doc_id"), str)
+    } if isinstance(candidates, (tuple, list)) else set()
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _normalize_fresh_decision(response: Mapping[str, Any], accepted_command: str) -> RoutingDecision:
+    if not _strict_fresh_shapes(response):
+        raise ValueError("fresh selector shape does not match the static schema")
+    values = {key: response[key] for key in _FRESH_FIELDS
+              if key not in {"tool_choice", "target_operation_id"}}
+    if isinstance(values.get("folder_name"), str) and not values["folder_name"].strip():
+        values["folder_name"] = None
+        missing = list(values.get("missing_slots", []))
+        if MissingSlot.FOLDER_NAME.value not in missing:
+            missing.append(MissingSlot.FOLDER_NAME.value)
+        values["missing_slots"] = missing
+        if values.get("disposition") == Disposition.EXECUTE.value:
+            values["disposition"] = Disposition.CLARIFY.value
+            values["certainty"] = Certainty.UNCERTAIN.value
+    decision = RoutingDecision.from_dict(values)
+    decision.validate_command_spans(accepted_command)
+    for span in decision.explicit_references:
+        if not _response_span(span, accepted_command):
+            raise ValueError("explicit reference does not match its accepted literal")
+    selector = decision.document_selector
+    selector_span = selector.span if selector is not None else None
+    if selector_span is not None:
+        if not _response_span(selector_span, accepted_command):
+            raise ValueError("document selector span does not match accepted command")
+        if (selector.kind in {DocumentSelectorKind.EXPLICIT_REFERENCE,
+                              DocumentSelectorKind.DIALOG_NUMBER,
+                              DocumentSelectorKind.LAST_SAVED}
+                and selector_span not in decision.explicit_references):
+            raise ValueError("explicit document selector span is missing from references")
+    _validate_folder_selector_depth(decision.folder_selector, depth=0)
+    return decision
+
+
+def _validate_folder_selector_depth(selector: Any, *, depth: int) -> None:
+    if selector is None:
+        return
+    if depth > 1:
+        raise ValueError("fresh folder selectors are limited to one typed parent")
+    _validate_folder_selector_depth(selector.parent, depth=depth + 1)
+
+
+def _validate_fresh_action(
+    decision: RoutingDecision, *, tool_choice: Mapping[str, Any] | None,
+    target_operation_id: str | None,
+) -> RoutingDecision:
+    if decision.action in {Action.SUBSTANTIVE, Action.SEARCH, Action.ANNOTATION} and (
+        not decision.substantive_text.strip()
+    ):
+        raise ValueError("action requires substantive text")
+    if target_operation_id is not None and decision.action not in {
+        Action.PURE_SWITCH, Action.SUBSTANTIVE, Action.MOVE_TRANSCRIPT,
+        Action.CREATE_THEN_MOVE,
+    }:
+        raise ValueError("predecessor save is only valid for ordinary routes")
+    if decision.action is Action.SEARCH:
+        if (tool_choice is None or tool_choice["name"] != "query"
+                or not decision.substantive_text.strip()
+                or decision.document_selector is not None
+                or decision.folder_selector is not None or target_operation_id is not None):
+            raise ValueError("search requires a nonblank query route")
+    elif decision.action is Action.MOVE_TRANSCRIPT:
+        if tool_choice is not None and tool_choice["name"] != "move_transcript":
+            raise ValueError("move action requires move_transcript tool")
+    elif decision.action is Action.CREATE_FOLDER:
+        if tool_choice is not None and tool_choice["name"] != "create_folder":
+            raise ValueError("create action requires create_folder tool")
+        if target_operation_id is not None:
+            raise ValueError("create action cannot target a predecessor save")
+    elif decision.action is Action.CREATE_THEN_MOVE:
+        if tool_choice is not None:
+            raise ValueError("composite action has no fixed tool or predecessor")
+    elif decision.action is not Action.SUBSTANTIVE and tool_choice is not None:
+        raise ValueError("tool choice is incompatible with this action")
+    elif decision.action is Action.SUBSTANTIVE and tool_choice is not None:
+        if tool_choice["name"] in {"move_transcript", "create_folder"}:
+            raise ValueError("move/create tools require their semantic action")
+    if decision.disposition is Disposition.DELEGATE and tool_choice is not None:
+        if OPERATIONS[tool_choice["name"]].write:
+            raise ValueError("delegation cannot authorize a write tool")
+    if decision.disposition is Disposition.DELEGATE and decision.action in {
+        Action.MOVE_TRANSCRIPT, Action.CREATE_FOLDER, Action.CREATE_THEN_MOVE, Action.SAVE,
+    }:
+        raise ValueError("delegation cannot describe a write action")
+    if decision.action is Action.RETRY and (
+        decision.document_selector is None
+        or decision.document_selector.kind is not DocumentSelectorKind.DIALOG_NUMBER
+    ):
+        raise ValueError("retry requires an explicit local dialog number")
+
+    missing = list(decision.missing_slots)
+    folder_name = decision.folder_name
+    if decision.action in {Action.CREATE_FOLDER, Action.CREATE_THEN_MOVE}:
+        if (folder_name is None and MissingSlot.FOLDER_NAME not in missing
+                and decision.disposition is Disposition.EXECUTE):
+            missing.append(MissingSlot.FOLDER_NAME)
+        if decision.folder_selector is None and decision.disposition is Disposition.EXECUTE:
+            from services.connectors.telegram.runtime.routing_context import FolderSelector, FolderSelectorKind
+            folder = FolderSelector(FolderSelectorKind.ROOT_DEFAULT)
+        else:
+            folder = decision.folder_selector
+    else:
+        folder = decision.folder_selector
+    if decision.action is Action.CREATE_FOLDER and decision.document_selector is not None:
+        raise ValueError("folder-only action cannot select a document")
+    if (decision.action is Action.CREATE_THEN_MOVE and decision.document_selector is None
+            and target_operation_id is None
+            and decision.disposition is Disposition.EXECUTE):
+        if MissingSlot.DOCUMENT not in missing:
+            missing.append(MissingSlot.DOCUMENT)
+    if decision.action is Action.MOVE_TRANSCRIPT and decision.disposition is Disposition.EXECUTE:
+        if (decision.document_selector is None and target_operation_id is None
+                and MissingSlot.DOCUMENT not in missing):
+            missing.append(MissingSlot.DOCUMENT)
+        if folder is None and MissingSlot.DESTINATION not in missing:
+            missing.append(MissingSlot.DESTINATION)
+    if missing and decision.disposition is Disposition.EXECUTE:
+        decision_status = Disposition.CLARIFY
+        certainty = Certainty.UNCERTAIN
+    else:
+        decision_status = decision.disposition
+        certainty = decision.certainty
+    if (tuple(missing) != decision.missing_slots or folder is not decision.folder_selector
+            or decision_status is not decision.disposition or certainty is not decision.certainty):
+        return RoutingDecision(
+            disposition=decision_status,
+            action=decision.action, substantive_text=decision.substantive_text,
+            document_selector=decision.document_selector, folder_selector=folder,
+            folder_name=folder_name, explicit_references=decision.explicit_references,
+            missing_slots=tuple(missing), evidence_refs=decision.evidence_refs,
+            clarification_id=decision.clarification_id,
+            clarification_generation=decision.clarification_generation,
+            certainty=certainty,
+        )
+    return decision
+
+
+def _first_operation_candidate(operation_candidates: Any, operation_id: str | None) -> Any:
+    if operation_id is None or not isinstance(operation_candidates, (tuple, list)):
+        return None
+    return next((item for item in operation_candidates
+                 if isinstance(item, Mapping) and item.get("operation_id") == operation_id), None)
+
+
+def _semantic_route_shell(
+    decision: RoutingDecision, *, tool_choice: Mapping[str, Any] | None,
+    target_operation_id: str | None, raw_response: Mapping[str, Any],
+    operation_candidate: Any,
+) -> dict[str, Any]:
+    semantic = decision.to_dict()
+    ordinary_kind = {
+        Action.MOVE_TRANSCRIPT: "substantive", Action.CREATE_FOLDER: "substantive",
+        Action.CREATE_THEN_MOVE: "substantive",
+    }.get(decision.action, decision.action.value)
+    route = {
+        "kind": ordinary_kind, "target_ref": None,
+        "target_operation_id": target_operation_id, "dialog_number": None,
+        "result_refs": [], "substantive_text": decision.substantive_text,
+        "tool_choice": tool_choice, "certainty": decision.certainty.value,
+        "semantic_decision": semantic, "semantic_response": dict(raw_response),
+    }
+    operation_doc_id = operation_candidate.get("doc_id") if isinstance(operation_candidate, Mapping) else None
+    if isinstance(operation_doc_id, str) and operation_doc_id:
+        # The confirmed predecessor is an independent known document source,
+        # even when another required slot needs clarification.
+        route["target_ref"] = operation_doc_id
+    return route
+
+
+def _project_semantic_selector(
+    route: dict[str, Any], decision: RoutingDecision, candidates: tuple[Any, ...],
+    active_doc_id: str | None,
+) -> str | None:
+    selector = decision.document_selector
+    if selector is None:
+        return None
+    if selector.kind is DocumentSelectorKind.EXPLICIT_REFERENCE:
+        if selector.span.kind is ExplicitReferenceKind.ID:
+            route["target_ref"] = selector.span.parsed_value
+        else:
+            from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+            route["target_ref"] = TelegramRuntimeStore._reference_value(selector.span)
+    elif selector.kind is DocumentSelectorKind.DIALOG_NUMBER:
+        route["dialog_number"] = selector.dialog_number
+        bound_doc = _unique_candidate_for_number(candidates, selector.dialog_number)
+        if bound_doc is not None:
+            route["target_ref"] = bound_doc
+    elif selector.kind is DocumentSelectorKind.LAST_SAVED:
+        route["target_ref"] = "last"
+    elif selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
+        if isinstance(active_doc_id, str) and active_doc_id:
+            route["target_ref"] = active_doc_id
+    else:
+        # Evidence and shown positions require scoped snapshot/manifest resolution.
+        return "uncertain"
+    return None
+
+
+def _validate_semantic_predecessor(
+    route: dict[str, Any], selector: Any, operation_candidate: Any,
+    operation_candidates: Any,
+    target_operation_id: str | None, *, active_doc_id: str | None,
+    last_doc_id: str | None,
+) -> tuple[dict[str, Any], str] | None:
+    if target_operation_id is None:
+        return None
+    available = {item.get("operation_id") for item in operation_candidates
+                 if isinstance(item, Mapping)} if isinstance(operation_candidates, (tuple, list)) else set()
+    if target_operation_id not in available:
+        return route, "invalid_route"
+    if operation_candidate is None:
+        return route, "invalid_route"
+    if not isinstance(operation_candidate.get("doc_id"), str):
+        return route, "invalid_route"
+    fixed_doc_id = operation_candidate["doc_id"]
+    if selector is None:
+        route["target_ref"] = fixed_doc_id
+    elif selector.kind in {DocumentSelectorKind.EVIDENCE,
+                           DocumentSelectorKind.SHOWN_POSITION}:
+        # Those selectors need their scoped snapshot/manifest binding.
+        return route, "uncertain"
+    elif route.get("target_ref") not in {fixed_doc_id, "last"}:
+        return _mark_explicit_conflict(route)
+    elif (selector.kind is DocumentSelectorKind.DIALOG_NUMBER
+          and selector.dialog_number != operation_candidate.get("dialog_number")):
+        return _mark_explicit_conflict(route)
+    elif (selector.kind is DocumentSelectorKind.LAST_SAVED
+          and last_doc_id != fixed_doc_id):
+        return _mark_explicit_conflict(route)
+    elif (selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT
+          and active_doc_id != fixed_doc_id):
+        return _mark_explicit_conflict(route)
+    return None
+
+
+def _project_semantic_tool_choice(
+    route: dict[str, Any], decision: RoutingDecision, *,
+    tool_choice: Mapping[str, Any] | None, last_doc_id: str | None,
+) -> tuple[dict[str, Any], str] | None:
+    if decision.action in {Action.MOVE_TRANSCRIPT, Action.CREATE_FOLDER}:
+        generated = _semantic_write_tool(decision, route, last_doc_id=last_doc_id)
+        if generated is None and decision.action is Action.MOVE_TRANSCRIPT and route.get("dialog_number") is not None:
+            # The scoped dialog-number lookup occurs immediately before dispatch.
+            route["tool_choice"] = tool_choice
+            generated = None
+        elif generated is None:
+            return route, "uncertain"
+        if tool_choice is not None and generated is not None:
+            provided_choice = dict(tool_choice)
+            provided_args = dict(provided_choice.get("arguments", {}))
+            if (provided_choice.get("name") == "create_folder"
+                    and provided_args.get("parent_path") == []):
+                provided_args.pop("parent_path")
+            provided_choice["arguments"] = provided_args
+            if provided_choice != generated:
+                return _mark_explicit_conflict(route)
+        if generated is not None:
+            route["tool_choice"] = generated
+    elif decision.action is Action.CREATE_THEN_MOVE:
+        route["tool_choice"] = None
+    return None
+
+
+def _project_semantic_decision(
+    decision: RoutingDecision, *, tool_choice: Mapping[str, Any] | None,
+    target_operation_id: str | None, operation_candidates: Any,
+    raw_response: Mapping[str, Any], active_doc_id: str | None = None,
+    last_doc_id: str | None = None, candidates: Any = (),
+) -> tuple[dict[str, Any], str]:
+    """Project established ordinary routes while retaining the rich decision in memory."""
+    operation_candidate = _first_operation_candidate(operation_candidates, target_operation_id)
+    operation_doc_id = operation_candidate.get("doc_id") if isinstance(operation_candidate, Mapping) else None
+    route = _semantic_route_shell(
+        decision, tool_choice=tool_choice, target_operation_id=target_operation_id,
+        raw_response=raw_response, operation_candidate=operation_candidate,
+    )
+    scoped_candidates = tuple(candidates) if isinstance(candidates, (tuple, list)) else ()
+    if isinstance(operation_candidates, (tuple, list)):
+        scoped_candidates += tuple(operation_candidates)
+    if _semantic_conflict(decision, tool_choice, active_doc_id=active_doc_id,
+                          last_doc_id=last_doc_id, candidates=scoped_candidates,
+                          target_doc_id=operation_doc_id):
+        semantic = route["semantic_decision"]
+        semantic["disposition"] = Disposition.CLARIFY.value
+        semantic["certainty"] = Certainty.UNCERTAIN.value
+        semantic["missing_slots"] = list(dict.fromkeys(
+            [*semantic["missing_slots"], "explicit_conflict"]
+        ))
+        route["semantic_decision"] = semantic
+        return route, "uncertain"
+    if (decision.disposition not in {Disposition.EXECUTE, Disposition.DELEGATE}
+            or decision.certainty is not Certainty.CERTAIN or decision.missing_slots):
+        return route, "uncertain"
+    selector = decision.document_selector
+    selector_status = _project_semantic_selector(
+        route, decision, scoped_candidates, active_doc_id
+    )
+    if selector_status is not None:
+        return route, selector_status
+    predecessor_result = _validate_semantic_predecessor(
+        route, selector, operation_candidate, operation_candidates, target_operation_id,
+        active_doc_id=active_doc_id, last_doc_id=last_doc_id,
+    )
+    if predecessor_result is not None:
+        return predecessor_result
+    if (decision.action in {Action.MOVE_TRANSCRIPT, Action.CREATE_FOLDER,
+                            Action.CREATE_THEN_MOVE}
+            and _folder_parent_conflict(decision.folder_selector)):
+        return _mark_explicit_conflict(route)
+    tool_result = _project_semantic_tool_choice(
+        route, decision, tool_choice=tool_choice, last_doc_id=last_doc_id
+    )
+    if tool_result is not None:
+        return tool_result
+    if route["kind"] not in _ROUTE_KINDS:
+        return route, "invalid_route"
+    return route, "ok"
+
+
+def _folder_path(selector: Any) -> list[str] | None:
+    """Normalize literal paths: absolute paths start at root, relative ones use parent."""
+    if selector is None:
+        return None
+    if selector.kind.value == "root_default":
+        return []
+    if selector.kind.value != "explicit_path":
+        return None
+    parent_path = _folder_path(selector.parent) if selector.parent is not None else []
+    if parent_path is None:
+        return None
+    raw_path = selector.value
+    absolute = raw_path.startswith("/")
+    components = (raw_path[1:] if absolute else raw_path).split("/")
+    if not components or any(not item or item in {".", ".."} for item in components):
+        return None
+    if absolute:
+        if parent_path and components[:len(parent_path)] != parent_path:
+            return None
+        return components
+    return [*parent_path, *components]
+
+
+def _folder_parent_conflict(selector: Any) -> bool:
+    if selector is None or selector.kind.value == "root_default":
+        return False
+    if selector.parent is not None and _folder_parent_conflict(selector.parent):
+        return True
+    if selector.kind.value != "explicit_path" or not selector.value.startswith("/"):
+        return False
+    parent_path = _folder_path(selector.parent) if selector.parent is not None else []
+    if parent_path is None:
+        return False
+    components = selector.value[1:].split("/")
+    return bool(parent_path and components[:len(parent_path)] != parent_path)
+
+
+def _mark_explicit_conflict(route: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    semantic = route.get("semantic_decision")
+    if isinstance(semantic, Mapping):
+        semantic = dict(semantic)
+        semantic["disposition"] = Disposition.CLARIFY.value
+        semantic["certainty"] = Certainty.UNCERTAIN.value
+        semantic["missing_slots"] = list(dict.fromkeys(
+            [*semantic.get("missing_slots", []), MissingSlot.EXPLICIT_CONFLICT.value]
+        ))
+        route["semantic_decision"] = semantic
+    route["certainty"] = Certainty.UNCERTAIN.value
+    return route, "uncertain"
+
+
+def _semantic_write_tool(
+    decision: RoutingDecision, route: Mapping[str, Any], *, last_doc_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Build a registry write choice only when semantic inputs are concrete."""
+    selector = decision.folder_selector
+    if decision.action is Action.CREATE_FOLDER:
+        if decision.folder_name is None:
+            return None
+        parent_path = _folder_path(selector)
+        if parent_path is None:
+            return None
+        args: dict[str, Any] = {"name": decision.folder_name}
+        if parent_path:
+            args["parent_path"] = parent_path
+        return {"name": "create_folder", "arguments": args, "link_requested": False}
+    if decision.action is Action.MOVE_TRANSCRIPT:
+        doc_id = route.get("target_ref")
+        if (decision.document_selector is not None
+                and decision.document_selector.kind is DocumentSelectorKind.LAST_SAVED
+                and doc_id == "last"):
+            doc_id = last_doc_id
+        folder_path = _folder_path(selector)
+        if not isinstance(doc_id, str) or not doc_id or not folder_path:
+            return None
+        return {"name": "move_transcript",
+                "arguments": {"doc_id": doc_id, "folder_path": folder_path},
+                "link_requested": False}
+    return None
+
+
+def _valid_response(
+    response: Any, *, accepted_command: str,
+    operation_candidates: Any = (), active_doc_id: str | None = None,
+    last_doc_id: str | None = None, candidates: Any = (),
+) -> tuple[dict[str, Any] | None, str]:
+    """Strictly validate a fresh semantic response against its exact command."""
+    if not isinstance(response, Mapping) or set(response) != _FRESH_FIELDS:
+        return None, "invalid_route"
+    tool_choice = response.get("tool_choice")
+    if tool_choice is not None:
+        if not isinstance(tool_choice, Mapping) or not {"name", "arguments"}.issubset(tool_choice):
+            return None, "invalid_route"
+        name = tool_choice.get("name")
+        if not isinstance(name, str) or name not in OPERATIONS:
+            return None, "invalid_route"
+        allowed_tool_fields = {"name", "arguments"} | ({"link_requested"} if name == "get_transcript" else set())
+        if not {"name", "arguments"}.issubset(tool_choice) or set(tool_choice) - allowed_tool_fields:
+            return None, "invalid_route"
+        try:
+            arguments = validate_arguments(name, tool_choice.get("arguments"))
+        except (TypeError, ValueError):
+            return None, "invalid_route"
+        link_requested = tool_choice.get("link_requested", False)
+        if not isinstance(link_requested, bool) or (link_requested and name != "get_transcript"):
+            return None, "invalid_route"
+        tool_choice = {"name": name, "arguments": arguments,
+                       "link_requested": link_requested}
+    try:
+        target_operation_id = response.get("target_operation_id")
+        if target_operation_id is not None and (
+            not isinstance(target_operation_id, str) or not target_operation_id
+        ):
+            return None, "invalid_route"
+        decision = _normalize_fresh_decision(response, accepted_command)
+        decision = _validate_fresh_action(
+            decision, tool_choice=tool_choice, target_operation_id=target_operation_id,
+        )
+        if target_operation_id is not None:
+            available = {item.get("operation_id") for item in operation_candidates
+                         if isinstance(item, Mapping)} if isinstance(operation_candidates, (tuple, list)) else set()
+            if target_operation_id not in available:
+                return None, "invalid_route"
+        projected, status = _project_semantic_decision(
+            decision, tool_choice=tool_choice, target_operation_id=target_operation_id,
+            operation_candidates=operation_candidates, raw_response=response,
+            active_doc_id=active_doc_id, last_doc_id=last_doc_id,
+            candidates=candidates,
+        )
+        if status == "ok" and decision.action is Action.RETRY:
+            projected["tool_choice"] = None
+        return projected, status
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None, "invalid_route"
 
 
 _CARD_FIELDS = (
@@ -267,15 +1039,27 @@ def _resolve_target(
     try:
         context_id = context.context_id
         number = decision["dialog_number"]
-        # An explicit number is the strongest target signal, even if semantic
-        # metadata points somewhere else. Unknown numbers never fall back.
         if number is not None:
             target = _doc_for_number(store, context_id, number)
             if target is None or target not in candidates:
                 return None, None, "not_found"
+            semantic = decision.get("semantic_decision")
+            selector = (semantic.get("document_selector")
+                        if isinstance(semantic, Mapping) else None)
+            if (isinstance(selector, Mapping)
+                    and selector.get("kind") == DocumentSelectorKind.ACTIVE_DOCUMENT.value):
+                active = _current_doc(store, candidates, context)
+                if active is not None and active != target:
+                    return None, None, "uncertain"
         else:
             ref = decision["target_ref"]
-            if ref == "last":
+            semantic = decision.get("semantic_decision")
+            selector = (semantic.get("document_selector")
+                        if isinstance(semantic, Mapping) else None)
+            semantic_last = (isinstance(selector, Mapping)
+                             and selector.get("kind") == DocumentSelectorKind.LAST_SAVED.value)
+            legacy_last = semantic is None and ref == "last"
+            if (semantic_last or legacy_last) and ref == "last":
                 target = context.last_doc_id
                 if not isinstance(target, str) or target not in candidates:
                     return None, None, "not_found"
@@ -305,6 +1089,7 @@ def _resolve_target(
 async def _request_route(
     *, text: str, model: Any, cards: tuple[dict[str, Any], ...],
     operation_candidates: Mapping[str, dict[str, Any]],
+    active_doc_id: str | None = None, last_doc_id: str | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """Ask the model for one structured route, with sanitized save targets."""
     try:
@@ -317,7 +1102,87 @@ async def _request_route(
             raw = await model.route(text=text, candidates=cards)
     except Exception:
         return None, "error"
-    return _valid_response(raw)
+    return _valid_response(
+        raw, accepted_command=text,
+        operation_candidates=tuple(operation_candidates.values()),
+        active_doc_id=active_doc_id, last_doc_id=last_doc_id, candidates=cards,
+    )
+
+
+def _active_doc_id(cards: Any, context: Any) -> str | None:
+    """Return the active document only from the cards already captured for this route."""
+    conversation_id = getattr(context, "active_conversation_id", None)
+    if not isinstance(conversation_id, str):
+        return None
+    matches = {card["doc_id"] for card in cards
+               if isinstance(card, Mapping) and card.get("conversation_id") == conversation_id
+               and isinstance(card.get("doc_id"), str)} if isinstance(cards, (tuple, list)) else set()
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+async def _consume_validated_route(
+    decision: Mapping[str, Any] | None, status: str, *, text: str,
+    context: Any, store: Any, search: Any, notices: Any, actions: Any,
+    operation_id: str | None, owner: str | None, fence: int | None,
+    now: datetime | None, cards: tuple[dict[str, Any], ...],
+    operation_candidates: Mapping[str, dict[str, Any]], notify_switch: bool,
+) -> dict[str, Any]:
+    """Consume a server-validated ordinary route projection without revalidation."""
+    if decision is None or status != "ok":
+        return _failure(status)
+    kind = decision["kind"]
+    if kind == "search":
+        return await _run_search_route(
+            text=text, arguments=decision["tool_choice"]["arguments"],
+            context=context, store=store, search=search,
+        )
+    if kind == "save":
+        return _confirm_save_decision(
+            context=context, store=store, operation_id=operation_id,
+            owner=owner, fence=fence, now=now,
+        )
+    if kind == "retry":
+        return {"status": "ok", "kind": "retry",
+                "dialog_number": decision["dialog_number"]}
+    semantic = decision.get("semantic_decision")
+    if (kind == "substantive" and isinstance(semantic, Mapping)
+            and semantic.get("action") == Action.CREATE_FOLDER.value
+            and decision.get("tool_choice") is not None):
+        choice = decision["tool_choice"]
+        try:
+            action_result = await actions.execute(
+                name=choice["name"], arguments=choice["arguments"],
+                target_doc_id=None, link_requested=False,
+            )
+        except Exception:
+            return _failure("error", kind=kind)
+        return {"status": "ok", "kind": kind, "target_doc_id": None,
+                "substantive_text": decision["substantive_text"],
+                "tool_choice": choice, "action_result": action_result}
+    target, failure = _resolve_route_target(
+        decision, context=context, store=store,
+        candidates=tuple(card["doc_id"] for card in cards),
+        operation_candidates=operation_candidates,
+    )
+    if failure:
+        return _failure(failure, kind=kind)
+    if (kind == "substantive" and isinstance(semantic, Mapping)
+            and semantic.get("action") == Action.MOVE_TRANSCRIPT.value
+            and decision.get("tool_choice") is None):
+        try:
+            typed = RoutingDecision.from_dict(semantic)
+            generated = _semantic_write_tool(
+                typed, {"target_ref": target["target_doc_id"]},
+            )
+        except (TypeError, ValueError):
+            generated = None
+        if generated is None:
+            return _failure("uncertain", kind=kind)
+        decision = {**decision, "tool_choice": generated}
+    return await _finish_targeted_route(
+        decision, target=target, context=context, notices=notices, actions=actions,
+        notify_switch=notify_switch,
+    )
 
 
 async def _run_search_route(
@@ -406,10 +1271,28 @@ def _resolve_route_target(
         fixed_target = operation_candidates.get(target_operation_id)
         if fixed_target is None:
             return None, "invalid_route"
+        semantic = decision.get("semantic_decision")
+        selector = (semantic.get("document_selector")
+                    if isinstance(semantic, Mapping) else None)
+        if (isinstance(selector, Mapping)
+                and selector.get("kind") == DocumentSelectorKind.ACTIVE_DOCUMENT.value):
+            active = _current_doc(store, candidates, context)
+            if active is None or active != fixed_target["doc_id"]:
+                # Active focus and the predecessor's fixed target are independent
+                # signals; without equality, leave the route unresolved.
+                return None, "uncertain"
         concrete_ref = decision["target_ref"]
-        if concrete_ref is not None and concrete_ref not in {
-            "last", fixed_target["doc_id"],
-        }:
+        semantic = decision.get("semantic_decision")
+        selector = (semantic.get("document_selector")
+                    if isinstance(semantic, Mapping) else None)
+        semantic_last = (isinstance(selector, Mapping)
+                         and selector.get("kind") == DocumentSelectorKind.LAST_SAVED.value)
+        allowed_refs = {fixed_target["doc_id"]}
+        if semantic_last:
+            allowed_refs.add("last")
+            if context.last_doc_id != fixed_target["doc_id"]:
+                return None, "uncertain"
+        if concrete_ref is not None and concrete_ref not in allowed_refs:
             return None, "invalid_route"
         return _resolved_target(
             fixed_target["doc_id"], fixed_target["dialog_number"],
@@ -508,34 +1391,13 @@ async def route_message(
     decision, status = await _request_route(
         text=text, model=model, cards=cards,
         operation_candidates=operation_candidates,
+        active_doc_id=_active_doc_id(cards, context),
+        last_doc_id=getattr(context, "last_doc_id", None),
     )
-    if decision is None:
-        return _failure(status)
-    kind = decision["kind"]
-    if kind == "search":
-        return await _run_search_route(
-            text=text, arguments=decision["tool_choice"]["arguments"],
-            context=context, store=store, search=search,
-        )
-
-    if kind == "save":
-        return _confirm_save_decision(
-            context=context, store=store, operation_id=operation_id,
-            owner=owner, fence=fence, now=now,
-        )
-
-    if kind == "retry":
-        return {"status": "ok", "kind": "retry",
-                "dialog_number": decision["dialog_number"]}
-
-    target, failure = _resolve_route_target(
-        decision, context=context, store=store, candidates=candidates,
-        operation_candidates=operation_candidates,
-    )
-    if failure:
-        return _failure(failure, kind=kind)
-    return await _finish_targeted_route(
-        decision, target=target, context=context, notices=notices, actions=actions,
+    return await _consume_validated_route(
+        decision, status, text=text, context=context, store=store, search=search,
+        notices=notices, actions=actions, operation_id=operation_id, owner=owner,
+        fence=fence, now=now, cards=cards, operation_candidates=operation_candidates,
         notify_switch=notify_switch,
     )
 
