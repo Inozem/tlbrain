@@ -387,8 +387,10 @@ def _tool_choice_conflicts_with_selector(
                 return True
         elif selector.kind in {DocumentSelectorKind.SHOWN_POSITION,
                                DocumentSelectorKind.EVIDENCE}:
-            # Equality requires resolving an independently scoped binding.
-            return True
+            # Resolve the selector from the captured evidence first. The
+            # ordinary write projection below compares the resulting document
+            # with this proposed argument, so a bad model target still fails.
+            pass
         elif selector.kind is DocumentSelectorKind.LAST_SAVED:
             if not isinstance(last_doc_id, str) or argument_doc_id != last_doc_id:
                 return True
@@ -517,11 +519,17 @@ def _validate_fresh_action(
         Action.MOVE_TRANSCRIPT, Action.CREATE_FOLDER, Action.CREATE_THEN_MOVE, Action.SAVE,
     }:
         raise ValueError("delegation cannot describe a write action")
-    if decision.action is Action.RETRY and (
-        decision.document_selector is None
-        or decision.document_selector.kind is not DocumentSelectorKind.DIALOG_NUMBER
-    ):
+    if (decision.action is Action.RETRY
+            and decision.disposition is not Disposition.CLARIFY
+            and (decision.document_selector is None
+                 or decision.document_selector.kind is not DocumentSelectorKind.DIALOG_NUMBER)):
         raise ValueError("retry requires an explicit local dialog number")
+    if (decision.action is Action.RETRY
+            and decision.disposition is Disposition.CLARIFY
+            and not (
+                decision.document_selector is None
+            )):
+        raise ValueError("retry clarification cannot bind an executable dialog target")
 
     missing = list(decision.missing_slots)
     folder_name = decision.folder_name
@@ -547,6 +555,13 @@ def _validate_fresh_action(
         if (decision.document_selector is None and target_operation_id is None
                 and MissingSlot.DOCUMENT not in missing):
             missing.append(MissingSlot.DOCUMENT)
+        if (decision.document_selector is None and target_operation_id is None
+                and isinstance(tool_choice, Mapping)
+                and tool_choice.get("name") == "move_transcript"
+                and isinstance(tool_choice.get("arguments"), Mapping)
+                and isinstance(tool_choice["arguments"].get("doc_id"), str)
+                and MissingSlot.EXPLICIT_CONFLICT not in missing):
+            missing.append(MissingSlot.EXPLICIT_CONFLICT)
         if folder is None and MissingSlot.DESTINATION not in missing:
             missing.append(MissingSlot.DESTINATION)
     if missing and decision.disposition is Disposition.EXECUTE:
@@ -625,8 +640,54 @@ def _project_semantic_selector(
     elif selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
         if isinstance(active_doc_id, str) and active_doc_id:
             route["target_ref"] = active_doc_id
+    elif selector.kind is DocumentSelectorKind.EVIDENCE:
+        cited = set(selector.evidence_refs)
+        matches = []
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            refs = candidate.get("evidence_refs", ())
+            if not isinstance(refs, (list, tuple)):
+                continue
+            doc_id = candidate.get("doc_id")
+            if (doc_id == selector.doc_id and cited
+                    and cited.issubset(set(refs))):
+                matches.append(candidate["doc_id"])
+        if len(set(matches)) != 1:
+            return "uncertain"
+        route["target_ref"] = matches[0]
+    elif selector.kind is DocumentSelectorKind.SHOWN_POSITION:
+        # shown_position is a closed three-field selector in the static
+        # response schema. Its source citations live in the top-level decision
+        # evidence_refs and must match the captured list evidence exactly.
+        cited_sources = set(decision.evidence_refs)
+        if not cited_sources:
+            return "uncertain"
+        matched = [candidate for candidate in candidates
+                   if isinstance(candidate, Mapping)
+                   and candidate.get("list_id") == selector.list_id
+                   and isinstance(candidate.get("evidence_refs"), (list, tuple))
+                   and cited_sources.intersection(candidate["evidence_refs"])
+                   and type(candidate.get("position")) is int]
+        actual_sources = {
+            ref for candidate in matched
+            for ref in candidate.get("evidence_refs", ())
+            if isinstance(ref, str)
+        }
+        if len(actual_sources) != 1 or cited_sources != actual_sources:
+            return "uncertain"
+        if selector.position == "last":
+            last = max((item["position"] for item in matched), default=None)
+            matched = [item for item in matched if item["position"] == last]
+        else:
+            matched = [item for item in matched
+                       if item["position"] == selector.position]
+        doc_ids = {item.get("doc_id") for item in matched
+                   if isinstance(item.get("doc_id"), str)}
+        if len(doc_ids) != 1:
+            return "uncertain"
+        route["target_ref"] = next(iter(doc_ids))
     else:
-        # Evidence and shown positions require scoped snapshot/manifest resolution.
         return "uncertain"
     return None
 
@@ -712,7 +773,11 @@ def _project_semantic_decision(
     scoped_candidates = tuple(candidates) if isinstance(candidates, (tuple, list)) else ()
     if isinstance(operation_candidates, (tuple, list)):
         scoped_candidates += tuple(operation_candidates)
-    if _semantic_conflict(decision, tool_choice, active_doc_id=active_doc_id,
+    # First preserve contradictions stated directly by the user's explicit
+    # references/numbers. A tool proposal is checked after its semantic target
+    # has been projected, so an unsupported concrete ID can be refused without
+    # turning unresolved selectors into an executable target.
+    if _semantic_conflict(decision, None, active_doc_id=active_doc_id,
                           last_doc_id=last_doc_id, candidates=scoped_candidates,
                           target_doc_id=operation_doc_id):
         semantic = route["semantic_decision"]
@@ -727,17 +792,44 @@ def _project_semantic_decision(
             or decision.certainty is not Certainty.CERTAIN or decision.missing_slots):
         return route, "uncertain"
     selector = decision.document_selector
+    if (decision.action is Action.MOVE_TRANSCRIPT and selector is None
+            and isinstance(tool_choice, Mapping)
+            and tool_choice.get("name") == "move_transcript"):
+        arguments = tool_choice.get("arguments")
+        if isinstance(arguments, Mapping) and isinstance(arguments.get("doc_id"), str):
+            route, _ = _mark_missing_document_clarification(route)
+            return _mark_explicit_conflict(route)
     selector_status = _project_semantic_selector(
         route, decision, scoped_candidates, active_doc_id
     )
     if selector_status is not None:
+        if selector_status == "uncertain":
+            return _mark_missing_document_clarification(route)
         return route, selector_status
     predecessor_result = _validate_semantic_predecessor(
         route, selector, operation_candidate, operation_candidates, target_operation_id,
         active_doc_id=active_doc_id, last_doc_id=last_doc_id,
     )
     if predecessor_result is not None:
+        if predecessor_result[1] == "uncertain":
+            return _mark_missing_document_clarification(predecessor_result[0])
         return predecessor_result
+    if (decision.action is Action.MOVE_TRANSCRIPT
+            and isinstance(tool_choice, Mapping)
+            and tool_choice.get("name") == "move_transcript"):
+        arguments = tool_choice.get("arguments")
+        proposed_doc_id = arguments.get("doc_id") if isinstance(arguments, Mapping) else None
+        projected_doc_id = route.get("target_ref")
+        candidate_ids = {
+            item.get("doc_id") for item in scoped_candidates
+            if isinstance(item, Mapping) and isinstance(item.get("doc_id"), str)
+        }
+        if (isinstance(proposed_doc_id, str)
+                and isinstance(projected_doc_id, str)
+                and projected_doc_id != "last"
+                and proposed_doc_id != projected_doc_id
+                and proposed_doc_id not in candidate_ids):
+            return route, "invalid_route"
     if (decision.action in {Action.MOVE_TRANSCRIPT, Action.CREATE_FOLDER,
                             Action.CREATE_THEN_MOVE}
             and _folder_parent_conflict(decision.folder_selector)):
@@ -803,6 +895,21 @@ def _mark_explicit_conflict(route: dict[str, Any]) -> tuple[dict[str, Any], str]
     return route, "uncertain"
 
 
+def _mark_missing_document_clarification(route: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Turn an unresolved scoped selector into a typed T011 document question."""
+    semantic = route.get("semantic_decision")
+    if isinstance(semantic, Mapping):
+        semantic = dict(semantic)
+        semantic["disposition"] = Disposition.CLARIFY.value
+        semantic["certainty"] = Certainty.UNCERTAIN.value
+        semantic["missing_slots"] = list(dict.fromkeys(
+            [*semantic.get("missing_slots", []), MissingSlot.DOCUMENT.value]
+        ))
+        route["semantic_decision"] = semantic
+    route["certainty"] = Certainty.UNCERTAIN.value
+    return route, "uncertain"
+
+
 def _semantic_write_tool(
     decision: RoutingDecision, route: Mapping[str, Any], *, last_doc_id: str | None = None,
 ) -> dict[str, Any] | None:
@@ -842,9 +949,36 @@ def _validate_stored_joint_projection(
     )
     resolved_operation = resolved.get("target_operation_id")
     summary_operation = summary.get("target_operation_id")
-    _validate_stored_selector_projection(
-        summary, selector, resolved_doc, resolved_operation, summary_operation,
-    )
+    if (decision.action is Action.RETRY
+            and decision.disposition is not Disposition.CLARIFY):
+        target_ref = summary.get("target_ref")
+        target_doc_id = summary.get("target_doc_id")
+        if (selector is None or selector.kind is not DocumentSelectorKind.DIALOG_NUMBER
+                or type(summary.get("dialog_number")) is not int
+                or summary.get("dialog_number") != selector.dialog_number
+                or resolved_doc is not None
+                or target_ref is not None or target_doc_id is not None
+                or resolved_operation is not None or summary_operation is not None):
+            raise ValueError("retry projection conflicts with its failed-draft selector")
+    elif decision.disposition is not Disposition.CLARIFY:
+        _validate_stored_selector_projection(
+            summary, selector, resolved_doc, resolved_operation, summary_operation,
+        )
+    else:
+        target_ref = summary.get("target_ref")
+        target_doc_id = summary.get("target_doc_id")
+        if decision.action is Action.RETRY:
+            if (selector is not None or resolved_doc is not None
+                    or target_ref is not None or target_doc_id is not None):
+                raise ValueError("retry clarification contains an executable document target")
+        elif any(value is not None for value in (target_ref, target_doc_id)):
+            _validate_stored_selector_projection(
+                summary, selector, resolved_doc, resolved_operation, summary_operation,
+            )
+        elif summary_operation is not None or resolved_operation is not None:
+            if (not isinstance(resolved_operation, str) or not resolved_operation
+                    or summary_operation != resolved_operation):
+                raise ValueError("ordinary operation target conflicts with clarification binding")
     _validate_stored_disposition_projection(
         application_route, summary, contextual, decision, resolved,
     )
@@ -894,34 +1028,55 @@ def _validate_stored_selector_projection(
     resolved_operation: Any, summary_operation: Any,
 ) -> None:
     """Check frozen selector bindings against the ordinary route summary."""
+    # Joint T023 route controls persist a resolved target_doc_id; legacy
+    # projections retain target_ref. Keep both representations checked when
+    # present, since last-saved intentionally differs from its resolved ID.
+    missing = object()
+    target_ref = summary.get("target_ref", missing)
+    target_doc_id = summary.get("target_doc_id", missing)
+    has_target_binding = any(value is not missing and value is not None
+                             for value in (target_ref, target_doc_id))
     if selector is None:
         if ((resolved_operation is None and summary_operation is not None)
                 or (resolved_operation is not None and summary_operation != resolved_operation)):
             raise ValueError("ordinary route has no verified operation target")
-        if resolved_doc is not None and summary.get("target_ref") not in (None, resolved_doc):
+        if resolved_doc is not None and any(
+                value not in (missing, None, resolved_doc)
+                for value in (target_ref, target_doc_id)):
             raise ValueError("ordinary document target conflicts with resolved binding")
     elif selector.kind is DocumentSelectorKind.EXPLICIT_REFERENCE:
         from services.connectors.telegram.runtime.store import TelegramRuntimeStore
         expected_ref = TelegramRuntimeStore._reference_value(selector.span)
         if not isinstance(expected_ref, str) or not expected_ref:
             raise ValueError("literal document selector has no canonical reference")
-        if summary.get("target_ref") != expected_ref:
+        if (not has_target_binding
+                or target_ref not in (missing, None, expected_ref, resolved_doc)
+                or target_doc_id not in (missing, None, resolved_doc)):
             raise ValueError("ordinary route target conflicts with literal selector")
         if resolved_doc is not None and resolved_doc != expected_ref:
             raise ValueError("resolved document conflicts with literal selector")
     elif selector.kind is DocumentSelectorKind.DIALOG_NUMBER:
         if (summary.get("dialog_number") != selector.dialog_number
-                or (resolved_doc is not None and summary.get("target_ref") != resolved_doc)):
+                or not has_target_binding or not isinstance(resolved_doc, str)
+                or any(value not in (missing, None, resolved_doc)
+                       for value in (target_ref, target_doc_id))):
             raise ValueError("ordinary route target conflicts with dialog selector")
     elif selector.kind is DocumentSelectorKind.LAST_SAVED:
-        if summary.get("target_ref") != "last":
+        if (not has_target_binding or not isinstance(resolved_doc, str)
+                or target_ref not in (missing, None, "last", resolved_doc)
+                or target_doc_id not in (missing, None, resolved_doc)
+                or (target_ref == "last" and target_doc_id not in (missing, None, resolved_doc))):
             raise ValueError("ordinary route target conflicts with last-saved selector")
     elif selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
-        if resolved_doc is not None and summary.get("target_ref") != resolved_doc:
+        if (not has_target_binding or not isinstance(resolved_doc, str)
+                or any(value not in (missing, None, resolved_doc)
+                       for value in (target_ref, target_doc_id))):
             raise ValueError("ordinary route target conflicts with active-document binding")
     elif selector.kind in {DocumentSelectorKind.EVIDENCE,
                            DocumentSelectorKind.SHOWN_POSITION}:
-        if resolved_doc is not None and summary.get("target_ref") != resolved_doc:
+        if (not has_target_binding or not isinstance(resolved_doc, str)
+                or any(value not in (missing, None, resolved_doc)
+                       for value in (target_ref, target_doc_id))):
             raise ValueError("ordinary route target conflicts with resolved evidence")
 
 
@@ -1227,6 +1382,12 @@ def _resolve_target(
             else:
                 target = _current_doc(store, candidates, context)
                 if target is None:
+                    choice = decision.get("tool_choice")
+                    if isinstance(choice, Mapping):
+                        from core.operations.registry import OPERATIONS
+                        operation = OPERATIONS.get(choice.get("name"))
+                        if operation is not None and operation.write:
+                            return None, None, "uncertain"
                     return None, None, "not_found"
         metadata = _metadata(store, target)
         if metadata is None:
@@ -2213,6 +2374,7 @@ async def process_operation(
     *, operation_id: str, context: Any, text: str, repository: Any,
     router: Any, agent: Any, notifications: Any, queue: Any = None,
     selection_publisher: Callable[..., Any] | None = None,
+    defer_route_persistence: Callable[[Any], bool] | None = None,
     owner: str | None = None, fence: int | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -2237,10 +2399,27 @@ async def process_operation(
             and route.get("kind") in {"pure_switch", "substantive"}
             else None
         )
-    state = _persist_operation_route(
-        route, operation_id=operation_id, context=context, repository=repository,
-        owner=owner, fence=fence, now=now, selection_policy=selection_policy,
-    )
+    deferred = False
+    if callable(defer_route_persistence):
+        deferred = defer_route_persistence(route) is True
+    if deferred:
+        deferred_route = dict(route) if isinstance(route, Mapping) else route
+        if (isinstance(deferred_route, dict) and selection_policy == "silent_v1"
+                and _operation_route_status(deferred_route) == "ok"
+                and deferred_route.get("kind") in {"pure_switch", "substantive"}):
+            deferred_route["selection_policy"] = selection_policy
+        route_record = _control_route_record(deferred_route)
+        route_record["status"] = _operation_route_status(deferred_route)
+        state = _PersistedOperationRoute(
+            route=deferred_route, route_record=route_record,
+            context_id=getattr(context, "context_id", None),
+            clear_candidate=None, repository=repository,
+        )
+    else:
+        state = _persist_operation_route(
+            route, operation_id=operation_id, context=context, repository=repository,
+            owner=owner, fence=fence, now=now, selection_policy=selection_policy,
+        )
     if state is None:
         return {"status": "error"}
     failure = _route_failure_result(state)

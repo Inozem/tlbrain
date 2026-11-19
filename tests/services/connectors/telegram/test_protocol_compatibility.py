@@ -2358,6 +2358,84 @@ def test_t016_governed_cached_success_cannot_drop_a_trusted_target_binding(
     assert cached is None, "unbound governor invocation adopted a typed-target success"
 
 
+def test_t024_real_unbound_cached_write_cannot_adopt_a_new_capability(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A real historical write result cannot gain route authority on cache replay."""
+    from types import SimpleNamespace
+
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+    from core.integrations.firestore.operation_queue import QueueOperationRetryStore
+    import json
+    from core.operations.retries import RetryGovernor
+    from core.operations.write import _new_resolved_write_targets
+    from services.connectors.telegram.runtime.runtime import _GovernedExecutor
+    from services.connectors.telegram.runtime.tools import stable_effect_id
+
+    now = BASE_TIME + timedelta(minutes=12)
+    root_id, folder_id = "t024-unbound-root", "t024-unbound-folder"
+    monkeypatch.setenv("ROOT_FOLDER_URL", f"https://drive.google.com/drive/folders/{root_id}")
+    client = firestore_fake.client_class()
+    client.collection(FOLDERS_COLLECTION).document(root_id).set({
+        "folder_id": root_id, "name": "TLBrain", "parent_id": None,
+    })
+    accepted, _operation, lease, _repository, executor = _executor_for_folder_write(
+        client, now=now, chat_id=93624, monkeypatch=monkeypatch,
+    )
+    operation_id = accepted.operation_id
+    arguments = {"name": "Legacy Archive"}
+    child_id = "telegram-tool-" + hashlib.sha256(
+        f"{operation_id}\0{0}".encode("utf-8")
+    ).hexdigest()
+    legacy_intent = "sha256:" + hashlib.sha256(json.dumps(
+        {"name": "Legacy Archive", "parent_id": root_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    marker = "v1:" + hashlib.sha256("\0".join((
+        child_id, stable_effect_id(operation_id, 0), "drive_folder", legacy_intent,
+    )).encode("utf-8")).hexdigest()
+    root_metadata = {"id": root_id, "name": "TLBrain",
+                     "mimeType": "application/vnd.google-apps.folder",
+                     "parents": [], "trashed": False}
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": [folder_id]})
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", error=_http_404())
+    sdk_fakes.drive.queue("files.get", response=root_metadata)
+    sdk_fakes.drive.queue("files.create", response={"id": folder_id})
+    sdk_fakes.drive.queue("files.get", response={
+        "id": folder_id, "name": "Legacy Archive",
+        "mimeType": "application/vnd.google-apps.folder", "parents": [root_id],
+        "trashed": False, "appProperties": {"tlbrain_effect_intent": marker},
+    })
+    governor = RetryGovernor(
+        client, clock=SimpleNamespace(now=lambda: now),
+        retry_store=QueueOperationRetryStore(
+            client, client.collection("telegram_sessions").document(accepted.context_id),
+        ),
+    )
+    legacy_result = governor.run_stage(
+        operation_id, "telegram-tool-00",
+        lambda: executor.execute(name="create_folder", arguments=arguments,
+                                  call_ordinal=0, resolved_targets=None),
+        now=now, owner=lease.owner, fence=lease.fence,
+    )
+    assert legacy_result == folder_id
+    capability = _new_resolved_write_targets(
+        operation_name="create_folder", operation_id=child_id,
+        effect_id=stable_effect_id(operation_id, 0), arguments=arguments,
+        parent_id=root_id, root_id=root_id, intent_digest="a" * 64,
+    )
+    governed = _GovernedExecutor(
+        executor, governor, operation_id, lease, lambda: now, lambda: True,
+    )
+    provider_calls = list(sdk_fakes.trace)
+    with pytest.raises(PermissionError, match="unbound cached write"):
+        governed.execute(name="create_folder", arguments=arguments,
+                         call_ordinal=0, resolved_targets=capability)
+    assert sdk_fakes.trace == provider_calls
+
+
 def _t016_seed_real_folder_application(
     firestore_fake, sdk_fakes, monkeypatch, *, seed_completed=True,
 ):

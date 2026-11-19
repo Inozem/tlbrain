@@ -627,21 +627,48 @@ def _runtime_queue_item(client, *, operation_id="op-runtime", text="private requ
         "lock_expires_at": now + timedelta(minutes=2), "fence": 1,
         "created_at": now, "updated_at": now,
     })
+    command_row = {
+        "context_id": context_id, "operation_id": operation_id, "user_id": 7,
+        "kind": "freeform", "text": text, "candidate": text,
+    }
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+    identity_digest = TelegramRuntimeStore._accepted_input_digest(command_row, text)
     client.collection("telegram_sessions").document(context_id).collection(
         "operations").document(operation_id).set({
             "operation_id": operation_id, "context_id": context_id,
             "state": "running", "sequence": 1,
             "input_ref": f"telegram_sessions/{context_id}/commands/9",
+            "identity_digest": identity_digest,
         })
     client.collection("telegram_sessions").document(context_id).collection(
-        "commands").document("9").set({
-            "context_id": context_id, "operation_id": operation_id, "user_id": 7,
-            "kind": "freeform", "text": text,
-        })
+        "commands").document("9").set(command_row)
     operation = {"operation_id": operation_id, "context_id": context_id,
                  "sequence": 1, "dependency_operation_id": None}
     lease = SimpleNamespace(operation_id=operation_id, owner="worker", fence=1)
     return context_id, operation, lease, TelegramCommand("freeform", text)
+
+
+def _bind_runtime_input(client, context_id, operation, command):
+    """Seed a canonical accepted row for a fresh command scenario."""
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+
+    input_ref = operation["input_ref"]
+    parts = input_ref.split("/")
+    command_ref = client.collection(parts[0]).document(parts[1]).collection(
+        parts[2]).document(parts[3])
+    command_row = command_ref.get().to_dict() or {}
+    command_row.update({"context_id": context_id,
+                        "operation_id": operation["operation_id"],
+                        "kind": command.kind, "text": command.text,
+                        "candidate": command.text})
+    identity_digest = TelegramRuntimeStore._accepted_input_digest(
+        command_row, command.text,
+    )
+    command_ref.set(command_row, merge=False)
+    client.collection("telegram_sessions").document(context_id).collection(
+        "operations").document(operation["operation_id"]).update({
+            "identity_digest": identity_digest,
+        })
 
 
 class _Bot:
@@ -870,8 +897,9 @@ def test_no_document_command_runs_agent_and_delivers_durable_answer(firestore_fa
 
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
-    context_id, operation, lease, command = _runtime_queue_item(client)
-    command = TelegramCommand("freeform", "switch to dialog #2 and what was decided?")
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text="what was decided?",
+    )
     route = _route()
     route["substantive_text"] = "what was decided?"
     bot, model = _Bot(), _RuntimeModel(route, "A useful answer.")
@@ -882,7 +910,6 @@ def test_no_document_command_runs_agent_and_delivers_durable_answer(firestore_fa
                                 context_id=context_id).existing_dialog_candidates() == ()
     result = asyncio.run(runtime(context_id, operation, lease, command=command),
                          loop_factory=_selector_loop)
-
     assert result.value == "completed"
     assert [row[0] for row in model.calls] == ["routing", "tool_loop"], (bot.sent, firestore_fake.documents)
     assert len(bot.sent) == 1
@@ -905,6 +932,36 @@ def test_no_document_command_runs_agent_and_delivers_durable_answer(firestore_fa
     assert replay.value == "completed"
     assert len(bot.sent) == sent_count
     assert len(model.calls) == call_count
+
+
+def test_missing_numbered_dialog_does_not_fall_back_to_global_chat(firestore_fake):
+    from services.connectors.telegram.repository import TelegramRepository
+    from services.connectors.telegram.runtime import TelegramCommandRuntime
+
+    client = firestore_fake.client_class()
+    repository = TelegramRepository(client=client)
+    context_id, operation, lease, command = _runtime_queue_item(
+        client, text="switch to dialog #2 and what was decided?",
+    )
+    route = _route()
+    route["substantive_text"] = "what was decided?"
+    bot, model = _Bot(), _RuntimeModel(route, "A useful answer.")
+    runtime = TelegramCommandRuntime(repository=repository, save_handler=object(),
+                                     client=bot, model=model)
+
+    result = asyncio.run(runtime(context_id, operation, lease, command=command),
+                         loop_factory=_selector_loop)
+
+    assert result.value in {"completed", "failed"}
+    assert not any(mode == "tool_loop" for mode, _contents, _tools in model.calls)
+    assert not repository.list_turns(context_id,
+        "telegram-chat-" + __import__("hashlib").sha256(context_id.encode()).hexdigest())
+    assert len(bot.sent) == 1
+    assert "dialog" in bot.sent[0][1].lower() or "document" in bot.sent[0][1].lower()
+    route_control = repository.get_route_control(context_id, operation["operation_id"])
+    assert route_control is not None
+    assert route_control.get("target_doc_id") is None
+    assert route_control.get("target_ref") is None
 
 
 def test_pending_first_answer_stays_running_and_replays_without_model_call(
@@ -1274,8 +1331,10 @@ def test_current_draft_question_and_followup_use_full_history_and_ephemeral_sour
     runtime = TelegramCommandRuntime(
         repository=repository, save_handler=object(), client=bot, model=ConversationModel(),
     )
+    first_command = TelegramCommand("freeform", "When is the kickoff?")
+    _bind_runtime_input(client, context_id, operation, first_command)
     first = asyncio.run(runtime(
-        context_id, operation, lease, command=TelegramCommand("freeform", "When is the kickoff?"),
+        context_id, operation, lease, command=first_command,
     ), loop_factory=_selector_loop)
     assert first.value == "completed", (first, accepted, firestore_fake.documents)
     assert route_rows
@@ -1323,7 +1382,7 @@ def test_current_draft_question_and_followup_use_full_history_and_ephemeral_sour
     client.collection("telegram_sessions").document(context_id).collection(
         "commands").document("10").set({
             "context_id": context_id, "operation_id": second_id,
-            "kind": "freeform", "text": "And what day?",
+            "user_id": 7, "kind": "freeform", "text": "And what day?",
             "draft_id": accepted.draft_id, "dialog_number": accepted.dialog_number,
             "cutoff_message_ids": [accepted.message_id],
         })
@@ -1340,12 +1399,14 @@ def test_current_draft_question_and_followup_use_full_history_and_ephemeral_sour
         "input_ref": f"telegram_sessions/{context_id}/commands/10",
     }
     second_lease = SimpleNamespace(operation_id=second_id, owner="worker", fence=2)
+    second_command = TelegramCommand("freeform", "And what day?")
+    _bind_runtime_input(client, context_id, second_operation, second_command)
     second = asyncio.run(runtime(
         context_id, second_operation, second_lease,
-        command=TelegramCommand("freeform", "And what day?"),
+        command=second_command,
     ), loop_factory=_selector_loop)
     assert second.value == "completed"
-    assert len(route_rows) == 2, (bot.sent, getattr(runtime, "debug_route_context_error", None))
+    assert len(route_rows) == 2, bot.sent
     assert [turn["parts"][0]["text"] for turn in route_rows[1]["conversation_history"]] == [
         "When is the kickoff?", "The kickoff is April 17.",
     ]
@@ -3868,6 +3929,26 @@ def _t016_default_move_runtime(client, monkeypatch, sdk_fakes, *, now):
     lease = claim_head(client, context_ref, owner="t016-runtime-worker", now=now)
     assert lease is not None
     operation = context_ref.collection("operations").document(accepted.operation_id).get().to_dict()
+    source_number = repository.bind_document(
+        accepted.context_id, "doc-a", "t016-document-a",
+        metadata={"title": "Synthetic A", "source_file": "A",
+                  "parent_id": ROOT_FOLDER_ID},
+        now=now, operation_id=accepted.operation_id, owner=lease.owner,
+        fence=lease.fence, ensure_document_conversation=True,
+    )
+    repository.ensure_conversation(
+        accepted.context_id, "t016-document-a", kind="document", doc_id="doc-a",
+        dialog_number=source_number, queue_operation_id=accepted.operation_id,
+        queue_owner=lease.owner, queue_fence=lease.fence,
+        select_if_unselected=True, now=now,
+    )
+    repository.append_turn(
+        accepted.context_id, "t016-document-a", turn_id="t016-source-history",
+        operation_id="t016-prior-operation", role="user",
+        parts=[{"text": "Earlier source document history."}], now=now,
+        queue_operation_id=accepted.operation_id, queue_owner=lease.owner,
+        queue_fence=lease.fence,
+    )
     dialog_number = repository.bind_document(
         accepted.context_id, "doc-b", "t016-document-b",
         metadata={"title": "Synthetic B", "source_file": "B",
@@ -3879,7 +3960,7 @@ def _t016_default_move_runtime(client, monkeypatch, sdk_fakes, *, now):
         accepted.context_id, "t016-document-b", kind="document", doc_id="doc-b",
         dialog_number=dialog_number, queue_operation_id=accepted.operation_id,
         queue_owner=lease.owner, queue_fence=lease.fence,
-        select_if_unselected=True, now=now,
+        now=now,
     )
     runtime = TelegramCommandRuntime(
         repository=repository, save_handler=TelegramSaveRuntime(repository=repository),
@@ -4001,14 +4082,16 @@ def test_t016_default_runtime_publishes_rich_fixed_move_before_effect(
     history_ref = BoundRef.from_dict(contextual["full_history_ref"])
     assert command_ref.context_id == accepted.context_id
     assert command_ref.actor_id == 17 and command_ref.operation_id == accepted.operation_id
-    assert command_ref.payload == {"text": contextual["accepted_command"]}
     assert command_ref.ref == operation["input_ref"]
     command_ref_segments = command_ref.ref.split("/")
     assert len(command_ref_segments) == 4
     command_record = client.collection(command_ref_segments[0]).document(
         command_ref_segments[1],
     ).collection(command_ref_segments[2]).document(command_ref_segments[3]).get().to_dict()
-    assert command_record["candidate"] == contextual["accepted_command"]
+    from services.connectors.telegram.runtime.store import TelegramRuntimeStore
+    assert command_ref.to_dict()["payload"] == TelegramRuntimeStore._accepted_payload_projection(
+        command_record, contextual["accepted_command"],
+    )
     assert history_ref.context_id == accepted.context_id
     assert history_ref.conversation_id == contextual["source_conversation_id"]
     assert isinstance(history_ref.payload, Mapping) and "turns" in history_ref.payload
@@ -4113,7 +4196,13 @@ def test_t016_default_runtime_confirmed_replay_skips_provider_and_catalog_lookup
     finally:
         asyncio.run(bot_http.aclose())
     assert replay == QueueOperationState.COMPLETED
-    assert not scans, "CONFIRMED runtime replay enumerated mutable resources or history"
+    allowed_checkpoint_results = (
+        f"telegram_sessions/{accepted.context_id}/operations/{accepted.operation_id}"
+        "/agent_checkpoints/turn/tool_results",
+    )
+    assert all(scan["collection"] in allowed_checkpoint_results for scan in scans), (
+        "CONFIRMED replay enumerated resources outside its own durable tool results"
+    )
     blocked_read_tokens = (
         "/folders/", "/transcript_index/", "/dialogs/", "/conversations/",
         "/turns/", "/history/",

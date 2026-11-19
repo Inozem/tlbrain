@@ -1909,6 +1909,19 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
     assert not any("Starting to process dialog" in str(payload.get("text", ""))
                    for method, payload in sent)
     assert operation["route_control"]["tool_choice"]["name"] == "list_recent_transcripts"
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    saved_route = FirestoreAgentLedger(
+        db, context_id=context_id, operation_id=dispatch["operation_id"],
+        owner="read-only", fence=0, clock=lambda: now,
+    ).load_turn("conversation-selected", dispatch["operation_id"])
+    assert saved_route["application_route"]["name"] == "list_recent_transcripts"
+    assert saved_route["application_route"]["arguments"] == {"folder_path": ["Client"]}
+    assert saved_route["application_route"]["ordinal"] == 0
+    assert saved_route["tool_calls"] == [{
+        "id": f"application-{dispatch['operation_id']}-0",
+        "name": "list_recent_transcripts", "arguments": {"folder_path": ["Client"]},
+        "ordinal": 0, "round": -1,
+    }]
     turns = repository.list_turns(context_id, "conversation-selected")
     assert [turn["role"] for turn in turns] == ["user", "model", "user", "model"]
     assert turns[-2]["operation_id"] == dispatch["operation_id"]
@@ -2199,6 +2212,7 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
     first_manifest = repository.get_presentation_manifest(
         context_id, search_session_id, first_presentation_id,
     )
+    assert first_manifest is not None
     in_agent_source = next(
         source for source in first_manifest["sources"]
         if source["call_id"] == "read-call-2"
@@ -3162,6 +3176,16 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
             "date_from": "2026-01-01", "date_to": "2026-12-31",
         }, "link_requested": False,
     }
+    global_conversation_id = "telegram-global-" + hashlib.sha256(
+        f"{dispatch['context_id']}\0{dispatch['operation_id']}".encode()
+    ).hexdigest()
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    saved_search_route = FirestoreAgentLedger(
+        db, context_id=context_id, operation_id=dispatch["operation_id"],
+        owner="read-only", fence=0, clock=lambda: now,
+    ).load_turn(global_conversation_id, dispatch["operation_id"])
+    assert saved_search_route["application_route"]["name"] == "query"
+    assert saved_search_route["tool_calls"][0]["round"] == -1
     search_session_id = operation["route_control"]["search_session_id"]
     search_conversation = repository.get_conversation(context_id, search_session_id)
     assert search_conversation.kind.value == "search"

@@ -224,10 +224,82 @@ def test_stored_projection_requires_frozen_operation_and_literal_document_bindin
         "decision": mismatched_decision.to_dict(), "resolved": {"doc_id": "doc-b"},
         "accepted_command_ref": {"payload": {"text": "Open doc-a"}},
     }}
+    _validate_stored_joint_projection(
+        selected_route,
+        {"status": "ok", "kind": "substantive", "target_doc_id": "doc-a"},
+    )
+    with pytest.raises(ValueError, match="literal selector"):
+        _validate_stored_joint_projection(
+            selected_route,
+            {"status": "ok", "kind": "substantive", "target_doc_id": "doc-b"},
+        )
     with pytest.raises(ValueError):
         _validate_stored_joint_projection(
             mismatched_route,
             {"status": "ok", "kind": "substantive", "target_ref": "doc-b"},
+        )
+
+
+def test_clarification_allows_absent_target_but_rejects_conflicting_optional_binding():
+    from services.connectors.telegram.runtime.routing_context import (
+        Action, Certainty, CommandSpan, Disposition, DocumentSelector,
+        DocumentSelectorKind, ExplicitReferenceKind, RoutingDecision,
+    )
+    from services.connectors.telegram.sessions import _validate_stored_joint_projection
+
+    command = "Move document doc-b"
+    start = command.index("doc-b")
+    span = CommandSpan(
+        ExplicitReferenceKind.ID, start=start, end=start + len("doc-b"),
+        raw_text="doc-b", parsed_value="doc-b",
+    )
+    decision = RoutingDecision(
+        disposition=Disposition.CLARIFY, action=Action.MOVE_TRANSCRIPT,
+        substantive_text=command,
+        document_selector=DocumentSelector(
+            kind=DocumentSelectorKind.EXPLICIT_REFERENCE,
+            raw_value="doc-b", span=span,
+        ),
+        explicit_references=(span,), missing_slots=("destination",),
+        certainty=Certainty.UNCERTAIN,
+    )
+    route = {"contextual": {
+        "decision": decision.to_dict(), "resolved": {"doc_id": "doc-b"},
+        "fixed_plan": None,
+    }}
+    uncertain = {"status": "uncertain", "kind": "substantive"}
+    _validate_stored_joint_projection(route, uncertain)
+    with pytest.raises(ValueError, match="literal selector"):
+        _validate_stored_joint_projection(
+            route, {**uncertain, "target_doc_id": "doc-c"},
+        )
+
+
+def test_retry_clarification_allows_missing_dialog_selector():
+    from services.connectors.telegram.runtime.routing_context import (
+        Action, Certainty, Disposition, MissingSlot, RoutingDecision,
+    )
+    from services.connectors.telegram.sessions import (
+        _validate_fresh_action, _validate_stored_joint_projection,
+    )
+
+    for missing_slot in (MissingSlot.DOCUMENT, MissingSlot.EXPLICIT_CONFLICT):
+        decision = RoutingDecision(
+            disposition=Disposition.CLARIFY, action=Action.RETRY,
+            substantive_text="retry the failed save",
+            document_selector=None, missing_slots=(missing_slot,),
+            certainty=Certainty.UNCERTAIN,
+        )
+        validated = _validate_fresh_action(
+            decision, tool_choice=None, target_operation_id=None,
+        )
+        assert validated.document_selector is None
+
+        application_route = {"contextual": {
+            "decision": validated.to_dict(), "resolved": {}, "fixed_plan": None,
+        }}
+        _validate_stored_joint_projection(
+            application_route, {"status": "uncertain", "kind": "retry"},
         )
 
 

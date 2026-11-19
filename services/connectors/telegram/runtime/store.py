@@ -59,10 +59,10 @@ class TelegramRuntimeStore:
     def get_doc(self, doc_id: str) -> dict[str, Any] | None:
         if not isinstance(doc_id, str) or not doc_id:
             return None
-        context_ids = ([self.context_id] if self.context_id else
-                       [context.id for context in self.client.collection(SESSIONS).stream()])
-        for context_id in context_ids:
-            for row in self._dialog_rows(context_id):
+        if self.context_id is not None:
+            return self._get_scoped_doc(doc_id, self.context_id)
+        for context in self.client.collection(SESSIONS).stream():
+            for row in self._dialog_rows(context.id):
                 if row.get("doc_id") == doc_id:
                     meta = self._metadata(doc_id) or {}
                     return {**meta, "doc_id": doc_id,
@@ -75,6 +75,88 @@ class TelegramRuntimeStore:
             f"{self.context_id or ''}\0{doc_id}".encode("utf-8")
         ).hexdigest()
         return {**metadata, "doc_id": doc_id, "conversation_id": conversation_id}
+
+    def _get_scoped_doc(self, doc_id: str, context_id: str) -> dict[str, Any] | None:
+        """Resolve one document only through its directly addressed local binding."""
+        context_ref = self.client.collection(SESSIONS).document(context_id)
+        binding_key = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()
+        binding_snapshot = context_ref.collection("document_bindings").document(binding_key).get()
+        binding = binding_snapshot.to_dict() or {} if binding_snapshot.exists else {}
+        metadata = self._addressed_metadata(doc_id) or {}
+
+        if binding_snapshot.exists:
+            number = binding.get("dialog_number")
+            conversation_id = binding.get("conversation_id")
+            if (binding.get("doc_id") != doc_id or type(number) is not int or number < 1
+                    or not isinstance(conversation_id, str) or not conversation_id):
+                raise ValueError("addressed document binding is malformed")
+            row = self._dialog_binding(context_id, number)
+            if (row is None or row.get("draft_id") is not None
+                    or row.get("doc_id") != doc_id
+                    or row.get("conversation_id") != conversation_id):
+                raise ValueError("addressed document and numbered binding disagree")
+            conversation_snapshot = context_ref.collection("conversations").document(
+                conversation_id,
+            ).get()
+            conversation = (conversation_snapshot.to_dict() or {}
+                            if conversation_snapshot.exists else {})
+            if (not conversation_snapshot.exists
+                    or conversation.get("conversation_id") != conversation_id
+                    or conversation.get("kind") != "document"
+                    or conversation.get("doc_id") != doc_id
+                    or conversation.get("draft_id") is not None
+                    or conversation.get("dialog_number") != number):
+                raise ValueError("addressed document conversation binding changed")
+            return {**metadata, "doc_id": doc_id, "conversation_id": conversation_id,
+                    "dialog_number": number}
+
+        # Some accepted active-document histories predate the document index.
+        # A directly selected numbered binding or canonical conversation can
+        # supply read scope, but never a mutation capability.
+        context_snapshot = context_ref.get()
+        context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
+        number = context.get("selected_dialog_number")
+        if type(number) is int and number > 0:
+            row = self._dialog_binding(context_id, number)
+            if row is not None and row.get("doc_id") == doc_id:
+                if row.get("draft_id") is not None:
+                    return None
+                conversation_id = row.get("conversation_id")
+                conversation_snapshot = context_ref.collection("conversations").document(
+                    conversation_id,
+                ).get()
+                conversation = (conversation_snapshot.to_dict() or {}
+                                if conversation_snapshot.exists else {})
+                if (not conversation_snapshot.exists
+                        or conversation.get("conversation_id") != conversation_id
+                        or conversation.get("kind") != "document"
+                        or conversation.get("doc_id") != doc_id
+                        or conversation.get("draft_id") is not None
+                        or conversation.get("dialog_number") != number):
+                    raise ValueError("active document conversation binding changed")
+                return {**metadata, "doc_id": doc_id,
+                        "conversation_id": conversation_id, "dialog_number": number}
+        active_conversation_id = context.get("active_conversation_id")
+        if isinstance(active_conversation_id, str) and active_conversation_id:
+            conversation_snapshot = context_ref.collection("conversations").document(
+                active_conversation_id,
+            ).get()
+            if conversation_snapshot.exists:
+                conversation = conversation_snapshot.to_dict() or {}
+                if (conversation.get("conversation_id") == active_conversation_id
+                        and conversation.get("kind") == "document"
+                        and conversation.get("doc_id") == doc_id
+                        and conversation.get("draft_id") is None):
+                    return {**metadata, "doc_id": doc_id,
+                            "conversation_id": active_conversation_id,
+                            "dialog_number": conversation.get("dialog_number")}
+        if metadata:
+            conversation_id = "document-" + hashlib.sha256(
+                f"{context_id}\0{doc_id}".encode("utf-8")
+            ).hexdigest()
+            return {**metadata, "doc_id": doc_id,
+                    "conversation_id": conversation_id}
+        return None
 
     def _addressed_metadata(self, doc_id: str) -> dict[str, Any] | None:
         """Read one transcript record directly, propagating storage failures."""
@@ -123,6 +205,7 @@ class TelegramRuntimeStore:
             "predecessor_operation_id", "pending_save_candidate_operation_id",
             "action_metadata", "observed_clarification_id",
             "observed_clarification_generation", "observed_question_delivery_ref",
+            "observed_presentation_id",
         )
         return {
             "text": text, "kind": command.get("kind", "freeform"),
@@ -138,9 +221,33 @@ class TelegramRuntimeStore:
             return None
         row = snapshot.to_dict() or {}
         if (type(row.get("dialog_number")) is not int or row.get("dialog_number") != number
-                or not isinstance(row.get("doc_id"), str) or not row.get("doc_id")
                 or not isinstance(row.get("conversation_id"), str)
                 or not row.get("conversation_id")):
+            raise ValueError("local dialog binding is malformed")
+        draft_id = row.get("draft_id")
+        if isinstance(draft_id, str) and draft_id:
+            if row.get("doc_id") is not None:
+                raise ValueError("draft dialog has an existing-document binding")
+            draft_snapshot = (self.client.collection(SESSIONS).document(context_id)
+                              .collection("drafts").document(draft_id).get())
+            draft = draft_snapshot.to_dict() or {} if draft_snapshot.exists else {}
+            conversation_snapshot = (self.client.collection(SESSIONS).document(context_id)
+                                     .collection("conversations")
+                                     .document(row["conversation_id"]).get())
+            conversation = (conversation_snapshot.to_dict() or {}
+                            if conversation_snapshot.exists else {})
+            if (not draft_snapshot.exists or draft.get("draft_id") != draft_id
+                    or draft.get("dialog_number") != number
+                    or draft.get("conversation_id") != row["conversation_id"]
+                    or draft.get("state") != "failed"
+                    or not conversation_snapshot.exists
+                    or conversation.get("conversation_id") != row["conversation_id"]
+                    or conversation.get("kind") != "draft"
+                    or conversation.get("draft_id") != draft_id
+                    or conversation.get("dialog_number") != number):
+                raise ValueError("failed-draft dialog binding is malformed")
+            return {**row, "draft_id": draft_id, "draft_state": "failed"}
+        if not isinstance(row.get("doc_id"), str) or not row.get("doc_id"):
             raise ValueError("local dialog binding is malformed")
         binding_key = hashlib.sha256(row["doc_id"].encode("utf-8")).hexdigest()
         binding = (self.client.collection(SESSIONS).document(context_id)
@@ -211,6 +318,8 @@ class TelegramRuntimeStore:
         self, snapshot: RoutingContextSnapshot, *, actor_id: int,
         input_ref: str, operation: Mapping[str, Any],
         command: Mapping[str, Any], conversation_id: str,
+        allow_finalized_ingress: bool = False, ledger: Any = None,
+        transaction: Any = None, frozen_identity_only: bool = False,
     ) -> None:
         accepted = snapshot.accepted_command_ref
         history = snapshot.full_history_ref
@@ -220,11 +329,29 @@ class TelegramRuntimeStore:
             raise ValueError("routing snapshot scope is invalid")
         accepted_digest = hashlib.sha256(snapshot.accepted_command.encode("utf-8")).hexdigest()
         expected_payload = self._accepted_payload_projection(command, snapshot.accepted_command)
+        frozen_payload = accepted.to_dict()["payload"]
+        ingress_evolution_fields = {
+            "draft_id", "cutoff_message_ids", "cutoff_intake_sequence",
+        }
+        immutable_keys = set(expected_payload) - ingress_evolution_fields
+        payload_matches = (
+            set(frozen_payload) == set(expected_payload)
+            and json_digest({key: frozen_payload[key] for key in immutable_keys})
+            == json_digest({key: expected_payload[key] for key in immutable_keys})
+            if frozen_identity_only else frozen_payload == expected_payload
+        )
+        if (not payload_matches and allow_finalized_ingress
+                and self._finalized_ingress_evolution_valid(
+                    frozen_payload, expected_payload, command=command,
+                    operation=operation, input_ref=input_ref, actor_id=actor_id,
+                    ledger=ledger, transaction=transaction,
+                )):
+            payload_matches = True
         if (accepted.ref != input_ref or accepted.digest != accepted_digest
                 or accepted.context_id != self.context_id or accepted.actor_id != actor_id
                 or accepted.conversation_id != conversation_id
                 or accepted.operation_id != self.operation_id
-                or accepted.to_dict()["payload"] != expected_payload
+                or not payload_matches
                 or operation.get("identity_digest") != self._accepted_input_digest(
                     command, snapshot.accepted_command)):
             raise ValueError("captured accepted-command reference is inconsistent")
@@ -263,6 +390,104 @@ class TelegramRuntimeStore:
         if json_digest(projected) != history.digest:
             raise ValueError("captured history is not a complete projected conversation")
 
+    def _finalized_ingress_evolution_valid(
+        self, frozen: Mapping[str, Any], current: Mapping[str, Any], *,
+        command: Mapping[str, Any], operation: Mapping[str, Any],
+        input_ref: str, actor_id: int, ledger: Any = None, transaction: Any = None,
+    ) -> bool:
+        """Validate only the documented pending-to-forward-bound input evolution."""
+        mutable = {"draft_id", "cutoff_message_ids", "cutoff_intake_sequence"}
+        immutable_keys = set(frozen) - mutable
+        if (set(frozen) != set(current)
+                or json_digest({key: frozen[key] for key in immutable_keys})
+                != json_digest({key: current[key] for key in immutable_keys})
+                or operation.get("identity_digest") != self._accepted_input_digest(
+                    command, current.get("text"))):
+            return False
+        # A finalized association can only extend an initially unbound accepted
+        # request. The frozen checkpoint itself remains byte-for-byte unchanged.
+        if (frozen.get("draft_id") is not None
+                or frozen.get("cutoff_message_ids") not in (None, [])
+                or frozen.get("cutoff_intake_sequence") not in (None, 0)):
+            return False
+        if transaction is None and not isinstance(ledger, FirestoreAgentLedger):
+            return False
+        if transaction is None:
+            ledger._assert_current(transaction=None)
+        parts = input_ref.split("/")
+        if len(parts) != 4 or parts[:3] != [SESSIONS, self.context_id, "commands"]:
+            return False
+        context_ref = self.client.collection(SESSIONS).document(self.context_id)
+        binding_snapshot = context_ref.collection("ingress_bindings").document(
+            self.operation_id,
+        ).get(transaction=transaction)
+        binding = binding_snapshot.to_dict() or {} if binding_snapshot.exists else {}
+        draft_id = command.get("draft_id")
+        cutoff = command.get("cutoff_message_ids")
+        sequence = command.get("cutoff_intake_sequence")
+        matched = binding.get("matched_message_ids")
+        if (binding.get("context_id") != self.context_id
+                or binding.get("operation_id") != self.operation_id
+                or binding.get("owner_user_id") != actor_id
+                or binding.get("candidate_message_id") != command.get("message_id")
+                or binding.get("source_binding_finalized") is not True
+                or binding.get("state") not in {"collecting", "sealed"}
+                or not isinstance(draft_id, str) or not draft_id
+                or binding.get("draft_id") != draft_id
+                or type(command.get("dialog_number")) is not int
+                or not isinstance(cutoff, list) or not cutoff
+                or any(type(item) is not int or item < 1 for item in cutoff)
+                or len(set(cutoff)) != len(cutoff)
+                or type(sequence) is not int or sequence < 1
+                or not isinstance(matched, list)
+                or cutoff != matched[:len(cutoff)]):
+            return False
+        operation_id = operation.get("operation_id")
+        if operation_id != self.operation_id:
+            return False
+        draft_snapshot = context_ref.collection("drafts").document(draft_id).get(
+            transaction=transaction,
+        )
+        draft = draft_snapshot.to_dict() or {} if draft_snapshot.exists else {}
+        dialog_number = command.get("dialog_number")
+        conversation_id = draft.get("conversation_id")
+        ordered = draft.get("ordered_message_ids")
+        if (draft.get("draft_id") != draft_id or draft.get("context_id") not in (None, self.context_id)
+                or draft.get("state") != "collecting"
+                or draft.get("dialog_number") != dialog_number
+                or not isinstance(conversation_id, str) or not conversation_id
+                or not isinstance(ordered, list)
+                or ordered[:len(cutoff)] != cutoff
+                or any(message_id not in matched for message_id in cutoff)):
+            return False
+        cutoff_source_snapshot = (context_ref.collection("drafts").document(draft_id)
+                                  .collection("messages").document(str(cutoff[-1]))
+                                  .get(transaction=transaction))
+        cutoff_source = cutoff_source_snapshot.to_dict() or {} if cutoff_source_snapshot.exists else {}
+        if (not cutoff_source_snapshot.exists
+                or cutoff_source.get("message_id") != cutoff[-1]
+                or cutoff_source.get("intake_sequence") != sequence):
+            return False
+        dialog_snapshot = context_ref.collection("dialogs").document(
+            str(dialog_number),
+        ).get(transaction=transaction)
+        dialog = dialog_snapshot.to_dict() or {} if dialog_snapshot.exists else {}
+        if (dialog.get("dialog_number") != dialog_number
+                or dialog.get("draft_id") != draft_id
+                or dialog.get("conversation_id") != conversation_id
+                or dialog.get("doc_id") is not None):
+            return False
+        for message_id in matched:
+            if type(message_id) is not int or message_id < 1:
+                return False
+            message_snapshot = (context_ref.collection("drafts").document(draft_id)
+                                .collection("messages").document(str(message_id))
+                                .get(transaction=transaction))
+            message = message_snapshot.to_dict() or {} if message_snapshot.exists else {}
+            if (message.get("message_id") != message_id or message_id not in ordered):
+                return False
+        return True
+
     def _load_routing_checkpoint(
         self, ledger: FirestoreAgentLedger, *, actor_id: int, input_ref: str,
         operation: Mapping[str, Any], command: Mapping[str, Any],
@@ -292,6 +517,7 @@ class TelegramRuntimeStore:
         self._validate_captured_snapshot(
             snapshot, actor_id=actor_id, input_ref=input_ref, operation=operation,
             command=command, conversation_id=header["conversation_id"],
+            allow_finalized_ingress=True, ledger=ledger,
         )
         if "candidate" in command and (
             not isinstance(command.get("candidate"), str)
@@ -309,8 +535,6 @@ class TelegramRuntimeStore:
             _evidence_is_scoped_read,
         )
 
-        if search_filters is None:
-            return {}
         evidence: dict[str, list[DocumentEvidence]] = {}
         for item in exchanges:
             exchange = item["exchange"]
@@ -378,6 +602,7 @@ class TelegramRuntimeStore:
 
     def _capture_selected_history(
         self, *, context_ref: Any, actor_id: int, search_exchange_loader: Any,
+        owner: str, fence: int, now: Any,
     ) -> tuple[str, ConversationKind, dict[str, Any], BoundRef, list[Mapping[str, Any]]]:
         """Read one canonical selected conversation and freeze its full history."""
         context_snapshot = context_ref.get()
@@ -392,7 +617,49 @@ class TelegramRuntimeStore:
         conversation_id = active or stable_chat
         conversation = self.repository.get_conversation(self.context_id, conversation_id)
         if conversation is None and active is not None:
-            raise ValueError("selected conversation is missing")
+            number = context.get("selected_dialog_number")
+            if type(number) is not int or number < 1:
+                raise ValueError("selected conversation has no numbered binding")
+            dialog_snapshot = (context_ref.collection("dialogs")
+                               .document(str(number)).get())
+            dialog = dialog_snapshot.to_dict() or {} if dialog_snapshot.exists else {}
+            if (dialog.get("dialog_number") != number
+                    or dialog.get("conversation_id") != conversation_id):
+                raise ValueError("selected conversation numbered binding changed")
+            draft_id, doc_id = dialog.get("draft_id"), dialog.get("doc_id")
+            if isinstance(draft_id, str) and draft_id and doc_id is None:
+                draft = self.repository.get_draft(self.context_id, draft_id)
+                draft_state = draft.get("state") if isinstance(draft, Mapping) else None
+                if (not isinstance(draft, Mapping)
+                        or draft.get("draft_id") != draft_id
+                        or draft_state not in {"collecting", "failed"}
+                        or draft.get("conversation_id") != conversation_id
+                        or draft.get("dialog_number") != number
+                        or (draft_state == "collecting"
+                            and context.get("active_draft_id") != draft_id)
+                        or (draft_state == "failed"
+                            and context.get("active_draft_id") == draft_id)):
+                    raise ValueError("selected draft binding is invalid")
+                kind, binding = "draft", {"draft_id": draft_id}
+            elif isinstance(doc_id, str) and doc_id and draft_id is None:
+                key = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()
+                doc_binding = (context_ref.collection("document_bindings")
+                               .document(key).get().to_dict() or {})
+                if (doc_binding.get("doc_id") != doc_id
+                        or doc_binding.get("conversation_id") != conversation_id
+                        or doc_binding.get("dialog_number") != number):
+                    raise ValueError("selected document binding is invalid")
+                kind, binding = "document", {"doc_id": doc_id}
+            else:
+                raise ValueError("selected numbered dialog has no valid target")
+            if (not isinstance(owner, str) or not owner or type(fence) is not int
+                    or fence < 1):
+                raise PermissionError("selected conversation lease is invalid")
+            conversation = self.repository.ensure_conversation(
+                self.context_id, conversation_id, kind=kind, dialog_number=number,
+                **binding, queue_operation_id=self.operation_id,
+                queue_owner=owner, queue_fence=fence, now=now(),
+            )
         if conversation is None:
             kind = ConversationKind.CHAT
             last_turn_sequence = 0
@@ -521,9 +788,11 @@ class TelegramRuntimeStore:
             evidence.setdefault(doc_id, []).extend(entries)
 
         if isinstance(selected_doc_id, str) and selected_doc_id:
-            metadata = self._addressed_metadata(selected_doc_id)
-            if metadata is None:
-                raise ValueError("selected document metadata is missing")
+            # The canonical selected conversation and its numbered dialog are
+            # sufficient evidence of the active document. Transcript metadata
+            # is useful presentation data, but may legitimately be absent for
+            # a saved conversation that has not yet been indexed.
+            metadata = self._addressed_metadata(selected_doc_id) or {}
             evidence.setdefault(selected_doc_id, []).append(DocumentEvidence(
                 doc_id=selected_doc_id, source_kind=SourceKind.ACTIVE_DOCUMENT,
                 source=history_ref, context_id=self.context_id, actor_id=actor_id,
@@ -545,6 +814,10 @@ class TelegramRuntimeStore:
             elif span.kind is ExplicitReferenceKind.LOCAL_NUMBER:
                 binding = self._dialog_binding(self.context_id, value)
                 if binding is None:
+                    continue
+                if binding.get("draft_state") == "failed":
+                    # Numbered failed drafts remain valid retry inputs, but do
+                    # not become existing-document evidence or write targets.
                     continue
                 doc_id = binding["doc_id"]
                 metadata = self._addressed_metadata(doc_id)
@@ -631,7 +904,8 @@ class TelegramRuntimeStore:
         (selected_conversation_id, conversation_kind, conversation_projection,
          history_ref, verified_exchanges) = self._capture_selected_history(
             context_ref=context_ref, actor_id=actor_id,
-            search_exchange_loader=search_exchange_loader,
+            search_exchange_loader=search_exchange_loader, owner=owner, fence=fence,
+            now=now,
         )
         accepted_ref = BoundRef(
             ref=input_ref,

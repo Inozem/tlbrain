@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from google.cloud import firestore
@@ -175,25 +176,40 @@ class _GovernedExecutor:
         self.failure: tuple[BaseException, bool] | None = None
         self.failure_stage: str | None = None
 
-    def execute(self, *, name: str, arguments: Any, call_ordinal: int) -> Any:
+    def execute(self, *, name: str, arguments: Any, call_ordinal: int,
+                resolved_targets: Any = None) -> Any:
+        context = getattr(self.executor, "execution_context", None)
+        if resolved_targets is None and name in {"move_transcript", "create_folder"}:
+            if isinstance(context, Mapping):
+                resolved_targets = context.get("resolved_targets")
+        validator = getattr(self.executor, "resolved_target_binding", None)
+        if callable(validator):
+            binding = validator(name, arguments, call_ordinal, resolved_targets)
+            self._reject_changed_cached_binding(name, call_ordinal, binding)
+        self._reject_unbound_cached_target(name, call_ordinal, resolved_targets)
         if not self.lease_check():
             raise PermissionError("Telegram operation lease is stale")
         if name == "add_dialog":
             # The shared save pipeline owns physical stage budgets. A queue-level
             # logical tool attempt would incorrectly charge each indexing slice.
             return self.executor.execute(name=name, arguments=arguments,
-                                         call_ordinal=call_ordinal)
+                                         call_ordinal=call_ordinal,
+                                         resolved_targets=resolved_targets)
         if self.governor is None:
             return self.executor.execute(name=name, arguments=arguments,
-                                         call_ordinal=call_ordinal)
+                                         call_ordinal=call_ordinal,
+                                         resolved_targets=resolved_targets)
         stage_key = f"telegram-tool-{call_ordinal:02d}"
         try:
             result = self.governor.run_stage(
                 self.operation_id, stage_key,
                 lambda: self._pack(stage_key, self.executor.execute(
-                    name=name, arguments=arguments, call_ordinal=call_ordinal)),
+                    name=name, arguments=arguments, call_ordinal=call_ordinal,
+                    resolved_targets=resolved_targets)),
                 retryable=self.retryable or _provider_error_retryable,
-                reconcile=lambda: self._reconcile(stage_key, name, arguments, call_ordinal),
+                reconcile=lambda: self._reconcile(
+                    stage_key, name, arguments, call_ordinal, resolved_targets,
+                ),
                 now=self.clock(), owner=_value(self.lease, "owner"),
                 fence=_value(self.lease, "fence"),
             )
@@ -209,17 +225,30 @@ class _GovernedExecutor:
             self.failure_stage = stage_key
             raise
 
+    def prepare_native_batch(self, calls: Any) -> None:
+        """Ask the command boundary to validate every write before the batch."""
+        context = getattr(self.executor, "execution_context", None)
+        callback = context.get("prepare_native_batch") if isinstance(context, Mapping) else None
+        if callable(callback):
+            callback(calls=calls, execution_context=context)
+
     def _reconcile(self, stage_key: str, name: str, arguments: Any,
-                   call_ordinal: int) -> Any:
+                   call_ordinal: int, resolved_targets: Any = None) -> Any:
         from core.operations import registry
+        if resolved_targets is None and name in {"move_transcript", "create_folder"}:
+            context = getattr(self.executor, "execution_context", None)
+            if isinstance(context, Mapping):
+                resolved_targets = context.get("resolved_targets")
         try:
             reconcile = getattr(self.executor, "reconcile", None)
             if callable(reconcile):
                 result = reconcile(name=name, arguments=arguments,
-                                   call_ordinal=call_ordinal)
+                                   call_ordinal=call_ordinal,
+                                   resolved_targets=resolved_targets)
             elif not registry.OPERATIONS[name].write:
                 result = self.executor.execute(name=name, arguments=arguments,
-                                               call_ordinal=call_ordinal)
+                                               call_ordinal=call_ordinal,
+                                               resolved_targets=resolved_targets)
             else:
                 result = None
         except Exception:
@@ -232,6 +261,50 @@ class _GovernedExecutor:
             retryable=not registry.OPERATIONS[name].write,
             service="connected_service", stage=stage_key,
         ))
+
+    def _reject_unbound_cached_target(
+        self, name: str, call_ordinal: int, resolved_targets: Any,
+    ) -> None:
+        """Do not let a governor cache bypass a previously bound write target."""
+        if resolved_targets is not None or name not in {"move_transcript", "create_folder"}:
+            return
+        context = getattr(self.executor, "execution_context", None)
+        if not isinstance(context, Mapping):
+            return
+        client = getattr(self.executor, "client", None)
+        context_id, parent_id = context.get("context_id"), context.get("operation_id")
+        if client is None or not isinstance(context_id, str) or not isinstance(parent_id, str):
+            return
+        reference = (client.collection("telegram_sessions").document(context_id)
+                     .collection("operations").document(parent_id)
+                     .collection("agent_checkpoints").document(f"tool-{int(call_ordinal)}"))
+        snapshot = reference.get()
+        checkpoint = snapshot.to_dict() or {} if snapshot.exists else {}
+        if checkpoint.get("resolved_targets_binding") is not None:
+            raise PermissionError("cached write target requires its original trusted binding")
+
+    def _reject_changed_cached_binding(
+        self, name: str, call_ordinal: int, binding: Any,
+    ) -> None:
+        if name not in {"move_transcript", "create_folder"}:
+            return
+        context = getattr(self.executor, "execution_context", None)
+        if not isinstance(context, Mapping):
+            return
+        client = getattr(self.executor, "client", None)
+        context_id, parent_id = context.get("context_id"), context.get("operation_id")
+        if client is None or not isinstance(context_id, str) or not isinstance(parent_id, str):
+            return
+        reference = (client.collection("telegram_sessions").document(context_id)
+                     .collection("operations").document(parent_id)
+                     .collection("agent_checkpoints").document(f"tool-{int(call_ordinal)}"))
+        snapshot = reference.get()
+        checkpoint = snapshot.to_dict() or {} if snapshot.exists else {}
+        saved = checkpoint.get("resolved_targets_binding")
+        if snapshot.exists and binding is not None and saved is None:
+            raise PermissionError("unbound cached write cannot adopt a new target binding")
+        if saved is not None and saved != binding:
+            raise ValueError("resolved write target binding changed on replay")
 
     def _pack(self, key: str, value: Any) -> Any:
         if self.payload_codec is None:
@@ -247,8 +320,11 @@ class _GovernedExecutor:
 
 
 class _CapturingAgent:
-    def __init__(self, agent: TelegramAgent):
+    def __init__(self, agent: TelegramAgent, *, on_answer: Any = None,
+                 defer_route_persistence: Any = None):
         self.agent = agent
+        self.on_answer = on_answer
+        self.defer_route_persistence = defer_route_persistence
         self.answer: str | None = None
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
@@ -257,10 +333,16 @@ class _CapturingAgent:
         self.answer = answer if isinstance(answer, str) and answer.strip() else None
         if self.answer is None:
             raise RuntimeError("Telegram agent returned no answer")
+        if callable(self.on_answer):
+            self.on_answer()
         return result
 
     def dispatch_tool_choice(self, **kwargs: Any) -> Any:
         return self.agent.dispatch_tool_choice(**kwargs)
+
+    def should_defer_route_persistence(self, route: Any) -> bool:
+        callback = self.defer_route_persistence
+        return callback(route) is True if callable(callback) else False
 
 
 class _SearchPort:
@@ -382,7 +464,7 @@ class _DurableCommandReplies:
 
     async def prepare_presentation(
         self, body: str, *, presentation: str, presentation_id: str,
-        presentation_conversation_id: str,
+        presentation_conversation_id: str, kind: str = "final",
     ) -> list[dict[str, Any]]:
         """Prepare every deterministic answer chunk before its immutable header."""
         context_ref = self.repository.client.collection("telegram_sessions").document(self.context_id)
@@ -392,7 +474,7 @@ class _DurableCommandReplies:
         if ((isinstance(action, Mapping) and action.get("action") == "receipt_save")
                 or isinstance(initial.get("receipt_card_notification_id"), str)):
             raise ValueError("search presentation cannot be bound to a receipt card")
-        chunk_work = _command_reply_chunks(body, kind="final", bound_receipt_card=False)
+        chunk_work = _command_reply_chunks(body, kind=kind, bound_receipt_card=False)
         safe_rich_chunks = rich_markdown_safe_chunk_indices(
             (index, chunk) for index, chunk, _chunk_kind in chunk_work
         )
@@ -450,7 +532,7 @@ class _DurableCommandReplies:
 
     async def deliver_prepared(
         self, body: str, *, prepared_notifications: Mapping[str, Any],
-        presentation: str = "rich_markdown",
+        presentation: str = "rich_markdown", kind: str = "final",
     ) -> _DeliveryStatus:
         """Publish exactly the immutable chunk revisions already linked by a manifest."""
         presentation_id = prepared_notifications.get("presentation_id")
@@ -459,7 +541,7 @@ class _DurableCommandReplies:
         if (not isinstance(presentation_id, str) or not isinstance(conversation_id, str)
                 or not isinstance(refs, list)):
             return _DeliveryStatus("terminal")
-        chunk_work = _command_reply_chunks(body, kind="final", bound_receipt_card=False)
+        chunk_work = _command_reply_chunks(body, kind=kind, bound_receipt_card=False)
         safe_rich_chunks = rich_markdown_safe_chunk_indices(
             (index, chunk) for index, chunk, _chunk_kind in chunk_work
         )
@@ -497,7 +579,7 @@ class _DurableCommandReplies:
         if prepared_notifications is not None:
             return await self.deliver_prepared(
                 body, prepared_notifications=prepared_notifications,
-                presentation=presentation,
+                presentation=presentation, kind=kind,
             )
         context_ref = self.repository.client.collection("telegram_sessions").document(self.context_id)
         operation_ref = context_ref.collection("operations").document(self.operation_id)
@@ -862,6 +944,9 @@ class _CommandExecution(SearchAgentMixin):
         self.owner, self.fence = _value(lease, "owner"), _value(lease, "fence")
         self._has_verified_metadata = False
         self.search_offload = _offload
+        self.cards = ()
+        self.save_candidates = ()
+        self.recent_search_results = ()
 
     async def run(self) -> QueueOperationState:
         """Validate the lease, compose ports, route, then settle the selected flow."""
@@ -871,8 +956,101 @@ class _CommandExecution(SearchAgentMixin):
             return self.replay_save_result
         self._compose_ports()
         await self._select_route()
+        confirmed = await self._confirmed_contextual_replay()
+        if confirmed is not None:
+            return confirmed
+        if self._refuse_missing_local_number_target():
+            refusal = {"status": "not_found", "kind": "substantive"}
+            persisted = await _offload(
+                self.runtime.repository.persist_route, self.operation_id, refusal,
+                context_id=self.context_id, owner=self.owner, fence=self.fence,
+                now=self.runtime.clock(),
+            )
+            if not persisted:
+                return QueueOperationState.FAILED
+            self.pinned = refusal
+            self._compose_replies()
+            return await self.finish_reply(
+                "I could not find that dialog. Please choose an existing dialog number.",
+                kind="error", failure_final=True,
+            )
+        # A saved contextual clarification is a prepared T011 completion. It
+        # must be resumed before the legacy pinned-error reply can consume the
+        # operation, while ordinary legacy failure pins keep their old path.
+        invalid_pinned_route = (
+            getattr(self, "route_from_pin", False)
+            and getattr(self, "decision_status", None) in {"invalid_route", "error"}
+        )
+        clarification = (None if invalid_pinned_route
+                        else await self._resume_prepared_clarification())
+        if clarification is not None:
+            return clarification
+        if (getattr(self, "route_from_pin", False)
+                and getattr(self, "decision_status", None) in {
+                    "uncertain", "invalid_route", "error",
+                }):
+            self._compose_replies()
+            if self.decision_status == "uncertain":
+                return await self.finish_reply(_UNCERTAIN_ROUTE_REPLY)
+            return await self.finish_reply(
+                _PROCESSING_ERROR_REPLY, kind="error", failure_final=True,
+            )
+        if (getattr(self, "scoped_fresh_route", False)
+                and self.decision_status == "uncertain"
+                and isinstance(self.semantic_decision, Mapping)
+                and self.semantic_decision.get("disposition") == "clarify"
+                and self.semantic_decision.get("missing_slots")):
+            self._compose_replies()
+            try:
+                return await self._prepare_fresh_clarification()
+            except Exception as error:
+                self._log_preparation_failure("clarification", error)
+                return await self._finish_preparation_failure()
         await self._prepare_search()
         self._compose_replies()
+        if (getattr(self, "scoped_fresh_route", False)
+                and self.decision_status == "ok"
+                and isinstance(self.decision, Mapping)
+                and isinstance(self.decision.get("tool_choice"), Mapping)
+                and self.decision["tool_choice"].get("name") in {
+                    "move_transcript", "create_folder",
+                }):
+            try:
+                self.prepared_route_result = await self._route_callback(
+                    context=self.context,
+                    text=self.command.text if self.command is not None else "",
+                )
+            except Exception as error:
+                self._log_preparation_failure("joint_route", error)
+                return await self._finish_preparation_failure()
+            if not isinstance(self.prepared_route_result, Mapping):
+                return await self._finish_preparation_failure()
+            if self.prepared_route_result.get("status") != "ok":
+                if self._clarify_unresolved_document_target(self.prepared_route_result):
+                    try:
+                        return await self._prepare_fresh_clarification()
+                    except Exception as error:
+                        self._log_preparation_failure("clarification", error)
+                return await self._finish_preparation_failure()
+        if (getattr(self, "scoped_fresh_route", False)
+                and self.decision_status == "ok"
+                and isinstance(self.decision, Mapping)
+                and isinstance(self.decision.get("tool_choice"), Mapping)
+                and self.decision["tool_choice"].get("name") == "add_dialog"):
+            try:
+                self._prepare_declared_add_dialog(self.decision["tool_choice"])
+            except Exception as error:
+                self._log_preparation_failure("direct_save", error)
+                return await self._finish_preparation_failure()
+        if (getattr(self, "scoped_fresh_route", False)
+                and self.decision_status == "ok"
+                and isinstance(self.decision, Mapping)
+                and isinstance(self.decision.get("tool_choice"), Mapping)):
+            try:
+                self._prepare_declared_read_route(self.decision["tool_choice"])
+            except Exception as error:
+                self._log_preparation_failure("read_route", error)
+                return await self._finish_preparation_failure()
         early = await self._early_governed_failure()
         if early is not None:
             return early
@@ -881,6 +1059,348 @@ class _CommandExecution(SearchAgentMixin):
             settled = await self._settle_governed_failure()
             return settled if settled is not None else result
         return await self._run_document()
+
+    def _log_preparation_failure(self, phase: str, error: Exception) -> None:
+        _LOGGER.warning(
+            "telegram contextual route preparation failed",
+            extra={"operation_id": self.operation_id, "phase": phase,
+                   "code": "route_preparation_failed",
+                   "exception_class": type(error).__name__},
+        )
+
+    async def _finish_preparation_failure(self) -> QueueOperationState:
+        if not hasattr(self, "replies"):
+            self._compose_replies()
+        return await self.finish_reply(
+            _PROCESSING_ERROR_REPLY, kind="error", failure_final=True,
+        )
+
+    def _clarify_unresolved_document_target(self, route: Mapping[str, Any]) -> bool:
+        """Turn an ungrounded model-only mutation target into a typed T011 question."""
+        if (route.get("status") not in {"not_found", "invalid_route"}
+                or not isinstance(self.semantic_decision, Mapping)):
+            return False
+        from services.connectors.telegram.runtime.routing_context import (
+            Action, Certainty, Disposition, MissingSlot, RoutingDecision,
+        )
+        from dataclasses import replace
+        try:
+            decision = RoutingDecision.from_dict(self.semantic_decision)
+        except (TypeError, ValueError, KeyError):
+            return False
+        if (decision.action is not Action.MOVE_TRANSCRIPT
+                or decision.document_selector is not None
+                or MissingSlot.DOCUMENT in decision.missing_slots):
+            return False
+        # A concrete model-proposed tool target is a contradiction to refuse,
+        # not an unresolved semantic target to reinterpret as a T011 question.
+        ordinary = getattr(self, "decision", None)
+        choice = ordinary.get("tool_choice") if isinstance(ordinary, Mapping) else None
+        arguments = choice.get("arguments") if isinstance(choice, Mapping) else None
+        if (isinstance(choice, Mapping) and choice.get("name") == "move_transcript"
+                and isinstance(arguments, Mapping)
+                and isinstance(arguments.get("doc_id"), str)):
+            return False
+        decision = replace(
+            decision, disposition=Disposition.CLARIFY,
+            certainty=Certainty.UNCERTAIN,
+            missing_slots=tuple(dict.fromkeys(
+                (*decision.missing_slots, MissingSlot.DOCUMENT),
+            )),
+        )
+        self.semantic_decision = decision.to_dict()
+        self.decision = {
+            "kind": "substantive", "target_ref": None,
+            "target_operation_id": None, "dialog_number": None,
+            "result_refs": [], "substantive_text": decision.substantive_text,
+            "tool_choice": None, "certainty": Certainty.UNCERTAIN.value,
+            "semantic_decision": decision.to_dict(),
+        }
+        self.decision_status = "uncertain"
+        return True
+
+    def _refuse_missing_local_number_target(self) -> bool:
+        """Refuse a literal dialog number absent from the captured bindings."""
+        semantic = getattr(self, "semantic_decision", None)
+        if (not getattr(self, "scoped_fresh_route", False)
+                or not isinstance(semantic, Mapping)
+                or semantic.get("action") not in {"move_transcript", "substantive"}):
+            return False
+        selector = semantic.get("document_selector")
+        if (not isinstance(selector, Mapping)
+                or selector.get("kind") != "dialog_number"
+                or type(selector.get("dialog_number")) is not int):
+            return False
+        number = selector["dialog_number"]
+        return not any(
+            isinstance(card, Mapping) and card.get("dialog_number") == number
+            for card in self.cards
+        )
+
+    async def _resume_prepared_clarification(self) -> Any | None:
+        """Return the same T011 prepared completion after a contextual restart."""
+        from services.connectors.telegram.queue import TelegramQueueCompletion
+        from services.connectors.telegram.repository._commands import (
+            _TelegramCommandMixin,
+        )
+        from services.connectors.telegram.runtime.routing_context import RoutingDecision
+        route = await _offload(
+            self.runtime.repository.get_route_control, self.context_id, self.operation_id,
+        )
+        if not isinstance(route, Mapping):
+            return None
+        checkpoint_conversation = await _offload(
+            self.ledger.checkpoint_conversation_id, self.operation_id,
+        )
+        if not isinstance(checkpoint_conversation, str) or not checkpoint_conversation:
+            return None
+        turn = await _offload(self.ledger.load_turn, checkpoint_conversation, self.operation_id)
+        application_route = turn.get("application_route") if isinstance(turn, Mapping) else None
+        if not isinstance(application_route, Mapping) or "contextual" not in application_route:
+            return None
+        contextual, _executable = _TelegramCommandMixin._validate_joint_contextual_shape(
+            application_route, context_id=self.context_id, operation_id=self.operation_id,
+            checkpoint_conversation_id=checkpoint_conversation,
+        )
+        decision = RoutingDecision.from_dict(contextual.get("decision"))
+        if decision.disposition.value != "clarify":
+            return None
+        intent = await _offload(
+            self.ledger.load_routing_checkpoint, "intent",
+            actor_id=contextual["actor_id"],
+            conversation_id=contextual["source_conversation_id"],
+        )
+        reference = intent.get("reference") if isinstance(intent, Mapping) else None
+        if (not isinstance(reference, Mapping)
+                or reference.get("ref") != contextual.get("intent_ref")
+                or reference.get("digest") != contextual.get("intent_digest")):
+            raise ValueError("prepared clarification intent binding is invalid")
+        context_reference = (self.contextual_snapshot.get("reference")
+                             if isinstance(self.contextual_snapshot, Mapping) else None)
+        captured = (self.contextual_snapshot.get("value")
+                    if isinstance(self.contextual_snapshot, Mapping) else None)
+        if not isinstance(context_reference, Mapping) or not isinstance(captured, Mapping):
+            raise ValueError("prepared clarification source context is invalid")
+        from services.connectors.telegram.runtime.routing_context import RoutingContextSnapshot
+        snapshot = RoutingContextSnapshot.from_dict(captured)
+        from services.connectors.telegram.repository._commands import _TelegramCommandMixin
+        _TelegramCommandMixin._validate_joint_intent_binding(
+            self.runtime.repository.client, contextual, snapshot, context_reference,
+        )
+        completion = await _offload(
+            self.runtime.repository.prepare_clarification_completion, reference,
+        )
+        return TelegramQueueCompletion("clarification", completion)
+
+    async def _prepare_fresh_clarification(self) -> Any:
+        """Persist the frozen T017 context and T011 intent before queue completion."""
+        from services.connectors.telegram.models import (
+            ClarificationState, PendingClarification, build_clarification_id,
+        )
+        from services.connectors.telegram.queue import TelegramQueueCompletion
+        from services.connectors.telegram.repository._clarifications import (
+            build_clarification_request,
+        )
+        from services.connectors.telegram.repository._commands import _TelegramCommandMixin
+        from services.connectors.telegram.runtime.routing_context import RoutingDecision
+
+        snapshot = getattr(self, "contextual_source", None)
+        if snapshot is None or not isinstance(self.semantic_decision, Mapping):
+            raise ValueError("fresh clarification has no frozen routing context")
+        decision = RoutingDecision.from_dict(self.semantic_decision)
+        if decision.disposition.value != "clarify" or not decision.missing_slots:
+            raise ValueError("fresh clarification has no typed missing slot")
+        checkpoint_id = getattr(self, "agent_conversation_id", None)
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            raise ValueError("clarification checkpoint conversation is unresolved")
+        context_record = self.ledger.load_routing_checkpoint(
+            "context", actor_id=snapshot.actor_id,
+            conversation_id=snapshot.selected_conversation_id,
+        )
+        context_reference = context_record.get("reference") if isinstance(context_record, Mapping) else None
+        if not isinstance(context_reference, Mapping):
+            raise ValueError("fresh clarification context reference is absent")
+        now = self.runtime.clock()
+        clarification_id = build_clarification_id(self.context_id, self.operation_id)
+        parameters: dict[str, Any] = {}
+        selector = decision.document_selector
+        known_doc_id = self._known_clarification_document(selector, decision)
+        if isinstance(known_doc_id, str):
+            parameters["doc_id"] = known_doc_id
+        folder = decision.folder_selector
+        if folder is not None:
+            if folder.kind.value == "explicit_path":
+                key = "folder_path" if decision.action.value == "move_transcript" else "parent_path"
+                parameters[key] = [item for item in folder.value.split("/") if item]
+            elif folder.kind.value == "explicit_id":
+                parameters["destination_id" if decision.action.value == "move_transcript"
+                           else "parent_id"] = folder.value
+        if decision.folder_name is not None:
+            parameters["name"] = decision.folder_name
+        question_slots = [slot.value for slot in decision.missing_slots]
+        question_text = (
+            "Which document did you mean?" if "document" in question_slots else
+            "Which destination folder should I use?" if "destination" in question_slots else
+            "Which parent folder should I use?" if "parent" in question_slots else
+            "What should I name the folder?" if "folder_name" in question_slots else
+            "Please clarify the conflicting document reference."
+        )
+        choices = []
+        if "document" in question_slots or "explicit_conflict" in question_slots:
+            evidence = snapshot.document_evidence
+            if isinstance(evidence, Mapping) and len(evidence) > 1:
+                for doc_id, entries in evidence.items():
+                    if not entries:
+                        continue
+                    metadata = entries[0].metadata or {}
+                    title = metadata.get("title", metadata.get("source_file", doc_id))
+                    choices.append({"doc_id": doc_id, "title": title,
+                                    "evidence_refs": list(dict.fromkeys(
+                                        item.source.ref for item in entries))})
+                if choices:
+                    question_text += "\n" + "\n".join(
+                        f"{index}. {choice['title']} ({choice['doc_id']})"
+                        for index, choice in enumerate(choices, start=1)
+                    )
+        pending = PendingClarification(
+            clarification_id=clarification_id, context_id=self.context_id,
+            actor_id=snapshot.actor_id, initiating_operation_id=self.operation_id,
+            origin_conversation_id=snapshot.selected_conversation_id,
+            original_command_ref=context_reference["ref"],
+            original_command_digest=context_reference["digest"],
+            action=decision.action.value, resolved_parameters=parameters,
+            missing_slots=tuple(question_slots),
+            evidence_snapshot_ref=context_reference["ref"],
+            evidence_snapshot_digest=context_reference["digest"],
+            state=ClarificationState.WAITING, created_at=now, updated_at=now,
+        )
+        question = {"clarification_id": clarification_id,
+                    "missing_slots": question_slots,
+                    "evidence_refs": list(decision.evidence_refs),
+                    **({"document_choices": choices} if choices else {})}
+        request = build_clarification_request(
+            pending, context_reference, question=question, prompt_body=question_text,
+        )
+        intent_reference = self.ledger.save_routing_checkpoint(
+            "intent", actor_id=snapshot.actor_id,
+            conversation_id=snapshot.selected_conversation_id, value=request,
+        )
+        route_kind = {
+            "move_transcript": "substantive", "create_folder": "substantive",
+            "create_then_move": "substantive", "substantive": "substantive",
+            "save": "save", "search": "search", "retry": "retry",
+            "annotation": "annotation", "pure_switch": "pure_switch",
+        }.get(decision.action.value)
+        if route_kind is None:
+            raise ValueError("clarification action has no ordinary route projection")
+        summary = _TelegramCommandMixin._route_control_data({
+            "status": "uncertain", "kind": route_kind,
+        })
+        contextual = {
+            "schema_version": 1, "context_ref": context_reference["ref"],
+            "context_digest": context_reference["digest"], "context_id": self.context_id,
+            "operation_id": self.operation_id, "actor_id": snapshot.actor_id,
+            "accepted_command": snapshot.accepted_command,
+            "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+            "full_history_ref": snapshot.full_history_ref.to_dict(),
+            "source_conversation_id": snapshot.selected_conversation_id,
+            "checkpoint_conversation_id": checkpoint_id,
+            "decision": decision.to_dict(), "resolved": parameters, "summary": summary,
+            "fixed_plan": None, "intent_ref": intent_reference["ref"],
+            "intent_digest": intent_reference["digest"],
+        }
+        application_route = {"contextual": contextual}
+        checkpoint = self.ledger.prepare_application_route(
+            checkpoint_id, self.operation_id,
+            route=application_route, tool_calls=[], application_route_round=None,
+        )
+        persisted = await _offload(
+            self.runtime.repository.persist_route, self.operation_id, summary,
+            context_id=self.context_id, owner=self.owner, fence=self.fence,
+            now=self.runtime.clock(), application_checkpoint=checkpoint,
+        )
+        if not persisted:
+            raise PermissionError("clarification publication lost its queue fence")
+        completion = await _offload(
+            self.runtime.repository.prepare_clarification_completion, intent_reference,
+        )
+        self.pinned, self.application_route = summary, application_route
+        self.contextual_metadata = contextual
+        return TelegramQueueCompletion("clarification", completion)
+
+    def _known_clarification_document(self, selector: Any, decision: Any) -> str | None:
+        """Retain only selectors that already resolve against frozen T017 evidence."""
+        from services.connectors.telegram.runtime.routing_context import (
+            DocumentSelectorKind, SourceKind,
+        )
+        snapshot = getattr(self, "contextual_source", None)
+        if snapshot is None or selector is None:
+            return None
+        from services.connectors.telegram.sessions import _semantic_conflict
+        tool_choice = (self.decision.get("tool_choice")
+                       if isinstance(getattr(self, "decision", None), Mapping) else None)
+        proposed_doc_id = None
+        if isinstance(tool_choice, Mapping):
+            arguments = tool_choice.get("arguments")
+            proposed_doc_id = (arguments.get("doc_id")
+                               if isinstance(arguments, Mapping) else None)
+        if _semantic_conflict(
+                decision, tool_choice,
+                active_doc_id=snapshot.selected_doc_id,
+                last_doc_id=getattr(self.context, "last_doc_id", None),
+                candidates=self.cards,
+                target_doc_id=proposed_doc_id):
+            return None
+        evidence = snapshot.document_evidence
+        if selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
+            doc_id = snapshot.selected_doc_id
+            rows = evidence.get(doc_id, ()) if isinstance(doc_id, str) else ()
+            return doc_id if any(item.source_kind is SourceKind.ACTIVE_DOCUMENT for item in rows) else None
+        if selector.kind is DocumentSelectorKind.DIALOG_NUMBER:
+            matches = [doc_id for doc_id, rows in evidence.items()
+                       if any(item.source_kind is SourceKind.LOCAL_NUMBER
+                              and item.command_span is not None
+                              and item.command_span.parsed_value == selector.dialog_number
+                              for item in rows)]
+            return matches[0] if len(matches) == 1 else None
+        if selector.kind is DocumentSelectorKind.EXPLICIT_REFERENCE:
+            matches = [doc_id for doc_id, rows in evidence.items()
+                       if any(item.source_kind is SourceKind.EXPLICIT_REFERENCE
+                              and item.command_span == selector.span for item in rows)]
+            return matches[0] if len(matches) == 1 else None
+        if selector.kind is DocumentSelectorKind.EVIDENCE:
+            rows = evidence.get(selector.doc_id, ())
+            refs = {item.source.ref for item in rows}
+            return (selector.doc_id if selector.evidence_refs
+                    and set(selector.evidence_refs).issubset(refs) else None)
+        if selector.kind is DocumentSelectorKind.SHOWN_POSITION:
+            matches = [doc_id for doc_id, rows in evidence.items()
+                       if any(isinstance(item.metadata, Mapping)
+                              and item.metadata.get("list_id") == selector.list_id
+                              and (item.metadata.get("position") == selector.position
+                                   or selector.position == "last")
+                              and item.source.ref in selector.evidence_refs
+                              for item in rows)]
+            unique = set(matches)
+            if selector.position == "last" and unique:
+                rows = [(doc_id, item.metadata.get("position"))
+                        for doc_id, items in evidence.items() for item in items
+                        if isinstance(item.metadata, Mapping)
+                        and item.metadata.get("list_id") == selector.list_id
+                        and item.source.ref in selector.evidence_refs]
+                if rows:
+                    maximum = max(position for _doc_id, position in rows
+                                  if type(position) is int)
+                    unique = {doc_id for doc_id, position in rows if position == maximum}
+            return next(iter(unique)) if len(unique) == 1 else None
+        if selector.kind is DocumentSelectorKind.LAST_SAVED:
+            target = self.decision.get("target_ref") if isinstance(self.decision, Mapping) else None
+            if isinstance(target, str) and target and target != "last":
+                # T017 records confirmed saves independently from active focus.
+                if any(ref.payload.get("doc_id") == target
+                       for ref in snapshot.confirmed_predecessor_saves):
+                    return target
+        return None
 
     def _valid_invocation(self) -> bool:
         """Reject malformed operation identity and lease metadata before IO."""
@@ -1076,6 +1596,8 @@ class _CommandExecution(SearchAgentMixin):
             "owner": self.owner, "fence": self.fence, "lease": self.lease,
             "retry_governor": self.retry_governor,
             "last_doc_id": self.context.last_doc_id,
+            "prepare_native_call": self._prepare_native_call,
+            "prepare_native_batch": self._prepare_native_batch,
         }
         self.governed_executors: list[_GovernedExecutor] = []
         self.agent = TelegramAgent(
@@ -1118,15 +1640,140 @@ class _CommandExecution(SearchAgentMixin):
             _valid_response,
         )
         runtime = self.runtime
-        self.cards = await _offload(_candidate_cards, self.store)
+        # Durable route and application state is authoritative.  Read it before
+        # any mutable catalog or conversation lookup so a restart cannot choose
+        # a different target from today's index state.
+        self.pinned = await _offload(runtime.repository.get_route_control,
+                                     self.context_id, self.operation_id)
+        if await self._load_contextual_pin():
+            return
+        self.scoped_fresh_route = self.command is not None and self.pinned is None
+        if self.scoped_fresh_route:
+            try:
+                captured = await self._capture_scoped_routing_context()
+                if not captured:
+                    # A missing immutable accepted-input projection is not
+                    # authority to widen this request to a mutable catalog.
+                    self.raw_decision = {}
+                    self.decision, self.decision_status = None, "error"
+                    self.route_from_pin = False
+                    return
+            except Exception as error:
+                self.raw_decision = {}
+                self.decision, self.decision_status = None, "error"
+                self.route_from_pin = False
+                _LOGGER.warning(
+                    "telegram scoped routing context failed",
+                    extra={"operation_id": self.operation_id, "phase": "routing",
+                           "code": "scoped_context_failed",
+                           "exception_class": type(error).__name__},
+                )
+                return
+        elif self.pinned is not None:
+            # Ordinary route_control rows are summaries, not model responses.
+            # Preserve their terminal failure status directly; expand a saved
+            # successful summary with the same legacy replay projection used
+            # before contextual routing, without reading candidate catalogs.
+            self.cards, self.save_candidates, self.recent_search_results = (), (), ()
+            self.route_from_pin = True
+            status = self.pinned.get("status") if isinstance(self.pinned, Mapping) else None
+            self.route_history_error = False
+            self.route_history, self.route_conversation = [], None
+            if status not in {"ok", "success"}:
+                self.raw_decision = None
+                self.decision = None
+                self.decision_status = status if status in {
+                    "uncertain", "invalid_route", "error",
+                } else "invalid_route"
+                self.semantic_decision = None
+                self.chat_conversation_id = None
+                self.agent_conversation_id = (
+                    self.pinned.get("conversation_id")
+                    if isinstance(self.pinned, Mapping) else None
+                )
+                if not isinstance(self.agent_conversation_id, str):
+                    self.agent_conversation_id = "telegram-global-" + hashlib.sha256(
+                        f"{self.context_id}\0{self.operation_id}".encode()).hexdigest()
+                self.global_conversation_id = self.agent_conversation_id
+                self.replay_request = None
+                return
+            checkpoint_conversation_id = await _offload(
+                self.ledger.checkpoint_conversation_id, self.operation_id,
+            )
+            self.agent_conversation_id = checkpoint_conversation_id or (
+                self.pinned.get("conversation_id")
+                if isinstance(self.pinned, Mapping) else None
+            ) or "telegram-global-" + hashlib.sha256(
+                f"{self.context_id}\0{self.operation_id}".encode()).hexdigest()
+            self.chat_conversation_id = self.agent_conversation_id
+            self.agent_conversation_id = self.chat_conversation_id or (
+                "telegram-global-" + hashlib.sha256(
+                    f"{self.context_id}\0{self.operation_id}".encode()).hexdigest()
+            )
+            self.global_conversation_id = self.agent_conversation_id
+            self.replay_request = await _offload(
+                self.ledger.load_request, self.global_conversation_id, self.operation_id,
+            )
+            self.raw_decision = self._pinned_decision()
+            if (isinstance(self.pinned, Mapping)
+                    and self.pinned.get("kind") == "annotation"
+                    and isinstance(self.pinned.get("annotation_payload"), Mapping)):
+                try:
+                    from services.connectors.telegram.runtime.annotations import (
+                        hydrate_annotation_text,
+                    )
+                    annotation_text = await _offload(
+                        hydrate_annotation_text, self.runtime.repository.client,
+                        {"context_id": self.context_id, "operation_id": self.operation_id,
+                         "text_payload": self.pinned["annotation_payload"],
+                         "text_sha256": self.pinned.get("annotation_text_sha256")},
+                        context_id=self.context_id, operation_id=self.operation_id,
+                        owner=self.owner, fence=self.fence, clock=self.runtime.clock,
+                    )
+                except (ValueError, TypeError, KeyError):
+                    annotation_text = None
+                if isinstance(annotation_text, str):
+                    self.raw_decision["substantive_text"] = annotation_text
+                else:
+                    self.raw_decision = None
+                    self.decision_status = "error"
+                    self.decision = None
+                    return
+            if await self._trusted_legacy_search_pin():
+                self.decision = {
+                    "kind": "search", "target_ref": None,
+                    "target_operation_id": None, "dialog_number": None,
+                    "result_refs": list(self.pinned.get("result_refs", [])),
+                    "substantive_text": self.replay_request,
+                    "tool_choice": None, "certainty": "certain",
+                }
+                self.decision_status = "ok"
+            else:
+                self.decision, self.decision_status = _valid_persisted_route(
+                    self.raw_decision,
+                )
+            self.semantic_decision = (
+                self.decision.get("semantic_decision")
+                if isinstance(self.decision, Mapping) else None
+            )
+            target_doc_id = self.pinned.get("target_doc_id")
+            target_conversation_id = self.pinned.get("target_conversation_id")
+            dialog_number = self.pinned.get("dialog_number")
+            if (isinstance(target_doc_id, str)
+                    and isinstance(target_conversation_id, str)
+                    and type(dialog_number) is int):
+                self.cards = ({"doc_id": target_doc_id,
+                               "conversation_id": target_conversation_id,
+                               "dialog_number": dialog_number},)
+            return
+        else:
+            self.cards = await _offload(_candidate_cards, self.store)
         self.save_candidates = await _offload(
             runtime._predecessor_save_candidates, self.context_id, self.operation,
         )
         self.recent_search_results = await _offload(
             runtime._predecessor_search_results, self.context_id, self.operation, self.cards,
         )
-        self.pinned = await _offload(runtime.repository.get_route_control,
-                                     self.context_id, self.operation_id)
         pinned_status = self.pinned.get("status") if isinstance(self.pinned, Mapping) else None
         if pinned_status in {"uncertain", "invalid_route", "error"}:
             self.raw_decision = None
@@ -1134,19 +1781,20 @@ class _CommandExecution(SearchAgentMixin):
             self.decision_status = pinned_status
             return
         self.route_history_error = False
-        try:
-            self.chat_conversation_id, self.route_history, self.route_conversation = (
-                await self._routing_conversation()
-            )
-        except Exception as error:
-            self.chat_conversation_id, self.route_history, self.route_conversation = None, [], None
-            self.route_history_error = True
-            _LOGGER.warning(
-                "telegram route history load failed",
-                extra={"operation_id": self.operation_id, "phase": "routing",
-                       "code": "history_load_failed",
-                       "exception_class": type(error).__name__},
-            )
+        if not getattr(self, "scoped_fresh_route", False):
+            try:
+                self.chat_conversation_id, self.route_history, self.route_conversation = (
+                    await self._routing_conversation()
+                )
+            except Exception as error:
+                self.chat_conversation_id, self.route_history, self.route_conversation = None, [], None
+                self.route_history_error = True
+                _LOGGER.warning(
+                    "telegram route history load failed",
+                    extra={"operation_id": self.operation_id, "phase": "routing",
+                           "code": "history_load_failed",
+                           "exception_class": type(error).__name__},
+                )
         checkpoint_conversation_id = await _offload(
             self.ledger.checkpoint_conversation_id, self.operation_id,
         )
@@ -1206,6 +1854,9 @@ class _CommandExecution(SearchAgentMixin):
             return
         if self.raw_decision is None and self.chat_conversation_id is not None:
             initial_context, initial_binding = await self._routing_context_metadata()
+            if getattr(self, "scoped_fresh_route", False):
+                initial_context["contextual_evidence"] = self.contextual_evidence
+                initial_context["presentation_refs"] = self.contextual_presentation_refs
             try:
                 self.raw_decision = await self._classify_route(initial_context)
                 refreshed_context, refreshed_binding = await self._routing_context_metadata()
@@ -1231,7 +1882,7 @@ class _CommandExecution(SearchAgentMixin):
                     "telegram route selection failed",
                     extra={"operation_id": self.operation_id, "phase": "routing",
                            "code": "route_selection_failed",
-                           "exception_class": type(error).__name__},
+                       "exception_class": type(error).__name__},
                 )
         if self.route_from_pin:
             self.decision, self.decision_status = _valid_persisted_route(self.raw_decision)
@@ -1248,6 +1899,570 @@ class _CommandExecution(SearchAgentMixin):
             self.decision.get("semantic_decision")
             if isinstance(self.decision, Mapping) else None
         )
+        if (getattr(self, "scoped_fresh_route", False)
+                and isinstance(self.decision, Mapping)
+                and self.decision.get("kind") == "search"
+                and isinstance(self.decision.get("substantive_text"), str)):
+            self.replay_request = self.decision["substantive_text"]
+
+    @staticmethod
+    def _command_spans(text: str) -> tuple[Any, ...]:
+        """Capture exact supported references without turning pronouns into authority."""
+        from services.connectors.telegram.runtime.routing_context import (
+            CommandSpan, ExplicitReferenceKind,
+        )
+        patterns = (
+            (ExplicitReferenceKind.URL,
+             re.compile(r"https?://[^\s<>]+", re.IGNORECASE)),
+            (ExplicitReferenceKind.ID, re.compile(r"\bdoc-[A-Za-z0-9_-]+\b")),
+            (ExplicitReferenceKind.ID, re.compile(r"\b[A-Za-z0-9_-]{20,}\b")),
+            (ExplicitReferenceKind.LOCAL_NUMBER,
+             re.compile(r"(?:#\s*\d+|\bno\.?\s*\d+|\b(?:dialog|transcript)"
+                        r"\s+(?:number\s+)?#?\s*\d+)", re.IGNORECASE)),
+            (ExplicitReferenceKind.LAST_SAVED,
+             re.compile(r"\blast\s+saved\b", re.IGNORECASE)),
+        )
+        found = []
+        for kind, pattern in patterns:
+            for match in pattern.finditer(text):
+                raw = match.group(0)
+                if kind is ExplicitReferenceKind.LOCAL_NUMBER:
+                    digits = re.search(r"\d+", raw)
+                    if digits is None:
+                        continue
+                    parsed: str | int = int(digits.group(0))
+                    if re.match(r"(?:dialog|transcript)\b", raw, flags=re.IGNORECASE):
+                        # The T017 explicit-reference parser accepts a bare
+                        # local number, #N, or no. N. Keep only the number
+                        # token inside natural-language labels such as
+                        # "dialog #2" so its accepted span validates exactly.
+                        start = match.start() + digits.start()
+                        raw = digits.group(0)
+                    else:
+                        start = match.start()
+                else:
+                    parsed = raw
+                    start = match.start()
+                found.append(CommandSpan(kind, start, start + len(raw), raw, parsed))
+        found.sort(key=lambda span: (span.start, -(span.end - span.start), span.kind.value))
+        deduplicated = []
+        for span in found:
+            if any(span.start < prior.end and prior.start < span.end
+                   for prior in deduplicated):
+                continue
+            deduplicated.append(span)
+        return tuple(deduplicated)
+
+    async def _capture_scoped_routing_context(self) -> bool:
+        """Freeze selected history and direct evidence before asking the router."""
+        operation_ref = (self.runtime.repository.client.collection("telegram_sessions")
+                         .document(self.context_id).collection("operations")
+                         .document(self.operation_id))
+        stored_operation = (await _offload(operation_ref.get)).to_dict() or {}
+        input_ref = stored_operation.get("input_ref")
+        if not isinstance(input_ref, str) or not input_ref.startswith(
+            f"telegram_sessions/{self.context_id}/commands/",
+        ):
+            raise ValueError("accepted command reference is unavailable")
+        command_id = input_ref.rsplit("/", 1)[-1]
+        command_snapshot = await _offload(
+            self.runtime.repository.client.collection("telegram_sessions")
+            .document(self.context_id).collection("commands").document(command_id).get
+        )
+        command_row = command_snapshot.to_dict() or {} if command_snapshot.exists else {}
+        if (not isinstance(command_row.get("candidate"), str)
+                or command_row.get("candidate") != getattr(self.command, "text", None)
+                or (command_row.get("text") is not None
+                    and command_row.get("text") != getattr(self.command, "text", None))
+                or command_row.get("context_id") != self.context_id
+                or command_row.get("operation_id") != self.operation_id
+                or command_row.get("kind") != getattr(self.command, "kind", None)):
+            return False
+        actor_id = command_row.get("user_id")
+        if type(actor_id) is not int or actor_id <= 0:
+            raise ValueError("accepted command actor is invalid")
+        presentation_id = command_row.get("observed_presentation_id")
+        presentation_refs, presentation_evidence = await self._capture_presentation_evidence(
+            actor_id=actor_id, observed_presentation_id=presentation_id,
+            accepted_at=command_row.get("created_at"),
+        )
+        self.contextual_source = await _offload(
+            self.store.capture_routing_context,
+            actor_id=actor_id, owner=self.owner, fence=self.fence,
+            search_exchange_loader=self._load_search_exchange,
+            clock=self.runtime.clock,
+            explicit_references=self._command_spans(self.command.text),
+            presentation_refs=presentation_refs,
+            document_evidence=presentation_evidence,
+        )
+        snapshot = self.contextual_source
+        history_projection = snapshot.full_history_ref.to_dict()["payload"]
+        history_payload = history_projection
+        if not isinstance(history_payload, Mapping) or not isinstance(history_payload.get("turns"), (list, tuple)):
+            raise ValueError("captured route history is malformed")
+        self.chat_conversation_id = snapshot.selected_conversation_id
+        if not isinstance(self.chat_conversation_id, str) or not self.chat_conversation_id:
+            self.chat_conversation_id = "telegram-chat-" + hashlib.sha256(
+                self.context_id.encode("utf-8")
+            ).hexdigest()
+        self.route_history = history_payload["turns"]
+        source_projection = history_payload.get("conversation")
+        if not isinstance(source_projection, Mapping):
+            raise ValueError("captured selected conversation projection is malformed")
+        from services.connectors.telegram.conversations import build_conversation
+        self.route_conversation = build_conversation(
+            snapshot.selected_conversation_id, source_projection.get("kind"),
+            draft_id=source_projection.get("draft_id"),
+            doc_id=source_projection.get("doc_id"),
+            dialog_number=source_projection.get("dialog_number"),
+            search_filters=source_projection.get("search_filters"),
+            now=self.runtime.clock(),
+        )
+        self.route_history_error = False
+        self.agent_conversation_id = await _offload(
+            self.ledger.checkpoint_conversation_id, self.operation_id,
+        ) or ("telegram-global-" + hashlib.sha256(
+            f"{self.context_id}\0{self.operation_id}".encode()).hexdigest())
+        self.global_conversation_id = self.agent_conversation_id
+        self.replay_request = await _offload(
+            self.ledger.load_request, self.agent_conversation_id, self.operation_id,
+        )
+        target_bindings = {
+            doc_id: await self._resolve_target_document_binding(doc_id)
+            for doc_id in snapshot.document_evidence
+        }
+        cards = []
+        for doc_id, entries in snapshot.document_evidence.items():
+            evidence = entries[0]
+            metadata = dict(evidence.metadata or {})
+            card = {key: metadata[key] for key in (
+                "title", "source_file", "date", "dialog_date", "created_at",
+                "folder", "folder_id", "folder_path", "parent_id",
+            ) if key in metadata}
+            card["doc_id"] = doc_id
+            target_binding = target_bindings[doc_id]
+            card["conversation_id"] = target_binding["conversation_id"]
+            card["dialog_number"] = target_binding["dialog_number"]
+            source_refs = []
+            list_entries = []
+            for item in entries:
+                source_refs.append(item.source.ref)
+                source_refs.extend(ref.ref for ref in item.fragment_refs)
+                if isinstance(item.metadata, Mapping):
+                    if (isinstance(item.metadata.get("list_id"), str)
+                            and type(item.metadata.get("position")) is int):
+                        list_entries.append({
+                            "list_id": item.metadata["list_id"],
+                            "position": item.metadata["position"],
+                            "evidence_ref": item.source.ref,
+                        })
+            card["evidence_refs"] = list(dict.fromkeys(source_refs))
+            if list_entries:
+                for entry in list_entries:
+                    cards.append({**card, "list_id": entry["list_id"],
+                                  "position": entry["position"],
+                                  "evidence_refs": [entry["evidence_ref"]]})
+            else:
+                cards.append(card)
+        self.cards = tuple(cards)
+        self.contextual_evidence = {
+            doc_id: [{"source_kind": item.source_kind.value,
+                      "source_ref": item.source.ref,
+                      "fragment_refs": [ref.ref for ref in item.fragment_refs],
+                      **({key: item.metadata[key] for key in ("list_id", "position")
+                          if key in item.metadata} if isinstance(item.metadata, Mapping) else {})}
+                     for item in entries]
+            for doc_id, entries in snapshot.document_evidence.items()
+        }
+        self.contextual_presentation_refs = [
+            {"ref": item.ref,
+             **(item.to_dict()["payload"] if isinstance(item.payload, Mapping) else {})}
+            for item in snapshot.presentation_refs
+        ]
+        return True
+
+    async def _resolve_target_document_binding(self, doc_id: str) -> dict[str, Any]:
+        """Resolve one evidence document to its canonical local target binding."""
+        if not isinstance(doc_id, str) or not doc_id or "/" in doc_id:
+            raise ValueError("evidence document identity is invalid")
+        client = self.runtime.repository.client
+        context_ref = client.collection("telegram_sessions").document(self.context_id)
+        binding_key = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()
+        binding_ref = context_ref.collection("document_bindings").document(binding_key)
+        binding_snapshot = await _offload(binding_ref.get)
+        binding = binding_snapshot.to_dict() or {} if binding_snapshot.exists else {}
+        if not binding_snapshot.exists:
+            metadata = await _offload(self.store._addressed_metadata, doc_id)
+            if not isinstance(metadata, Mapping):
+                raise ValueError("evidence document metadata is unavailable")
+            conversation_id = "document-" + hashlib.sha256(
+                f"{self.context_id}\0{doc_id}".encode("utf-8")
+            ).hexdigest()
+            if not await _offload(self.lease_check):
+                raise PermissionError("Telegram operation lease is stale")
+            number = await _offload(
+                self.runtime.repository.bind_document,
+                self.context_id, doc_id, conversation_id,
+                metadata=metadata, update_last_doc=False,
+                operation_id=self.operation_id, owner=self.owner, fence=self.fence,
+                ensure_document_conversation=True, now=self.runtime.clock(),
+            )
+            binding = {"doc_id": doc_id, "conversation_id": conversation_id,
+                       "dialog_number": number}
+        conversation_id, number = binding.get("conversation_id"), binding.get("dialog_number")
+        if (binding.get("doc_id") != doc_id or not isinstance(conversation_id, str)
+                or not conversation_id or type(number) is not int or number < 1):
+            raise ValueError("evidence document binding is malformed")
+        dialog_snapshot = await _offload(
+            context_ref.collection("dialogs").document(str(number)).get,
+        )
+        dialog = dialog_snapshot.to_dict() or {} if dialog_snapshot.exists else {}
+        if (not dialog_snapshot.exists or dialog.get("dialog_number") != number
+                or dialog.get("doc_id") != doc_id
+                or dialog.get("conversation_id") != conversation_id
+                or dialog.get("draft_id") is not None):
+            raise ValueError("evidence document numbered binding changed")
+        conversation = await _offload(
+            self.runtime.repository.get_conversation, self.context_id, conversation_id,
+        )
+        if conversation is None:
+            if not await _offload(self.lease_check):
+                raise PermissionError("Telegram operation lease is stale")
+            conversation = await _offload(
+                self.runtime.repository.ensure_conversation,
+                self.context_id, conversation_id, kind="document", doc_id=doc_id,
+                dialog_number=number, queue_operation_id=self.operation_id,
+                queue_owner=self.owner, queue_fence=self.fence, now=self.runtime.clock(),
+            )
+        if (conversation.doc_id != doc_id or conversation.dialog_number != number
+                or conversation.kind.value != "document"):
+            raise ValueError("evidence document conversation binding changed")
+        return {"conversation_id": conversation_id, "dialog_number": number}
+
+    async def _capture_presentation_evidence(
+        self, *, actor_id: int, observed_presentation_id: Any = None,
+        accepted_at: Any = None,
+    ) -> tuple[tuple[Any, ...], dict[str, tuple[Any, ...]]]:
+        """Capture only addressed history lists with their own verified delivery."""
+        from services.connectors.telegram.runtime.routing_context import (
+            BoundRef, DocumentEvidence, SourceKind, json_digest,
+        )
+
+        context_ref = self.runtime.repository.client.collection("telegram_sessions").document(
+            self.context_id,
+        )
+        context_snapshot = await _offload(context_ref.get)
+        context = context_snapshot.to_dict() or {} if context_snapshot.exists else {}
+        conversation_id = context.get("active_conversation_id")
+        if (not isinstance(conversation_id, str) or not conversation_id
+                or not isinstance(observed_presentation_id, str)
+                or not observed_presentation_id
+                or not isinstance(accepted_at, datetime)
+                or accepted_at.tzinfo is None or accepted_at.utcoffset() is None
+                or accepted_at.utcoffset().total_seconds() != 0):
+            return (), {}
+
+        # A command's intake-time observation bounds which list generations
+        # may explain its selector. Walk only canonical turns in the selected
+        # conversation; never stream presentation catalogs or follow today's
+        # last-presentation pointer.
+        turns = await _offload(
+            self.runtime.repository.list_turns, self.context_id, conversation_id,
+        )
+        addressed = []
+        for turn in turns:
+            binding = turn.get("presentation_binding") if isinstance(turn, Mapping) else None
+            scope = binding.get("scope") if isinstance(binding, Mapping) else None
+            if (not isinstance(scope, Mapping)
+                    or scope.get("context_id") != self.context_id
+                    or scope.get("conversation_id") != conversation_id
+                    or scope.get("answer_turn_id") != turn.get("turn_id")
+                    or not isinstance(scope.get("presentation_id"), str)):
+                continue
+            addressed.append(scope["presentation_id"])
+        try:
+            observed_index = addressed.index(observed_presentation_id)
+        except ValueError:
+            return (), {}
+        presentation_ids = tuple(dict.fromkeys(addressed[:observed_index + 1]))
+        sources = []
+        evidence: dict[str, list[Any]] = {}
+        for presentation_id in presentation_ids:
+            manifest = await _offload(
+                self.runtime.repository.get_presentation_manifest,
+                self.context_id, conversation_id, presentation_id,
+            )
+            if not isinstance(manifest, Mapping):
+                continue
+            delivered_ids = await _offload(
+                self.runtime.repository.get_verified_presentation_list_ids,
+                self.context_id, conversation_id, presentation_id,
+                actor_id=actor_id, now=self.runtime.clock(), eligible_at=accepted_at,
+            )
+            lists = []
+            for block in manifest.get("blocks", ()):
+                if (not isinstance(block, Mapping) or block.get("type") != "document_list"
+                        or block.get("list_id") not in delivered_ids):
+                    continue
+                rows = block.get("entries")
+                if isinstance(block.get("list_id"), str) and isinstance(rows, (list, tuple)):
+                    lists.append({"list_id": block["list_id"], "entries": [
+                        {"position": row.get("position", index), "doc_id": row.get("doc_id")}
+                        for index, row in enumerate(rows, start=1)
+                        if isinstance(row, Mapping) and isinstance(row.get("doc_id"), str)
+                    ]})
+            if not lists:
+                continue
+            projection = {"context_id": self.context_id,
+                          "conversation_id": conversation_id,
+                          "presentation_id": presentation_id, "lists": lists}
+            source = BoundRef(
+                ref=(f"telegram_sessions/{self.context_id}/conversations/{conversation_id}"
+                     f"/presentations/{presentation_id}"),
+                digest=json_digest(projection), context_id=self.context_id,
+                actor_id=actor_id, conversation_id=conversation_id,
+                operation_id=manifest.get("producing_operation_id"), payload=projection,
+            )
+            sources.append(source)
+            for item in lists:
+                for row in item["entries"]:
+                    doc_id = row["doc_id"]
+                    evidence.setdefault(doc_id, []).append(DocumentEvidence(
+                        doc_id=doc_id, source_kind=SourceKind.PRESENTATION_ENTRY,
+                        source=source, context_id=self.context_id, actor_id=actor_id,
+                        conversation_id=conversation_id,
+                        operation_id=manifest.get("producing_operation_id"),
+                        metadata={"presentation_id": presentation_id,
+                                  "list_id": item["list_id"],
+                                  "position": row["position"]},
+                    ))
+        return tuple(sources), {key: tuple(items) for key, items in evidence.items()}
+
+    async def _load_contextual_pin(self) -> bool:
+        """Load a complete saved application route before mutable routing inputs."""
+        try:
+            checkpoint_conversation = await _offload(
+                self.ledger.checkpoint_conversation_id, self.operation_id,
+            )
+            if not isinstance(checkpoint_conversation, str) or not checkpoint_conversation:
+                return False
+            turn = await _offload(
+                self.ledger.load_turn, checkpoint_conversation, self.operation_id,
+            )
+            self.contextual_turn = turn
+            application_route = turn.get("application_route") if isinstance(turn, Mapping) else None
+            if not isinstance(application_route, Mapping):
+                return False
+            if "contextual" not in application_route:
+                return False
+            if not isinstance(self.pinned, Mapping):
+                raise ValueError("contextual application checkpoint has no route summary")
+            from services.connectors.telegram.repository._commands import (
+                _TelegramCommandMixin,
+            )
+            contextual, _executable = _TelegramCommandMixin._validate_joint_contextual_shape(
+                application_route, context_id=self.context_id,
+                operation_id=self.operation_id,
+                checkpoint_conversation_id=checkpoint_conversation,
+            )
+            _TelegramCommandMixin._validate_joint_application_projection(
+                application_route, contextual.get("summary"),
+            )
+            if (_TelegramCommandMixin._route_control_data(contextual.get("summary"))
+                    != self.pinned):
+                raise ValueError("saved contextual summary differs from route pin")
+            from services.connectors.telegram.runtime.routing_context import RoutingDecision
+            semantic = RoutingDecision.from_dict(contextual.get("decision"))
+            if semantic.to_dict() != contextual.get("decision"):
+                raise ValueError("saved contextual decision is malformed")
+            summary = contextual.get("summary")
+            if not isinstance(summary, Mapping):
+                raise ValueError("saved contextual route summary is malformed")
+            if semantic.disposition.value == "clarify":
+                decision, status = None, "uncertain"
+            elif summary.get("status") in {"ok", "success"}:
+                selector = semantic.document_selector
+                resolved = contextual.get("resolved")
+                decision = {
+                    "kind": summary.get("kind"),
+                    "target_ref": (resolved.get("doc_id")
+                                   if isinstance(resolved, Mapping) else None),
+                    "target_operation_id": summary.get("target_operation_id"),
+                    "dialog_number": (selector.dialog_number if selector is not None
+                                      else summary.get("dialog_number")),
+                    "result_refs": list(summary.get("result_refs", [])),
+                    "substantive_text": semantic.substantive_text,
+                    "tool_choice": summary.get("tool_choice"),
+                    "certainty": semantic.certainty.value,
+                    "semantic_decision": semantic.to_dict(),
+                }
+                if not isinstance(decision["kind"], str):
+                    raise ValueError("saved contextual route kind is invalid")
+                status = "ok"
+            else:
+                raise ValueError("saved contextual route summary is malformed")
+            self.application_route = dict(application_route)
+            self.contextual_metadata = dict(contextual)
+            self._restore_saved_write_capability(application_route, contextual)
+            self.contextual_snapshot = self.ledger.load_routing_checkpoint(
+                "context", actor_id=contextual["actor_id"],
+                conversation_id=contextual["source_conversation_id"],
+            )
+            if not isinstance(self.contextual_snapshot, Mapping):
+                raise ValueError("saved contextual source snapshot is absent")
+            captured = self.contextual_snapshot.get("value")
+            if not isinstance(captured, Mapping):
+                raise ValueError("saved contextual source payload is malformed")
+            from services.connectors.telegram.conversations import build_conversation
+            source_conversation = contextual.get("source_conversation_id")
+            if not isinstance(source_conversation, str) or not source_conversation:
+                raise ValueError("saved contextual source conversation is invalid")
+            source_kind = captured.get("selected_conversation_kind")
+            history = captured.get("full_history_ref")
+            history_payload = history.get("payload") if isinstance(history, Mapping) else None
+            source_projection = (history_payload.get("conversation")
+                                 if isinstance(history_payload, Mapping) else None)
+            if not isinstance(source_kind, str):
+                raise ValueError("saved selected conversation kind is invalid")
+            if semantic.disposition.value == "clarify" and source_projection is None:
+                # Accepted T023 structural snapshots can predate the optional
+                # conversation projection. A prepared clarification already
+                # carries its frozen intent; replay must not reconstruct it
+                # from current source history.
+                self.route_conversation = None
+            else:
+                if (not isinstance(source_projection, Mapping)
+                        or source_projection.get("kind") != source_kind
+                        or source_projection.get("doc_id") != captured.get("selected_doc_id")):
+                    raise ValueError("saved selected conversation projection is invalid")
+                self.route_conversation = build_conversation(
+                    source_conversation, source_kind,
+                    draft_id=source_projection.get("draft_id"),
+                    doc_id=source_projection.get("doc_id"),
+                    dialog_number=source_projection.get("dialog_number"),
+                    search_filters=source_projection.get("search_filters"),
+                    now=self.runtime.clock(),
+                )
+            self.decision, self.decision_status = decision, status
+            self.semantic_decision = semantic.to_dict()
+            self.raw_decision = decision
+            self.route_from_pin = True
+            self.chat_conversation_id = contextual["source_conversation_id"]
+            self.agent_conversation_id = checkpoint_conversation
+            self.global_conversation_id = checkpoint_conversation
+            self.route_history = []
+            self.cards, self.save_candidates, self.recent_search_results = (), (), ()
+            self.replay_request = (
+                semantic.substantive_text if semantic.action.value == "search"
+                else contextual["accepted_command"]
+            )
+            return True
+        except (TypeError, ValueError, KeyError, AttributeError):
+            self.raw_decision = None
+            self.decision = None
+            self.decision_status = "error"
+            self.route_from_pin = True
+            self.cards, self.save_candidates, self.recent_search_results = (), (), ()
+            self.chat_conversation_id = None
+            self.route_history = []
+            self.route_conversation = None
+            return True
+
+    async def _confirmed_contextual_replay(self) -> QueueOperationState | None:
+        """Reuse a completed fixed move and answer without touching live source state."""
+        from services.connectors.telegram.runtime.routing_context import (
+            Action, Disposition, RoutingDecision,
+        )
+        contextual = getattr(self, "contextual_metadata", None)
+        turn = getattr(self, "contextual_turn", None)
+        if not isinstance(contextual, Mapping) or not isinstance(turn, Mapping):
+            return None
+        try:
+            decision = RoutingDecision.from_dict(contextual.get("decision"))
+        except (TypeError, ValueError, KeyError):
+            return None
+        plan = contextual.get("fixed_plan")
+        steps = plan.get("steps") if isinstance(plan, Mapping) else None
+        if (decision.action is not Action.MOVE_TRANSCRIPT
+                or decision.disposition is not Disposition.EXECUTE
+                or not isinstance(steps, list) or not steps
+                or not all(isinstance(step, Mapping) for step in steps)):
+            return None
+        raw_results = turn.get("tool_results")
+        if not isinstance(raw_results, Mapping):
+            return None
+        for step in steps:
+            ordinal = step.get("ordinal")
+            if type(ordinal) is not int or str(ordinal) not in raw_results:
+                return None
+        answer = self._answer_from_checkpoint_turn(turn)
+        if not isinstance(answer, str) or not answer.strip():
+            return None
+        # The existing reply outbox is idempotent. It either returns the
+        # already delivered reply or resumes its saved chunks without rerunning
+        # source history, target preflight, model calls, or the mutation.
+        if not hasattr(self, "replies"):
+            self._compose_replies()
+        return await self.finish_reply(answer, presentation="rich_markdown")
+
+    @staticmethod
+    def _answer_from_checkpoint_turn(turn: Mapping[str, Any]) -> Any:
+        response = turn.get("model_response")
+        rounds = (response.get("rounds", [])
+                  if isinstance(response, Mapping)
+                  and response.get("_telegram_tool_loop_rounds") == 1
+                  else [response])
+        final = (rounds[-1].get("response") if rounds
+                 and isinstance(rounds[-1], Mapping) and "response" in rounds[-1]
+                 else (rounds[-1] if rounds else None))
+        return _value(final, "text")
+
+    def _restore_saved_write_capability(
+        self, application_route: Mapping[str, Any], contextual: Mapping[str, Any],
+    ) -> None:
+        """Reissue T009 authority only after validating the persisted fixed step."""
+        if application_route.get("name") not in {"move_transcript", "create_folder"}:
+            return
+        from core.operations.write import (
+            _new_resolved_write_targets, _resolved_targets_projection,
+        )
+        from services.connectors.telegram.runtime.tools import stable_effect_id
+
+        plan = contextual.get("fixed_plan")
+        steps = plan.get("steps") if isinstance(plan, Mapping) else None
+        if not isinstance(steps, list) or len(steps) != 1 or not isinstance(steps[0], Mapping):
+            raise ValueError("saved mutation plan is incomplete")
+        step = steps[0]
+        name = application_route.get("name")
+        arguments = application_route.get("arguments")
+        ordinal = application_route.get("ordinal")
+        child_id = "telegram-tool-" + hashlib.sha256(
+            f"{self.operation_id}\0{ordinal}".encode("utf-8")
+        ).hexdigest()
+        effect_id = stable_effect_id(self.operation_id, ordinal)
+        resolved = contextual.get("resolved")
+        stored = step.get("resolved_targets")
+        if (step.get("ordinal") != ordinal or step.get("name") != name
+                or step.get("arguments") != arguments
+                or step.get("target_doc_id") != application_route.get("target_doc_id")
+                or step.get("operation_id") != child_id or step.get("effect_id") != effect_id
+                or not isinstance(resolved, Mapping) or not isinstance(stored, Mapping)):
+            raise ValueError("saved mutation binding is incomplete")
+        resolved_binding = dict(resolved)
+        root_id = resolved_binding.pop("root_id", None)
+        intent_digest = resolved_binding.pop("intent_digest", None)
+        if root_id != self.runtime.root_folder_id:
+            raise ValueError("saved mutation root binding changed")
+        capability = _new_resolved_write_targets(
+            operation_name=name, operation_id=child_id, effect_id=effect_id,
+            arguments=dict(arguments), root_id=root_id, intent_digest=intent_digest,
+            doc_id=resolved_binding.get("doc_id"),
+            destination_id=resolved_binding.get("destination_id"),
+            parent_id=resolved_binding.get("parent_id"),
+        )
+        if _resolved_targets_projection(capability) != dict(stored):
+            raise ValueError("saved mutation capability projection changed")
+        self.executor_context["resolved_targets"] = capability
 
     @staticmethod
     def _ingress_source_is_bound(binding: Any) -> bool:
@@ -1276,8 +2491,12 @@ class _CommandExecution(SearchAgentMixin):
                            "draft_state": ingress_draft.get("state"),
                            "dialog_number": ingress_draft.get("dialog_number")}
         captured = await self._accepted_collecting_draft()
+        source = getattr(self, "contextual_source", None)
         context = {
-            "active_conversation_id": self.context.active_conversation_id,
+            "active_conversation_id": (
+                source.selected_conversation_id if source is not None
+                else self.context.active_conversation_id
+            ),
             "selected_dialog_number": self.context.selected_dialog_number,
             "last_doc_id": self.context.last_doc_id,
             "selected_conversation_kind": (
@@ -1737,9 +2956,20 @@ class _CommandExecution(SearchAgentMixin):
             and type(decision.get("dialog_number")) is int
             and decision.get("dialog_number") == self.route_conversation.dialog_number
         )
+        missing_number_refusal = bool(
+            command is not None
+            and self.decision_status in {"invalid_route", "not_found"}
+            and isinstance(getattr(self, "semantic_decision", None), Mapping)
+            and getattr(self, "semantic_decision").get("action") in {
+                "move_transcript", "substantive",
+            }
+            and isinstance(getattr(self, "semantic_decision").get("document_selector"), Mapping)
+            and getattr(self, "semantic_decision")["document_selector"].get("kind") == "dialog_number"
+        )
         return bool(pinned_global or (command is not None and (
             decision is None or decision["kind"] in {"save", "retry", "search", "annotation"}
             or pure_switch or no_document or current_draft_question or global_tool_choice
+            or missing_number_refusal
         )))
 
     async def _settle_governed_failure(self) -> QueueOperationState | None:
@@ -1762,7 +2992,25 @@ class _CommandExecution(SearchAgentMixin):
 
     async def _run_global(self) -> QueueOperationState:
         """Persist global route control and dispatch its specific command handler."""
-        if not await self._persist_global_route():
+        choice = self.decision.get("tool_choice") if isinstance(self.decision, Mapping) else None
+        native_call_pending = bool(
+            getattr(self, "scoped_fresh_route", False)
+            and self.decision_status == "ok"
+            and isinstance(self.decision, Mapping)
+            and self.decision.get("kind") == "substantive"
+            and choice is None
+            and not getattr(self, "search_continuation", False)
+        )
+        if not native_call_pending:
+            native_call_pending = self._saved_native_application_call()
+        if native_call_pending:
+            persisted = True
+        elif (isinstance(getattr(self, "application_route", None), Mapping)
+                and isinstance(self.application_route.get("contextual"), Mapping)):
+            persisted = True
+        else:
+            persisted = await self._persist_global_route()
+        if not persisted:
             return QueueOperationState.FAILED
         if (isinstance(self.pinned, Mapping)
                 and self.pinned.get("kind") == "annotation"
@@ -1772,18 +3020,29 @@ class _CommandExecution(SearchAgentMixin):
         if self.decision is None or self.decision_status != "ok":
             if self.decision_status == "uncertain":
                 return await self.finish_reply(_UNCERTAIN_ROUTE_REPLY)
+            semantic = (self.semantic_decision
+                        if isinstance(self.semantic_decision, Mapping) else {})
+            selector = semantic.get("document_selector")
+            if (self.decision_status in {"invalid_route", "not_found"}
+                    and isinstance(selector, Mapping)
+                    and selector.get("kind") == "dialog_number"):
+                return await self.finish_reply(
+                    "I could not find that dialog. Please choose an existing dialog number.",
+                    kind="error", failure_final=True,
+                )
             if (self.decision_status == "invalid_route"
                     and isinstance(self.pinned, Mapping)
                     and self.pinned.get("kind") == "annotation"):
                 return await self._invalid_annotation_target_reply()
             return await self._finish_processing_error()
-        cleared = await _offload(
-            self.runtime.repository.clear_command_candidate, self.context_id,
-            self.operation_id, owner=self.owner, fence=self.fence,
-            now=self.runtime.clock(),
-        )
-        if cleared is False:
-            return QueueOperationState.RUNNING
+        if not native_call_pending:
+            cleared = await _offload(
+                self.runtime.repository.clear_command_candidate, self.context_id,
+                self.operation_id, owner=self.owner, fence=self.fence,
+                now=self.runtime.clock(),
+            )
+            if cleared is False:
+                return QueueOperationState.RUNNING
         handlers = {
             "save": self._handle_global_save,
             "retry": self._handle_global_retry,
@@ -1891,13 +3150,33 @@ class _CommandExecution(SearchAgentMixin):
             elif self.search_continuation:
                 record["conversation_id"] = self.search_session_id
                 record["search_protocol"] = "agent-v1"
-            prompt = (
-                decision.get("substantive_text") if decision.get("kind") in {"substantive", "search"}
-                else self.command.text if self.command is not None else self.replay_request
-            )
-            if decision.get("kind") in {"substantive", "search", "save"} and isinstance(prompt, str):
-                await _offload(self.ledger.save_request, self.global_conversation_id,
-                               self.operation_id, prompt)
+        if (getattr(self, "scoped_fresh_route", False)
+                and record.get("status") in {"ok", "success"}
+                and not isinstance(getattr(self, "application_route", None), Mapping)
+                and not isinstance(record.get("tool_choice"), Mapping)):
+            if isinstance(decision, Mapping) and decision.get("kind") == "save":
+                # SaveHandler consumes the immutable original request after the
+                # accepted command candidate is cleared. Persist it against the
+                # already resolved global checkpoint before joint publication
+                # can make that cleanup eligible.
+                prompt = self.command.text if self.command is not None else self.replay_request
+                if isinstance(prompt, str):
+                    await _offload(
+                        self.ledger.save_request, self.global_conversation_id,
+                        self.operation_id, prompt,
+                    )
+            self._publish_joint_metadata_route(record)
+            return True
+        prompt = (
+            decision.get("substantive_text") if isinstance(decision, Mapping)
+            and decision.get("kind") in {"substantive", "search"}
+            else self.command.text if self.command is not None else self.replay_request
+        )
+        if (isinstance(decision, Mapping)
+                and decision.get("kind") in {"substantive", "search", "save"}
+                and isinstance(prompt, str)):
+            await _offload(self.ledger.save_request, self.global_conversation_id,
+                           self.operation_id, prompt)
         try:
             persisted = bool(await _offload(
                 self.runtime.repository.persist_route, self.operation_id, record,
@@ -2259,7 +3538,7 @@ class _CommandExecution(SearchAgentMixin):
         executor = self.executor_factory(None, self.operation_id, self.executor_context)
         self.direct_save_conversation_id = self.agent_conversation_id
         choice = self.decision.get("tool_choice")
-        if choice is not None:
+        if choice is not None and not self._saved_native_application_call():
             await self._persist_chat_turn("user", prompt)
             return await self._handle_global_tool(executor, choice)
         try:
@@ -2311,6 +3590,16 @@ class _CommandExecution(SearchAgentMixin):
         if not isinstance(answer, str) or not answer.strip():
             return await self._finish_processing_error()
         if record.get("status") == "ok":
+            if (getattr(self, "scoped_fresh_route", False)
+                    and not isinstance(getattr(self, "application_route", None), Mapping)):
+                self._publish_joint_metadata_route()
+                cleared = await _offload(
+                    self.runtime.repository.clear_command_candidate, self.context_id,
+                    self.operation_id, owner=self.owner, fence=self.fence,
+                    now=self.runtime.clock(),
+                )
+                if not cleared:
+                    return QueueOperationState.RUNNING
             answer = await self._include_verified_direct_metadata(
                 answer, self.global_conversation_id,
             )
@@ -2325,6 +3614,31 @@ class _CommandExecution(SearchAgentMixin):
         """Deliver a fixed safe error and release the operation as failed."""
         return await self.finish_reply(
             _PROCESSING_ERROR_REPLY, kind="error", failure_final=True,
+        )
+
+    def _saved_native_application_call(self) -> bool:
+        """Recognize a saved native proposal from its exact provider-call provenance."""
+        route = getattr(self, "application_route", None)
+        turn = getattr(self, "contextual_turn", None)
+        if (not isinstance(route, Mapping) or not isinstance(route.get("contextual"), Mapping)
+                or not isinstance(turn, Mapping)
+                or turn.get("application_route_round") is not None):
+            return False
+        name, arguments = route.get("name"), route.get("arguments")
+        ordinal = route.get("ordinal")
+        if (name not in {"add_dialog", "move_transcript", "create_folder"}
+                or type(ordinal) is not int or not isinstance(arguments, Mapping)):
+            return False
+        calls = turn.get("tool_calls")
+        if not isinstance(calls, list) or ordinal >= len(calls):
+            return False
+        call = calls[ordinal]
+        route_call_id = route.get("call_id")
+        return bool(
+            isinstance(call, Mapping) and call.get("ordinal") == ordinal
+            and call.get("name") == name and call.get("arguments") == arguments
+            and type(call.get("round")) is int and call["round"] >= 0
+            and (route_call_id is None or call.get("id") == route_call_id)
         )
 
     async def _ensure_chat_conversation(self) -> str | None:
@@ -2501,12 +3815,25 @@ class _CommandExecution(SearchAgentMixin):
         if isinstance(saved, Mapping) and "0" in saved:
             result = saved["0"]
         else:
-            await _offload(
-                self.ledger.save_turn, self.global_conversation_id, self.operation_id,
-                model_response={"text": "", "parts": []},
-                tool_calls=[{"id": f"route-{self.operation_id}", "name": name,
-                             "arguments": arguments, "ordinal": 0, "round": 0}],
+            application_route = checkpoint.get("application_route") if checkpoint else None
+            application_calls = checkpoint.get("tool_calls", []) if checkpoint else []
+            declared_call = (
+                isinstance(application_route, Mapping)
+                and application_route.get("name") == name
+                and application_route.get("arguments") == arguments
+                and application_route.get("ordinal") == 0
+                and isinstance(application_calls, list)
+                and len(application_calls) == 1
+                and isinstance(application_calls[0], Mapping)
+                and application_calls[0].get("round") == -1
             )
+            if not declared_call:
+                await _offload(
+                    self.ledger.save_turn, self.global_conversation_id, self.operation_id,
+                    model_response={"text": "", "parts": []},
+                    tool_calls=[{"id": f"route-{self.operation_id}", "name": name,
+                                 "arguments": arguments, "ordinal": 0, "round": 0}],
+                )
             try:
                 result = await _offload(
                     executor.execute, name=name, arguments=arguments, call_ordinal=0,
@@ -2586,7 +3913,12 @@ class _CommandExecution(SearchAgentMixin):
     async def _document_target_conversation_id(self) -> str | None:
         route = await _offload(self.runtime.repository.get_route_control,
                                self.context_id, self.operation_id)
-        conversation_id = route.get("conversation_id") if isinstance(route, Mapping) else None
+        conversation_id = (
+            route.get("target_conversation_id")
+            if isinstance(route, Mapping) else None
+        )
+        if not isinstance(conversation_id, str) or not conversation_id:
+            conversation_id = route.get("conversation_id") if isinstance(route, Mapping) else None
         return conversation_id if isinstance(conversation_id, str) and conversation_id else None
 
     async def _run_document(self) -> QueueOperationState:
@@ -2594,7 +3926,10 @@ class _CommandExecution(SearchAgentMixin):
         processor = TelegramCommandProcessor(
             context_loader=lambda _context_id, _operation: self.context,
             router=self._route_callback, repository=self.runtime.repository,
-            agent=_CapturingAgent(self.agent), notifications=self.publisher,
+            agent=_CapturingAgent(
+                self.agent, on_answer=self._publish_pending_metadata_route,
+                defer_route_persistence=self._should_defer_route_persistence,
+            ), notifications=self.publisher,
             executor_factory=self.executor_factory,
             selection_publisher=self._selection_callback, clock=self.runtime.clock,
         )
@@ -2609,10 +3944,9 @@ class _CommandExecution(SearchAgentMixin):
         except Exception as error:
             return await self._settle_document_exception(error)
         if result == QueueOperationState.FAILED:
-            route = await _offload(self.runtime.repository.get_route_control,
-                                   self.context_id, self.operation_id)
-            conversation_id = route.get("conversation_id") if isinstance(route, Mapping) else None
-            direct_failure = await self._direct_add_dialog_failure(conversation_id)
+            direct_failure = await self._direct_add_dialog_failure(
+                self._agent_checkpoint_conversation_id(),
+            )
             if direct_failure is not False:
                 return direct_failure
         failure_result = await self._settle_governed_failure()
@@ -2624,13 +3958,14 @@ class _CommandExecution(SearchAgentMixin):
         """Honor direct/governed failures, recover real answers, then report processing errors."""
         from services.connectors.telegram.errors import TelegramDirectSaveInterrupted
         if isinstance(error, TelegramDirectSaveInterrupted):
-            conversation_id = await self._document_target_conversation_id()
-            direct_failure = await self._direct_add_dialog_failure(conversation_id)
+            direct_failure = await self._direct_add_dialog_failure(
+                self._agent_checkpoint_conversation_id(),
+            )
             if direct_failure is False:
                 raise error
             return direct_failure
         direct_failure = await self._direct_add_dialog_failure(
-            await self._document_target_conversation_id(),
+            self._agent_checkpoint_conversation_id(),
         )
         if direct_failure is not False:
             return direct_failure
@@ -2656,14 +3991,54 @@ class _CommandExecution(SearchAgentMixin):
                 return await self._settle_document_reply(QueueOperationState.FAILED)
             except Exception:
                 return QueueOperationState.RUNNING
+        if not self._publish_pending_document_failure_route():
+            return QueueOperationState.RUNNING
         return await self._finish_processing_error()
+
+    def _publish_pending_document_failure_route(self) -> bool:
+        """Commit a deferred complete route only at an irrecoverable document failure."""
+        if not isinstance(getattr(self, "pending_metadata_route", None), Mapping):
+            return True
+        try:
+            self._publish_pending_metadata_route()
+        except Exception as error:
+            self._log_preparation_failure("document_failure", error)
+            return False
+        return True
+
+    def _agent_checkpoint_conversation_id(self) -> str | None:
+        """Select the saved model checkpoint binding for this route generation."""
+        contextual_pin = isinstance(getattr(self, "contextual_metadata", None), Mapping)
+        if getattr(self, "scoped_fresh_route", False) or contextual_pin:
+            return getattr(self, "agent_conversation_id", None)
+        route = getattr(self, "pinned", None)
+        conversation_id = route.get("conversation_id") if isinstance(route, Mapping) else None
+        if isinstance(conversation_id, str) and conversation_id:
+            return conversation_id
+        return getattr(self, "agent_conversation_id", None)
 
     async def _route_callback(self, **kwargs: Any) -> Any:
         """Consume the already validated projection without re-entering model validation."""
+        if isinstance(getattr(self, "prepared_route_result", None), Mapping):
+            return dict(self.prepared_route_result)
+        if (isinstance(getattr(self, "application_route", None), Mapping)
+                and isinstance(getattr(self, "contextual_metadata", None), Mapping)):
+            route = dict(self.pinned)
+            semantic = self.contextual_metadata.get("decision")
+            try:
+                from services.connectors.telegram.runtime.routing_context import RoutingDecision
+                typed = RoutingDecision.from_dict(semantic)
+                route["substantive_text"] = typed.substantive_text
+            except (TypeError, ValueError, KeyError):
+                return {"status": "invalid_route"}
+            route["agent_conversation_id"] = self.contextual_metadata.get(
+                "checkpoint_conversation_id",
+            )
+            return route
         from services.connectors.telegram.sessions import (
             _consume_validated_route, _safe_save_candidates,
         )
-        return await _consume_validated_route(
+        result = await _consume_validated_route(
             self.decision, self.decision_status, text=kwargs["text"],
             context=kwargs["context"], store=self.store, search=self.search,
             notices=_NoopNotice(), actions=_NoopAction(),
@@ -2672,6 +4047,753 @@ class _CommandExecution(SearchAgentMixin):
             operation_candidates=_safe_save_candidates(self.save_candidates),
             notify_switch=True,
         )
+        if (getattr(self, "scoped_fresh_route", False)
+                and isinstance(result, Mapping) and result.get("status") == "ok"):
+            if result.get("kind") in {"pure_switch", "substantive"}:
+                # process_operation uses this exact policy for a newly accepted
+                # successful selection. Include it in the first joint write so
+                # the later ordinary persistence is byte-for-byte identical.
+                result = {**result, "selection_policy": "silent_v1"}
+            # The route callback/processor contract consumes conversation_id.
+            # Resolve that execution binding before writing either durable
+            # half; the frozen source conversation remains in T017 context.
+            route_conversation = result.get("conversation_id")
+            checkpoint = await _offload(
+                self.ledger.checkpoint_conversation_id, self.operation_id,
+            )
+            if isinstance(route_conversation, str) and route_conversation:
+                if checkpoint is not None and checkpoint != route_conversation:
+                    raise RuntimeError("agent checkpoint conversation binding changed")
+                self.agent_conversation_id = route_conversation
+            elif isinstance(checkpoint, str) and checkpoint:
+                self.agent_conversation_id = checkpoint
+            if (isinstance(result.get("tool_choice"), Mapping)
+                    and result["tool_choice"].get("name") in {"move_transcript", "create_folder"}):
+                try:
+                    await self._publish_joint_write_route(result)
+                except Exception as error:
+                    _LOGGER.warning(
+                        "telegram joint route publication failed",
+                        extra={"operation_id": self.operation_id, "phase": "routing",
+                               "code": "joint_route_publication_failed",
+                               "exception_class": type(error).__name__},
+                    )
+                    raise RuntimeError("joint route publication failed") from error
+            elif (getattr(self, "scoped_fresh_route", False)
+                  and result.get("status") == "ok"
+                  and not isinstance(result.get("tool_choice"), Mapping)
+                  and not isinstance(getattr(self, "application_route", None), Mapping)):
+                # Document answers may still lead to an actual native SDK
+                # proposal. Hold the first pair until the real call/terminal
+                # answer is known so it can never be enriched after publication.
+                if result.get("kind") == "substantive":
+                    self.pending_metadata_route = dict(result)
+                else:
+                    self._publish_joint_metadata_route(result)
+        return result
+
+    def _publish_pending_metadata_route(self) -> None:
+        route = getattr(self, "pending_metadata_route", None)
+        if not isinstance(route, Mapping):
+            return
+        if isinstance(getattr(self, "application_route", None), Mapping):
+            # A native call prepared the complete first pair at its executor
+            # boundary and already consumed the accepted candidate.
+            self.pending_metadata_route = None
+            return
+        self._publish_joint_metadata_route(route)
+        self.pending_metadata_route = None
+        cleared = self.runtime.repository.clear_command_candidate(
+            self.context_id, self.operation_id, owner=self.owner, fence=self.fence,
+            now=self.runtime.clock(),
+        )
+        if not cleared:
+            raise PermissionError("prepared metadata route could not consume its candidate")
+
+    def _should_defer_route_persistence(self, route: Any) -> bool:
+        pending = getattr(self, "pending_metadata_route", None)
+        return bool(
+            getattr(self, "scoped_fresh_route", False)
+            and isinstance(pending, Mapping) and isinstance(route, Mapping)
+            and dict(route) == dict(pending)
+            and route.get("status") == "ok" and route.get("kind") == "substantive"
+            and not isinstance(route.get("tool_choice"), Mapping)
+            and not isinstance(getattr(self, "application_route", None), Mapping)
+        )
+
+    async def _publish_joint_write_route(self, routed: Mapping[str, Any]) -> None:
+        """Commit one validated route and its immutable application plan atomically."""
+        from core.documents.operations import resolve_move_target
+        from core.operations.write import _new_resolved_write_targets, _resolved_targets_projection
+        from services.connectors.telegram.repository._commands import _TelegramCommandMixin
+        from services.connectors.telegram.runtime.routing_context import RoutingDecision
+        from services.connectors.telegram.runtime.tools import stable_effect_id
+
+        snapshot = getattr(self, "contextual_source", None)
+        if snapshot is None:
+            raise ValueError("scoped route has no frozen source snapshot")
+        if (not isinstance(self.agent_conversation_id, str)
+                or not self.agent_conversation_id):
+            raise ValueError("final execution checkpoint conversation is unresolved")
+        decision = RoutingDecision.from_dict(self.semantic_decision)
+        choice = routed["tool_choice"]
+        name, arguments = choice["name"], dict(choice["arguments"])
+        target_doc_id = routed.get("target_doc_id")
+        if name == "move_transcript":
+            if not isinstance(target_doc_id, str) or arguments.get("doc_id") != target_doc_id:
+                raise ValueError("move route has no matching fixed document")
+            destination_id = resolve_move_target(arguments["folder_path"], self.store.client)
+            if not isinstance(destination_id, str) or not destination_id:
+                raise ValueError("move destination is unresolved")
+            resolved = {"doc_id": target_doc_id, "destination_id": destination_id,
+                        "root_id": self.runtime.root_folder_id}
+        else:
+            from core.integrations.google_drive import folder_service
+            parent_path = arguments.get("parent_path") or []
+            root_id = self.runtime.root_folder_id
+            if not isinstance(root_id, str) or not root_id:
+                raise ValueError("configured root folder is unavailable")
+            if parent_path:
+                parent_id = folder_service.prepare_create_folder(
+                    arguments["name"], parent_path, db=self.store.client,
+                )
+            else:
+                parent_id = root_id
+                folder_service.validate_folder_name_available(
+                    arguments["name"], parent_id, db=self.store.client,
+                )
+            if not isinstance(parent_id, str) or not parent_id:
+                raise ValueError("folder parent is unresolved")
+            target_doc_id = None
+            resolved = {"parent_id": parent_id, "root_id": self.runtime.root_folder_id,
+                        "folder_name": arguments["name"]}
+
+        root_id = self.runtime.root_folder_id
+        if not isinstance(root_id, str) or not root_id:
+            raise ValueError("configured root folder is unavailable")
+        intent_payload = {"decision": decision.to_dict(), "resolved": resolved}
+        intent_digest = hashlib.sha256(json.dumps(
+            intent_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        child_id = "telegram-tool-" + hashlib.sha256(
+            f"{self.operation_id}\0{0}".encode("utf-8")
+        ).hexdigest()
+        effect_id = stable_effect_id(self.operation_id, 0)
+        capability = _new_resolved_write_targets(
+            operation_name=name, operation_id=child_id, effect_id=effect_id,
+            arguments=arguments, root_id=root_id, intent_digest=intent_digest,
+            doc_id=resolved.get("doc_id"), destination_id=resolved.get("destination_id"),
+            parent_id=resolved.get("parent_id"),
+        )
+        self.executor_context["resolved_targets"] = capability
+        stored_targets = _resolved_targets_projection(capability)
+        resolved.update({"intent_digest": intent_digest})
+
+        summary = dict(routed)
+        summary["target_doc_id"] = target_doc_id
+        if not isinstance(summary.get("conversation_id"), str):
+            summary["conversation_id"] = self.agent_conversation_id
+        summary = _TelegramCommandMixin._route_control_data(summary)
+        if isinstance(summary.get("conversation_id"), str):
+            summary["conversation_id"] = self.agent_conversation_id
+        step = {"ordinal": 0, "name": name, "arguments": arguments,
+                "target_doc_id": target_doc_id, "operation_id": child_id,
+                "effect_id": effect_id, "resolved_targets": stored_targets}
+        contextual = {
+            "schema_version": 1,
+            "context_ref": None, "context_digest": None,
+            "context_id": self.context_id, "operation_id": self.operation_id,
+            "actor_id": snapshot.actor_id,
+            "accepted_command": snapshot.accepted_command,
+            "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+            "full_history_ref": snapshot.full_history_ref.to_dict(),
+            "source_conversation_id": snapshot.selected_conversation_id,
+            "checkpoint_conversation_id": self.agent_conversation_id,
+            "decision": decision.to_dict(), "resolved": resolved,
+            "summary": summary, "fixed_plan": {"steps": [step]},
+        }
+        saved_context = await _offload(
+            self.ledger.load_routing_checkpoint, "context",
+            actor_id=snapshot.actor_id,
+            conversation_id=snapshot.selected_conversation_id,
+        )
+        reference = saved_context.get("reference") if isinstance(saved_context, Mapping) else None
+        if not isinstance(reference, Mapping):
+            raise ValueError("frozen route context reference is unavailable")
+        contextual["context_ref"] = reference["ref"]
+        contextual["context_digest"] = reference["digest"]
+        application_route = {"contextual": contextual, "name": name,
+                             "arguments": arguments, "ordinal": 0,
+                             "target_doc_id": target_doc_id,
+                             "call_id": f"application-{self.operation_id}-0"}
+        call = {"id": application_route["call_id"], "name": name,
+                "arguments": arguments, "ordinal": 0, "round": -1}
+        checkpoint = self.ledger.prepare_application_route(
+            self.agent_conversation_id, self.operation_id,
+            route=application_route, tool_calls=[call], application_route_round=None,
+        )
+        persisted = await _offload(
+            self.runtime.repository.persist_route, self.operation_id, summary,
+            context_id=self.context_id, owner=self.owner, fence=self.fence,
+            now=self.runtime.clock(), application_checkpoint=checkpoint,
+        )
+        if not persisted:
+            raise PermissionError("joint route publication lost its queue fence")
+        self.pinned = summary
+        self.application_route = application_route
+        self.contextual_metadata = contextual
+
+    def _prepare_native_call(
+        self, *, name: str, arguments: Any, call_ordinal: int,
+        execution_context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Jointly bind a real native add_dialog proposal before child allocation."""
+        if not getattr(self, "scoped_fresh_route", False):
+            return
+        from core.operations import registry
+        if name not in registry.OPERATIONS or not registry.OPERATIONS[name].write:
+            return
+        existing = getattr(self, "application_route", None)
+        if isinstance(existing, Mapping):
+            contextual = existing.get("contextual")
+            if not isinstance(contextual, Mapping):
+                if not isinstance(getattr(self, "contextual_metadata", None), Mapping):
+                    return
+                raise PermissionError("contextual route is missing its saved decision")
+            plan = contextual.get("fixed_plan") if isinstance(contextual, Mapping) else None
+            steps = plan.get("steps") if isinstance(plan, Mapping) else None
+            matching = [step for step in steps or () if isinstance(step, Mapping)
+                        and step.get("ordinal") == call_ordinal
+                        and step.get("name") == name
+                        and step.get("arguments") == arguments]
+            if len(matching) != 1:
+                raise PermissionError("native write differs from the published fixed plan")
+            return
+        from services.connectors.telegram.repository._commands import _TelegramCommandMixin
+        from services.connectors.telegram.runtime.routing_context import (
+            Action, Disposition, RoutingDecision,
+        )
+        from services.connectors.telegram.runtime.tools import (
+            direct_add_dialog_operation_id, stable_effect_id,
+        )
+
+        if name != "add_dialog" or type(call_ordinal) is not int or call_ordinal < 0:
+            raise ValueError("contextual native mutation is unsupported")
+        semantic = RoutingDecision.from_dict(self.semantic_decision)
+        if (semantic.disposition is not Disposition.EXECUTE
+                or semantic.action is not Action.SUBSTANTIVE):
+            raise PermissionError("route disposition does not authorize a native write")
+        validated = registry.validate_arguments(name, arguments)
+        checkpoint_id = getattr(self, "agent_conversation_id", None)
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            raise ValueError("native checkpoint conversation is unresolved")
+        turn = self.ledger.load_turn(checkpoint_id, self.operation_id)
+        calls = turn.get("tool_calls", []) if isinstance(turn, Mapping) else []
+        matching = [item for item in calls if isinstance(item, Mapping)
+                    and item.get("ordinal") == call_ordinal
+                    and item.get("name") == name
+                    and item.get("arguments") == validated]
+        if (len(matching) != 1 or call_ordinal >= len(calls)
+                or any(not isinstance(item, Mapping)
+                       or item.get("ordinal") != index
+                       for index, item in enumerate(calls[:call_ordinal + 1]))):
+            raise ValueError("native mutation does not match its complete model prefix")
+        call = dict(matching[0])
+        if (set(call) != {
+                "id", "name", "arguments", "thought_signature", "ordinal", "round",
+        } or type(call.get("round")) is not int or call["round"] < 0):
+            raise ValueError("native mutation proposal identity is incomplete")
+        snapshot = getattr(self, "contextual_source", None)
+        if snapshot is None:
+            raise ValueError("native mutation has no frozen source context")
+        child_id = direct_add_dialog_operation_id(
+            self.operation_id, call_ordinal, validated,
+        )
+        effect_id = stable_effect_id(self.operation_id, call_ordinal)
+        routed_target_doc_id, routed_conversation_id, routed_number = (
+            self._native_execution_scope(execution_context)
+        )
+        routed_target = (dict(doc_id=routed_target_doc_id,
+                              conversation_id=routed_conversation_id,
+                              dialog_number=routed_number)
+                         if isinstance(routed_target_doc_id, str) else {})
+        summary = _TelegramCommandMixin._route_control_data({
+            "status": "ok", "kind": "substantive",
+            "conversation_id": checkpoint_id,
+            **({"target_doc_id": routed_target_doc_id}
+               if isinstance(routed_target_doc_id, str) else {}),
+            **({"target_conversation_id": routed_conversation_id}
+               if isinstance(routed_target_doc_id, str) else {}),
+            **({"dialog_number": routed_number}
+               if isinstance(routed_target_doc_id, str) else {}),
+            **({"selection_policy": "silent_v1"}
+               if isinstance(routed_target_doc_id, str) else {}),
+            "tool_choice": {"name": name, "arguments": validated},
+        })
+        saved_context = self.ledger.load_routing_checkpoint(
+            "context", actor_id=snapshot.actor_id,
+            conversation_id=snapshot.selected_conversation_id,
+        )
+        reference = saved_context.get("reference") if isinstance(saved_context, Mapping) else None
+        if not isinstance(reference, Mapping):
+            raise ValueError("frozen route context reference is unavailable")
+        step = {"ordinal": call_ordinal, "name": name, "arguments": validated,
+                "target_doc_id": routed_target_doc_id, "operation_id": child_id,
+                "effect_id": effect_id, "resolved_targets": {}}
+        contextual = {
+            "schema_version": 1, "context_ref": reference["ref"],
+            "context_digest": reference["digest"], "context_id": self.context_id,
+            "operation_id": self.operation_id, "actor_id": snapshot.actor_id,
+            "accepted_command": snapshot.accepted_command,
+            "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+            "full_history_ref": snapshot.full_history_ref.to_dict(),
+            "source_conversation_id": snapshot.selected_conversation_id,
+            "checkpoint_conversation_id": checkpoint_id,
+            "decision": semantic.to_dict(), "resolved": routed_target, "summary": summary,
+            "fixed_plan": {"steps": [step]},
+        }
+        application_route = {
+            "contextual": contextual, "name": name, "arguments": validated,
+            "ordinal": call_ordinal, "target_doc_id": routed_target_doc_id,
+        }
+        if isinstance(call.get("id"), str) and call["id"]:
+            application_route["call_id"] = call["id"]
+        checkpoint = self.ledger.prepare_application_route(
+            checkpoint_id, self.operation_id,
+            route=application_route, tool_calls=calls,
+            application_route_round=None,
+        )
+        persisted = self.runtime.repository.persist_route(
+            self.operation_id, summary, context_id=self.context_id,
+            owner=self.owner, fence=self.fence, now=self.runtime.clock(),
+            application_checkpoint=checkpoint,
+        )
+        if not persisted:
+            raise PermissionError("native mutation route lost its queue fence")
+        self.pinned = summary
+        self.application_route = application_route
+        self.contextual_metadata = contextual
+        if not self.runtime.repository.clear_command_candidate(
+                self.context_id, self.operation_id, owner=self.owner, fence=self.fence,
+                now=self.runtime.clock()):
+            raise PermissionError("native mutation could not consume its accepted command")
+
+    def _native_execution_scope(
+        self, execution_context: Mapping[str, Any] | None = None,
+    ) -> tuple[str | None, str | None, int | None]:
+        """Resolve the existing processor target independently from a new save output."""
+        snapshot = getattr(self, "contextual_source", None)
+        if snapshot is None:
+            raise ValueError("native execution scope has no frozen source")
+        target_doc_id = (execution_context.get("target_doc_id")
+                         if isinstance(execution_context, Mapping) else None)
+        if not isinstance(target_doc_id, str) or not target_doc_id:
+            route = getattr(self, "prepared_route_result", None)
+            if not isinstance(route, Mapping):
+                route = getattr(self, "pending_metadata_route", None)
+            target_doc_id = route.get("target_doc_id") if isinstance(route, Mapping) else None
+        if not isinstance(target_doc_id, str) or not target_doc_id:
+            decision = getattr(self, "decision", None)
+            candidate = decision.get("target_ref") if isinstance(decision, Mapping) else None
+            target_doc_id = candidate if isinstance(candidate, str) and candidate != "last" else None
+        if not isinstance(target_doc_id, str) or not target_doc_id:
+            return None, None, None
+        card = next((item for item in self.cards
+                     if isinstance(item, Mapping) and item.get("doc_id") == target_doc_id), None)
+        if (not isinstance(card, Mapping)
+                or not isinstance(card.get("conversation_id"), str)
+                or type(card.get("dialog_number")) is not int):
+            raise PermissionError("native execution target has no captured binding")
+        return target_doc_id, card["conversation_id"], card["dialog_number"]
+
+    def _prepare_declared_add_dialog(self, choice: Mapping[str, Any]) -> None:
+        """Publish a route-declared direct save as the one server-provenance slot."""
+        from core.operations import registry
+        from services.connectors.telegram.repository._commands import _TelegramCommandMixin
+        from services.connectors.telegram.runtime.routing_context import (
+            Action, Disposition, RoutingDecision,
+        )
+        from services.connectors.telegram.runtime.tools import (
+            direct_add_dialog_operation_id, stable_effect_id,
+        )
+
+        snapshot = getattr(self, "contextual_source", None)
+        if snapshot is None or getattr(self, "application_route", None) is not None:
+            raise ValueError("declared direct save is missing its fresh route context")
+        if choice.get("name") != "add_dialog":
+            raise ValueError("declared direct save operation is invalid")
+        arguments = registry.validate_arguments("add_dialog", choice.get("arguments"))
+        semantic = RoutingDecision.from_dict(self.semantic_decision)
+        if (semantic.disposition is not Disposition.EXECUTE
+                or semantic.action is not Action.SUBSTANTIVE):
+            raise PermissionError("route disposition does not authorize a direct save")
+        if (not isinstance(self.agent_conversation_id, str)
+                or not self.agent_conversation_id):
+            raise ValueError("direct save checkpoint conversation is unresolved")
+        child_id = direct_add_dialog_operation_id(self.operation_id, 0, arguments)
+        effect_id = stable_effect_id(self.operation_id, 0)
+        routed_target_doc_id, routed_conversation_id, routed_number = (
+            self._native_execution_scope()
+        )
+        routed_target = (dict(doc_id=routed_target_doc_id,
+                              conversation_id=routed_conversation_id,
+                              dialog_number=routed_number)
+                         if isinstance(routed_target_doc_id, str) else {})
+        summary = _TelegramCommandMixin._route_control_data({
+            "status": "ok", "kind": "substantive",
+            "conversation_id": self.agent_conversation_id,
+            **({"target_doc_id": routed_target_doc_id}
+               if isinstance(routed_target_doc_id, str) else {}),
+            **({"target_conversation_id": routed_conversation_id}
+               if isinstance(routed_target_doc_id, str) else {}),
+            **({"dialog_number": routed_number}
+               if isinstance(routed_target_doc_id, str) else {}),
+            **({"selection_policy": "silent_v1"}
+               if isinstance(routed_target_doc_id, str) else {}),
+            "tool_choice": {"name": "add_dialog", "arguments": arguments},
+        })
+        saved_context = self.ledger.load_routing_checkpoint(
+            "context", actor_id=snapshot.actor_id,
+            conversation_id=snapshot.selected_conversation_id,
+        )
+        reference = saved_context.get("reference") if isinstance(saved_context, Mapping) else None
+        if not isinstance(reference, Mapping):
+            raise ValueError("frozen direct save context reference is unavailable")
+        call_id = f"application-{self.operation_id}-0"
+        call = {"id": call_id, "name": "add_dialog", "arguments": arguments,
+                "ordinal": 0, "round": -1}
+        step = {"ordinal": 0, "name": "add_dialog", "arguments": arguments,
+                "target_doc_id": routed_target_doc_id, "operation_id": child_id,
+                "effect_id": effect_id, "resolved_targets": {}}
+        contextual = {
+            "schema_version": 1, "context_ref": reference["ref"],
+            "context_digest": reference["digest"], "context_id": self.context_id,
+            "operation_id": self.operation_id, "actor_id": snapshot.actor_id,
+            "accepted_command": snapshot.accepted_command,
+            "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+            "full_history_ref": snapshot.full_history_ref.to_dict(),
+            "source_conversation_id": snapshot.selected_conversation_id,
+            "checkpoint_conversation_id": self.agent_conversation_id,
+            "decision": semantic.to_dict(), "resolved": routed_target, "summary": summary,
+            "fixed_plan": {"steps": [step]},
+        }
+        application_route = {
+            "contextual": contextual, "name": "add_dialog", "arguments": arguments,
+            "ordinal": 0, "target_doc_id": routed_target_doc_id, "call_id": call_id,
+        }
+        checkpoint = self.ledger.prepare_application_route(
+            self.agent_conversation_id, self.operation_id,
+            route=application_route, tool_calls=[call], application_route_round=None,
+        )
+        persisted = self.runtime.repository.persist_route(
+            self.operation_id, summary, context_id=self.context_id,
+            owner=self.owner, fence=self.fence, now=self.runtime.clock(),
+            application_checkpoint=checkpoint,
+        )
+        if not persisted:
+            raise PermissionError("direct save joint publication lost its queue fence")
+        self.pinned = summary
+        self.application_route = application_route
+        self.contextual_metadata = contextual
+
+    def _prepare_declared_read_route(self, choice: Mapping[str, Any]) -> None:
+        """Publish a complete declared read call before its first execution."""
+        from core.operations import registry
+        from services.connectors.telegram.repository._commands import _TelegramCommandMixin
+        from services.connectors.telegram.runtime.routing_context import RoutingDecision
+
+        name = choice.get("name")
+        if name not in registry.OPERATIONS:
+            raise ValueError("declared operation is unsupported")
+        if registry.OPERATIONS[name].write:
+            if getattr(self, "application_route", None) is not None:
+                return
+            raise PermissionError("write choice has no complete route preparation")
+        if getattr(self, "application_route", None) is not None:
+            return
+        snapshot = getattr(self, "contextual_source", None)
+        if snapshot is None or not isinstance(self.semantic_decision, Mapping):
+            raise ValueError("declared read has no frozen route context")
+        name = choice["name"]
+        arguments = registry.validate_arguments(name, choice.get("arguments"))
+        if self.decision.get("kind") not in {"search", "substantive"}:
+            raise PermissionError("declared read conflicts with ordinary route kind")
+        semantic = RoutingDecision.from_dict(self.semantic_decision)
+
+        target_doc_id = None
+        target_card = None
+        selector = semantic.document_selector
+        raw_target = self.decision.get("target_ref")
+        if getattr(self, "search_continuation", False):
+            # The document parameter in a search continuation is validated by
+            # the search-only executor against its frozen result set. It is
+            # not the tool's route target; that executor runs in the search
+            # conversation and the route remains unselected.
+            raw_target = None
+        if (selector is not None and selector.kind.value == "last_saved"
+                and raw_target == "last"):
+            raw_target = getattr(self.context, "last_doc_id", None)
+        if isinstance(raw_target, str) and raw_target:
+            target_doc_id = raw_target
+            target_card = next((item for item in self.cards
+                                if isinstance(item, Mapping)
+                                and item.get("doc_id") == target_doc_id), None)
+        elif type(self.decision.get("dialog_number")) is int:
+            target_card = next((item for item in self.cards
+                                if isinstance(item, Mapping)
+                                and item.get("dialog_number") == self.decision["dialog_number"]), None)
+            if isinstance(target_card, Mapping):
+                target_doc_id = target_card.get("doc_id")
+        argument_doc_id = arguments.get("doc_id")
+        if argument_doc_id is not None:
+            if (not getattr(self, "search_continuation", False)
+                    and (not isinstance(argument_doc_id, str)
+                    or not any(isinstance(item, Mapping)
+                               and item.get("doc_id") == argument_doc_id
+                               for item in self.cards))):
+                raise PermissionError("declared read target is outside frozen evidence")
+            if (not getattr(self, "search_continuation", False)
+                    and target_doc_id not in (None, argument_doc_id)):
+                raise PermissionError("declared read target conflicts with the selector")
+            if not getattr(self, "search_continuation", False):
+                target_doc_id = argument_doc_id
+                target_card = next(item for item in self.cards
+                                   if isinstance(item, Mapping)
+                                   and item.get("doc_id") == target_doc_id)
+        if target_doc_id is not None and not isinstance(target_card, Mapping):
+            raise ValueError("declared read target has no frozen binding")
+
+        route_kind = self.decision["kind"]
+        checkpoint_id = getattr(self, "agent_conversation_id", None)
+        if (route_kind == "substantive" and isinstance(target_card, Mapping)
+                and isinstance(target_card.get("conversation_id"), str)
+                and target_card.get("conversation_id")):
+            # The existing document processor executes substantive routes in
+            # the resolved target conversation. Keep this distinct from the
+            # frozen source conversation retained in T017 context.
+            checkpoint_id = target_card["conversation_id"]
+            self.agent_conversation_id = checkpoint_id
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            raise ValueError("declared read checkpoint conversation is unresolved")
+        summary_data: dict[str, Any] = {
+            "status": "ok", "kind": route_kind,
+            "tool_choice": {"name": name, "arguments": arguments,
+                            "link_requested": bool(choice.get("link_requested", False))},
+        }
+        if target_doc_id is not None:
+            summary_data["target_doc_id"] = target_doc_id
+            summary_data["conversation_id"] = checkpoint_id
+            summary_data["target_conversation_id"] = target_card["conversation_id"]
+            summary_data["dialog_number"] = target_card["dialog_number"]
+            if route_kind == "substantive":
+                summary_data["selection_policy"] = "silent_v1"
+        if self.decision.get("target_operation_id") is not None:
+            summary_data["target_operation_id"] = self.decision["target_operation_id"]
+            predecessor = next((item for item in self.save_candidates
+                                if isinstance(item, Mapping)
+                                and item.get("operation_id") == self.decision["target_operation_id"]), None)
+            if (not isinstance(predecessor, Mapping)
+                    or predecessor.get("operation_id") != self.decision["target_operation_id"]
+                    or predecessor.get("state") != "completed"
+                    or not isinstance(predecessor.get("route_result"), Mapping)
+                    or predecessor["route_result"].get("kind") != "save"):
+                raise PermissionError("declared read predecessor binding changed")
+            dependency_id = predecessor["operation_id"]
+            summary_data["dependency_operation_id"] = dependency_id
+        if route_kind == "search":
+            if name != "query":
+                raise PermissionError("search route must use its declared query")
+            search_session_id = "search-" + hashlib.sha256(
+                f"{self.context_id}\0{self.operation_id}".encode("utf-8")
+            ).hexdigest()
+            summary_data.update({
+                "search_protocol": "agent-v1", "result_refs": [],
+                "search_session_id": search_session_id,
+                "conversation_id": checkpoint_id,
+            })
+        elif getattr(self, "search_continuation", False):
+            if not isinstance(self.search_session_id, str) or not self.search_session_id:
+                raise ValueError("search continuation has no frozen session")
+            summary_data.update({
+                "conversation_id": self.search_session_id,
+                "search_protocol": "agent-v1",
+            })
+        summary = _TelegramCommandMixin._route_control_data(summary_data)
+        resolved: dict[str, Any] = {}
+        if target_doc_id is not None:
+            resolved = {"doc_id": target_doc_id,
+                        "conversation_id": target_card["conversation_id"],
+                        "dialog_number": target_card["dialog_number"]}
+        if self.decision.get("target_operation_id") is not None:
+            resolved["target_operation_id"] = self.decision["target_operation_id"]
+            resolved["dependency_operation_id"] = summary_data["dependency_operation_id"]
+        saved_context = self.ledger.load_routing_checkpoint(
+            "context", actor_id=snapshot.actor_id,
+            conversation_id=snapshot.selected_conversation_id,
+        )
+        reference = saved_context.get("reference") if isinstance(saved_context, Mapping) else None
+        if not isinstance(reference, Mapping):
+            raise ValueError("frozen declared read context reference is unavailable")
+        contextual = {
+            "schema_version": 1, "context_ref": reference["ref"],
+            "context_digest": reference["digest"], "context_id": self.context_id,
+            "operation_id": self.operation_id, "actor_id": snapshot.actor_id,
+            "accepted_command": snapshot.accepted_command,
+            "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+            "full_history_ref": snapshot.full_history_ref.to_dict(),
+            "source_conversation_id": snapshot.selected_conversation_id,
+            "checkpoint_conversation_id": checkpoint_id,
+            "decision": semantic.to_dict(), "resolved": resolved,
+            "summary": summary, "fixed_plan": None,
+        }
+        call_id = f"application-{self.operation_id}-0"
+        application_route = {
+            "contextual": contextual, "name": name, "arguments": arguments,
+            "ordinal": 0, "target_doc_id": target_doc_id, "call_id": call_id,
+        }
+        call = {"id": call_id, "name": name, "arguments": arguments,
+                "ordinal": 0, "round": -1}
+        checkpoint = self.ledger.prepare_application_route(
+            checkpoint_id, self.operation_id, route=application_route,
+            tool_calls=[call], application_route_round=None,
+        )
+        if not self.runtime.repository.persist_route(
+                self.operation_id, summary, context_id=self.context_id,
+                owner=self.owner, fence=self.fence, now=self.runtime.clock(),
+                application_checkpoint=checkpoint):
+            raise PermissionError("declared read joint publication lost its queue fence")
+        self.pinned = summary
+        self.application_route = application_route
+        self.contextual_metadata = contextual
+
+    def _prepare_native_batch(
+        self, *, calls: Any, execution_context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Validate all contextual writes before executing the first call."""
+        from core.operations import registry
+        if not isinstance(calls, (list, tuple)):
+            raise TypeError("native proposal batch is invalid")
+        writes = [call for call in calls if isinstance(call, Mapping)
+                  and call.get("name") in registry.OPERATIONS
+                  and registry.OPERATIONS[call["name"]].write]
+        if not writes:
+            return
+        existing = getattr(self, "application_route", None)
+        if isinstance(existing, Mapping):
+            contextual = existing.get("contextual")
+            if not isinstance(contextual, Mapping):
+                if (not isinstance(getattr(self, "contextual_metadata", None), Mapping)
+                        and not getattr(self, "scoped_fresh_route", False)):
+                    return
+                raise PermissionError("contextual route is missing its saved decision")
+            plan = contextual.get("fixed_plan") if isinstance(contextual, Mapping) else None
+            steps = plan.get("steps") if isinstance(plan, Mapping) else None
+            expected = {(step.get("ordinal"), step.get("name"),
+                         json.dumps(step.get("arguments"), sort_keys=True,
+                                    separators=(",", ":")))
+                        for step in steps or () if isinstance(step, Mapping)}
+            actual = {(call.get("ordinal"), call.get("name"),
+                       json.dumps(call.get("arguments"), sort_keys=True,
+                                  separators=(",", ":"))) for call in writes}
+            if not actual.issubset(expected):
+                raise PermissionError("native write batch exceeds its published fixed plan")
+            return
+        if (not isinstance(getattr(self, "contextual_metadata", None), Mapping)
+                and not getattr(self, "scoped_fresh_route", False)):
+            return
+        if isinstance(getattr(self, "contextual_metadata", None), Mapping):
+            raise PermissionError("contextual metadata route cannot authorize native writes")
+        if len(writes) != 1 or writes[0].get("name") != "add_dialog":
+            raise PermissionError("native write batch has no complete fixed preparation")
+        call = writes[0]
+        self._prepare_native_call(
+            name=call.get("name"), arguments=call.get("arguments"),
+            call_ordinal=call.get("ordinal"), execution_context=execution_context,
+        )
+
+    def _publish_joint_metadata_route(
+        self, route: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Publish one validated metadata interpretation with its frozen source map."""
+        from services.connectors.telegram.repository._commands import _TelegramCommandMixin
+        from services.connectors.telegram.runtime.routing_context import RoutingDecision
+
+        snapshot = getattr(self, "contextual_source", None)
+        if snapshot is None or not isinstance(self.semantic_decision, Mapping):
+            raise ValueError("contextual metadata route is incomplete")
+        checkpoint_id = getattr(self, "agent_conversation_id", None)
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            raise ValueError("contextual metadata checkpoint is unresolved")
+        semantic = RoutingDecision.from_dict(self.semantic_decision)
+        if semantic.disposition.value == "clarify":
+            raise ValueError("clarification requires its prepared T011 intent")
+        if semantic.disposition.value == "delegate":
+            choice = self.decision.get("tool_choice") if isinstance(self.decision, Mapping) else None
+            if isinstance(choice, Mapping) and choice.get("name") in {
+                "add_dialog", "move_transcript", "create_folder",
+            }:
+                raise PermissionError("delegate cannot authorize a native write")
+        route = route if isinstance(route, Mapping) else {
+            "status": "ok", "kind": "substantive",
+            "conversation_id": checkpoint_id,
+        }
+        summary = _TelegramCommandMixin._route_control_data(route)
+        saved_context = self.ledger.load_routing_checkpoint(
+            "context", actor_id=snapshot.actor_id,
+            conversation_id=snapshot.selected_conversation_id,
+        )
+        reference = saved_context.get("reference") if isinstance(saved_context, Mapping) else None
+        if not isinstance(reference, Mapping):
+            raise ValueError("frozen route context reference is unavailable")
+        contextual = {
+            "schema_version": 1, "context_ref": reference["ref"],
+            "context_digest": reference["digest"], "context_id": self.context_id,
+            "operation_id": self.operation_id, "actor_id": snapshot.actor_id,
+            "accepted_command": snapshot.accepted_command,
+            "accepted_command_ref": snapshot.accepted_command_ref.to_dict(),
+            "full_history_ref": snapshot.full_history_ref.to_dict(),
+            "source_conversation_id": snapshot.selected_conversation_id,
+            "checkpoint_conversation_id": checkpoint_id,
+            "decision": semantic.to_dict(),
+            "resolved": self._metadata_route_resolution(summary), "summary": summary,
+            "fixed_plan": None,
+        }
+        application_route = {"contextual": contextual}
+        turn = self.ledger.load_turn(checkpoint_id, self.operation_id)
+        calls = turn.get("tool_calls", []) if isinstance(turn, Mapping) else []
+        checkpoint = self.ledger.prepare_application_route(
+            checkpoint_id, self.operation_id,
+            route=application_route, tool_calls=list(calls),
+            application_route_round=None,
+        )
+        persisted = self.runtime.repository.persist_route(
+            self.operation_id, summary, context_id=self.context_id,
+            owner=self.owner, fence=self.fence, now=self.runtime.clock(),
+            application_checkpoint=checkpoint,
+        )
+        if not persisted:
+            raise PermissionError("metadata route lost its queue fence")
+        self.pinned = summary
+        self.application_route = application_route
+        self.contextual_metadata = contextual
+
+    @staticmethod
+    def _metadata_route_resolution(summary: Mapping[str, Any]) -> dict[str, Any]:
+        """Project only already validated summary bindings into contextual metadata."""
+        resolved: dict[str, Any] = {}
+        doc_id = summary.get("target_doc_id")
+        if isinstance(doc_id, str) and doc_id:
+            resolved["doc_id"] = doc_id
+            conversation_id = summary.get("target_conversation_id")
+            if not isinstance(conversation_id, str) or not conversation_id:
+                conversation_id = summary.get("conversation_id")
+            if isinstance(conversation_id, str) and conversation_id:
+                resolved["conversation_id"] = conversation_id
+        for field in ("dialog_number", "target_operation_id", "target_draft_id"):
+            value = summary.get(field)
+            if value is not None:
+                resolved[field] = value
+        return resolved
 
     async def _selection_callback(self, pinned_operation_id: str, *,
                                   conversation_id: str, dialog_number: int) -> bool:
@@ -2723,6 +4845,8 @@ class _CommandExecution(SearchAgentMixin):
                         if type(number) is int and number > 0:
                             return await self.finish_reply(f"Selected dialog #{number}.")
                     return result
+                if not self._publish_pending_document_failure_route():
+                    return QueueOperationState.RUNNING
                 return await self._finish_processing_error()
         if result == QueueOperationState.FAILED and self.decision is not None:
             message = (
@@ -2730,12 +4854,16 @@ class _CommandExecution(SearchAgentMixin):
                 if self.decision.get("kind") == "pure_switch" else
                 _PROCESSING_ERROR_REPLY
             )
+            if not self._publish_pending_document_failure_route():
+                return QueueOperationState.RUNNING
             return await self.finish_reply(message, kind="error", failure_final=True)
         if result == QueueOperationState.FAILED:
             route = await _offload(self.runtime.repository.get_route_control,
                                    self.context_id, self.operation_id)
             if isinstance(route, Mapping) and route.get("status") == "uncertain":
                 return await self.finish_reply(_UNCERTAIN_ROUTE_REPLY)
+            if not self._publish_pending_document_failure_route():
+                return QueueOperationState.RUNNING
             return await self._finish_processing_error()
         return result
 
@@ -2782,7 +4910,12 @@ class _CommandExecution(SearchAgentMixin):
                         and isinstance(parts[0], Mapping)
                         and isinstance(parts[0].get("text"), str)):
                     return parts[0]["text"]
-        saved = await _offload(self.ledger.load_turn, conversation_id, self.operation_id)
+        checkpoint_conversation = self._agent_checkpoint_conversation_id()
+        if not isinstance(checkpoint_conversation, str) or not checkpoint_conversation:
+            return None
+        saved = await _offload(
+            self.ledger.load_turn, checkpoint_conversation, self.operation_id,
+        )
         response = saved.get("model_response") if isinstance(saved, Mapping) else None
         rounds = response.get("rounds", []) if isinstance(response, Mapping) and response.get(
             "_telegram_tool_loop_rounds") == 1 else [response]

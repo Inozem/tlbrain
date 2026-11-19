@@ -422,6 +422,8 @@ def _rewrite_route_call(parts: Any, *, prompt: dict[str, Any]) -> tuple[Any, boo
                     source_bound_draft=source_bound,
                     source_bound_dialog_number=source_bound_dialog_number,
                     known_doc_ids=known_doc_ids,
+                    contextual_evidence=context.get("contextual_evidence"),
+                    presentation_refs=context.get("presentation_refs"),
                 )
                 call = _model_replace(call, "args", semantic)
                 part = _model_replace(part, "function_call", call)

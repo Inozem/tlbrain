@@ -308,6 +308,53 @@ class GeminiCommandRouter:
         if isinstance(filters, (Mapping, list, str, int, float, bool)) or filters is None:
             if filters is not None:
                 safe_context["selected_search_filters"] = filters
+        evidence = context.get("contextual_evidence")
+        if isinstance(evidence, Mapping):
+            safe_evidence = {}
+            for doc_id, rows in evidence.items():
+                if not isinstance(doc_id, str) or not doc_id or not isinstance(rows, (list, tuple)):
+                    continue
+                safe_rows = []
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        continue
+                    source_ref = row.get("source_ref")
+                    fragments = row.get("fragment_refs", [])
+                    source_kind = row.get("source_kind")
+                    if (not isinstance(source_ref, str) or not source_ref
+                            or not isinstance(source_kind, str)
+                            or not isinstance(fragments, (list, tuple))
+                            or any(not isinstance(ref, str) or not ref for ref in fragments)):
+                        continue
+                    safe_rows.append({"source_kind": source_kind,
+                                      "source_ref": source_ref,
+                                      "fragment_refs": list(fragments),
+                                      **({key: row[key] for key in ("list_id", "position")
+                                          if key in row})})
+                if safe_rows:
+                    safe_evidence[doc_id] = safe_rows
+            safe_context["contextual_evidence"] = safe_evidence
+        presentation_refs = context.get("presentation_refs")
+        if isinstance(presentation_refs, (list, tuple)):
+            safe_refs = []
+            for item in presentation_refs:
+                if isinstance(item, str) and item:
+                    safe_refs.append(item)
+                elif (isinstance(item, Mapping) and isinstance(item.get("ref"), str)
+                      and item.get("ref") and isinstance(item.get("lists"), (list, tuple))):
+                    safe_refs.append({"ref": item["ref"], "lists": [
+                        {"list_id": row["list_id"], "entries": [
+                            {"position": entry["position"], "doc_id": entry["doc_id"]}
+                            for entry in row.get("entries", ())
+                            if isinstance(entry, Mapping)
+                            and type(entry.get("position")) is int
+                            and isinstance(entry.get("doc_id"), str)
+                        ]}
+                        for row in item["lists"] if isinstance(row, Mapping)
+                        and isinstance(row.get("list_id"), str)
+                    ]})
+            if safe_refs:
+                safe_context["presentation_refs"] = safe_refs
         route_schema = self._invocation_schema(
             safe_cards, safe_recent_search, operation_candidates,
             safe_context.get("last_doc_id"),

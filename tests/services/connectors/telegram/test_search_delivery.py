@@ -162,7 +162,9 @@ def test_independent_publisher_waits_for_presentation_header_before_send(
 
     client_db = firestore_fake.client_class()
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
-    repository, accepted, operation, lease, now = _running_command(client_db)
+    repository, accepted, operation, lease, now = _running_command(
+        client_db, text="Find project discussions",
+    )
     bot = _bot_client()
     runtime = TelegramCommandRuntime(
         repository=repository, save_handler=object(), client=bot,
@@ -218,7 +220,9 @@ def test_partial_multichunk_list_keeps_earlier_list_proof_and_withholds_current_
 
     client_db = firestore_fake.client_class()
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
-    repository, accepted, operation, lease, now = _running_command(client_db)
+    repository, accepted, operation, lease, now = _running_command(
+        client_db, text="Find project discussions",
+    )
     bot = _bot_client(fail_send_number=2)
     runtime = TelegramCommandRuntime(
         repository=repository, save_handler=object(), client=bot,
@@ -325,7 +329,9 @@ def test_search_continuation_can_present_a_verified_exchange_from_prior_turn(
     client_db = firestore_fake.client_class()
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
-    repository, first, first_operation, first_lease, now = _running_command(client_db)
+    repository, first, first_operation, first_lease, now = _running_command(
+        client_db, text="Find project discussions",
+    )
     bot = _bot_client()
     runtime = TelegramCommandRuntime(
         repository=repository, save_handler=object(), client=bot,
@@ -439,7 +445,9 @@ def test_continuation_without_route_query_pins_its_first_native_query(
     client_db = firestore_fake.client_class()
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
-    repository, first, first_operation, first_lease, now = _running_command(client_db)
+    repository, first, first_operation, first_lease, now = _running_command(
+        client_db, text="Find project discussions",
+    )
     bot = _bot_client()
     runtime = TelegramCommandRuntime(
         repository=repository, save_handler=object(), client=bot,
@@ -561,7 +569,9 @@ def test_narrower_current_bounds_reject_broader_historical_presentation_proof(
     client_db = firestore_fake.client_class()
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
-    repository, first, first_operation, first_lease, now = _running_command(client_db)
+    repository, first, first_operation, first_lease, now = _running_command(
+        client_db, text="Find project discussions",
+    )
     bot = _bot_client()
     runtime = TelegramCommandRuntime(
         repository=repository, save_handler=object(), client=bot,

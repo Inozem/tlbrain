@@ -1,6 +1,7 @@
 """Focused direct-save completion binding coverage."""
 
 from datetime import datetime, timezone
+from collections.abc import Mapping
 import hashlib
 import asyncio
 import json
@@ -283,7 +284,7 @@ def test_direct_folder_classification_normalizes_speakers_and_recovers_interrupt
 @pytest.mark.parametrize(
     "folder_mode", ["explicit", "automatic", "unassigned", "ambiguous", "finalizer_failure"],
 )
-@pytest.mark.parametrize("flow_mode", ["route_tool", "agent"])
+@pytest.mark.parametrize("flow_mode", ["route_tool", "agent", "agent_opaque"])
 def test_global_direct_save_waits_for_real_index_and_replays(
     firestore_fake, sdk_fakes, monkeypatch,
     folder_mode, flow_mode,
@@ -322,10 +323,21 @@ def test_global_direct_save_waits_for_real_index_and_replays(
     runtime.route_response("substantive", substantive_text="Create a new conversation.",
                            **({"tool_choice": {"name": "add_dialog", "arguments": arguments}}
                               if flow_mode == "route_tool" else {}))
-    if flow_mode == "agent":
+    if flow_mode in {"agent", "agent_opaque"}:
+        call = types.FunctionCall(
+            **({"id": "direct-save-call"} if flow_mode == "agent_opaque" else {}),
+            name="add_dialog", args=arguments,
+        )
+        part = types.Part(
+            function_call=call,
+            **({"thought_signature": b"t024-native-save-signature"}
+               if flow_mode == "agent_opaque" else {}),
+        )
         sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
             candidates=[types.Candidate(content=types.Content(parts=[types.Part(
-                function_call=types.FunctionCall(name="add_dialog", args=arguments),
+                    function_call=part.function_call,
+                    **({"thought_signature": part.thought_signature}
+                       if flow_mode == "agent_opaque" else {}),
             )]))],
         ))
     if folder_mode in {"automatic", "ambiguous", "finalizer_failure"}:
@@ -381,6 +393,34 @@ def test_global_direct_save_waits_for_real_index_and_replays(
     assert not session.collection("document_bindings").stream()
     pending_turn = ledger.load_turn(global_conversation_id, task["operation_id"])
     assert pending_turn["tool_calls"][0]["name"] == "add_dialog"
+    if flow_mode in {"agent", "agent_opaque"}:
+        from services.connectors.telegram.agent import _contextual_call_provenance_valid
+        native_call = pending_turn["tool_calls"][0]
+        assert native_call["round"] == 0
+        if flow_mode == "agent":
+            assert native_call["id"] is None
+            assert native_call["thought_signature"] is None
+        else:
+            assert native_call["id"] == "direct-save-call"
+            assert native_call["thought_signature"] is None
+            model_response = pending_turn["model_response"]
+            if (isinstance(model_response, Mapping)
+                    and model_response.get("_telegram_tool_loop_rounds") == 1):
+                native_response = model_response["rounds"][0]["response"]
+            else:
+                native_response = model_response
+            native_part = native_response[
+                "candidates"][0]["content"]["parts"][0]
+            assert native_part["thought_signature"] == "dDAyNC1uYXRpdmUtc2F2ZS1zaWduYXR1cmU="
+        provenance = {
+            "application_route": pending_turn["application_route"],
+            "application_route_round": pending_turn["application_route_round"],
+            "model_response": pending_turn["model_response"],
+            "tool_calls": pending_turn["tool_calls"],
+        }
+        assert _contextual_call_provenance_valid(provenance)
+        tampered = {**provenance, "tool_calls": [dict(native_call, id="tampered-native-id")]}
+        assert not _contextual_call_provenance_valid(tampered)
     assert not pending_turn["tool_results"]
     index_task = next(item for item in runtime.task_requests
                       if item["url"].startswith("https://vector-sync.pytest.invalid/sync/doc/"))
@@ -507,7 +547,7 @@ def test_global_direct_save_waits_for_real_index_and_replays(
                     if event["boundary"] == "docs"
                     and event["operation"] == "documents.get"]) == 3
         return
-    if flow_mode == "agent":
+    if flow_mode in {"agent", "agent_opaque"}:
         sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
             candidates=[types.Candidate(content=types.Content(parts=[types.Part(
                 text="The direct-doc-b save is complete.",

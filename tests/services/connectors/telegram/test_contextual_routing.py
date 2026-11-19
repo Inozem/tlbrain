@@ -499,9 +499,15 @@ def test_us1_3_verified_price_fragment_selects_b_but_title_only_has_no_authority
         client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
         doc_ids=("doc-a", "doc-b", "doc-c"),
     )
-    result, route_control, _runtime = _invoke(
-        case, sdk_fakes, _route(target_ref="doc-b", tool_choice=_move_choice("doc-b")),
-    )
+    with capture_sdk_calls() as calls:
+        result, route_control, _runtime = _invoke(
+            case, sdk_fakes, _route(target_ref="doc-b", tool_choice=_move_choice("doc-b")),
+        )
+    event = next(row for row in calls if row["boundary"] == "gemini"
+                 and row["operation"] == "generate_content")
+    prompt = json.loads(event["arguments"]["contents"][0]["parts"][0]["text"])
+    assert any(row.get("source_kind") == "verified_exchange"
+               for row in prompt["context"]["contextual_evidence"]["doc-b"])
     assert route_control["target_doc_id"] == "doc-b"
     _assert_completed(result)
     assert provider.files["doc-b"]["parents"] == ["archive-folder"]
@@ -562,6 +568,8 @@ def test_us1_4_quote_uses_its_verified_document(
     active_history = repr(prompt["conversation_history"])
     assert "I quoted the monthly price as €42." in active_history
     assert "doc-b" in active_history and "call-prices" in active_history
+    assert any(row.get("source_kind") == "verified_exchange"
+               for row in prompt["context"]["contextual_evidence"]["doc-b"])
     assert route_control["target_doc_id"] == "doc-b"
     _assert_completed(result)
     assert provider.files["doc-b"]["parents"] == ["archive-folder"]
@@ -615,9 +623,139 @@ def test_us1_4_multiple_verified_quote_sources_ask_concrete_question_before_effe
     assert "I quoted €42 from one source and 84 from another." in active_history
     assert "doc-b" in active_history and "doc-c" in active_history
     assert "call-prices" in active_history
+    assert all(any(row.get("source_kind") == "verified_exchange"
+                   for row in prompt["context"]["contextual_evidence"][doc_id])
+               for doc_id in ("doc-b", "doc-c"))
     assert not provider.drive_mutations
     assert not provider.qdrant_mutations
     _assert_prepared_question(result, "doc-b", "doc-c")
+
+
+def test_current14_evidence_selector_can_choose_document_from_multi_document_exchange(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A concrete doc-b choice can use its membership in a shared exchange."""
+    from core.integrations.gemini.agent import GeminiAgent
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.runtime.runtime import _CommandExecution
+    from tests.fixtures.sdk_fakes import FakeGeminiClient
+
+    client = firestore_fake.client_class()
+    scenario = make_contextual_scenario(unrelated_count=0)
+    both_sources = {
+        **scenario.exchanges[0],
+        "result": {
+            "segments": [
+                {"doc_id": "doc-b", "order_index": 2,
+                 "quote": "The quoted monthly price is €42."},
+                {"doc_id": "doc-c", "order_index": 4,
+                 "quote": "The quoted launch figure was 84."},
+            ],
+            "truncated": False, "total_matches": 2, "returned_segments": 2,
+        },
+        "source_refs": [
+            {"doc_id": "doc-b", "order_index": 2},
+            {"doc_id": "doc-c", "order_index": 4},
+        ],
+    }
+    command_text = "Move the document where we discussed the monthly price to Archive"
+    case = _start_runtime_case(
+        client, command_text=command_text, exchanges=(both_sources,),
+        prior_answer="I quoted €42 from one source and 84 from another.",
+        prior_answer_source_refs=(
+            {"doc_id": "doc-b", "order_index": 2},
+            {"doc_id": "doc-c", "order_index": 4},
+        ),
+    )
+    _scenario, repository, accepted, operation, lease, runtime, _text = case
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
+        doc_ids=("doc-a", "doc-b", "doc-c"),
+    )
+
+    # Capture the real T017 proof through the runtime/store path so the
+    # current14 proposal cites the canonical exchange ref for doc-b.
+    runtime.model = GeminiAgent(client=FakeGeminiClient(api_key="synthetic-context-key"))
+    execution = _CommandExecution(
+        runtime, accepted.context_id, operation, lease,
+        parse_command(command_text), retry_governor=None,
+    )
+    assert not asyncio.run(execution._load_context_and_replay_save())
+    execution._compose_ports()
+    assert asyncio.run(execution._capture_scoped_routing_context())
+    proof = next(
+        item for item in execution.contextual_source.document_evidence["doc-b"]
+        if item.source_kind.value == "verified_exchange"
+    )
+    assert proof.fragment_refs
+    cited = list(dict.fromkeys((proof.source.ref, proof.fragment_refs[0].ref)))
+    proposal = {
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": command_text,
+        "document_selector": {
+            "kind": "evidence", "doc_id": "doc-b", "evidence_refs": cited,
+        },
+        "folder_selector": {"kind": "explicit_path", "value": "Archive", "parent": None},
+        "folder_name": None, "explicit_references": [], "missing_slots": [],
+        "evidence_refs": cited, "clarification_id": None,
+        "clarification_generation": None, "target_operation_id": None,
+        "tool_choice": _move_choice("doc-b"), "certainty": "certain",
+    }
+
+    result, route_control, _runtime = _invoke(case, sdk_fakes, proposal)
+    _assert_completed(result)
+    assert route_control.get("target_doc_id") == "doc-b"
+    assert provider.files["doc-b"]["parents"] == ["archive-folder"]
+    assert provider.files["doc-c"]["parents"] == [_ROUTE_ROOT_ID]
+    assert not [row for row in provider.drive_mutations
+                if row.get("fileId") != "doc-b"]
+
+
+@pytest.mark.parametrize("selector_kind,command_text,expected_doc", [
+    ("explicit_reference", "Move document doc-b", "doc-b"),
+    ("active_document", "Move it", "doc-a"),
+])
+def test_fresh_clarification_preserves_known_document_without_executable_target(
+    firestore_fake, sdk_fakes, monkeypatch,
+    selector_kind, command_text, expected_doc,
+):
+    client = firestore_fake.client_class()
+    case = _start_runtime_case(
+        client, command_text=command_text, exchanges=(), active_document=True,
+    )
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
+        doc_ids=("doc-a", "doc-b", "doc-c"),
+    )
+    explicit = []
+    if selector_kind == "explicit_reference":
+        start = command_text.index("doc-b")
+        span = {"kind": "id", "start": start, "end": start + len("doc-b"),
+                "raw_text": "doc-b", "parsed_value": "doc-b"}
+        selector = {"kind": "explicit_reference", "raw_value": "doc-b", "span": span}
+        explicit = [span]
+    else:
+        selector = {"kind": "active_document"}
+    proposal = {
+        "disposition": "clarify", "action": "move_transcript",
+        "substantive_text": command_text, "document_selector": selector,
+        "folder_selector": None, "folder_name": None,
+        "explicit_references": explicit, "missing_slots": ["destination"],
+        "evidence_refs": [], "clarification_id": None,
+        "clarification_generation": None, "target_operation_id": None,
+        "tool_choice": None, "certainty": "uncertain",
+    }
+    result, route_control, _runtime = _invoke(case, sdk_fakes, proposal)
+    from services.connectors.telegram.queue import TelegramQueueCompletion
+
+    assert isinstance(result, TelegramQueueCompletion)
+    assert result.result_type == "clarification"
+    assert result.clarification.pending.resolved_parameters["doc_id"] == expected_doc
+    assert result.clarification.pending.missing_slots == ("destination",)
+    assert route_control["status"] == "uncertain"
+    assert "target_doc_id" not in route_control
+    assert not provider.drive_mutations
+    assert not provider.qdrant_mutations
 
 
 def test_us1_6_local_dialog_two_is_independent_of_prior_list_position_two(
@@ -695,6 +833,8 @@ def test_us1_7_conflicting_explicit_id_and_local_number_clarifies_before_effect(
     assert not provider.drive_mutations
     assert not provider.qdrant_mutations
     _assert_prepared_question(result, "doc-a", "doc-c")
+    assert "doc_id" not in result.clarification.pending.resolved_parameters
+    assert result.clarification.pending.resolved_parameters.get("folder_path") == ("Archive",)
 
 
 @pytest.mark.parametrize("state", ["deleted", "inaccessible", "outside-root"])

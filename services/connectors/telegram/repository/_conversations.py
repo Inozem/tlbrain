@@ -1108,6 +1108,50 @@ class _TelegramConversationMixin:
             presentation_id=presentation_id,
         )
 
+    def get_verified_presentation_list_ids(
+        self, context_id: str, conversation_id: str, presentation_id: str,
+        *, actor_id: int, now: datetime, eligible_at: datetime | None = None,
+    ) -> tuple[str, ...]:
+        """Return only list IDs whose own rendered spans have delivery proof."""
+        if type(actor_id) is not int or actor_id <= 0:
+            return ()
+        manifest = self.get_presentation_manifest(
+            context_id, conversation_id, presentation_id,
+        )
+        if not isinstance(manifest, Mapping):
+            return ()
+        conversation_ref = self._conversation_ref(context_id, conversation_id)
+        header_snapshot = conversation_ref.collection("presentations").document(
+            presentation_id,
+        ).get()
+        header = header_snapshot.to_dict() or {} if header_snapshot.exists else {}
+        if (header.get("producer_actor_id") != actor_id
+                or type(header.get("producer_actor_id")) is not int):
+            return ()
+        try:
+            chunks, list_spans = self._presentation_chunk_plan(manifest)
+            prepared = manifest.get("notification_refs", [])
+            _indexes, revisions = self._presentation_notification_indexes(manifest, chunks)
+            proof_by_index = self._read_presentation_delivery_proofs(
+                None, context_id=context_id, conversation_id=conversation_id,
+                presentation_id=presentation_id, prepared=prepared,
+                revisions=revisions, chunks=chunks,
+                header_created_at=self._presentation_utc_timestamp(
+                    header.get("created_at"), "created_at",
+                ), now=self._presentation_utc_timestamp(now, "now"),
+            )
+            if eligible_at is not None:
+                cutoff = self._presentation_utc_timestamp(eligible_at, "eligible_at")
+                proof_by_index = {
+                    index: proof for index, proof in proof_by_index.items()
+                    if proof.get("delivered_at") <= cutoff
+                }
+            return tuple(self._complete_presentation_lists(
+                list_spans, chunks, proof_by_index,
+            ))
+        except (KeyError, TypeError, ValueError):
+            return ()
+
     @staticmethod
     def _presentation_chunk_plan(manifest: Mapping[str, Any]) -> tuple[list[str], list[tuple[str, int, int]]]:
         from services.connectors.telegram.runtime.presentation import _render

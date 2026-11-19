@@ -48,6 +48,8 @@ class TelegramRegistryExecutor:
 
     def execute(self, *, name: str, arguments: Any, call_ordinal: int,
                 resolved_targets: ResolvedWriteTargets | None = None) -> Any:
+        if resolved_targets is None and name in {"move_transcript", "create_folder"}:
+            resolved_targets = self.execution_context.get("resolved_targets")
         validated = registry.validate_arguments(name, arguments)
         if resolved_targets is not None and name not in {"move_transcript", "create_folder"}:
             raise ValueError("resolved write targets are unsupported for this operation")
@@ -82,6 +84,8 @@ class TelegramRegistryExecutor:
     def reconcile(self, *, name: str, arguments: Any, call_ordinal: int,
                   resolved_targets: ResolvedWriteTargets | None = None) -> Any:
         """Read durable evidence for an interrupted child without invoking a tool."""
+        if resolved_targets is None and name in {"move_transcript", "create_folder"}:
+            resolved_targets = self.execution_context.get("resolved_targets")
         validated = registry.validate_arguments(name, arguments)
         if not registry.OPERATIONS[name].write:
             if resolved_targets is not None:
@@ -133,6 +137,25 @@ class TelegramRegistryExecutor:
                 return None
             return deepcopy(checkpoint["result"])
         return None
+
+    def resolved_target_binding(
+        self, name: str, arguments: Any, call_ordinal: int,
+        resolved_targets: ResolvedWriteTargets | None,
+    ) -> dict[str, Any] | None:
+        """Validate a write capability before a retry cache can return a result."""
+        if resolved_targets is None:
+            return None
+        validated = registry.validate_arguments(name, arguments)
+        if name not in {"move_transcript", "create_folder"}:
+            raise ValueError("resolved write targets are unsupported for this operation")
+        parent_id = self.execution_context["operation_id"]
+        operation_id = "telegram-tool-" + hashlib.sha256(
+            f"{parent_id}\0{int(call_ordinal)}".encode("utf-8")
+        ).hexdigest()
+        return _assert_resolved_targets(
+            resolved_targets, operation_name=name, operation_id=operation_id,
+            effect_id=stable_effect_id(parent_id, call_ordinal), arguments=validated,
+        )
 
     def _assert_queue_lease_live(self) -> None:
         context_id = self.execution_context.get("context_id")

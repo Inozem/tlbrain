@@ -146,6 +146,19 @@ def test_capture_projects_complete_history_and_replay_ignores_mutable_selection_
     assert replay.full_history_ref.payload["turns"] == history
 
 
+def test_active_document_evidence_survives_missing_index_metadata(firestore_fake):
+    client = firestore_fake.client_class()
+    _repository, _accepted, lease, store, _conversation_id = _setup(client)
+    client.collection(COLLECTION_NAME).document("doc-A").delete()
+
+    snapshot = _capture(store, lease, client)
+
+    evidence = snapshot.document_evidence["doc-A"][0]
+    assert evidence.source_kind is SourceKind.ACTIVE_DOCUMENT
+    assert evidence.source.conversation_id == snapshot.selected_conversation_id
+    assert evidence.metadata == {"doc_id": "doc-A"}
+
+
 def test_stable_unselected_chat_history_is_captured_and_invalid_selection_fails_closed(firestore_fake):
     client = firestore_fake.client_class()
     repository = TelegramRepository(client=client)
@@ -227,6 +240,21 @@ def test_replay_rejects_semantically_corrupt_saved_snapshot_without_recapture(fi
     }
     checkpoint_ref.set(checkpoint)
     with pytest.raises(ValueError):
+        _capture(store, lease, client)
+
+
+def test_replay_rejects_changed_immutable_accepted_text(firestore_fake):
+    client = firestore_fake.client_class()
+    repository, accepted, lease, store, _ = _setup(
+        client, "replay immutable text", chat_id=43012, update_id=76112,
+    )
+    _capture(store, lease, client)
+    context_ref = client.collection(SESSIONS).document(accepted.context_id)
+    operation = context_ref.collection("operations").document(accepted.operation_id).get().to_dict()
+    command_id = operation["input_ref"].rsplit("/", 1)[-1]
+    command_ref = context_ref.collection("commands").document(command_id)
+    command_ref.update({"candidate": "replay different text", "text": "replay different text"})
+    with pytest.raises(ValueError, match="accepted command candidate changed after capture"):
         _capture(store, lease, client)
 
 
@@ -894,4 +922,24 @@ def test_fresh_capture_rejects_changed_accepted_candidate_and_foreign_history(fi
      .collection("turns").document("prior-2").delete())
     with pytest.raises(ValueError, match="incomplete"):
         _capture(store, lease, client)
+
+
+def test_scoped_get_doc_uses_direct_binding_and_allows_missing_index_metadata(firestore_fake):
+    client = firestore_fake.client_class()
+    repository, accepted, _lease, store, _conversation_id = _setup(client)
+    client.collection(COLLECTION_NAME).document("doc-A").delete()
+    with guard_firestore_enumeration(blocked_collections=("transcript_index", "dialogs")):
+        selected = store.get_doc("doc-A")
+    assert selected == {
+        "doc_id": "doc-A", "conversation_id": "selected-conversation",
+        "dialog_number": 1,
+    }
+
+    binding_ref = (client.collection(SESSIONS).document(accepted.context_id)
+                   .collection("document_bindings").document(
+                       hashlib.sha256(b"doc-A").hexdigest(),
+                   ))
+    binding_ref.update({"conversation_id": "foreign-conversation"})
+    with pytest.raises(ValueError, match="binding"):
+        store.get_doc("doc-A")
 

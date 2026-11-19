@@ -188,12 +188,35 @@ def _source_evidence(fixture, doc_id):
     }
 
 
+def _presentation_source_ref(fixture, doc_id):
+    """Project one actual loaded exchange row into the T018 selector shape."""
+    row = next(item for item in fixture["result"]["segments"] if item["doc_id"] == doc_id)
+    return {
+        "doc_id": doc_id,
+        "order_index": row["order_index"],
+        "operation_id": fixture["accepted"].operation_id,
+        "checkpoint_conversation_id": fixture["checkpoint_id"],
+        "call_id": fixture["call"]["id"],
+        "ordinal": fixture["call"]["ordinal"],
+        "reference": fixture["reference"],
+    }
+
+
+def _verified_exchange_input(fixture):
+    """Supply the T018 wrapper from the fixture's real saved search exchange."""
+    return {
+        "reference": fixture["reference"],
+        "exchange": fixture["verified_exchange"],
+        "source_filters": fixture["call"]["arguments"],
+    }
+
+
 def _list_block(fixture, *, list_id, doc_ids, labels=None):
     labels = labels or {"doc-a": "Alpha", "doc-b": "Beta", "doc-c": "Gamma"}
     return {"type": "document_list", "list_id": list_id, "entries": [
-        {"position": position, "doc_id": doc_id, "label": labels[doc_id],
-         "evidence_refs": [_source_evidence(fixture, doc_id)]}
-        for position, doc_id in enumerate(doc_ids, 1)
+        {"doc_id": doc_id, "label": labels[doc_id],
+         "source_refs": [_presentation_source_ref(fixture, doc_id)]}
+        for doc_id in doc_ids
     ]}
 
 
@@ -253,14 +276,16 @@ def _publish_fixture_answer(
     client_db, fixture, bot, *, answer_turn_id, body, list_blocks,
     kind="final", pointer=True, persist_manifest=True, now=None,
 ):
-    """Persist a representative manifest before real send; select only after ACK."""
+    """Publish a verified fixture answer through the production T019/T021 APIs."""
     from services.connectors.telegram.notifications import TelegramNotificationPublisher
     from services.connectors.telegram.runtime.runtime import _DurableCommandReplies
+    from services.connectors.telegram.runtime.presentation import build_presentation_manifest
 
     repository = fixture["repository"]
-    accepted = fixture["accepted"]
-    lease = fixture["lease"]
-    now = fixture["now"] if now is None else now
+    producer = fixture.get("presentation_producer", {})
+    accepted = producer.get("accepted", fixture["accepted"])
+    lease = producer.get("lease", fixture["lease"])
+    now = producer.get("now", fixture["now"]) if now is None else now
     repository.append_turn(
         accepted.context_id, fixture["conversation_id"], turn_id=answer_turn_id,
         operation_id=accepted.operation_id, role="model", parts=[{"text": body}],
@@ -274,68 +299,94 @@ def _publish_fixture_answer(
         context_id=accepted.context_id, operation_id=accepted.operation_id,
         owner=lease.owner, fence=lease.fence, clock=lambda: now,
     )
-    chunks = [body[index:index + 4000] for index in range(0, len(body), 4000)] or [""]
-    notification_refs = []
-    for index, _chunk in enumerate(chunks):
-        chunk_kind = kind if len(chunks) == 1 or index == len(chunks) - 1 else "progress"
-        notification_refs.append({
-            "notification_id": replies.notification_id(chunk_kind, index), "revision": 1,
-        })
     presentation_id = "presentation-" + answer_turn_id
-    presentation = {
-        "schema_version": 1, "presentation_id": presentation_id,
-        "context_id": accepted.context_id, "conversation_id": fixture["conversation_id"],
-        "producing_operation_id": accepted.operation_id,
-        "answer_turn_id": answer_turn_id, "body": body,
-        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-        "blocks": list_blocks,
-        "sources": [{"call_id": fixture["call"]["id"], "ordinal": 0,
-                     "checkpoint_conversation_id": fixture["checkpoint_id"],
-                     "operation_id": accepted.operation_id,
-                     "reference": fixture["reference"]}],
-        "notification_refs": notification_refs,
-        "source_refs": [_source_evidence(fixture, row["doc_id"])
-                        for row in fixture["result"]["segments"]],
-    }
     conversation_ref = (client_db.collection("telegram_sessions").document(accepted.context_id)
                         .collection("conversations").document(fixture["conversation_id"]))
     manifest_ref = conversation_ref.collection("presentations").document(presentation_id)
+    notification_refs = []
+    presentation = None
     if persist_manifest:
-        manifest_ref.set(presentation)
+        prepared = asyncio.run(replies.prepare_presentation(
+            body, presentation="rich_markdown", presentation_id=presentation_id,
+            presentation_conversation_id=fixture["conversation_id"], kind=kind,
+        ))
+        notification_refs = [{"notification_id": item["notification_id"],
+                              "revision": item["revision"]} for item in prepared]
+        scope = {
+            "context_id": accepted.context_id,
+            "conversation_id": fixture["conversation_id"],
+            "producing_operation_id": accepted.operation_id,
+            "presentation_id": presentation_id,
+            "answer_turn_id": answer_turn_id,
+        }
+        presentation = build_presentation_manifest(
+            scope=scope, blocks=list_blocks,
+            verified_exchanges=[_verified_exchange_input(fixture)],
+            notification_refs=notification_refs, revision_refs=notification_refs,
+        ).to_dict()
+        source = presentation["sources"][0]
+        payload = source["reference"].get("payload", {})
+        assert (source["operation_id"], source["checkpoint_conversation_id"],
+                source["call_id"], source["ordinal"], payload.get("sha256")) == (
+                    fixture["accepted"].operation_id, fixture["checkpoint_id"],
+                    fixture["call"]["id"], fixture["call"]["ordinal"],
+                    fixture["reference"]["payload"]["sha256"],
+                )
+        presentation = repository.save_presentation_manifest(
+            accepted.context_id, presentation,
+            queue_operation_id=accepted.operation_id, queue_owner=lease.owner,
+            queue_fence=lease.fence, now=now,
+            verified_exchanges=[_verified_exchange_input(fixture)],
+            source_turn_refs={source["source_id"]: "presentation-prior-query"},
+            clock=lambda: now,
+        )
     pre_send_observations = []
 
     def inspect_before_send(payload, sent):
-        notification_id = notification_refs[len(pre_send_observations)]["notification_id"]
+        notification_id = (notification_refs[len(pre_send_observations)]["notification_id"]
+                           if persist_manifest else replies.notification_id(kind))
         notification = fixture["repository"].get_notification(notification_id)
         if persist_manifest:
-            stored = manifest_ref.get().to_dict()
+            header = manifest_ref.get().to_dict()
+            assert header["body_ref"]["turn_id"] == answer_turn_id
+            stored = repository.get_presentation_manifest(
+                accepted.context_id, fixture["conversation_id"], presentation_id,
+            )
             assert stored["body"] == body
             assert stored["body_sha256"] == hashlib.sha256(body.encode("utf-8")).hexdigest()
         assert notification["body"] == sent["text"]
-        assert notification["revision"] == notification_refs[len(pre_send_observations)]["revision"]
+        if persist_manifest:
+            assert notification["revision"] == notification_refs[len(pre_send_observations)]["revision"]
         assert notification["state"] in {"sending", "pending"}
         assert notification.get("message_id") is None
         pre_send_observations.append((notification_id, sent["text"]))
 
     bot._before_send = inspect_before_send
     sent_offset = len(bot._test_sent)
-    outcome = asyncio.run(replies.deliver(body, kind=kind, presentation="rich_markdown"))
-    assert len(pre_send_observations) == len(notification_refs)
-    notification_rows = [repository.get_notification(row["notification_id"])
-                         for row in notification_refs]
-    if outcome == "delivered":
+    if persist_manifest:
+        outcome = asyncio.run(replies.deliver_prepared(
+            body, prepared_notifications={
+                "presentation_id": presentation_id,
+                "conversation_id": fixture["conversation_id"],
+                "notification_refs": notification_refs,
+            }, presentation="rich_markdown", kind=kind,
+        ))
+    else:
+        outcome = asyncio.run(replies.deliver(body, kind=kind, presentation="rich_markdown"))
+    outcome_name = getattr(outcome, "disposition", None) or str(outcome)
+    if outcome_name.startswith("_DeliveryStatus("):
+        outcome_name = outcome.disposition
+    assert len(pre_send_observations) == (len(notification_refs) if persist_manifest else 1)
+    notification_rows = ([repository.get_notification(row["notification_id"])
+                          for row in notification_refs] if persist_manifest else
+                         [repository.get_notification(replies.notification_id(kind))])
+    if outcome_name == "delivered":
         assert all(row["state"] == "delivered" and type(row.get("message_id")) is int
                    for row in notification_rows)
         assert all(row["message_id"] == 91001 + sent_offset + index
                    for index, row in enumerate(notification_rows))
         assert all(row["revision"] == ref["revision"]
                    for row, ref in zip(notification_rows, notification_refs))
-        if persist_manifest and pointer and len(list_blocks) == 1:
-            conversation_ref.update({"last_presented_list_id": list_blocks[0]["list_id"],
-                                     "last_presentation_id": presentation_id})
-        elif persist_manifest and len(list_blocks) > 1:
-            conversation_ref.update({"last_presented_list_id": None,
-                                     "last_presentation_id": presentation_id})
     else:
         assert not pointer
         assert not any(row.get("state") == "delivered" for row in notification_rows[1:])
@@ -343,6 +394,35 @@ def _publish_fixture_answer(
             "manifest_ref": manifest_ref, "conversation_ref": conversation_ref,
             "notification_refs": notification_refs, "notifications": notification_rows,
             "outcome": outcome, "replies": replies}
+
+
+def _start_fixture_presentation_producer(fixture, *, answer_turn_id, now):
+    """Accept a distinct real operation for another T019 answer turn."""
+    from core.integrations.firestore.operation_queue import claim_head
+    from services.connectors.telegram.commands import parse_command
+
+    source_accepted = fixture["accepted"]
+    chat_text, thread_text = source_accepted.context_id.rsplit("_", 1)
+    update_id = int(hashlib.sha256(
+        f"presentation-producer\0{source_accepted.context_id}\0{answer_turn_id}".encode()
+    ).hexdigest()[:12], 16)
+    accepted = fixture["repository"].accept_command(
+        update_id, chat_id=int(chat_text),
+        thread_id=None if thread_text == "default" else int(thread_text),
+        user_id=17, command=parse_command("Continue the same search"), now=now,
+    )
+    context_ref = fixture["repository"].client.collection("telegram_sessions").document(
+        source_accepted.context_id,
+    )
+    lease = claim_head(
+        fixture["repository"].client, context_ref,
+        owner=f"presentation-{answer_turn_id}", now=now,
+    )
+    if lease is None or lease.operation_id != accepted.operation_id:
+        raise AssertionError("fixture answer producer did not acquire its accepted queue operation")
+    return {**fixture, "presentation_producer": {
+        "accepted": accepted, "lease": lease, "now": now,
+    }}
 
 
 def test_search_agent_presents_native_ordered_list_and_bound_quote_through_runtime(
@@ -541,7 +621,9 @@ def test_invalid_native_terminal_must_not_publish_duplicate_or_unbound_quote(
 
     client_db = firestore_fake.client_class()
     _script_source_retrieval(sdk_fakes, monkeypatch, client_db)
-    repository, accepted, operation, lease, now = _running_command(client_db, text="Find discussions")
+    repository, accepted, operation, lease, now = _running_command(
+        client_db, text="Find the three project discussions",
+    )
     bot = _bot_client()
     runtime = TelegramCommandRuntime(
         repository=repository, save_handler=object(), client=bot,
@@ -782,6 +864,146 @@ def test_partial_trusted_search_list_cannot_authorize_visible_selector(
         asyncio.run(bot._test_http_client.aclose())
 
 
+def test_list_authority_uses_delivery_proofs_available_at_command_intake(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    """A later delivered list cannot retarget an earlier accepted command."""
+    from types import SimpleNamespace
+    from core.integrations.firestore.operation_queue import claim_head, complete_head
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+    from services.connectors.telegram.runtime.presentation import build_presentation_manifest
+    from services.connectors.telegram.runtime.runtime import (
+        _CommandExecution, _DurableCommandReplies, TelegramCommandRuntime,
+    )
+    from tests.fixtures.shared_write_authorization import ROOT_FOLDER_ID
+
+    client = firestore_fake.client_class()
+    fixture = _source_search_fixture(client)
+    _configure_writer_boundary(client, monkeypatch, sdk_fakes)
+    repository, producer, lease = fixture["repository"], fixture["accepted"], fixture["lease"]
+    start = fixture["now"]
+    clock = SimpleNamespace(value=start)
+    context_ref = client.collection("telegram_sessions").document(producer.context_id)
+    bot = _bot_client()
+    publisher = TelegramNotificationPublisher(repository, bot, clock=lambda: clock.value)
+    replies = _DurableCommandReplies(
+        repository=repository, publisher=publisher,
+        context_id=producer.context_id, operation_id=producer.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: clock.value,
+    )
+    blocks = [
+        _list_block(fixture, list_id="shown-first", doc_ids=["doc-a", "doc-b"]),
+        {"type": "paragraph", "text": "x" * 120, "source_refs": []},
+        _list_block(
+            fixture, list_id="delivered-later", doc_ids=["doc-a", "doc-b", "doc-c"],
+            labels={doc: f"Entry {index} " + "x" * 1400
+                    for index, doc in enumerate(("doc-a", "doc-b", "doc-c"), 1)},
+        ),
+    ]
+    presentation_id, answer_turn_id = "presentation-causal-cutoff", "answer-causal-cutoff"
+    scope = {
+        "context_id": producer.context_id, "conversation_id": fixture["conversation_id"],
+        "producing_operation_id": producer.operation_id,
+        "presentation_id": presentation_id, "answer_turn_id": answer_turn_id,
+    }
+    verified = [_verified_exchange_input(fixture)]
+    body = build_presentation_manifest(
+        scope=scope, blocks=blocks, verified_exchanges=verified,
+    ).to_dict()["body"]
+    repository.append_turn(
+        producer.context_id, fixture["conversation_id"], turn_id=answer_turn_id,
+        operation_id=producer.operation_id, role="model", parts=[{"text": body}],
+        source_refs=[_source_evidence(fixture, row["doc_id"])
+                     for row in fixture["result"]["segments"]], now=clock.value,
+        queue_operation_id=producer.operation_id, queue_owner=lease.owner,
+        queue_fence=lease.fence,
+    )
+    prepared = asyncio.run(replies.prepare_presentation(
+        body, presentation="rich_markdown", presentation_id=presentation_id,
+        presentation_conversation_id=fixture["conversation_id"],
+    ))
+    refs = [{"notification_id": row["notification_id"], "revision": row["revision"]}
+            for row in prepared]
+    assert len(refs) == 2
+    manifest = build_presentation_manifest(
+        scope=scope, blocks=blocks, verified_exchanges=verified,
+        notification_refs=refs, revision_refs=refs,
+    ).to_dict()
+    repository.save_presentation_manifest(
+        producer.context_id, manifest, queue_operation_id=producer.operation_id,
+        queue_owner=lease.owner, queue_fence=lease.fence, now=clock.value,
+        verified_exchanges=verified,
+        source_turn_refs={row["source_id"]: "presentation-prior-query"
+                          for row in manifest["sources"]}, clock=lambda: clock.value,
+    )
+    text = "Move the second search result to Archive"
+
+    def accept(update_id):
+        accepted = repository.accept_command(
+            update_id, chat_id=42017, thread_id=73, user_id=17,
+            command=parse_command(text), now=clock.value,
+        )
+        operation = context_ref.collection("operations").document(
+            accepted.operation_id,
+        ).get().to_dict()
+        command_id = operation["input_ref"].rsplit("/", 1)[-1]
+        row = context_ref.collection("commands").document(command_id).get().to_dict()
+        assert row["observed_presentation_id"] == presentation_id
+        return accepted
+
+    def capture(accepted):
+        current = claim_head(client, context_ref, owner="causal-consumer", now=clock.value)
+        assert current is not None and current.operation_id == accepted.operation_id
+        operation = context_ref.collection("operations").document(
+            accepted.operation_id,
+        ).get().to_dict()
+        runtime = TelegramCommandRuntime(
+            repository=repository, save_handler=object(), client=bot,
+            clock=lambda: clock.value, root_folder_id=ROOT_FOLDER_ID,
+        )
+        execution = _CommandExecution(
+            runtime, accepted.context_id, operation, current,
+            parse_command(text), retry_governor=None,
+        )
+        assert not asyncio.run(execution._load_context_and_replay_save())
+        execution._compose_ports()
+        assert asyncio.run(execution._capture_scoped_routing_context())
+        lists = {
+            row.metadata.get("list_id")
+            for rows in execution.contextual_source.document_evidence.values()
+            for row in rows if row.source_kind.value == "presentation_entry"
+        }
+        assert complete_head(
+            client, context_ref, operation_id=accepted.operation_id,
+            owner=current.owner, fence=current.fence, now=clock.value,
+        )
+        return lists
+
+    try:
+        clock.value = start + timedelta(milliseconds=100)
+        assert asyncio.run(publisher.publish(refs[0]["notification_id"])) == "delivered"
+        clock.value = start + timedelta(seconds=1)
+        earlier = accept(88120)
+        clock.value = start + timedelta(seconds=2)
+        assert asyncio.run(publisher.publish(refs[1]["notification_id"])) == "delivered"
+        clock.value = start + timedelta(seconds=3)
+        later = accept(88121)
+        assert complete_head(
+            client, context_ref, operation_id=producer.operation_id,
+            owner=lease.owner, fence=lease.fence, now=clock.value,
+        )
+        clock.value = start + timedelta(seconds=4)
+        earlier_lists = capture(earlier)
+        later_lists = capture(later)
+        assert "shown-first" in earlier_lists
+        assert {"shown-first", "delivered-later"}.issubset(later_lists)
+        assert len(bot._test_sent) == 2
+        assert "delivered-later" not in earlier_lists
+    finally:
+        asyncio.run(bot._test_http_client.aclose())
+
+
 def test_unqualified_second_is_ambiguous_across_two_lists_in_one_answer(
     firestore_fake, sdk_fakes, monkeypatch,
 ):
@@ -973,13 +1195,24 @@ def _prepare_selector_fixture(client_db, sdk_fakes, monkeypatch, *, has_newer_li
         assert old_publication["notifications"][0]["state"] == "delivered"
         assert old_publication["conversation_ref"].get().to_dict()[
             "last_presented_list_id"] == "list-visible-1"
+    assert complete_head(
+        client_db, client_db.collection("telegram_sessions").document(
+            fixture["accepted"].context_id),
+        operation_id=fixture["accepted"].operation_id,
+        owner=fixture["lease"].owner, fence=fixture["lease"].fence,
+        now=now + timedelta(microseconds=1),
+    )
 
     if has_newer_list:
         newer_block = _list_block(fixture, list_id="list-visible-2",
                                   doc_ids=["doc-c", "doc-a", "doc-b"])
         newer_body = _render_fixture_blocks([newer_block])
+        newer_fixture = _start_fixture_presentation_producer(
+            fixture, answer_turn_id="presentation-newer-answer",
+            now=now + timedelta(milliseconds=1),
+        )
         newer = _publish_fixture_answer(
-            client_db, fixture, bot, answer_turn_id="presentation-newer-answer",
+            client_db, newer_fixture, bot, answer_turn_id="presentation-newer-answer",
             body=newer_body, list_blocks=[newer_block], kind="progress", now=now + timedelta(
                 milliseconds=1),
         )
@@ -989,6 +1222,14 @@ def _prepare_selector_fixture(client_db, sdk_fakes, monkeypatch, *, has_newer_li
             "presentation_id"]
         assert newer["conversation_ref"].get().to_dict()[
             "last_presented_list_id"] == "list-visible-2"
+        assert complete_head(
+            client_db, client_db.collection("telegram_sessions").document(
+                fixture["accepted"].context_id),
+            operation_id=newer_fixture["presentation_producer"]["accepted"].operation_id,
+            owner=newer_fixture["presentation_producer"]["lease"].owner,
+            fence=newer_fixture["presentation_producer"]["lease"].fence,
+            now=now + timedelta(milliseconds=2),
+        )
 
     for doc_id, number in (("doc-a", 1), ("doc-c", 2)):
         conversation_id = f"bound-{doc_id}"
@@ -1001,13 +1242,6 @@ def _prepare_selector_fixture(client_db, sdk_fakes, monkeypatch, *, has_newer_li
             fixture["accepted"].context_id, conversation_id, kind="document", doc_id=doc_id,
             dialog_number=number, now=now,
         )
-    assert complete_head(
-        client_db, client_db.collection("telegram_sessions").document(
-            fixture["accepted"].context_id),
-        operation_id=fixture["accepted"].operation_id,
-        owner=fixture["lease"].owner, fence=fixture["lease"].fence,
-        now=now + timedelta(seconds=1),
-    )
     asyncio.run(bot._test_http_client.aclose())
     return {"fixture": fixture, "provider": provider,
             "presentation": old_publication["presentation"],

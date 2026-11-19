@@ -870,7 +870,7 @@ class _TelegramCommandMixin:
     def _validate_joint_routing_snapshot(
         snapshot: Any, *, client: Any, context_id: str, operation_id: str,
         actor_id: int, input_ref: str, operation: Mapping[str, Any],
-        command: Mapping[str, Any], conversation_id: str,
+        command: Mapping[str, Any], conversation_id: str, transaction: Any = None,
     ) -> None:
         """Validate legacy minimal refs or the exact frozen T017 capture projection."""
         accepted = snapshot.accepted_command_ref
@@ -908,6 +908,8 @@ class _TelegramCommandMixin:
         validator._validate_captured_snapshot(
             snapshot, actor_id=actor_id, input_ref=input_ref, operation=operation,
             command=command, conversation_id=conversation_id,
+            allow_finalized_ingress=transaction is not None,
+            transaction=transaction, frozen_identity_only=transaction is None,
         )
 
     def _load_joint_payload(
@@ -1102,10 +1104,16 @@ class _TelegramCommandMixin:
         child_digest = hashlib.sha256(
             f"{parent_operation}\0{expected_ordinal}".encode("utf-8")
         ).hexdigest()
+        expected_operation_id = "telegram-tool-" + child_digest
+        if candidate["name"] == "add_dialog":
+            from services.connectors.telegram.runtime.tools import direct_add_dialog_operation_id
+            expected_operation_id = direct_add_dialog_operation_id(
+                parent_operation, expected_ordinal, candidate["arguments"],
+            )
         effect_digest = hashlib.sha256(
             f"{parent_operation}\0{expected_ordinal}".encode("utf-8")
         ).hexdigest()
-        if (candidate["operation_id"] != "telegram-tool-" + child_digest
+        if (candidate["operation_id"] != expected_operation_id
                 or candidate["effect_id"] != "telegram-effect-" + effect_digest):
             raise ValueError("fixed application step identity is not deterministic")
         if candidate["name"] not in OPERATIONS:
@@ -1238,7 +1246,7 @@ class _TelegramCommandMixin:
             snapshot, client=self.client, context_id=context_id,
             operation_id=operation_id, actor_id=actor_id,
             input_ref=command_ref.path, operation=operation, command=command,
-            conversation_id=contextual["source_conversation_id"],
+            conversation_id=contextual["source_conversation_id"], transaction=transaction,
         )
         decision = RoutingDecision.from_dict(contextual.get("decision"))
         decision.validate_command_spans(accepted_text)
