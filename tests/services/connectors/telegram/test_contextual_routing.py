@@ -99,7 +99,7 @@ def _assert_completed(result):
     assert result == QueueOperationState.COMPLETED
 
 
-def _queue_model(sdk_fakes, route):
+def _queue_model(sdk_fakes, route, *, queue_answer=True):
     """Queue valid native route and answer responses at the real Gemini boundary."""
     from google.genai import types
 
@@ -108,11 +108,12 @@ def _queue_model(sdk_fakes, route):
             function_call=types.FunctionCall(name="route_command", args=route),
         )]))],
     ))
-    sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
-        candidates=[types.Candidate(content=types.Content(parts=[types.Part(
-            text="I have routed the request.",
-        )]))],
-    ))
+    if queue_answer:
+        sdk_fakes.gemini.queue("generate_content", response=types.GenerateContentResponse(
+            candidates=[types.Candidate(content=types.Content(parts=[types.Part(
+                text="I have routed the request.",
+            )]))],
+        ))
 
 
 def _seed_catalog(client, *, root_id=_ROUTE_ROOT_ID, doc_ids=("doc-a", "doc-b", "doc-c")):
@@ -377,14 +378,14 @@ def _start_runtime_case(
     return scenario, repository, accepted, operation, lease, runtime, command_text
 
 
-def _invoke(case, sdk_fakes, route):
+def _invoke(case, sdk_fakes, route, *, queue_answer=True):
     from core.integrations.gemini.agent import GeminiAgent
     from services.connectors.telegram.commands import parse_command
     from tests.fixtures.sdk_fakes import FakeGeminiClient
 
     _scenario, repository, accepted, operation, lease, runtime, command_text = case
     try:
-        _queue_model(sdk_fakes, route)
+        _queue_model(sdk_fakes, route, queue_answer=queue_answer)
         runtime.model = GeminiAgent(client=FakeGeminiClient(api_key="synthetic-context-key"))
         result = asyncio.run(runtime(
             accepted.context_id, operation, lease,
@@ -756,6 +757,283 @@ def test_fresh_clarification_preserves_known_document_without_executable_target(
     assert "target_doc_id" not in route_control
     assert not provider.drive_mutations
     assert not provider.qdrant_mutations
+
+
+@pytest.mark.parametrize("known_slot", ["document", "destination"])
+def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
+    firestore_fake, sdk_fakes, monkeypatch, known_slot,
+):
+    from core.integrations.firestore.operation_queue import claim_head
+    from services.connectors.telegram.commands import parse_command
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    from services.connectors.telegram.runtime.routing_context import RoutingContextSnapshot
+
+    client = firestore_fake.client_class()
+    first_text = ("Move document doc-b" if known_slot == "document"
+                  else "Move to Archive")
+    case = _start_runtime_case(
+        client, command_text=first_text, exchanges=(), active_document=True,
+    )
+    scenario, repository, accepted, operation, lease, runtime, first_text = case
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
+        doc_ids=("doc-a", "doc-b", "doc-c"),
+    )
+    if known_slot == "document":
+        start = first_text.index("doc-b")
+        span = {"kind": "id", "start": start, "end": start + len("doc-b"),
+                "raw_text": "doc-b", "parsed_value": "doc-b"}
+        first_proposal = {
+            "disposition": "clarify", "action": "move_transcript",
+            "substantive_text": first_text,
+            "document_selector": {
+                "kind": "explicit_reference", "raw_value": "doc-b", "span": span,
+            },
+            "folder_selector": None, "folder_name": None,
+            "explicit_references": [span], "missing_slots": ["destination"],
+            "evidence_refs": [], "clarification_id": None,
+            "clarification_generation": None, "target_operation_id": None,
+            "tool_choice": None, "certainty": "uncertain",
+        }
+    else:
+        first_proposal = {
+            "disposition": "clarify", "action": "move_transcript",
+            "substantive_text": first_text, "document_selector": None,
+            "folder_selector": {"kind": "explicit_path", "value": "Archive",
+                                "parent": None},
+            "folder_name": None, "explicit_references": [],
+            "missing_slots": ["document"], "evidence_refs": [],
+            "clarification_id": None, "clarification_generation": None,
+            "target_operation_id": None, "tool_choice": None,
+            "certainty": "uncertain",
+        }
+    first, _, _ = _invoke(case, sdk_fakes, first_proposal, queue_answer=False)
+    from services.connectors.telegram.queue import TelegramQueueCompletion
+    assert isinstance(first, TelegramQueueCompletion)
+    assert first.result_type == "clarification"
+    assert repository.complete_with_clarification(
+        accepted.context_id, accepted.operation_id,
+        owner=lease.owner, fence=lease.fence,
+        completion=first.clarification, now=BASE_TIME + timedelta(minutes=3),
+    )
+    pending = repository.get_pending_clarification(accepted.context_id, actor_id=17)
+    assert pending is not None
+    expected_known = ({"doc_id": "doc-b"} if known_slot == "document"
+                      else {"folder_path": ("Archive",)})
+    expected_prompt_known = (expected_known if known_slot == "document"
+                             else {"folder_path": ["Archive"]})
+    assert pending.resolved_parameters == expected_known
+    assert not provider.drive_mutations
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode()
+    ).hexdigest()
+    publisher = TelegramNotificationPublisher(
+        repository, _telegram_client(), clock=lambda: BASE_TIME + timedelta(minutes=4),
+    )
+    assert asyncio.run(publisher.publish(notification_id)) == "delivered"
+
+    now = BASE_TIME + timedelta(minutes=6)
+    answer_text = "Archive" if known_slot == "document" else "doc-b"
+    accepted_answer = repository.accept_command(
+        99002, chat_id=42017, thread_id=73, user_id=17,
+        command=parse_command(answer_text), message_id=702,
+        transport_timestamp=int(now.timestamp()), now=now,
+    )
+    answer_operation = (client.collection("telegram_sessions").document(accepted_answer.context_id)
+                        .collection("operations").document(accepted_answer.operation_id)
+                        .get().to_dict())
+    command_id = answer_operation["input_ref"].rsplit("/", 1)[-1]
+    answer_ref = (client.collection("telegram_sessions").document(accepted_answer.context_id)
+                  .collection("commands").document(command_id))
+    answer_row = answer_ref.get().to_dict()
+    assert answer_row["observed_clarification_id"] == pending.clarification_id
+    assert answer_row["observed_clarification_generation"] == pending.generation
+    assert answer_row["observed_question_delivery_ref"]
+    context_ref = client.collection("telegram_sessions").document(accepted_answer.context_id)
+    answer_lease = claim_head(client, context_ref,
+                              owner="context-routing-answer-worker", now=now)
+    answer_runtime = type(runtime)(
+        repository=repository,
+        save_handler=runtime.save_handler,
+        client=_telegram_client(), clock=lambda: now,
+        root_folder_id=_ROUTE_ROOT_ID,
+    )
+    answer_case = (scenario, repository, accepted_answer, answer_operation,
+                   answer_lease, answer_runtime, answer_text)
+
+    original_ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=accepted.operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: now,
+    )
+    original_context = original_ledger.load_routing_checkpoint(
+        "context", actor_id=17, conversation_id=pending.origin_conversation_id,
+    )
+    original_snapshot = RoutingContextSnapshot.from_dict(original_context["value"])
+    if known_slot == "document":
+        evidence_refs = list(dict.fromkeys(
+            item.source.ref for item in original_snapshot.document_evidence["doc-b"]
+        ))
+        document_selector = {"kind": "evidence", "doc_id": "doc-b",
+                             "evidence_refs": evidence_refs}
+        explicit_references = []
+        substantive_text = "Move document doc-b to Archive"
+        cited_evidence = evidence_refs
+    else:
+        span = {"kind": "id", "start": 0, "end": len("doc-b"),
+                "raw_text": "doc-b", "parsed_value": "doc-b"}
+        document_selector = {"kind": "explicit_reference", "raw_value": "doc-b",
+                             "span": span}
+        explicit_references = [span]
+        substantive_text = answer_text
+        cited_evidence = []
+    answer_proposal = {
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": substantive_text,
+        "document_selector": document_selector,
+        "folder_selector": {"kind": "explicit_path", "value": "Archive",
+                             "parent": None},
+        "folder_name": None, "explicit_references": explicit_references, "missing_slots": [],
+        "evidence_refs": cited_evidence, "clarification_id": pending.clarification_id,
+        "clarification_generation": pending.generation, "target_operation_id": None,
+        "tool_choice": _move_choice("doc-b"), "certainty": "certain",
+    }
+    with capture_sdk_calls() as calls:
+        result, route_control, _ = _invoke(
+            answer_case, sdk_fakes, answer_proposal,
+        )
+    _assert_completed(result)
+    assert route_control["target_doc_id"] == "doc-b"
+    assert provider.files["doc-b"]["parents"] == ["archive-folder"]
+    assert provider.files["doc-a"]["parents"] == [_ROUTE_ROOT_ID]
+    assert not [row for row in provider.drive_mutations if row.get("fileId") != "doc-b"]
+    mutation_count = len(provider.drive_mutations)
+    replay_runtime = type(answer_runtime)(
+        repository=repository, save_handler=runtime.save_handler,
+        client=_telegram_client(), clock=lambda: now,
+        root_folder_id=_ROUTE_ROOT_ID,
+    )
+    try:
+        replay_result = asyncio.run(replay_runtime(
+            accepted_answer.context_id, answer_operation, answer_lease,
+            command=parse_command(answer_text),
+        ))
+    finally:
+        asyncio.run(replay_runtime.client._test_http_client.aclose())
+    _assert_completed(replay_result)
+    assert len(provider.drive_mutations) == mutation_count
+    request = next(row for row in calls if row["boundary"] == "gemini"
+                   and row["operation"] == "generate_content")
+    prompt = json.loads(request["arguments"]["contents"][0]["parts"][0]["text"])
+    linked = prompt["context"]["linked_clarification"]
+    assert linked["original_command"] == first_text
+    assert linked["resolved_parameters"] == expected_prompt_known
+    assert linked["missing_slots"] == (["destination"] if known_slot == "document"
+                                       else ["document"])
+    assert prompt["context"]["active_conversation_id"] == pending.origin_conversation_id
+    assert prompt["context"]["clarification_id"] == pending.clarification_id
+
+
+def test_linked_route_guard_requires_echo_and_preserves_every_known_slot():
+    from types import SimpleNamespace
+    from services.connectors.telegram.runtime.runtime import _CommandExecution
+
+    linked = {
+        "clarification_id": "clarification-one", "generation": 1,
+        "action": "move_transcript",
+        "resolved_parameters": {
+            "doc_id": "doc-b", "folder_path": ["Archive"],
+        },
+    }
+    current_card = {"doc_id": "doc-a"}
+    frozen_card = {"doc_id": "doc-b"}
+    standalone = {
+        "action": "move_transcript", "clarification_id": None,
+        "clarification_generation": None,
+    }
+    probe = SimpleNamespace(
+        linked_clarification=linked,
+        linked_document_card=frozen_card,
+        current_cards=(current_card,),
+        cards=(current_card, frozen_card),
+        decision={
+            "target_ref": "doc-a",
+            "semantic_decision": {
+                **standalone,
+                "folder_selector": {"kind": "explicit_path", "value": "Archive"},
+            },
+        },
+    )
+    assert _CommandExecution._linked_clarification_route_is_bound(probe)
+    assert probe.bound_linked_clarification is None
+    assert _CommandExecution._candidates_for_route(probe, standalone) == (current_card,)
+
+    echoed = {
+        **standalone, "clarification_id": "clarification-one",
+        "clarification_generation": 1,
+    }
+    probe.decision = {
+        "target_ref": "doc-a",
+        "semantic_decision": {
+            **echoed,
+            "folder_selector": {"kind": "explicit_path", "value": "Archive"},
+        },
+    }
+    assert not _CommandExecution._linked_clarification_route_is_bound(probe)
+    probe.decision = {
+        "target_ref": "doc-b",
+        "semantic_decision": {
+            **echoed,
+            "folder_selector": {"kind": "explicit_path", "value": "Trash"},
+        },
+    }
+    assert not _CommandExecution._linked_clarification_route_is_bound(probe)
+
+    for action, key, selector in (
+        ("move_transcript", "destination_id",
+         {"kind": "explicit_id", "value": "archive-id"}),
+        ("create_folder", "parent_id",
+         {"kind": "explicit_id", "value": "parent-id"}),
+    ):
+        probe.linked_clarification = {
+            **linked, "action": action,
+            "resolved_parameters": {key: selector["value"]},
+        }
+        probe.decision = {
+            "target_ref": "doc-b" if action == "move_transcript" else None,
+            "semantic_decision": {**echoed, "action": action,
+                                  "folder_selector": selector},
+        }
+        assert _CommandExecution._linked_clarification_route_is_bound(probe)
+        probe.decision["semantic_decision"]["folder_selector"] = {
+            "kind": "explicit_id", "value": "different-id",
+        }
+        assert not _CommandExecution._linked_clarification_route_is_bound(probe)
+
+    from services.connectors.telegram.sessions import _valid_response
+
+    root_question = {
+        **linked, "action": "create_folder",
+        "resolved_parameters": {"parent_path": [], "name": "Archive"},
+    }
+    projected, status = _valid_response({
+        "disposition": "execute", "action": "create_folder",
+        "substantive_text": "Create folder Archive",
+        "document_selector": None, "folder_selector": None,
+        "folder_name": "Archive", "explicit_references": [],
+        "missing_slots": [], "evidence_refs": [],
+        "clarification_id": "clarification-one",
+        "clarification_generation": 1, "target_operation_id": None,
+        "tool_choice": {"name": "create_folder",
+                        "arguments": {"name": "Archive"}},
+        "certainty": "certain",
+    }, accepted_command="Create folder Archive")
+    assert status == "ok"
+    probe.linked_clarification = root_question
+    probe.decision = projected
+    assert _CommandExecution._linked_clarification_route_is_bound(probe)
+    probe.decision["semantic_decision"]["folder_name"] = "Other"
+    assert not _CommandExecution._linked_clarification_route_is_bound(probe)
 
 
 def test_us1_6_local_dialog_two_is_independent_of_prior_list_position_two(

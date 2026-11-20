@@ -997,6 +997,7 @@ class _CommandExecution(SearchAgentMixin):
             )
         if (getattr(self, "scoped_fresh_route", False)
                 and self.decision_status == "uncertain"
+                and not isinstance(getattr(self, "bound_linked_clarification", None), Mapping)
                 and isinstance(self.semantic_decision, Mapping)
                 and self.semantic_decision.get("disposition") == "clarify"
                 and self.semantic_decision.get("missing_slots")):
@@ -1352,6 +1353,8 @@ class _CommandExecution(SearchAgentMixin):
                 target_doc_id=proposed_doc_id):
             return None
         evidence = snapshot.document_evidence
+        if isinstance(getattr(self, "bound_linked_clarification", None), Mapping):
+            evidence = getattr(self, "linked_clarification_source_evidence", evidence)
         if selector.kind is DocumentSelectorKind.ACTIVE_DOCUMENT:
             doc_id = snapshot.selected_doc_id
             rows = evidence.get(doc_id, ()) if isinstance(doc_id, str) else ()
@@ -1868,7 +1871,7 @@ class _CommandExecution(SearchAgentMixin):
                     operation_candidates=self.save_candidates,
                     active_doc_id=_active_doc_id(self.cards, self.context),
                     last_doc_id=getattr(self.context, "last_doc_id", None),
-                    candidates=self.cards,
+                    candidates=self._candidates_for_route(self.raw_decision),
                 )
                 needs_source_aware_refresh = (
                     initial_status == "ok" and isinstance(initial_decision, Mapping)
@@ -1893,17 +1896,101 @@ class _CommandExecution(SearchAgentMixin):
                 operation_candidates=self.save_candidates,
                 active_doc_id=_active_doc_id(self.cards, self.context),
                 last_doc_id=getattr(self.context, "last_doc_id", None),
-                candidates=self.cards,
+                candidates=self._candidates_for_route(self.raw_decision),
             )
         self.semantic_decision = (
             self.decision.get("semantic_decision")
             if isinstance(self.decision, Mapping) else None
         )
+        if not self._linked_clarification_route_is_bound():
+            self.raw_decision = {}
+            self.decision = None
+            self.decision_status = "invalid_route"
+            self.semantic_decision = None
+            return
         if (getattr(self, "scoped_fresh_route", False)
                 and isinstance(self.decision, Mapping)
                 and self.decision.get("kind") == "search"
                 and isinstance(self.decision.get("substantive_text"), str)):
             self.replay_request = self.decision["substantive_text"]
+
+    def _linked_clarification_route_is_bound(self) -> bool:
+        """Require a linked write to echo its trusted question and retain known targets."""
+        linked = getattr(self, "linked_clarification", None)
+        decision = getattr(self, "decision", None)
+        if not isinstance(linked, Mapping) or not isinstance(decision, Mapping):
+            self.bound_linked_clarification = None
+            return True
+        semantic = decision.get("semantic_decision")
+        linked_id = semantic.get("clarification_id") if isinstance(semantic, Mapping) else None
+        linked_generation = (semantic.get("clarification_generation")
+                             if isinstance(semantic, Mapping) else None)
+        if linked_id is None and linked_generation is None:
+            self.bound_linked_clarification = None
+            return True
+        if (linked_id != linked.get("clarification_id")
+                or linked_generation != linked.get("generation")
+                or not isinstance(semantic, Mapping)
+                or semantic.get("action") != linked.get("action")):
+            self.bound_linked_clarification = None
+            return False
+        self.bound_linked_clarification = linked
+        resolved = linked.get("resolved_parameters")
+        if not isinstance(resolved, Mapping):
+            return False
+        if "doc_id" in resolved:
+            known_doc = resolved["doc_id"]
+            if not isinstance(known_doc, str) or decision.get("target_ref") != known_doc:
+                return False
+        selector = semantic.get("folder_selector")
+        for key in ("folder_path", "parent_path"):
+            if key not in resolved:
+                continue
+            known_path = resolved[key]
+            if not isinstance(known_path, (list, tuple)) or not all(
+                isinstance(part, str) for part in known_path
+            ):
+                return False
+            if not known_path:
+                if selector is not None and not (
+                    isinstance(selector, Mapping)
+                    and selector.get("kind") == "root_default"
+                    and selector.get("value") is None
+                    and selector.get("parent") is None
+                ):
+                    return False
+            elif (not isinstance(selector, Mapping)
+                  or selector.get("kind") != "explicit_path"
+                  or selector.get("value") != "/".join(known_path)):
+                return False
+        for key in ("destination_id", "parent_id"):
+            if key not in resolved:
+                continue
+            known_id = resolved[key]
+            if (not isinstance(known_id, str)
+                    or not isinstance(selector, Mapping)
+                    or selector.get("kind") != "explicit_id"
+                    or selector.get("value") != known_id):
+                return False
+        if ("name" in resolved
+                and semantic.get("folder_name") != resolved["name"]):
+            return False
+        return True
+
+    def _candidates_for_route(self, raw_response: Any) -> tuple[Any, ...]:
+        """Only a model-bound answer may validate against frozen question evidence."""
+        current = tuple(getattr(self, "current_cards", self.cards))
+        linked = getattr(self, "linked_clarification", None)
+        semantic = raw_response.get("semantic_decision") if isinstance(raw_response, Mapping) else None
+        if not isinstance(semantic, Mapping) and isinstance(raw_response, Mapping):
+            semantic = raw_response
+        if (not isinstance(linked, Mapping) or not isinstance(semantic, Mapping)
+                or semantic.get("clarification_id") != linked.get("clarification_id")
+                or semantic.get("clarification_generation") != linked.get("generation")
+                or semantic.get("action") != linked.get("action")):
+            return current
+        candidate = getattr(self, "linked_document_card", None)
+        return current + (candidate,) if isinstance(candidate, Mapping) else current
 
     @staticmethod
     def _command_spans(text: str) -> tuple[Any, ...]:
@@ -1994,6 +2081,12 @@ class _CommandExecution(SearchAgentMixin):
             explicit_references=self._command_spans(self.command.text),
             presentation_refs=presentation_refs,
             document_evidence=presentation_evidence,
+            clarification_id=(command_row.get("observed_clarification_id")
+                              if isinstance(command_row.get("observed_question_delivery_ref"), Mapping)
+                              else None),
+            clarification_generation=(command_row.get("observed_clarification_generation")
+                                      if isinstance(command_row.get("observed_question_delivery_ref"), Mapping)
+                                      else None),
         )
         snapshot = self.contextual_source
         history_projection = snapshot.full_history_ref.to_dict()["payload"]
@@ -2079,7 +2172,133 @@ class _CommandExecution(SearchAgentMixin):
              **(item.to_dict()["payload"] if isinstance(item.payload, Mapping) else {})}
             for item in snapshot.presentation_refs
         ]
+        self.current_cards = self.cards
+        self.linked_document_card = None
+        self.linked_clarification_evidence = None
+        self.linked_clarification_source_evidence = None
+        self.linked_clarification = await self._load_linked_clarification(
+            command_row, actor_id=actor_id, snapshot=snapshot,
+        )
+        if isinstance(self.linked_document_card, Mapping):
+            self.cards = self.current_cards + (self.linked_document_card,)
+        if isinstance(self.linked_clarification_evidence, Mapping):
+            self.contextual_evidence = {
+                **self.contextual_evidence, **self.linked_clarification_evidence,
+            }
         return True
+
+    async def _load_linked_clarification(
+        self, command_row: Mapping[str, Any], *, actor_id: int, snapshot: Any,
+    ) -> dict[str, Any] | None:
+        """Read an exact delivered clarification as context for this new command."""
+        from services.connectors.telegram.models import ClarificationState
+        from services.connectors.telegram.runtime.routing_context import RoutingContextSnapshot
+
+        clarification_id = command_row.get("observed_clarification_id")
+        generation = command_row.get("observed_clarification_generation")
+        delivery_ref = command_row.get("observed_question_delivery_ref")
+        if (not isinstance(clarification_id, str) or type(generation) is not int
+                or not isinstance(delivery_ref, Mapping)
+                or delivery_ref.get("context_id") != self.context_id
+                or delivery_ref.get("actor_id") != actor_id
+                or delivery_ref.get("clarification_id") != clarification_id
+                or delivery_ref.get("generation") != generation
+                or delivery_ref.get("question_ref") != (
+                    f"telegram_sessions/{self.context_id}/clarifications/"
+                    f"{clarification_id}/questions/{generation}"
+                )):
+            return None
+        pending = await _offload(
+            self.runtime.repository.get_clarification,
+            self.context_id, clarification_id, actor_id=actor_id,
+        )
+        if (pending is None or pending.state is not ClarificationState.WAITING
+                or pending.generation != generation
+                or pending.context_id != self.context_id
+                or pending.origin_conversation_id != snapshot.selected_conversation_id):
+            return None
+        from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+        original_ledger = FirestoreAgentLedger(
+            self.runtime.repository.client, context_id=self.context_id,
+            operation_id=pending.initiating_operation_id,
+            owner=self.owner, fence=self.fence, clock=self.runtime.clock,
+        )
+        intent = await _offload(
+            original_ledger.load_routing_checkpoint, "intent", actor_id=actor_id,
+            conversation_id=pending.origin_conversation_id,
+        )
+        request = intent.get("value") if isinstance(intent, Mapping) else None
+        raw_pending = request.get("clarification") if isinstance(request, Mapping) else None
+        reference = intent.get("reference") if isinstance(intent, Mapping) else None
+        if (not isinstance(raw_pending, Mapping) or not isinstance(reference, Mapping)
+                or raw_pending.get("clarification_id") != pending.clarification_id
+                or raw_pending.get("generation") != pending.generation
+                or raw_pending.get("original_command_ref") != pending.original_command_ref
+                or raw_pending.get("original_command_digest") != pending.original_command_digest
+                or raw_pending.get("action") != pending.action
+                or json.dumps(raw_pending.get("resolved_parameters"),
+                              ensure_ascii=False, sort_keys=True)
+                != json.dumps(dict(pending.resolved_parameters),
+                              ensure_ascii=False, sort_keys=True)
+                or raw_pending.get("missing_slots") != list(pending.missing_slots)):
+            return None
+        original_context = await _offload(
+            original_ledger.load_routing_checkpoint, "context", actor_id=actor_id,
+            conversation_id=pending.origin_conversation_id,
+        )
+        original_value = (original_context.get("value")
+                          if isinstance(original_context, Mapping) else None)
+        original_reference = (original_context.get("reference")
+                              if isinstance(original_context, Mapping) else None)
+        try:
+            original_snapshot = RoutingContextSnapshot.from_dict(original_value)
+        except (TypeError, ValueError, KeyError):
+            return None
+        context_reference = request.get("context_reference")
+        if (not isinstance(context_reference, Mapping)
+                or context_reference.get("ref") != pending.original_command_ref
+                or context_reference.get("digest") != pending.original_command_digest
+                or not isinstance(original_reference, Mapping)
+                or original_reference.get("ref") != pending.original_command_ref
+                or original_reference.get("digest") != pending.original_command_digest
+                or original_snapshot.context_id != self.context_id
+                or original_snapshot.operation_id != pending.initiating_operation_id
+                or original_snapshot.actor_id != actor_id
+                or original_snapshot.selected_conversation_id != pending.origin_conversation_id):
+            return None
+        evidence = original_snapshot.document_evidence
+        self.linked_clarification_source_evidence = evidence
+        self.linked_clarification_evidence = {
+            doc_id: [{"source_kind": item.source_kind.value,
+                      "source_ref": item.source.ref,
+                      "fragment_refs": [ref.ref for ref in item.fragment_refs]}
+                     for item in entries]
+            for doc_id, entries in evidence.items()
+        }
+        known_doc = raw_pending.get("resolved_parameters", {}).get("doc_id")
+        if isinstance(known_doc, str) and known_doc in evidence:
+            binding = await self._resolve_target_document_binding(known_doc)
+            self.linked_document_card = {
+                "doc_id": known_doc,
+                "conversation_id": binding["conversation_id"],
+                "dialog_number": binding["dialog_number"],
+                "evidence_refs": list(dict.fromkeys(
+                    item.source.ref for item in evidence[known_doc]
+                )),
+                "title": next((item.metadata.get("title") for item in evidence[known_doc]
+                               if isinstance(item.metadata, Mapping)
+                               and isinstance(item.metadata.get("title"), str)), known_doc),
+            }
+        return {
+            "clarification_id": raw_pending["clarification_id"],
+            "generation": raw_pending["generation"],
+            "original_command": original_snapshot.accepted_command,
+            "action": raw_pending["action"],
+            "resolved_parameters": dict(raw_pending["resolved_parameters"]),
+            "missing_slots": list(raw_pending["missing_slots"]),
+            "question": (request.get("prompt", {}).get("body")
+                         if isinstance(request.get("prompt"), Mapping) else None),
+        }
 
     async def _resolve_target_document_binding(self, doc_id: str) -> dict[str, Any]:
         """Resolve one evidence document to its canonical local target binding."""
@@ -2517,6 +2736,14 @@ class _CommandExecution(SearchAgentMixin):
                 and self.route_conversation.kind.value == "search" else None
             ),
         }
+        linked = getattr(self, "linked_clarification", None)
+        if isinstance(linked, Mapping):
+            context["linked_clarification"] = dict(linked)
+        source = getattr(self, "contextual_source", None)
+        if (source is not None and isinstance(source.clarification_id, str)
+                and type(source.clarification_generation) is int):
+            context["clarification_id"] = source.clarification_id
+            context["clarification_generation"] = source.clarification_generation
         return context, association
 
     async def _classify_route(self, context_metadata: Mapping[str, Any]) -> dict[str, Any]:
