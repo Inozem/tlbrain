@@ -1027,7 +1027,8 @@ class _CommandExecution(SearchAgentMixin):
             if not isinstance(self.prepared_route_result, Mapping):
                 return await self._finish_preparation_failure()
             if self.prepared_route_result.get("status") != "ok":
-                if self._clarify_unresolved_document_target(self.prepared_route_result):
+                if (self._clarify_unresolved_folder_target(self.prepared_route_result)
+                        or self._clarify_unresolved_document_target(self.prepared_route_result)):
                     try:
                         return await self._prepare_fresh_clarification()
                     except Exception as error:
@@ -1112,6 +1113,45 @@ class _CommandExecution(SearchAgentMixin):
         self.semantic_decision = decision.to_dict()
         self.decision = {
             "kind": "substantive", "target_ref": None,
+            "target_operation_id": None, "dialog_number": None,
+            "result_refs": [], "substantive_text": decision.substantive_text,
+            "tool_choice": None, "certainty": Certainty.UNCERTAIN.value,
+            "semantic_decision": decision.to_dict(),
+        }
+        self.decision_status = "uncertain"
+        return True
+
+    def _clarify_unresolved_folder_target(self, route: Mapping[str, Any]) -> bool:
+        """Ask for a replacement folder only after typed resolution proved it absent/ambiguous."""
+        if route.get("folder_resolution_failure") is not True:
+            return False
+        if not isinstance(self.semantic_decision, Mapping):
+            return False
+        from dataclasses import replace
+        from services.connectors.telegram.runtime.routing_context import (
+            Action, Certainty, Disposition, MissingSlot, RoutingDecision,
+        )
+        try:
+            decision = RoutingDecision.from_dict(self.semantic_decision)
+        except (TypeError, ValueError, KeyError):
+            return False
+        if decision.action is Action.MOVE_TRANSCRIPT:
+            if (decision.document_selector is None
+                    and not isinstance(route.get("target_doc_id"), str)):
+                return False
+            missing_slot = MissingSlot.DESTINATION
+        elif decision.action is Action.CREATE_FOLDER:
+            missing_slot = MissingSlot.PARENT
+        else:
+            return False
+        decision = replace(
+            decision, disposition=Disposition.CLARIFY, certainty=Certainty.UNCERTAIN,
+            folder_selector=None,
+            missing_slots=tuple(dict.fromkeys((*decision.missing_slots, missing_slot))),
+        )
+        self.semantic_decision = decision.to_dict()
+        self.decision = {
+            "kind": "substantive", "target_ref": route.get("target_doc_id"),
             "target_operation_id": None, "dialog_number": None,
             "result_refs": [], "substantive_text": decision.substantive_text,
             "tool_choice": None, "certainty": Certainty.UNCERTAIN.value,
@@ -1230,9 +1270,51 @@ class _CommandExecution(SearchAgentMixin):
             parameters["doc_id"] = known_doc_id
         folder = decision.folder_selector
         if folder is not None:
-            if folder.kind.value == "explicit_path":
+            if folder.kind.value in {"explicit_path", "name"}:
                 key = "folder_path" if decision.action.value == "move_transcript" else "parent_path"
-                parameters[key] = [item for item in folder.value.split("/") if item]
+                binding = getattr(self, "resolved_folder_binding", None)
+                if not (isinstance(binding, Mapping)
+                        and binding.get("selector") == folder.to_dict()):
+                    from core.documents.operations import (
+                        AmbiguousFolderPathError, FolderPathNotFound,
+                    )
+                    from core.integrations.google_drive.folder_service import (
+                        AmbiguousFolderPath, FolderNotFound,
+                    )
+                    try:
+                        target_id, canonical_path = await _offload(
+                            self._resolve_folder_selector_binding, folder,
+                        )
+                        binding = {"selector": folder.to_dict(), "target_id": target_id,
+                                   "folder_path": canonical_path}
+                    except (FolderPathNotFound, AmbiguousFolderPathError,
+                            FolderNotFound, AmbiguousFolderPath):
+                        binding = None
+                        from dataclasses import replace
+                        from services.connectors.telegram.runtime.routing_context import (
+                            Certainty, Disposition, MissingSlot,
+                        )
+                        missing_slot = (MissingSlot.DESTINATION
+                                        if decision.action.value == "move_transcript"
+                                        else MissingSlot.PARENT)
+                        decision = replace(
+                            decision, disposition=Disposition.CLARIFY,
+                            certainty=Certainty.UNCERTAIN, folder_selector=None,
+                            missing_slots=tuple(dict.fromkeys(
+                                (*decision.missing_slots, missing_slot),
+                            )),
+                        )
+                        self.semantic_decision = decision.to_dict()
+                        folder = None
+                if isinstance(binding, Mapping):
+                    parameters[key] = list(binding["folder_path"])
+                if (folder is not None and folder.parent is not None
+                        and folder.parent.kind.value == "explicit_id"):
+                    if decision.action.value == "create_folder":
+                        if isinstance(binding, Mapping):
+                            parameters["parent_id"] = binding["target_id"]
+                    else:
+                        parameters["parent_id"] = folder.parent.value
             elif folder.kind.value == "explicit_id":
                 parameters["destination_id" if decision.action.value == "move_transcript"
                            else "parent_id"] = folder.value
@@ -1862,6 +1944,7 @@ class _CommandExecution(SearchAgentMixin):
                 initial_context["presentation_refs"] = self.contextual_presentation_refs
             try:
                 self.raw_decision = await self._classify_route(initial_context)
+                await self._prime_explicit_id_folder_binding(self.raw_decision)
                 refreshed_context, refreshed_binding = await self._routing_context_metadata()
                 was_unbound = not self._ingress_source_is_bound(initial_binding)
                 is_now_bound = self._ingress_source_is_bound(refreshed_binding)
@@ -1872,6 +1955,7 @@ class _CommandExecution(SearchAgentMixin):
                     active_doc_id=_active_doc_id(self.cards, self.context),
                     last_doc_id=getattr(self.context, "last_doc_id", None),
                     candidates=self._candidates_for_route(self.raw_decision),
+                    canonical_folder_path=getattr(self, "canonical_folder_path", None),
                 )
                 needs_source_aware_refresh = (
                     initial_status == "ok" and isinstance(initial_decision, Mapping)
@@ -1879,6 +1963,7 @@ class _CommandExecution(SearchAgentMixin):
                 )
                 if was_unbound and is_now_bound and needs_source_aware_refresh:
                     self.raw_decision = await self._classify_route(refreshed_context)
+                    await self._prime_explicit_id_folder_binding(self.raw_decision)
             except Exception as error:
                 self.raw_decision = {}
                 _LOGGER.warning(
@@ -1897,6 +1982,7 @@ class _CommandExecution(SearchAgentMixin):
                 active_doc_id=_active_doc_id(self.cards, self.context),
                 last_doc_id=getattr(self.context, "last_doc_id", None),
                 candidates=self._candidates_for_route(self.raw_decision),
+                canonical_folder_path=getattr(self, "canonical_folder_path", None),
             )
         self.semantic_decision = (
             self.decision.get("semantic_decision")
@@ -1916,6 +2002,9 @@ class _CommandExecution(SearchAgentMixin):
 
     def _linked_clarification_route_is_bound(self) -> bool:
         """Require a linked write to echo its trusted question and retain known targets."""
+        from services.connectors.telegram.sessions import _folder_path
+        from services.connectors.telegram.runtime.routing_context import FolderSelector
+
         linked = getattr(self, "linked_clarification", None)
         decision = getattr(self, "decision", None)
         if not isinstance(linked, Mapping) or not isinstance(decision, Mapping):
@@ -1959,18 +2048,51 @@ class _CommandExecution(SearchAgentMixin):
                     and selector.get("parent") is None
                 ):
                     return False
-            elif (not isinstance(selector, Mapping)
-                  or selector.get("kind") != "explicit_path"
-                  or selector.get("value") != "/".join(known_path)):
-                return False
+            else:
+                has_id_anchor = False
+                current_selector = selector
+                while isinstance(current_selector, Mapping):
+                    if current_selector.get("kind") == "explicit_id":
+                        has_id_anchor = True
+                        break
+                    current_selector = current_selector.get("parent")
+                if has_id_anchor:
+                    binding = getattr(self, "resolved_folder_binding", None)
+                    if (not isinstance(binding, Mapping)
+                            or binding.get("selector") != selector):
+                        return False
+                    selected_path = binding.get("folder_path")
+                    if not isinstance(selected_path, (list, tuple)):
+                        return False
+                else:
+                    selected_path = _folder_path(
+                        FolderSelector.from_dict(selector)
+                        if isinstance(selector, Mapping) else None,
+                    )
+                if selected_path is None or tuple(selected_path) != tuple(known_path):
+                    return False
         for key in ("destination_id", "parent_id"):
             if key not in resolved:
                 continue
             known_id = resolved[key]
-            if (not isinstance(known_id, str)
-                    or not isinstance(selector, Mapping)
-                    or selector.get("kind") != "explicit_id"
-                    or selector.get("value") != known_id):
+            if not isinstance(known_id, str):
+                return False
+            if key == "parent_id" and semantic.get("action") == "move_transcript":
+                anchor = selector.get("parent") if isinstance(selector, Mapping) else None
+                if (not isinstance(anchor, Mapping)
+                        or anchor.get("kind") != "explicit_id"
+                        or anchor.get("value") != known_id):
+                    return False
+                continue
+            binding = getattr(self, "resolved_folder_binding", None)
+            binding_matches = (isinstance(binding, Mapping)
+                               and binding.get("selector") == selector)
+            if binding_matches:
+                if binding.get("target_id") != known_id:
+                    return False
+            elif (not isinstance(selector, Mapping)
+                  or selector.get("kind") != "explicit_id"
+                  or selector.get("value") != known_id):
                 return False
         if ("name" in resolved
                 and semantic.get("folder_name") != resolved["name"]):
@@ -4262,6 +4384,20 @@ class _CommandExecution(SearchAgentMixin):
                 "checkpoint_conversation_id",
             )
             return route
+        folder_error = getattr(self, "folder_resolution_error", None)
+        if (getattr(self, "scoped_fresh_route", False) and folder_error is not None
+                and isinstance(getattr(self, "semantic_decision", None), Mapping)):
+            from core.documents.operations import AmbiguousFolderPathError, FolderPathNotFound
+            from core.integrations.google_drive.folder_service import (
+                AmbiguousFolderPath, FolderNotFound,
+            )
+            if isinstance(folder_error, (FolderPathNotFound, AmbiguousFolderPathError,
+                                         FolderNotFound, AmbiguousFolderPath)):
+                target_doc_id = (self.decision.get("target_ref")
+                                 if isinstance(self.decision, Mapping) else None)
+                return {"status": "not_found", "kind": "substantive",
+                        "target_doc_id": target_doc_id,
+                        "folder_resolution_failure": True}
         from services.connectors.telegram.sessions import (
             _consume_validated_route, _safe_save_candidates,
         )
@@ -4296,8 +4432,25 @@ class _CommandExecution(SearchAgentMixin):
                 self.agent_conversation_id = checkpoint
             if (isinstance(result.get("tool_choice"), Mapping)
                     and result["tool_choice"].get("name") in {"move_transcript", "create_folder"}):
+                from core.documents.operations import (
+                    AmbiguousFolderPathError, FolderPathNotFound,
+                )
+                from core.integrations.google_drive.folder_service import (
+                    AmbiguousFolderPath, FolderNotFound,
+                )
                 try:
                     await self._publish_joint_write_route(result)
+                except (FolderPathNotFound, AmbiguousFolderPathError,
+                        FolderNotFound, AmbiguousFolderPath) as error:
+                    _LOGGER.info(
+                        "telegram contextual folder target needs clarification",
+                        extra={"operation_id": self.operation_id,
+                               "phase": "routing",
+                               "code": "folder_target_unresolved",
+                               "exception_class": type(error).__name__},
+                    )
+                    result = {**result, "status": "not_found",
+                              "folder_resolution_failure": True}
                 except Exception as error:
                     _LOGGER.warning(
                         "telegram joint route publication failed",
@@ -4350,7 +4503,6 @@ class _CommandExecution(SearchAgentMixin):
 
     async def _publish_joint_write_route(self, routed: Mapping[str, Any]) -> None:
         """Commit one validated route and its immutable application plan atomically."""
-        from core.documents.operations import resolve_move_target
         from core.operations.write import _new_resolved_write_targets, _resolved_targets_projection
         from services.connectors.telegram.repository._commands import _TelegramCommandMixin
         from services.connectors.telegram.runtime.routing_context import RoutingDecision
@@ -4365,30 +4517,33 @@ class _CommandExecution(SearchAgentMixin):
         decision = RoutingDecision.from_dict(self.semantic_decision)
         choice = routed["tool_choice"]
         name, arguments = choice["name"], dict(choice["arguments"])
+        cached_binding = getattr(self, "resolved_folder_binding", None)
+        if (isinstance(cached_binding, Mapping)
+                and cached_binding.get("selector") == decision.folder_selector.to_dict()):
+            folder_target_id = cached_binding.get("target_id")
+            canonical_folder_path = cached_binding.get("folder_path")
+        else:
+            folder_target_id, canonical_folder_path = await _offload(
+                self._resolve_folder_selector_binding, decision.folder_selector,
+            )
         target_doc_id = routed.get("target_doc_id")
         if name == "move_transcript":
             if not isinstance(target_doc_id, str) or arguments.get("doc_id") != target_doc_id:
                 raise ValueError("move route has no matching fixed document")
-            destination_id = resolve_move_target(arguments["folder_path"], self.store.client)
+            destination_id = folder_target_id
             if not isinstance(destination_id, str) or not destination_id:
                 raise ValueError("move destination is unresolved")
             resolved = {"doc_id": target_doc_id, "destination_id": destination_id,
                         "root_id": self.runtime.root_folder_id}
         else:
             from core.integrations.google_drive import folder_service
-            parent_path = arguments.get("parent_path") or []
             root_id = self.runtime.root_folder_id
             if not isinstance(root_id, str) or not root_id:
                 raise ValueError("configured root folder is unavailable")
-            if parent_path:
-                parent_id = folder_service.prepare_create_folder(
-                    arguments["name"], parent_path, db=self.store.client,
-                )
-            else:
-                parent_id = root_id
-                folder_service.validate_folder_name_available(
-                    arguments["name"], parent_id, db=self.store.client,
-                )
+            parent_id = folder_target_id
+            folder_service.validate_folder_name_available(
+                arguments["name"], parent_id, db=self.store.client,
+            )
             if not isinstance(parent_id, str) or not parent_id:
                 raise ValueError("folder parent is unresolved")
             target_doc_id = None
@@ -4469,6 +4624,152 @@ class _CommandExecution(SearchAgentMixin):
         self.pinned = summary
         self.application_route = application_route
         self.contextual_metadata = contextual
+
+    def _resolve_folder_selector_binding(self, selector: Any) -> tuple[str, list[str]]:
+        """Resolve a fixed target and its canonical root-relative metadata path."""
+        from core.documents.operations import AmbiguousFolderPathError, FolderPathNotFound
+        from core.integrations.firestore import folders as folder_repository
+        from core.integrations.google_drive.folders import (
+            expand_subtree, make_folder_path_resolver, resolve_folder_path,
+        )
+        from services.connectors.telegram.runtime.routing_context import FolderSelectorKind
+
+        root_id = self.runtime.root_folder_id
+        if not isinstance(root_id, str) or not root_id.strip():
+            raise ValueError("configured root folder is unavailable")
+        records = folder_repository.get_all_folders(self.store.client)
+        scoped_ids = {root_id, *expand_subtree(root_id, records)}
+        folder_path_for = make_folder_path_resolver(records, root_id)
+
+        def is_path_chain(current: Any) -> bool:
+            if current is None or current.kind is FolderSelectorKind.ROOT_DEFAULT:
+                return True
+            return (current.kind in {FolderSelectorKind.EXPLICIT_PATH, FolderSelectorKind.NAME}
+                    and is_path_chain(current.parent))
+
+        def canonical_path(folder_id: str) -> list[str]:
+            value = folder_path_for(folder_id)
+            return [part for part in value.split("/") if part]
+
+        def resolve(current: Any) -> tuple[str, list[str]]:
+            if current is None or current.kind is FolderSelectorKind.ROOT_DEFAULT:
+                return root_id, []
+            if current.kind is FolderSelectorKind.EXPLICIT_ID:
+                folder_id = current.value
+                if folder_id not in scoped_ids:
+                    raise FolderPathNotFound([folder_id])
+                if current.parent is not None:
+                    expected_parent, _ = resolve(current.parent)
+                    if (folder_id == root_id
+                            or records.get(folder_id, {}).get("parent_id") != expected_parent):
+                        raise FolderPathNotFound([folder_id])
+                return folder_id, canonical_path(folder_id)
+            if current.kind not in {
+                    FolderSelectorKind.EXPLICIT_PATH, FolderSelectorKind.NAME}:
+                raise ValueError("unsupported folder selector")
+            if is_path_chain(current):
+                from services.connectors.telegram.sessions import _folder_path
+
+                full_path = _folder_path(current)
+                if full_path is None:
+                    raise FolderPathNotFound([current.value])
+                if not full_path:
+                    return root_id, []
+                matches = resolve_folder_path(full_path, records, root_id)
+                matches = [folder_id for folder_id in matches if folder_id in scoped_ids]
+                if not matches:
+                    raise FolderPathNotFound(full_path)
+                if len(matches) > 1:
+                    raise AmbiguousFolderPathError(full_path, len(matches))
+                return matches[0], full_path
+            raw = current.value
+            if not isinstance(raw, str) or not raw:
+                raise FolderPathNotFound([])
+            absolute = current.kind is FolderSelectorKind.EXPLICIT_PATH and raw.startswith("/")
+            parts = (raw[1:] if absolute else raw).split("/")
+            if not parts or any(not part or part in {".", ".."} for part in parts):
+                raise FolderPathNotFound(parts)
+            parent_id, parent_path = (resolve(current.parent) if current.parent is not None
+                                      else (root_id, []))
+            if absolute:
+                if parent_path and parts[:len(parent_path)] != parent_path:
+                    raise FolderPathNotFound(parts)
+                full_path = parts
+            else:
+                full_path = [*parent_path, *parts]
+            matches = resolve_folder_path(full_path, records, root_id)
+            matches = [folder_id for folder_id in matches if folder_id in scoped_ids]
+            if not matches:
+                raise FolderPathNotFound(full_path)
+            if current.parent is not None:
+                allowed_ids = set(expand_subtree(parent_id, records))
+                matches = [folder_id for folder_id in matches if folder_id in allowed_ids]
+                if not matches:
+                    raise FolderPathNotFound(full_path)
+            if len(matches) > 1:
+                raise AmbiguousFolderPathError(full_path, len(matches))
+            return matches[0], full_path
+
+        return resolve(selector)
+
+    async def _prime_explicit_id_folder_binding(self, raw_response: Any) -> None:
+        """Cache a root-validated ID target/path before the pure route projection."""
+        if not isinstance(raw_response, Mapping) or getattr(self, "route_from_pin", False):
+            return
+        from services.connectors.telegram.sessions import _normalize_fresh_decision
+        try:
+            decision = _normalize_fresh_decision(
+                raw_response, self.command.text if self.command is not None else "",
+            )
+        except (TypeError, ValueError, KeyError):
+            return
+        from services.connectors.telegram.runtime.routing_context import Action
+        if decision.action not in {Action.MOVE_TRANSCRIPT, Action.CREATE_FOLDER}:
+            self.canonical_folder_path = None
+            self.resolved_folder_binding = None
+            self.folder_resolution_error = None
+            return
+        selector = decision.folder_selector
+        current = selector
+        has_id_anchor = False
+        while current is not None:
+            if current.kind.value == "explicit_id":
+                has_id_anchor = True
+                break
+            current = current.parent
+        if selector is None or not has_id_anchor:
+            self.canonical_folder_path = None
+            self.resolved_folder_binding = None
+            self.folder_resolution_error = None
+            return
+        try:
+            target_id, folder_path = await _offload(
+                self._resolve_folder_selector_binding, selector,
+            )
+        except Exception as error:
+            from core.documents.operations import AmbiguousFolderPathError, FolderPathNotFound
+            from core.integrations.google_drive.folder_service import (
+                AmbiguousFolderPath, FolderNotFound,
+            )
+            if not isinstance(error, (FolderPathNotFound, AmbiguousFolderPathError,
+                                      FolderNotFound, AmbiguousFolderPath)):
+                raise
+            self.canonical_folder_path = None
+            self.resolved_folder_binding = None
+            self.folder_resolution_error = error
+            if selector is not None and selector.kind.value in {"explicit_path", "name"}:
+                raw = selector.value
+                self.canonical_folder_path = [
+                    part for part in (raw[1:] if raw.startswith("/") else raw).split("/")
+                    if part
+                ]
+            return
+        self.canonical_folder_path = folder_path
+        self.resolved_folder_binding = {
+            "selector": selector.to_dict(), "target_id": target_id,
+            "folder_path": list(folder_path),
+        }
+        self.folder_resolution_error = None
 
     def _prepare_native_call(
         self, *, name: str, arguments: Any, call_ordinal: int,

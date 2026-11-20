@@ -632,6 +632,432 @@ def test_us1_4_multiple_verified_quote_sources_ask_concrete_question_before_effe
     _assert_prepared_question(result, "doc-b", "doc-c")
 
 
+@pytest.mark.parametrize("folder_case", ["missing", "ambiguous"])
+def test_missing_or_ambiguous_destination_becomes_specific_clarification(
+    firestore_fake, sdk_fakes, monkeypatch, folder_case,
+):
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+
+    client = firestore_fake.client_class()
+    command_text = "Move it to Archive"
+    case = _start_runtime_case(client, command_text=command_text, exchanges=())
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
+        doc_ids=("doc-a", "doc-b"),
+    )
+    folder_path = ["Archive"]
+    if folder_case == "missing":
+        folder_path = ["Missing Archive"]
+    else:
+        client.collection(FOLDERS_COLLECTION).document("archive-folder-duplicate").set({
+            "folder_id": "archive-folder-duplicate", "name": "Archive",
+            "parent_id": _ROUTE_ROOT_ID,
+        })
+
+    proposal = {
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": command_text,
+        "document_selector": {"kind": "active_document"},
+        "folder_selector": {"kind": "explicit_path", "value": "/".join(folder_path),
+                             "parent": None},
+        "folder_name": None, "explicit_references": [], "missing_slots": [],
+        "evidence_refs": [], "clarification_id": None,
+        "clarification_generation": None, "target_operation_id": None,
+        "tool_choice": {"name": "move_transcript",
+                        "arguments": {"doc_id": "doc-a", "folder_path": folder_path}},
+        "certainty": "certain",
+    }
+    result, _route_control, _runtime = _invoke(
+        case, sdk_fakes, proposal, queue_answer=False,
+    )
+
+    from services.connectors.telegram.queue import TelegramQueueCompletion
+
+    assert isinstance(result, TelegramQueueCompletion)
+    assert result.result_type == "clarification"
+    assert result.clarification.pending.resolved_parameters == {"doc_id": "doc-a"}
+    assert result.clarification.pending.missing_slots == ("destination",)
+    assert result.clarification.request["prompt"]["body"] == (
+        "Which destination folder should I use?"
+    )
+    assert not provider.drive_mutations
+    assert not provider.qdrant_mutations
+
+
+@pytest.mark.parametrize("selector_kind", ["explicit_id", "name"])
+def test_explicit_folder_selector_resolves_inside_root_and_keeps_fixed_id(
+    firestore_fake, sdk_fakes, monkeypatch, selector_kind,
+):
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+
+    client = firestore_fake.client_class()
+    command_text = ("Move it to folder id archive-folder" if selector_kind == "explicit_id"
+                    else "Move it to Archive")
+    case = _start_runtime_case(client, command_text=command_text, exchanges=())
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
+        doc_ids=("doc-a", "doc-b"),
+    )
+    if selector_kind == "explicit_id":
+        # The second same-named child proves the explicit ID keeps its exact target.
+        client.collection(FOLDERS_COLLECTION).document("archive-folder-duplicate").set({
+            "folder_id": "archive-folder-duplicate", "name": "Archive",
+            "parent_id": _ROUTE_ROOT_ID,
+        })
+    selector = ({"kind": "explicit_id", "value": "archive-folder", "parent": None}
+                if selector_kind == "explicit_id" else
+                {"kind": "name", "value": "Archive", "parent": None})
+    proposal = {
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": command_text,
+        "document_selector": {"kind": "active_document"},
+        "folder_selector": selector, "folder_name": None,
+        "explicit_references": [], "missing_slots": [], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "target_operation_id": None,
+        "tool_choice": {"name": "move_transcript",
+                        "arguments": {"doc_id": "doc-a", "folder_path": ["Archive"]}},
+        "certainty": "certain",
+    }
+    result, route_control, _runtime = _invoke(case, sdk_fakes, proposal)
+
+    _assert_completed(result)
+    assert route_control["target_doc_id"] == "doc-a"
+    assert provider.files["doc-a"]["parents"] == ["archive-folder"]
+    assert provider.files["doc-b"]["parents"] == [_ROUTE_ROOT_ID]
+    assert not [row for row in provider.drive_mutations if row.get("fileId") != "doc-a"]
+
+
+@pytest.mark.parametrize("selector_kind", ["explicit_id", "name"])
+def test_create_folder_parent_selector_resolves_without_changing_public_arguments(
+    firestore_fake, sdk_fakes, monkeypatch, selector_kind,
+):
+    client = firestore_fake.client_class()
+    command_text = ("Create folder Notes under folder id archive-folder"
+                    if selector_kind == "explicit_id" else
+                    "Create folder Notes under Archive")
+    case = _start_runtime_case(
+        client, command_text=command_text, exchanges=(), active_document=False,
+    )
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID, doc_ids=(),
+    )
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+    if selector_kind == "explicit_id":
+        client.collection(FOLDERS_COLLECTION).document("archive-folder-duplicate").set({
+            "folder_id": "archive-folder-duplicate", "name": "Archive",
+            "parent_id": _ROUTE_ROOT_ID,
+        })
+    sdk_fakes.drive.queue("files.generateIds", response={"ids": ["created-notes"]})
+    selector = ({"kind": "explicit_id", "value": "archive-folder", "parent": None}
+                if selector_kind == "explicit_id" else
+                {"kind": "name", "value": "Archive", "parent": None})
+    proposal = {
+        "disposition": "execute", "action": "create_folder",
+        "substantive_text": command_text, "document_selector": None,
+        "folder_selector": selector, "folder_name": "Notes",
+        "explicit_references": [], "missing_slots": [], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "target_operation_id": None,
+        "tool_choice": {"name": "create_folder",
+                        "arguments": {"name": "Notes", "parent_path": ["Archive"]}},
+        "certainty": "certain",
+    }
+    result, route_control, _runtime = _invoke(case, sdk_fakes, proposal)
+
+    _assert_completed(result)
+    assert route_control.get("target_doc_id") is None
+    assert provider.files["created-notes"]["parents"] == ["archive-folder"]
+    assert client.collection("folders").document("created-notes").get().to_dict()[
+        "parent_id"] == "archive-folder"
+
+
+@pytest.mark.parametrize("action", ["move_transcript", "create_folder"])
+def test_explicit_folder_id_without_tool_choice_uses_metadata_projection(
+    firestore_fake, sdk_fakes, monkeypatch, action,
+):
+    client = firestore_fake.client_class()
+    command_text = ("Move it to folder id archive-folder" if action == "move_transcript"
+                    else "Create folder Notes under folder id archive-folder")
+    case = _start_runtime_case(
+        client, command_text=command_text, exchanges=(),
+        active_document=action == "move_transcript",
+    )
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
+        doc_ids=("doc-a",) if action == "move_transcript" else (),
+    )
+    if action == "create_folder":
+        sdk_fakes.drive.queue("files.generateIds", response={"ids": ["created-no-choice"]})
+        selector = {"kind": "explicit_id", "value": "archive-folder", "parent": None}
+        proposal = {
+            "disposition": "execute", "action": action,
+            "substantive_text": command_text, "document_selector": None,
+            "folder_selector": selector, "folder_name": "Notes",
+            "explicit_references": [], "missing_slots": [], "evidence_refs": [],
+            "clarification_id": None, "clarification_generation": None,
+            "target_operation_id": None, "tool_choice": None, "certainty": "certain",
+        }
+    else:
+        proposal = {
+            "disposition": "execute", "action": action,
+            "substantive_text": command_text,
+            "document_selector": {"kind": "active_document"},
+            "folder_selector": {"kind": "explicit_id", "value": "archive-folder",
+                                 "parent": None},
+            "folder_name": None, "explicit_references": [], "missing_slots": [],
+            "evidence_refs": [], "clarification_id": None,
+            "clarification_generation": None, "target_operation_id": None,
+            "tool_choice": None, "certainty": "certain",
+        }
+
+    result, route_control, _runtime = _invoke(case, sdk_fakes, proposal)
+
+    _assert_completed(result)
+    expected_args = ({"name": "Notes", "parent_path": ["Archive"]}
+                     if action == "create_folder" else
+                     {"doc_id": "doc-a", "folder_path": ["Archive"]})
+    assert route_control["tool_choice"]["arguments"] == expected_args
+    if action == "create_folder":
+        assert provider.files["created-no-choice"]["parents"] == ["archive-folder"]
+    else:
+        assert provider.files["doc-a"]["parents"] == ["archive-folder"]
+
+
+def test_full_folder_path_resolves_with_duplicate_ancestor_names(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+
+    client = firestore_fake.client_class()
+    case = _start_runtime_case(
+        client, command_text="Move it to Clients/Archive", exchanges=(),
+    )
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID, doc_ids=("doc-a",),
+    )
+    folders = client.collection(FOLDERS_COLLECTION)
+    folders.document("clients-one").set({
+        "folder_id": "clients-one", "name": "Clients", "parent_id": _ROUTE_ROOT_ID,
+    })
+    folders.document("clients-two").set({
+        "folder_id": "clients-two", "name": "Clients", "parent_id": _ROUTE_ROOT_ID,
+    })
+    folders.document("archive-under-clients-one").set({
+        "folder_id": "archive-under-clients-one", "name": "Archive",
+        "parent_id": "clients-one",
+    })
+    provider.set_file("clients-one", name="Clients", mime_type="application/vnd.google-apps.folder",
+                      parents=[_ROUTE_ROOT_ID])
+    provider.set_file("clients-two", name="Clients", mime_type="application/vnd.google-apps.folder",
+                      parents=[_ROUTE_ROOT_ID])
+    provider.set_file("archive-under-clients-one", name="Archive",
+                      mime_type="application/vnd.google-apps.folder", parents=["clients-one"])
+    proposal = {
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": "Move it to Clients/Archive",
+        "document_selector": {"kind": "active_document"},
+        "folder_selector": {
+            "kind": "explicit_path", "value": "Archive",
+            "parent": {"kind": "explicit_path", "value": "Clients", "parent": None},
+        },
+        "folder_name": None, "explicit_references": [], "missing_slots": [],
+        "evidence_refs": [], "clarification_id": None,
+        "clarification_generation": None, "target_operation_id": None,
+        "tool_choice": {"name": "move_transcript",
+                        "arguments": {"doc_id": "doc-a",
+                                       "folder_path": ["Clients", "Archive"]}},
+        "certainty": "certain",
+    }
+    result, _route_control, _runtime = _invoke(case, sdk_fakes, proposal)
+
+    _assert_completed(result)
+    assert provider.files["doc-a"]["parents"] == ["archive-under-clients-one"]
+
+
+def test_absolute_folder_path_conflicting_with_parent_id_clarifies_without_writes(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+    from services.connectors.telegram.queue import TelegramQueueCompletion
+
+    client = firestore_fake.client_class()
+    case = _start_runtime_case(
+        client, command_text="Move it under Clients to /Archive", exchanges=(),
+    )
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID, doc_ids=("doc-a",),
+    )
+    client.collection(FOLDERS_COLLECTION).document("clients-folder").set({
+        "folder_id": "clients-folder", "name": "Clients", "parent_id": _ROUTE_ROOT_ID,
+    })
+    provider.set_file("clients-folder", name="Clients",
+                      mime_type="application/vnd.google-apps.folder", parents=[_ROUTE_ROOT_ID])
+    proposal = {
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": "Move it under Clients to /Archive",
+        "document_selector": {"kind": "active_document"},
+        "folder_selector": {
+            "kind": "explicit_path", "value": "/Archive",
+            "parent": {"kind": "explicit_id", "value": "clients-folder", "parent": None},
+        },
+        "folder_name": None, "explicit_references": [], "missing_slots": [],
+        "evidence_refs": [], "clarification_id": None,
+        "clarification_generation": None, "target_operation_id": None,
+        "tool_choice": {"name": "move_transcript",
+                        "arguments": {"doc_id": "doc-a", "folder_path": ["Archive"]}},
+        "certainty": "certain",
+    }
+    result, _route_control, runtime = _invoke(case, sdk_fakes, proposal, queue_answer=False)
+
+    assert isinstance(result, TelegramQueueCompletion)
+    assert result.result_type == "clarification"
+    assert result.clarification.pending.resolved_parameters == {"doc_id": "doc-a"}
+    assert result.clarification.pending.missing_slots == ("destination",)
+    assert result.clarification.request["prompt"]["body"] == (
+        "Which destination folder should I use?"
+    )
+    assert not provider.drive_mutations
+    assert not provider.qdrant_mutations
+
+
+@pytest.mark.parametrize("failure_kind", ["firestore", "drive"])
+def test_folder_metadata_read_failure_stays_processing_error(
+    firestore_fake, sdk_fakes, monkeypatch, failure_kind,
+):
+    case = _start_runtime_case(
+        firestore_fake.client_class(), command_text="Move it to Archive", exchanges=(),
+    )
+    _scenario, _repository, _accepted, _operation, _lease, runtime, _text = case
+    provider = _configure_move_boundary(
+        case[1].client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
+        doc_ids=("doc-a",),
+    )
+    if failure_kind == "firestore":
+        from core.integrations.firestore import folders
+
+        def fail_folder_read(*_args, **_kwargs):
+            raise RuntimeError("synthetic Firestore outage")
+
+        monkeypatch.setattr(folders, "get_all_folders", fail_folder_read)
+    else:
+        import httplib2
+        from googleapiclient.errors import HttpError
+
+        provider.files["archive-folder"] = HttpError(
+            httplib2.Response({"status": "500"}), b"synthetic Drive outage",
+        )
+    proposal = {
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": "Move it to Archive",
+        "document_selector": {"kind": "active_document"},
+        "folder_selector": {"kind": "explicit_path", "value": "Archive",
+                             "parent": None},
+        "folder_name": None, "explicit_references": [], "missing_slots": [],
+        "evidence_refs": [], "clarification_id": None,
+        "clarification_generation": None, "target_operation_id": None,
+        "tool_choice": {"name": "move_transcript",
+                        "arguments": {"doc_id": "doc-a", "folder_path": ["Archive"]}},
+        "certainty": "certain",
+    }
+    result, _route_control, runtime = _invoke(
+        case, sdk_fakes, proposal, queue_answer=False,
+    )
+
+    from core.operations.queue import QueueOperationState
+
+    assert result == QueueOperationState.FAILED
+    sent_text = "\n".join(row.get("text", "") for row in runtime.client._test_sent)
+    assert "An error occurred while processing your request. Please try again." in sent_text
+    assert "Which destination folder" not in sent_text
+    assert not provider.drive_mutations
+    assert not provider.qdrant_mutations
+
+
+def test_folder_metadata_failure_during_missing_document_clarification_is_processing_error(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore import folders
+    from core.operations.queue import QueueOperationState
+
+    client = firestore_fake.client_class()
+    case = _start_runtime_case(
+        client, command_text="Move to Archive", exchanges=(), active_document=True,
+    )
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID, doc_ids=("doc-a",),
+    )
+
+    def fail_folder_read(*_args, **_kwargs):
+        raise RuntimeError("synthetic Firestore outage during clarification")
+
+    monkeypatch.setattr(folders, "get_all_folders", fail_folder_read)
+    proposal = {
+        "disposition": "clarify", "action": "move_transcript",
+        "substantive_text": "Move to Archive", "document_selector": None,
+        "folder_selector": {"kind": "name", "value": "Archive", "parent": None},
+        "folder_name": None, "explicit_references": [],
+        "missing_slots": ["document"], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "target_operation_id": None, "tool_choice": None,
+        "certainty": "uncertain",
+    }
+
+    result, _route_control, runtime = _invoke(case, sdk_fakes, proposal, queue_answer=False)
+
+    assert result == QueueOperationState.FAILED
+    sent_text = "\n".join(row.get("text", "") for row in runtime.client._test_sent)
+    assert "An error occurred while processing your request. Please try again." in sent_text
+    assert not provider.drive_mutations
+    assert not provider.qdrant_mutations
+
+
+def test_create_folder_clarification_freezes_child_folder_id_under_id_scope(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    from core.integrations.firestore.client import FOLDERS_COLLECTION
+    from services.connectors.telegram.queue import TelegramQueueCompletion
+
+    client = firestore_fake.client_class()
+    command_text = "Create a folder under Child in Archive"
+    case = _start_runtime_case(
+        client, command_text=command_text, exchanges=(), active_document=False,
+    )
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID, doc_ids=(),
+    )
+    client.collection(FOLDERS_COLLECTION).document("child-folder").set({
+        "folder_id": "child-folder", "name": "Child", "parent_id": "archive-folder",
+    })
+    provider.set_file("child-folder", name="Child",
+                      mime_type="application/vnd.google-apps.folder",
+                      parents=["archive-folder"])
+    proposal = {
+        "disposition": "clarify", "action": "create_folder",
+        "substantive_text": command_text, "document_selector": None,
+        "folder_selector": {
+            "kind": "name", "value": "Child",
+            "parent": {"kind": "explicit_id", "value": "archive-folder", "parent": None},
+        },
+        "folder_name": None, "explicit_references": [],
+        "missing_slots": ["folder_name"], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "target_operation_id": None, "tool_choice": None,
+        "certainty": "uncertain",
+    }
+
+    result, _route_control, _runtime = _invoke(case, sdk_fakes, proposal, queue_answer=False)
+
+    assert isinstance(result, TelegramQueueCompletion)
+    assert result.result_type == "clarification"
+    assert result.clarification.pending.resolved_parameters == {
+        "parent_path": ("Archive", "Child"), "parent_id": "child-folder",
+    }
+    assert result.clarification.pending.missing_slots == ("folder_name",)
+    assert not provider.drive_mutations
+    assert not provider.qdrant_mutations
+
+
 def test_current14_evidence_selector_can_choose_document_from_multi_document_exchange(
     firestore_fake, sdk_fakes, monkeypatch,
 ):
@@ -759,7 +1185,10 @@ def test_fresh_clarification_preserves_known_document_without_executable_target(
     assert not provider.qdrant_mutations
 
 
-@pytest.mark.parametrize("known_slot", ["document", "destination"])
+@pytest.mark.parametrize(
+    "known_slot", ["document", "destination", "destination_id", "destination_name",
+                   "destination_parent", "destination_parent_id"],
+)
 def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
     firestore_fake, sdk_fakes, monkeypatch, known_slot,
 ):
@@ -769,8 +1198,11 @@ def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
     from services.connectors.telegram.runtime.routing_context import RoutingContextSnapshot
 
     client = firestore_fake.client_class()
-    first_text = ("Move document doc-b" if known_slot == "document"
-                  else "Move to Archive")
+    first_text = ("Move document doc-b" if known_slot == "document" else
+                  "Move to folder id archive-folder" if known_slot == "destination_id" else
+                  "Move to Archive under Clients"
+                  if known_slot in {"destination_parent", "destination_parent_id"} else
+                  "Move to Archive")
     case = _start_runtime_case(
         client, command_text=first_text, exchanges=(), active_document=True,
     )
@@ -779,6 +1211,27 @@ def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
         client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID,
         doc_ids=("doc-a", "doc-b", "doc-c"),
     )
+    if known_slot == "destination_id":
+        from core.integrations.firestore.client import FOLDERS_COLLECTION
+        client.collection(FOLDERS_COLLECTION).document("archive-folder-duplicate").set({
+            "folder_id": "archive-folder-duplicate", "name": "Archive",
+            "parent_id": _ROUTE_ROOT_ID,
+        })
+    if known_slot in {"destination_parent", "destination_parent_id"}:
+        from core.integrations.firestore.client import FOLDERS_COLLECTION
+        client.collection(FOLDERS_COLLECTION).document("clients-folder").set({
+            "folder_id": "clients-folder", "name": "Clients", "parent_id": _ROUTE_ROOT_ID,
+        })
+        client.collection(FOLDERS_COLLECTION).document("archive-under-clients").set({
+            "folder_id": "archive-under-clients", "name": "Archive",
+            "parent_id": "clients-folder",
+        })
+        provider.set_file("clients-folder", name="Clients",
+                          mime_type="application/vnd.google-apps.folder",
+                          parents=[_ROUTE_ROOT_ID])
+        provider.set_file("archive-under-clients", name="Archive",
+                          mime_type="application/vnd.google-apps.folder",
+                          parents=["clients-folder"])
     if known_slot == "document":
         start = first_text.index("doc-b")
         span = {"kind": "id", "start": start, "end": start + len("doc-b"),
@@ -795,11 +1248,34 @@ def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
             "clarification_generation": None, "target_operation_id": None,
             "tool_choice": None, "certainty": "uncertain",
         }
+    elif known_slot in {"destination", "destination_name", "destination_parent",
+                        "destination_parent_id"}:
+        folder_selector = {"kind": "name", "value": "Archive", "parent": None} \
+            if known_slot == "destination_name" else \
+            {"kind": "explicit_path", "value": "Archive", "parent": None}
+        if known_slot in {"destination_parent", "destination_parent_id"}:
+            known_parent = ({"kind": "explicit_id", "value": "clients-folder", "parent": None}
+                            if known_slot == "destination_parent_id" else
+                            {"kind": "name", "value": "Clients", "parent": None})
+            folder_selector = {
+                "kind": "name", "value": "Archive",
+                "parent": known_parent,
+            }
+        first_proposal = {
+            "disposition": "clarify", "action": "move_transcript",
+            "substantive_text": first_text, "document_selector": None,
+            "folder_selector": folder_selector,
+            "folder_name": None, "explicit_references": [],
+            "missing_slots": ["document"], "evidence_refs": [],
+            "clarification_id": None, "clarification_generation": None,
+            "target_operation_id": None, "tool_choice": None,
+            "certainty": "uncertain",
+        }
     else:
         first_proposal = {
             "disposition": "clarify", "action": "move_transcript",
             "substantive_text": first_text, "document_selector": None,
-            "folder_selector": {"kind": "explicit_path", "value": "Archive",
+            "folder_selector": {"kind": "explicit_id", "value": "archive-folder",
                                 "parent": None},
             "folder_name": None, "explicit_references": [],
             "missing_slots": ["document"], "evidence_refs": [],
@@ -818,10 +1294,19 @@ def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
     )
     pending = repository.get_pending_clarification(accepted.context_id, actor_id=17)
     assert pending is not None
-    expected_known = ({"doc_id": "doc-b"} if known_slot == "document"
-                      else {"folder_path": ("Archive",)})
-    expected_prompt_known = (expected_known if known_slot == "document"
+    expected_known = ({"doc_id": "doc-b"} if known_slot == "document" else
+                      {"destination_id": "archive-folder"} if known_slot == "destination_id" else
+                      {"folder_path": ("Clients", "Archive")}
+                      if known_slot in {"destination_parent", "destination_parent_id"} else
+                      {"folder_path": ("Archive",)})
+    if known_slot == "destination_parent_id":
+        expected_known["parent_id"] = "clients-folder"
+    expected_prompt_known = (expected_known if known_slot not in {"destination", "destination_name"}
                              else {"folder_path": ["Archive"]})
+    if known_slot in {"destination_parent", "destination_parent_id"}:
+        expected_prompt_known = {"folder_path": ["Clients", "Archive"]}
+        if known_slot == "destination_parent_id":
+            expected_prompt_known["parent_id"] = "clients-folder"
     assert pending.resolved_parameters == expected_known
     assert not provider.drive_mutations
     from services.connectors.telegram.notifications import TelegramNotificationPublisher
@@ -887,16 +1372,32 @@ def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
         explicit_references = [span]
         substantive_text = answer_text
         cited_evidence = []
+    answer_folder_selector = (
+        {"kind": "explicit_id", "value": "archive-folder", "parent": None}
+        if known_slot == "destination_id" else
+        {"kind": "name", "value": "Archive", "parent": None}
+        if known_slot == "destination_name" else
+        {"kind": "name", "value": "Archive",
+         "parent": ({"kind": "explicit_id", "value": "clients-folder", "parent": None}
+                    if known_slot == "destination_parent_id" else
+                    {"kind": "name", "value": "Clients", "parent": None})}
+        if known_slot in {"destination_parent", "destination_parent_id"} else
+        {"kind": "explicit_path", "value": "Archive", "parent": None}
+    )
     answer_proposal = {
         "disposition": "execute", "action": "move_transcript",
         "substantive_text": substantive_text,
         "document_selector": document_selector,
-        "folder_selector": {"kind": "explicit_path", "value": "Archive",
-                             "parent": None},
+        "folder_selector": answer_folder_selector,
         "folder_name": None, "explicit_references": explicit_references, "missing_slots": [],
         "evidence_refs": cited_evidence, "clarification_id": pending.clarification_id,
         "clarification_generation": pending.generation, "target_operation_id": None,
-        "tool_choice": _move_choice("doc-b"), "certainty": "certain",
+        "tool_choice": (
+            {"name": "move_transcript", "arguments": {
+                "doc_id": "doc-b", "folder_path": ["Clients", "Archive"],
+            }} if known_slot in {"destination_parent", "destination_parent_id"}
+            else _move_choice("doc-b")
+        ), "certainty": "certain",
     }
     with capture_sdk_calls() as calls:
         result, route_control, _ = _invoke(
@@ -904,7 +1405,10 @@ def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
         )
     _assert_completed(result)
     assert route_control["target_doc_id"] == "doc-b"
-    assert provider.files["doc-b"]["parents"] == ["archive-folder"]
+    expected_destination = ("archive-under-clients"
+                            if known_slot in {"destination_parent", "destination_parent_id"}
+                            else "archive-folder")
+    assert provider.files["doc-b"]["parents"] == [expected_destination]
     assert provider.files["doc-a"]["parents"] == [_ROUTE_ROOT_ID]
     assert not [row for row in provider.drive_mutations if row.get("fileId") != "doc-b"]
     mutation_count = len(provider.drive_mutations)
@@ -937,6 +1441,7 @@ def test_ordinary_new_answer_executes_known_slot_from_delivered_question(
 def test_linked_route_guard_requires_echo_and_preserves_every_known_slot():
     from types import SimpleNamespace
     from services.connectors.telegram.runtime.runtime import _CommandExecution
+    from services.connectors.telegram.sessions import _valid_response
 
     linked = {
         "clarification_id": "clarification-one", "generation": 1,
@@ -1010,7 +1515,76 @@ def test_linked_route_guard_requires_echo_and_preserves_every_known_slot():
         }
         assert not _CommandExecution._linked_clarification_route_is_bound(probe)
 
-    from services.connectors.telegram.sessions import _valid_response
+    parent_id = _ROUTE_ROOT_ID
+    changed_selector = {
+        "kind": "name", "value": "Other",
+        "parent": {"kind": "explicit_id", "value": parent_id, "parent": None},
+    }
+    projected, status = _valid_response({
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": "Move doc-b to Other under the same parent",
+        "document_selector": {"kind": "active_document"},
+        "folder_selector": changed_selector,
+        "folder_name": None, "explicit_references": [], "missing_slots": [],
+        "evidence_refs": [], "clarification_id": "clarification-one",
+        "clarification_generation": 1, "target_operation_id": None,
+        "tool_choice": {"name": "move_transcript",
+                        "arguments": {"doc_id": "doc-b", "folder_path": ["Other"]}},
+        "certainty": "certain",
+    }, accepted_command="Move doc-b to Other under the same parent",
+       active_doc_id="doc-b", canonical_folder_path=["Other"])
+    assert status == "ok"
+    probe.linked_clarification = {
+        **linked, "resolved_parameters": {
+            "doc_id": "doc-b", "folder_path": ["Archive"], "parent_id": parent_id,
+        },
+    }
+    probe.resolved_folder_binding = {
+        "selector": changed_selector, "target_id": "other-folder",
+        "folder_path": ["Other"],
+    }
+    probe.decision = {**projected, "target_ref": "doc-b"}
+    assert not _CommandExecution._linked_clarification_route_is_bound(probe)
+
+    for action, known_key, operation_name, target_ref in (
+        ("move_transcript", "destination_id", "move_transcript", "doc-b"),
+        ("create_folder", "parent_id", "create_folder", None),
+    ):
+        selector = {
+            "kind": "name", "value": "Child",
+            "parent": {"kind": "explicit_id", "value": "archive-folder", "parent": None},
+        }
+        arguments = ({"doc_id": "doc-b", "folder_path": ["Archive", "Child"]}
+                     if action == "move_transcript" else
+                     {"name": "Notes", "parent_path": ["Archive", "Child"]})
+        projected, status = _valid_response({
+            "disposition": "execute", "action": action,
+            "substantive_text": "Use Child under Archive",
+            "document_selector": ({"kind": "active_document"}
+                                  if action == "move_transcript" else None),
+            "folder_selector": selector,
+            "folder_name": "Notes" if action == "create_folder" else None,
+            "explicit_references": [], "missing_slots": [], "evidence_refs": [],
+            "clarification_id": "clarification-one", "clarification_generation": 1,
+            "target_operation_id": None,
+            "tool_choice": {"name": operation_name, "arguments": arguments},
+            "certainty": "certain",
+        }, accepted_command="Use Child under Archive",
+           active_doc_id="doc-b" if action == "move_transcript" else None,
+           canonical_folder_path=["Archive", "Child"])
+        assert status == "ok"
+        probe.linked_clarification = {
+            **linked, "action": action,
+            "resolved_parameters": ({"doc_id": "doc-b", known_key: "archive-folder"}
+                                    if action == "move_transcript" else
+                                    {known_key: "archive-folder"}),
+        }
+        probe.resolved_folder_binding = {
+            "selector": selector, "target_id": "child-folder",
+            "folder_path": ["Archive", "Child"],
+        }
+        probe.decision = {**projected, "target_ref": target_ref}
+        assert not _CommandExecution._linked_clarification_route_is_bound(probe)
 
     root_question = {
         **linked, "action": "create_folder",

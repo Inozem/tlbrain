@@ -732,9 +732,13 @@ def _validate_semantic_predecessor(
 def _project_semantic_tool_choice(
     route: dict[str, Any], decision: RoutingDecision, *,
     tool_choice: Mapping[str, Any] | None, last_doc_id: str | None,
+    canonical_folder_path: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[dict[str, Any], str] | None:
     if decision.action in {Action.MOVE_TRANSCRIPT, Action.CREATE_FOLDER}:
-        generated = _semantic_write_tool(decision, route, last_doc_id=last_doc_id)
+        generated = _semantic_write_tool(
+            decision, route, last_doc_id=last_doc_id,
+            canonical_folder_path=canonical_folder_path,
+        )
         if generated is None and decision.action is Action.MOVE_TRANSCRIPT and route.get("dialog_number") is not None:
             # The scoped dialog-number lookup occurs immediately before dispatch.
             route["tool_choice"] = tool_choice
@@ -762,6 +766,7 @@ def _project_semantic_decision(
     target_operation_id: str | None, operation_candidates: Any,
     raw_response: Mapping[str, Any], active_doc_id: str | None = None,
     last_doc_id: str | None = None, candidates: Any = (),
+    canonical_folder_path: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Project established ordinary routes while retaining the rich decision in memory."""
     operation_candidate = _first_operation_candidate(operation_candidates, target_operation_id)
@@ -835,7 +840,8 @@ def _project_semantic_decision(
             and _folder_parent_conflict(decision.folder_selector)):
         return _mark_explicit_conflict(route)
     tool_result = _project_semantic_tool_choice(
-        route, decision, tool_choice=tool_choice, last_doc_id=last_doc_id
+        route, decision, tool_choice=tool_choice, last_doc_id=last_doc_id,
+        canonical_folder_path=canonical_folder_path,
     )
     if tool_result is not None:
         return tool_result
@@ -850,7 +856,7 @@ def _folder_path(selector: Any) -> list[str] | None:
         return None
     if selector.kind.value == "root_default":
         return []
-    if selector.kind.value != "explicit_path":
+    if selector.kind.value not in {"explicit_path", "name"}:
         return None
     parent_path = _folder_path(selector.parent) if selector.parent is not None else []
     if parent_path is None:
@@ -865,6 +871,30 @@ def _folder_path(selector: Any) -> list[str] | None:
             return None
         return components
     return [*parent_path, *components]
+
+
+def _folder_tool_path(selector: Any, route: Mapping[str, Any], *, field: str,
+                      required: bool,
+                      canonical_folder_path: list[str] | tuple[str, ...] | None = None
+                      ) -> list[str] | None:
+    """Project ordinary arguments from a server-validated folder path."""
+    path = _folder_path(selector)
+    if path is not None:
+        return path
+    if (canonical_folder_path is not None
+            and all(isinstance(item, str) and item.strip()
+                    for item in canonical_folder_path)):
+        return list(canonical_folder_path)
+    current = selector
+    has_id_anchor = False
+    while current is not None:
+        if current.kind.value == "explicit_id":
+            has_id_anchor = True
+            break
+        current = current.parent
+    if not has_id_anchor:
+        return None
+    return None
 
 
 def _folder_parent_conflict(selector: Any) -> bool:
@@ -912,13 +942,17 @@ def _mark_missing_document_clarification(route: dict[str, Any]) -> tuple[dict[st
 
 def _semantic_write_tool(
     decision: RoutingDecision, route: Mapping[str, Any], *, last_doc_id: str | None = None,
+    canonical_folder_path: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any] | None:
     """Build a registry write choice only when semantic inputs are concrete."""
     selector = decision.folder_selector
     if decision.action is Action.CREATE_FOLDER:
         if decision.folder_name is None:
             return None
-        parent_path = _folder_path(selector)
+        parent_path = _folder_tool_path(
+            selector, route, field="parent_path", required=False,
+            canonical_folder_path=canonical_folder_path,
+        )
         if parent_path is None:
             return None
         args: dict[str, Any] = {"name": decision.folder_name}
@@ -931,7 +965,10 @@ def _semantic_write_tool(
                 and decision.document_selector.kind is DocumentSelectorKind.LAST_SAVED
                 and doc_id == "last"):
             doc_id = last_doc_id
-        folder_path = _folder_path(selector)
+        folder_path = _folder_tool_path(
+            selector, route, field="folder_path", required=True,
+            canonical_folder_path=canonical_folder_path,
+        )
         if not isinstance(doc_id, str) or not doc_id or not folder_path:
             return None
         return {"name": "move_transcript",
@@ -1115,12 +1152,13 @@ def _validate_stored_disposition_projection(
         raise ValueError("saved tool is unsupported")
     if disposition is Disposition.DELEGATE and OPERATIONS[application_route["name"]].write:
         raise ValueError("delegated decisions cannot authorize writes")
+    choice = summary.get("tool_choice")
     projected_route = {
         "target_ref": resolved.get("doc_id", application_route.get("target_doc_id")),
+        "tool_choice": choice,
     }
     generated = _semantic_write_tool(decision, projected_route,
                                      last_doc_id=resolved.get("doc_id"))
-    choice = summary.get("tool_choice")
     if generated is not None:
         normalized = dict(choice) if isinstance(choice, Mapping) else choice
         if isinstance(normalized, Mapping):
@@ -1149,6 +1187,7 @@ def _valid_response(
     response: Any, *, accepted_command: str,
     operation_candidates: Any = (), active_doc_id: str | None = None,
     last_doc_id: str | None = None, candidates: Any = (),
+    canonical_folder_path: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """Strictly validate a fresh semantic response against its exact command."""
     if not isinstance(response, Mapping) or set(response) != _FRESH_FIELDS:
@@ -1191,7 +1230,7 @@ def _valid_response(
             decision, tool_choice=tool_choice, target_operation_id=target_operation_id,
             operation_candidates=operation_candidates, raw_response=response,
             active_doc_id=active_doc_id, last_doc_id=last_doc_id,
-            candidates=candidates,
+            candidates=candidates, canonical_folder_path=canonical_folder_path,
         )
         if status == "ok" and decision.action is Action.RETRY:
             projected["tool_choice"] = None
