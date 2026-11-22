@@ -763,13 +763,99 @@ def test_create_folder_parent_selector_resolves_without_changing_public_argument
                         "arguments": {"name": "Notes", "parent_path": ["Archive"]}},
         "certainty": "certain",
     }
-    result, route_control, _runtime = _invoke(case, sdk_fakes, proposal)
+    result, route_control, runtime = _invoke(case, sdk_fakes, proposal)
 
     _assert_completed(result)
     assert route_control.get("target_doc_id") is None
     assert provider.files["created-notes"]["parents"] == ["archive-folder"]
     assert client.collection("folders").document("created-notes").get().to_dict()[
         "parent_id"] == "archive-folder"
+    sent_text = "\n".join(row.get("text", "") for row in runtime.client._test_sent)
+    assert "Folder “Notes” created." in sent_text
+    assert "created-notes" not in sent_text
+    _scenario, repository, accepted, operation, lease, _runtime, _command = case
+    operation_id = operation["operation_id"]
+    checkpoint_id = "telegram-global-" + hashlib.sha256(
+        f"{accepted.context_id}\0{operation_id}".encode("utf-8")
+    ).hexdigest()
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: BASE_TIME,
+    )
+    checkpoint = ledger.load_turn(checkpoint_id, operation_id)
+    assert checkpoint["tool_results"]["0"] == "created-notes"
+    chat_id = "context-chat-search"
+    model_turns = [turn for turn in repository.list_turns(accepted.context_id, chat_id)
+                   if turn.get("operation_id") == operation_id
+                   and turn.get("role") == "model"]
+    assert model_turns[-1]["parts"] == [{"text": '"created-notes"'}]
+    final_id = "telegram-command-" + hashlib.sha256(
+        f"{operation_id}:final".encode("utf-8")
+    ).hexdigest()
+    notification = repository.get_notification(final_id)
+    assert notification["body"] == "Folder “Notes” created."
+    assert notification["state"] == "delivered"
+
+
+def test_create_folder_checkpoint_replays_legacy_final_notification_without_collision(
+    firestore_fake, sdk_fakes, monkeypatch,
+):
+    client = firestore_fake.client_class()
+    command_text = "Create folder Notes under Archive"
+    case = _start_runtime_case(
+        client, command_text=command_text, exchanges=(), active_document=False,
+    )
+    _scenario, repository, accepted, operation, lease, _runtime, _text = case
+    operation_id = operation["operation_id"]
+    provider = _configure_move_boundary(
+        client, monkeypatch, sdk_fakes, root_id=_ROUTE_ROOT_ID, doc_ids=(),
+    )
+    checkpoint_id = "telegram-global-" + hashlib.sha256(
+        f"{accepted.context_id}\0{operation_id}".encode("utf-8")
+    ).hexdigest()
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+
+    ledger = FirestoreAgentLedger(
+        client, context_id=accepted.context_id, operation_id=operation_id,
+        owner=lease.owner, fence=lease.fence, clock=lambda: BASE_TIME,
+    )
+    ledger.save_turn(checkpoint_id, operation_id,
+                     model_response={"text": "", "parts": []}, tool_calls=[])
+    ledger.save_tool_result(checkpoint_id, operation_id, 0, "created-notes")
+    legacy_body = json.dumps("created-notes", ensure_ascii=False, default=str)
+    notification_id = "telegram-command-" + hashlib.sha256(
+        f"{operation_id}:final".encode("utf-8")
+    ).hexdigest()
+    context = client.collection("telegram_sessions").document(accepted.context_id).get().to_dict()
+    notification = repository.prepare_notification_in_transaction(
+        notification_id, context_id=accepted.context_id, kind="final", body=legacy_body,
+        now=BASE_TIME, context_data=context, operation_id=operation_id,
+    )
+    notification.update({"state": "delivered", "message_id": 88001,
+                         "delivered_at": BASE_TIME})
+    client.collection("notification_outbox").document(notification_id).set(notification)
+
+    proposal = {
+        "disposition": "execute", "action": "create_folder",
+        "substantive_text": command_text, "document_selector": None,
+        "folder_selector": {"kind": "name", "value": "Archive", "parent": None},
+        "folder_name": "Notes", "explicit_references": [], "missing_slots": [],
+        "evidence_refs": [], "clarification_id": None,
+        "clarification_generation": None, "target_operation_id": None,
+        "tool_choice": {"name": "create_folder",
+                        "arguments": {"name": "Notes", "parent_path": ["Archive"]}},
+        "certainty": "certain",
+    }
+    result, _route_control, runtime = _invoke(case, sdk_fakes, proposal)
+
+    _assert_completed(result)
+    assert provider.drive_mutations == []
+    assert runtime.client._test_sent == []
+    replayed = repository.get_notification(notification_id)
+    assert replayed["body"] == legacy_body
+    assert replayed["state"] == "delivered"
 
 
 @pytest.mark.parametrize("action", ["move_transcript", "create_folder"])

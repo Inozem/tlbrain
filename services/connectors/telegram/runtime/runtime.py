@@ -4209,7 +4209,36 @@ class _CommandExecution(SearchAgentMixin):
                            self.operation_id, 0, result)
         answer = json.dumps(result, ensure_ascii=False, default=str)
         await self._persist_chat_turn("model", answer)
-        return await self.finish_reply(answer)
+        reply_body = answer
+        legacy_summary_pin = (
+            getattr(self, "route_from_pin", False)
+            and not isinstance(getattr(self, "contextual_metadata", None), Mapping)
+        )
+        if (name == "create_folder" and isinstance(result, str) and result.strip()
+                and not legacy_summary_pin):
+            from core.operations import registry
+
+            try:
+                validated = registry.validate_arguments(name, arguments)
+            except (TypeError, ValueError):
+                pass
+            else:
+                folder_name = validated.get("name")
+                if isinstance(folder_name, str) and folder_name.strip():
+                    reply_body = f'Folder “{folder_name.strip()}” created.'
+                    if isinstance(saved, Mapping) and "0" in saved:
+                        final_notification_id = self.replies.notification_id("final")
+                        legacy_notification = await _offload(
+                            self.runtime.repository.get_notification, final_notification_id,
+                        )
+                        if (isinstance(legacy_notification, Mapping)
+                                and legacy_notification.get("notification_id") == final_notification_id
+                                and legacy_notification.get("context_id") == self.context_id
+                                and legacy_notification.get("operation_id") == self.operation_id
+                                and legacy_notification.get("kind") == "final"
+                                and legacy_notification.get("body") == answer):
+                            reply_body = answer
+        return await self.finish_reply(reply_body)
 
     async def _direct_add_dialog_failure(self, conversation_id: str | None = None
                                          ) -> QueueOperationState | None | bool:
