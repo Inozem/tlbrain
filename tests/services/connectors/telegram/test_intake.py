@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -783,6 +784,7 @@ def test_receipt_save_callback_reserves_typed_fifo_once_and_clears_same_card(
     result = intake.handle_callback(callback)
     assert result.accepted is True
     assert result.operation_id
+    assert result.notification_id == accepted.notification_id
     command = _read_doc(
         client, f"telegram_sessions/{accepted.context_id}/commands/90",
     )
@@ -895,26 +897,54 @@ def test_new_receipt_invalidates_an_older_ready_card_callback(firestore_fake):
     assert context["pending_receipt_groups"] == 1
 
 
-def test_default_webhook_answers_save_callback_after_durable_reservation(firestore_fake):
+@pytest.mark.parametrize("edit_times_out", [False, True])
+def test_default_webhook_answers_save_callback_after_durable_reservation(
+    firestore_fake, edit_times_out,
+):
     repository, _client = _repository(firestore_fake)
     current = [NOW]
     intake, accepted, ready, callback = _ready_receipt_callback(
         repository, current=current,
     )
 
+    task_publisher = intake.publisher
+    queued_before_callback = list(task_publisher.outbox_ids)
+    save_outbox_queued = threading.Event()
+    original_publish = task_publisher.publish
+
+    def publish_and_signal(outbox_id):
+        original_publish(outbox_id)
+        if outbox_id.startswith("tgcard-saving-"):
+            save_outbox_queued.set()
+
+    task_publisher.publish = publish_and_signal
+
     class Bot:
         def __init__(self):
             self.answered = []
+            self.edited = []
 
         async def answer_callback_query(self, query_id, *, text=None):
             self.answered.append((query_id, text))
             return True
 
+        async def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None,
+                                    presentation=None):
+            assert await asyncio.to_thread(save_outbox_queued.wait, 2)
+            self.edited.append((chat_id, message_id, text, reply_markup))
+            if edit_times_out:
+                raise TimeoutError("synthetic edit timeout")
+            return {"message_id": message_id}
+
     bot = Bot()
     app_module = importlib.import_module("services.connectors.telegram.app.main")
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+
+    notification_publisher = TelegramNotificationPublisher(repository, bot, clock=lambda: current[0])
     app = app_module.create_app(
         intake=intake, webhook_secret="synthetic-webhook-secret",
         telegram_enabled=True, telegram_client=bot,
+        notification_publisher=notification_publisher,
     )
 
     async def post():
@@ -928,11 +958,73 @@ def test_default_webhook_answers_save_callback_after_durable_reservation(firesto
 
     response = asyncio.run(post())
     assert response.status_code == 200
-    assert bot.answered == [(callback["callback_query"]["id"], None)]
+    assert bot.answered == [(callback["callback_query"]["id"], "Save accepted.")]
+    assert bot.edited == [(
+        42, 189, f"Dialog #{ready['dialog_number']}: Saving…", {"inline_keyboard": []},
+    )]
+    assert task_publisher.outbox_ids[:len(queued_before_callback)] == queued_before_callback
+    newly_queued = task_publisher.outbox_ids[len(queued_before_callback):]
+    assert all(isinstance(outbox_id, str) and outbox_id for outbox_id in newly_queued)
+    assert len(newly_queued) == 2
+    assert save_outbox_queued.is_set()
+    assert all(_read_doc(_client, f"task_outbox/{outbox_id}") is not None
+               for outbox_id in newly_queued)
     card = repository.get_notification(accepted.notification_id)
     assert card["body"] == f"Dialog #{ready['dialog_number']}: Saving…"
+    assert card["message_id"] == 189
+    if edit_times_out:
+        assert card["state"] == "retry"
+        assert card["last_outcome"] == "unknown"
+    else:
+        assert card["state"] == "delivered"
     receipt = repository.get_update_receipt(accepted.context_id, callback["update_id"])
     assert receipt["accepted"] is True
+
+
+def test_webhook_callback_technical_failure_answers_without_claiming_acceptance(firestore_fake):
+    repository, _client = _repository(firestore_fake)
+    intake = _intake(repository, _Publisher())
+    class Bot:
+        def __init__(self):
+            self.answered = []
+
+        async def answer_callback_query(self, query_id, *, text=None):
+            self.answered.append((query_id, text))
+            return True
+
+    bot = Bot()
+
+    def fail_callback(_update):
+        raise RuntimeError("private detail")
+
+    intake.handle_callback = fail_callback
+    app_module = importlib.import_module("services.connectors.telegram.app.main")
+    app = app_module.create_app(
+        intake=intake, webhook_secret="synthetic-webhook-secret",
+        telegram_enabled=True, telegram_client=bot,
+    )
+    callback = {
+        "update_id": 701,
+        "callback_query": {"id": "technical-query", "from": {"id": 7}, "data": "s:token",
+                           "message": {"message_id": 1, "date": 1793320100,
+                                       "chat": {"id": 42, "type": "private"}}},
+    }
+
+    async def post():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as http:
+            return await http.post(
+                "/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"},
+                json=callback,
+            )
+
+    response = asyncio.run(post())
+    assert response.status_code == 503
+    assert bot.answered == [(
+        "technical-query", "Could not confirm Save. Check the card before trying again.",
+    )]
+    assert firestore_fake.documents == {}
 
 
 def test_webhook_persists_thinking_card_and_schedules_close_from_canonical_outbox(

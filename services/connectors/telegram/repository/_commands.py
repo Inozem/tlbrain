@@ -2183,7 +2183,7 @@ class _TelegramCommandMixin:
             })
             return TelegramIntakeResult(
                 result.accepted, result.context_id, result.draft_id, result.dialog_number,
-                result.message_id, result.intake_sequence, result.notification_id,
+                result.message_id, result.intake_sequence, notification_id,
                 result.outbox_id, result.operation_id, result.queue_position,
                 result.snapshot_message_ids, (saving_outbox_id,),
             )
