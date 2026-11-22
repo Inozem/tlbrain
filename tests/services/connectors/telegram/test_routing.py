@@ -28,6 +28,7 @@ def _route(**kwargs):
 class FakeModel:
     def __init__(self, response=None, *, error=None):
         self.response = deepcopy(response)
+        self.active_doc_id = None
         self.error = error
         self.calls = []
 
@@ -38,7 +39,12 @@ class FakeModel:
         })
         if self.error is not None:
             raise self.error
-        return deepcopy(self.response)
+        response = deepcopy(self.response)
+        if isinstance(response, dict) and "kind" in response:
+            return _legacy_fixture_to_semantic(
+                response, text, active_doc_id=self.active_doc_id,
+            )
+        return response
 
 
 class FakeStore:
@@ -157,6 +163,18 @@ def _decision(kind="substantive", **overrides):
     return value
 
 
+def _legacy_fixture_to_semantic(response, command, *, active_doc_id=None):
+    """TEST-ONLY adapter; it never invents a span absent from the command."""
+    from services.connectors.telegram.sessions import _valid_persisted_route
+    from tests.fixtures.semantic_routing import legacy_route_fixture_to_semantic
+    _normalized, status = _valid_persisted_route(response)
+    if status not in {"ok", "uncertain"}:
+        return deepcopy(response)
+    return legacy_route_fixture_to_semantic(
+        response, command, active_doc_id=active_doc_id,
+    )
+
+
 def _make_context(*, current=None, selected_number=None, last=None):
     current_doc = current
     active_conversation_id = (
@@ -183,6 +201,7 @@ def _harness(*, decision=None, docs=None, current=None, last=None, numbers=None,
     store.save_confirmation_result = True
     store.bind_existing_numbers(context.context_id, numbers or {})
     model = FakeModel(decision, error=model_error)
+    model.active_doc_id = current
     search = FakeSearch(search_results, error=search_error)
     notices = FakeNotices()
     actions = FakeActions()
@@ -228,7 +247,7 @@ def test_current_topic_continues_without_notice_and_automatic_switch_uses_target
     assert all("content" not in card and "transcript" not in card for card in cards)
 
     model.response = _decision("pure_switch", target_ref="doc-other")
-    switched = _call("unrelated thought", context=context, store=store, model=model,
+    switched = _call("open doc-other", context=context, store=store, model=model,
                      search=search, notices=notices, actions=actions)
     assert switched["target_doc_id"] == "doc-other"
     expected_number = store.document_bindings[(context.context_id, "doc-other")]
@@ -249,7 +268,7 @@ def test_substantive_semantic_switch_preserves_question_and_notifies_target_numb
         numbers={"doc-current": 3},
     )
 
-    result = _call("compare it with the research discussion", context=context,
+    result = _call("compare it with doc-research", context=context,
                    store=store, model=model, search=search, notices=notices,
                    actions=actions)
 
@@ -271,7 +290,7 @@ def test_route_message_can_defer_notice_to_operation_orchestrator():
     )
 
     result = _call(
-        "continue research", context=context, store=store, model=model,
+        "continue doc-research", context=context, store=store, model=model,
         search=search, notices=notices, actions=actions, notify_switch=False,
     )
 
@@ -307,6 +326,100 @@ def test_unknown_explicit_number_is_not_found_without_any_target_fallback():
     assert store.get_calls == []
 
 
+@pytest.mark.parametrize("action", ["substantive", "annotation"])
+@pytest.mark.parametrize(("literal", "span_kind"), [
+    ("last", "id"), ("https://docs.google.com/document/d/last/edit", "url"),
+])
+def test_literal_id_last_does_not_alias_context_last_and_has_no_write_effect(
+    action, literal, span_kind,
+):
+    command = f"open {literal}"
+    span = {"kind": span_kind, "start": 5, "end": len(command),
+            "raw_text": literal, "parsed_value": literal}
+    response = {
+        "disposition": "execute", "action": action,
+        "substantive_text": "open the literal document id",
+        "document_selector": {"kind": "explicit_reference", "raw_value": literal,
+                              "span": span},
+        "folder_selector": None, "folder_name": None,
+        "explicit_references": [span], "missing_slots": [], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "certainty": "certain", "tool_choice": None,
+        "target_operation_id": None,
+    }
+    context, store, model, search, notices, actions = _harness(
+        decision=response, docs={"doc-a": {}}, last="doc-a",
+    )
+    result = _call(command, context=context, store=store, model=model,
+                   search=search, notices=notices, actions=actions)
+    assert result["status"] == "not_found"
+    assert result.get("target_doc_id") is None
+    assert actions.calls == [] and notices.sent == []
+    assert store.created_docs == [] and store.created_drafts == []
+
+
+def test_persisted_annotation_target_last_remains_canonical_after_last_pointer_changes():
+    from services.connectors.telegram.sessions import _resolve_target, _valid_persisted_route
+
+    context = _make_context(last="doc-a")
+    store = FakeStore({"doc-a": {}, "doc-b": {}, "last": {}})
+    store.bind_existing_numbers(context.context_id, {"doc-a": 1, "doc-b": 2, "last": 3})
+    pinned, status = _valid_persisted_route({
+        "kind": "annotation", "target_ref": "last", "target_operation_id": None,
+        "dialog_number": 3, "result_refs": [], "substantive_text": "literal id note",
+        "tool_choice": None, "certainty": "certain",
+    })
+    assert status == "ok"
+    from dataclasses import replace
+    context = replace(context, last_doc_id="doc-b")
+    target, _number, failure = _resolve_target(
+        pinned, context=context, store=store,
+        candidates=("doc-a", "doc-b", "last"),
+    )
+    assert (target, _number, failure) == ("last", 3, None)
+
+
+def test_fresh_move_resolves_only_its_explicit_local_number_before_effects():
+    command = "move #2 to Archive"
+    number_span = {"kind": "local_number", "start": 5, "end": 7,
+                   "raw_text": "#2", "parsed_value": 2}
+    response = {
+        "disposition": "execute", "action": "move_transcript",
+        "substantive_text": "move the explicitly numbered transcript",
+        "document_selector": {"kind": "dialog_number", "dialog_number": 2,
+                              "span": number_span},
+        "folder_selector": {"kind": "explicit_path", "value": "Archive", "parent": None},
+        "folder_name": None, "explicit_references": [number_span],
+        "missing_slots": [], "evidence_refs": [], "clarification_id": None,
+        "clarification_generation": None, "certainty": "certain",
+        "tool_choice": None, "target_operation_id": None,
+    }
+    context, store, model, search, notices, actions = _harness(
+        decision=response,
+        docs={"doc-last": {}, "doc-number-2": {}, "doc-list-position-2": {}},
+        last="doc-last",
+        numbers={"doc-last": 3, "doc-number-2": 2, "doc-list-position-2": 4},
+    )
+    moved = _call(command, context=context, store=store, model=model,
+                  search=search, notices=notices, actions=actions)
+    assert moved["status"] == "ok"
+    assert moved["target_doc_id"] == "doc-number-2"
+    assert actions.calls == [(
+        "move_transcript", {"doc_id": "doc-number-2", "folder_path": ["Archive"]},
+        "doc-number-2", False,
+    )]
+
+    response["document_selector"]["dialog_number"] = 99
+    response["document_selector"]["span"] = {**number_span, "parsed_value": 99,
+                                              "raw_text": "99", "start": 5, "end": 7}
+    response["explicit_references"] = [response["document_selector"]["span"]]
+    model.response = deepcopy(response)
+    result = _call("move 99 to Archive", context=context, store=store, model=model,
+                   search=search, notices=notices, actions=actions)
+    assert result["status"] == "not_found"
+    assert len(actions.calls) == 1
+
+
 def test_retry_requires_an_explicit_structured_number_and_never_resolves_last_target():
     docs = {"doc-current": {}, "doc-last": {}}
     context, store, model, search, notices, actions = _harness(
@@ -320,14 +433,14 @@ def test_retry_requires_an_explicit_structured_number_and_never_resolves_last_ta
     assert notices.sent == []
 
     model.response = _decision("retry", dialog_number=2)
-    explicit = _call("please retry", context=context, store=store, model=model,
+    explicit = _call("please retry #2", context=context, store=store, model=model,
                      search=search, notices=notices, actions=actions)
     assert explicit == {"status": "ok", "kind": "retry", "dialog_number": 2}
     assert store.get_calls == []
     assert notices.sent == []
 
     model.response = _decision("retry", dialog_number=99)
-    invalid_number = _call("please retry", context=context, store=store, model=model,
+    invalid_number = _call("please retry #99", context=context, store=store, model=model,
                            search=search, notices=notices, actions=actions)
     assert invalid_number["status"] == "ok"
     assert invalid_number["dialog_number"] == 99
@@ -416,7 +529,7 @@ def test_snapshot_save_predecessor_candidate_sets_exact_dependency_and_fixed_tar
     assert "private command text" not in repr(offered)
 
 
-def test_explicit_dialog_number_overrides_conflicting_save_target():
+def test_explicit_dialog_number_conflicts_with_confirmed_predecessor_target():
     context, store, model, search, notices, actions = _harness(
         decision=_decision(
             "substantive", target_ref="doc-stale", dialog_number=3,
@@ -430,12 +543,12 @@ def test_explicit_dialog_number_overrides_conflicting_save_target():
         search=search, notices=notices, actions=actions,
         save_candidates=[_saved_predecessor()],
     )
-    assert result["target_doc_id"] == "doc-explicit"
-    assert result["dialog_number"] == 3
-    assert "dependency_operation_id" not in result
+    assert result["status"] == "uncertain"
+    assert store.created_docs == [] and store.created_drafts == []
+    assert actions.calls == []
 
 
-def test_explicit_dialog_number_wins_when_operation_id_is_not_a_candidate():
+def test_unbound_predecessor_id_fails_closed_even_with_an_explicit_dialog_number():
     context, store, model, search, notices, actions = _harness(
         decision=_decision(
             "substantive", target_ref="doc-explicit", dialog_number=3,
@@ -447,9 +560,9 @@ def test_explicit_dialog_number_wins_when_operation_id_is_not_a_candidate():
     result = _call("continue dialog 3", context=context, store=store, model=model,
                    search=search, notices=notices, actions=actions,
                    save_candidates=[])
-    assert result["target_doc_id"] == "doc-explicit"
-    assert result["dialog_number"] == 3
-    assert "dependency_operation_id" not in result
+    assert result["status"] == "invalid_route"
+    assert notices.sent == []
+    assert actions.calls == []
 
 
 def test_concrete_target_ref_cannot_contradict_selected_save_operation():
@@ -463,7 +576,7 @@ def test_concrete_target_ref_cannot_contradict_selected_save_operation():
     result = _call("continue from saved result", context=context, store=store,
                    model=model, search=search, notices=notices, actions=actions,
                    save_candidates=[_saved_predecessor()])
-    assert result["status"] == "invalid_route"
+    assert result["status"] == "uncertain"
     assert notices.sent == []
     assert actions.calls == []
 
@@ -498,6 +611,45 @@ def test_unverified_or_non_chain_save_target_fails_without_last_fallback(target_
     assert actions.calls == []
 
 
+def test_fresh_null_selector_never_falls_back_to_last_but_explicit_last_does():
+    accepted_last = "\u043f\u0435\u0440\u0435\u0438\u043c\u0435\u043d\u0443\u0439 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0434\u0438\u0430\u043b\u043e\u0433"
+    last_phrase = "\u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0434\u0438\u0430\u043b\u043e\u0433"
+    last_start = accepted_last.index(last_phrase)
+    span = {"kind": "last_saved", "start": last_start,
+            "end": last_start + len(last_phrase),
+            "raw_text": last_phrase, "parsed_value": last_phrase}
+    bare = {
+        "disposition": "execute", "action": "substantive",
+        "substantive_text": "rename the selected transcript",
+        "document_selector": None, "folder_selector": None,
+        "folder_name": None, "explicit_references": [], "missing_slots": [],
+        "evidence_refs": [], "clarification_id": None,
+        "clarification_generation": None, "certainty": "certain",
+        "target_operation_id": None,
+        "tool_choice": {"name": "rename_transcript", "arguments": {
+            "doc_id": "doc-last", "new_title": "Renamed",
+        }},
+    }
+    context, store, model, search, notices, actions = _harness(
+        decision=bare, docs={"doc-last": {}}, current=None, last="doc-last",
+        numbers={"doc-last": 1},
+    )
+    blocked = _call("\u043f\u0435\u0440\u0435\u0438\u043c\u0435\u043d\u0443\u0439 \u0435\u0433\u043e", context=context, store=store, model=model,
+                    search=search, notices=notices, actions=actions)
+    assert blocked["status"] == "uncertain"
+    assert actions.calls == [] and notices.sent == []
+
+    explicit = deepcopy(bare)
+    explicit["document_selector"] = {"kind": "last_saved", "span": span}
+    explicit["explicit_references"] = [span]
+    model.response = explicit
+    completed = _call(accepted_last, context=context, store=store, model=model,
+                      search=search, notices=notices, actions=actions)
+    assert completed["status"] == "ok"
+    assert completed["target_doc_id"] == "doc-last"
+    assert [call[0] for call in actions.calls] == ["rename_transcript"]
+
+
 def test_explicit_search_creates_only_search_session_then_selects_existing_result():
     arguments = {"query": "synthetic search query", "folder_path": ["Client"],
                  "date_from": "2026-01-01", "date_to": "2026-12-31"}
@@ -522,7 +674,7 @@ def test_explicit_search_creates_only_search_session_then_selects_existing_resul
     assert store.created_drafts == []
 
     model.response = _decision("pure_switch", target_ref="doc-imported")
-    first = _call("open that result", context=context, store=store, model=model,
+    first = _call("open doc-imported", context=context, store=store, model=model,
                   search=search, notices=notices, actions=actions)
     assigned_number = first["dialog_number"]
     assert assigned_number == store.document_bindings[(context.context_id, "doc-imported")]
@@ -538,7 +690,7 @@ def test_explicit_search_creates_only_search_session_then_selects_existing_resul
     assert recreated.context_id == context.context_id
     model.response = _decision("substantive", target_ref="doc-imported",
                                substantive_text="continue here")
-    repeated = _call("keep going", context=recreated, store=store, model=model,
+    repeated = _call("keep going doc-imported", context=recreated, store=store, model=model,
                      search=search, notices=notices, actions=actions)
     assert repeated["dialog_number"] == assigned_number
     assert len([key for key in store.document_bindings
@@ -573,12 +725,12 @@ def test_search_results_empty_results_and_errors_remain_search_results(
     ("save this", _decision("save", target_ref="doc-a"), "save", None),
     ("\u0441\u043e\u0445\u0440\u0430\u043d\u0438 \u044d\u0442\u043e",
      _decision("save", target_ref="doc-a"), "save", None),
-    ("please retry this", _decision("retry", target_ref="doc-a", dialog_number=1), "retry", None),
-    ("\u043f\u043e\u0432\u0442\u043e\u0440\u0438 \u043e\u043f\u0435\u0440\u0430\u0446\u0438\u044e",
+    ("please retry this #1", _decision("retry", target_ref="doc-a", dialog_number=1), "retry", None),
+    ("\u043f\u043e\u0432\u0442\u043e\u0440\u0438 #1",
      _decision("retry", target_ref="doc-a", dialog_number=1), "retry", None),
-    ("switch to another dialog", _decision("pure_switch", target_ref="doc-b"),
+    ("switch to doc-b", _decision("pure_switch", target_ref="doc-b"),
      "pure_switch", None),
-    ("\u043f\u0435\u0440\u0435\u0439\u0434\u0438 \u043a \u0434\u0440\u0443\u0433\u043e\u043c\u0443 \u0434\u0438\u0430\u043b\u043e\u0433\u0443",
+    ("\u043f\u0435\u0440\u0435\u0439\u0434\u0438 \u043a doc-b",
      _decision("pure_switch", target_ref="doc-b"), "pure_switch", None),
     ("find a related dialog", _decision("search", result_refs=[]), "search", None),
     ("\u043d\u0430\u0439\u0434\u0438 \u0441\u0432\u044f\u0437\u0430\u043d\u043d\u044b\u0439 \u0434\u0438\u0430\u043b\u043e\u0433",
@@ -742,7 +894,7 @@ def test_pure_switch_from_no_current_conversation_is_a_focus_change():
                            substantive_text="must be discarded"),
         docs={"doc-a": {"title": "A", "content": "private transcript"}},
     )
-    result = _call("open dialog", context=context, store=store, model=model,
+    result = _call("open doc-a", context=context, store=store, model=model,
                    search=search, notices=notices, actions=actions)
     assert result["selection_changed"] is True
     assert result["substantive_text"] is None
@@ -794,7 +946,8 @@ def test_malformed_store_target_or_dialog_identity_fails_before_effects(malforma
         store.get_or_assign_dialog_number = lambda *_: True
     else:
         store.docs["doc-a"]["conversation_id"] = ""
-    result = _call("open dialog", context=context, store=store, model=model,
+    command = "open dialog #8" if malformation == "target" else "open doc-a"
+    result = _call(command, context=context, store=store, model=model,
                    search=search, notices=notices, actions=actions)
     assert result["status"] in {"invalid_route", "not_found", "error"}
     assert actions.calls == []
@@ -864,12 +1017,14 @@ def test_invalid_or_uncertain_route_fails_closed_without_side_effects(response, 
 def test_only_explicit_uncertain_certainty_is_uncertainty(certainty):
     from services.connectors.telegram.sessions import _valid_response
 
-    response = _decision("substantive", substantive_text="synthetic request")
+    response = _decision("substantive", substantive_text="synthetic request",
+                         certainty="certain")
+    fresh = _legacy_fixture_to_semantic(response, "synthetic request")
     if certainty is None:
-        response.pop("certainty")
+        fresh.pop("certainty")
     else:
-        response["certainty"] = certainty
-    decision, status = _valid_response(response)
+        fresh["certainty"] = certainty
+    decision, status = _valid_response(fresh, accepted_command="synthetic request")
 
     assert decision is None
     assert status == "invalid_route"
@@ -878,7 +1033,10 @@ def test_only_explicit_uncertain_certainty_is_uncertainty(certainty):
 def test_malformed_unhashable_kind_is_invalid_route_not_validation_exception():
     from services.connectors.telegram.sessions import _valid_response
 
-    decision, status = _valid_response(_decision([], certainty="certain"))
+    decision, status = _valid_response(
+        _legacy_fixture_to_semantic(_decision([], certainty="certain"), ""),
+        accepted_command="",
+    )
 
     assert decision is None
     assert status == "invalid_route"
@@ -887,18 +1045,23 @@ def test_malformed_unhashable_kind_is_invalid_route_not_validation_exception():
 def test_explicit_model_uncertainty_remains_uncertain():
     from services.connectors.telegram.sessions import _valid_response
 
-    decision, status = _valid_response(_decision("search", certainty="uncertain"))
+    decision, status = _valid_response(
+        _legacy_fixture_to_semantic(_decision("search", certainty="uncertain"), "search"),
+        accepted_command="search",
+    )
 
-    assert decision is None
+    assert decision is not None
     assert status == "uncertain"
 
 
 def test_malformed_explicit_uncertain_route_is_invalid():
     from services.connectors.telegram.sessions import _valid_response
 
-    decision, status = _valid_response(_decision(
-        "save", certainty="uncertain", target_operation_id="synthetic-save",
-    ))
+    decision, status = _valid_response(
+        _legacy_fixture_to_semantic(_decision(
+            "save", certainty="uncertain", target_operation_id="synthetic-save",
+        ), "save"), accepted_command="save",
+    )
 
     assert decision is None
     assert status == "invalid_route"
@@ -940,13 +1103,16 @@ def test_route_kind_cross_field_violations_fail_closed_without_effects(
     from services.connectors.telegram.runtime.routing import _ROUTE_SCHEMA
 
     variant = next(item for item in _ROUTE_SCHEMA["anyOf"]
-                   if item["properties"]["kind"]["enum"] == [schema_kind])
-    if schema_kind == "search" and schema_field == "tool_choice":
-        from services.connectors.telegram.runtime.routing import _tool_choice_schemas
-        expected_schema = next(item for item in _tool_choice_schemas()
-                               if item["properties"]["name"]["enum"] == ["query"])
+                   if item["properties"]["action"]["enum"] == [schema_kind])
+    shape = variant["properties"].get(schema_field)
+    if schema_field == "dialog_number":
+        shape = variant["properties"]["document_selector"]["properties"]["dialog_number"]
+    if shape is None:
+        shape = _ROUTE_SCHEMA["properties"][schema_field]
     if expected_schema is not None:
-        assert variant["properties"][schema_field] == expected_schema
+        assert shape == expected_schema
+    elif schema_kind == "search":
+        assert shape["properties"]["name"]["enum"] == ["query"]
 
     context, store, model, search, notices, actions = _harness(
         decision=response,
@@ -970,22 +1136,26 @@ def test_search_route_native_schema_matches_server_target_constraints():
     from services.connectors.telegram.runtime.routing import _ROUTE_SCHEMA
 
     search = next(item for item in _ROUTE_SCHEMA["anyOf"]
-                  if item["properties"]["kind"]["enum"] == ["search"])
+                  if item["properties"]["action"]["enum"] == ["search"])
     properties = search["properties"]
-    assert properties["target_ref"] == {"type": "null"}
-    assert properties["target_operation_id"] == {"type": "null"}
-    assert properties["dialog_number"] == {"type": "null"}
-    assert properties["result_refs"] == {
-        "type": "array", "maxItems": 0, "items": {"type": "string"},
-    }
+    assert properties["document_selector"] == {"type": "null"}
+    assert properties["folder_selector"] == {"type": "null"}
+    assert properties["tool_choice"]["properties"]["name"]["enum"] == ["query"]
+    assert "enum" not in _ROUTE_SCHEMA["properties"]["target_operation_id"]["anyOf"][0]
+    assert "target_ref" not in _ROUTE_SCHEMA["properties"]
 
-    # Other route kinds retain their broader or kind-specific target semantics.
     variants = {
-        item["properties"]["kind"]["enum"][0]: item["properties"]
+        item["properties"]["action"]["enum"][0]: item["properties"]
         for item in _ROUTE_SCHEMA["anyOf"]
     }
-    assert "target_ref" not in variants["substantive"]
-    assert "result_refs" not in variants["substantive"]
-    assert variants["retry"]["dialog_number"] == {
-        "type": "integer", "minimum": 1,
-    }
+    assert variants["create_folder"]["document_selector"] == {"type": "null"}
+    assert "document_selector" in variants["move_transcript"]
+    assert "document_selector" in variants["create_then_move"]
+    assert _ROUTE_SCHEMA["properties"]["substantive_text"] == {"type": "string"}
+    assert variants["retry"]["document_selector"]["properties"][
+        "dialog_number"] == {"type": "integer", "minimum": 1}
+    assert variants["move_transcript"]["tool_choice"]["anyOf"][0][
+        "properties"]["name"]["enum"] == ["move_transcript"]
+    assert variants["create_folder"]["tool_choice"]["anyOf"][0][
+        "properties"]["name"]["enum"] == ["create_folder"]
+    assert variants["create_then_move"]["tool_choice"] == {"type": "null"}

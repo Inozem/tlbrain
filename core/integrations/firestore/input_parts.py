@@ -74,10 +74,14 @@ def write_input_parts(
     return expected
 
 
-def read_input_parts(client: Any | None, input_ref: str) -> bytes:
+def read_input_parts(client: Any | None, input_ref: str, *, transaction: Any = None) -> bytes:
     """Verify a complete manifest and reconstruct the exact original byte string."""
     db = _db(client)
-    manifest_snapshot = input_manifest_ref(db, input_ref).get()
+    manifest_ref = input_manifest_ref(db, input_ref)
+    manifest_snapshot = (
+        manifest_ref.get() if transaction is None
+        else manifest_ref.get(transaction=transaction)
+    )
     if not manifest_snapshot.exists:
         raise ValueError("immutable input manifest is absent")
     manifest = manifest_snapshot.to_dict() or {}
@@ -93,7 +97,11 @@ def read_input_parts(client: Any | None, input_ref: str) -> bytes:
     payload_parts: list[bytes] = []
     parts_collection = _parts_collection(db, input_ref)
     for index in range(count):
-        snapshot = parts_collection.document(f"part-{index:06d}").get()
+        part_ref = parts_collection.document(f"part-{index:06d}")
+        snapshot = (
+            part_ref.get() if transaction is None
+            else part_ref.get(transaction=transaction)
+        )
         if not snapshot.exists:
             raise ValueError("immutable input is missing a part")
         part = snapshot.to_dict() or {}

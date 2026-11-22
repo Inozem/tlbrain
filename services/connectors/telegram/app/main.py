@@ -229,6 +229,33 @@ _TASK_FIELDS = frozenset({
     "schema_version", "outbox_id", "target_kind", "generation", "operation_id",
     "context_id", "document_id", "save_intent_id", "notification_id",
 })
+
+
+async def _clarification_task_notification(
+    payload: dict[str, Any], publisher: Any, record: Any,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Bind a canonical task to its clarification row when the publisher exposes it."""
+    repository = getattr(publisher, "repository", None)
+    getter = getattr(repository, "get_notification", None)
+    if not callable(getter) or not getattr(record, "notification_id", None):
+        return None, False
+    notification = await _offload_sync(getter, record.notification_id)
+    if not isinstance(notification, dict) or notification.get("kind") != "clarification":
+        return notification if isinstance(notification, dict) else None, False
+    expected_fields = {
+        "schema_version", "outbox_id", "target_kind", "generation",
+        "context_id", "notification_id",
+    }
+    if (set(payload) != expected_fields
+            or payload.get("target_kind") != "telegram_dispatch"
+            or record.operation_id is not None
+            or record.notification_id != notification.get("notification_id")
+            or record.context_id != notification.get("context_id")
+            or payload.get("notification_id") != notification.get("notification_id")
+            or payload.get("context_id") != notification.get("context_id")
+            or notification.get("operation_id") is not None):
+        return notification, True
+    return notification, False
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-internal")
 
 
@@ -603,29 +630,7 @@ def create_app(
                 return JSONResponse({"detail": "webhook unavailable"}, status_code=503)
         try:
             if "callback_query" in update:
-                result = await _offload_sync(intake_instance.handle_callback, update)
-                callback = update.get("callback_query")
-                query_id = callback.get("id") if isinstance(callback, dict) else None
-                publisher = app.state.telegram_notification_publisher
-                if publisher is None and app.state.telegram_client is None:
-                    try:
-                        publisher = await _offload_sync(_notification_runtime)
-                        app.state.telegram_notification_publisher = publisher
-                    except Exception:
-                        publisher = None
-                telegram_client = app.state.telegram_client or getattr(publisher, "client", None)
-                if isinstance(query_id, str) and telegram_client is not None:
-                    try:
-                        await telegram_client.answer_callback_query(
-                            query_id,
-                            text=None if getattr(result, "accepted", False)
-                            else "This Save button is no longer available.",
-                        )
-                    except Exception:
-                        logger.info("Telegram callback acknowledgement failed",
-                                    extra={"event": "callback_ack_failed"})
-                if result is not None:
-                    await _offload_sync(intake_instance.publish_result, result)
+                await _handle_save_callback(app, intake_instance, update)
             else:
                 await _offload_sync(intake_instance.handle_update, update)
         except Exception as exc:
@@ -687,11 +692,21 @@ def create_app(
             if record is None:
                 return {"status": "noop"}
             publisher = app.state.telegram_notification_publisher
-            if payload.get("notification_id"):
+            task_notification = None
+            if record.notification_id:
                 if publisher is None:
                     publisher = await _offload_sync(_notification_runtime)
                     app.state.telegram_notification_publisher = publisher
+                task_notification, malformed_clarification = await _clarification_task_notification(
+                    payload, publisher, record,
+                )
+                if malformed_clarification:
+                    return JSONResponse({"error": "Invalid task"}, status_code=400)
                 delivery_state = await publisher.publish(payload["notification_id"])
+                if (task_notification is not None
+                        and task_notification.get("kind") == "clarification"
+                        and delivery_state == "superseded"):
+                    return {"status": "superseded"}
                 if delivery_state != "delivered":
                     if delivery_state in {"failed", "delivery_unknown"}:
                         return {"status": delivery_state}
@@ -783,6 +798,11 @@ def create_app(
             if publisher is None:
                 publisher = await _offload_sync(_notification_runtime)
                 app.state.telegram_notification_publisher = publisher
+            task_notification, malformed_clarification = await _clarification_task_notification(
+                payload, publisher, record,
+            )
+            if malformed_clarification:
+                return JSONResponse({"error": "Invalid task"}, status_code=400)
             if record.outbox_id.startswith("tgcard-close-"):
                 notification = await _offload_sync(
                     publisher.repository.get_notification, payload["notification_id"],
@@ -796,11 +816,79 @@ def create_app(
             return JSONResponse({"error": "Invalid task"}, status_code=400)
         except Exception:
             return JSONResponse({"error": "Delivery unavailable"}, status_code=503)
+        if (task_notification is not None
+                and task_notification.get("kind") == "clarification"
+                and result == "superseded"):
+            return {"status": "superseded"}
         if result not in {"delivered", "failed", "delivery_unknown", "not_found"}:
             return JSONResponse({"error": "Notification delivery pending"}, status_code=503)
         return {"status": result}
 
     return app
+
+
+async def _callback_telegram_runtime(app: FastAPI) -> tuple[Any, Any]:
+    """Resolve the existing Telegram publisher/client for callback UX best-effort."""
+    publisher = app.state.telegram_notification_publisher
+    if publisher is None and app.state.telegram_client is None:
+        try:
+            publisher = await _offload_sync(_notification_runtime)
+            app.state.telegram_notification_publisher = publisher
+        except Exception:
+            publisher = None
+    return publisher, app.state.telegram_client or getattr(publisher, "client", None)
+
+
+async def _handle_save_callback(app: FastAPI, intake: Any, update: Any) -> None:
+    """Acknowledge a typed Save and run card edit alongside durable task dispatch."""
+    callback = update.get("callback_query") if isinstance(update, dict) else None
+    query_id = callback.get("id") if isinstance(callback, dict) else None
+    try:
+        result = await _offload_sync(intake.handle_callback, update)
+    except Exception:
+        _publisher, telegram_client = await _callback_telegram_runtime(app)
+        await _answer_save_callback(
+            telegram_client, query_id,
+            "Could not confirm Save. Check the card before trying again.",
+        )
+        raise
+
+    publisher, telegram_client = await _callback_telegram_runtime(app)
+    accepted = bool(getattr(result, "accepted", False))
+    await _answer_save_callback(
+        telegram_client, query_id,
+        "Save accepted." if accepted else "This Save button is no longer available.",
+    )
+
+    publications = []
+    if accepted and publisher is not None:
+        notification_id = getattr(result, "notification_id", None)
+        if isinstance(notification_id, str) and notification_id:
+            publications.append(_publish_save_card_best_effort(publisher, notification_id))
+    if result is not None:
+        publications.append(_offload_sync(intake.publish_result, result))
+    if publications:
+        await asyncio.gather(*publications)
+
+
+async def _publish_save_card_best_effort(publisher: Any, notification_id: str) -> None:
+    """Try the current Saving revision without changing durable save acceptance."""
+    try:
+        await publisher.publish(notification_id)
+    except Exception:
+        logger.info("Telegram Save card edit failed",
+                    extra={"event": "save_card_edit_failed"})
+
+
+async def _answer_save_callback(client: Any, query_id: Any, text: str) -> None:
+    """Answer a Save callback without allowing Telegram UX to change intake outcome."""
+    if not isinstance(query_id, str) or client is None:
+        return
+    try:
+        await client.answer_callback_query(query_id, text=text)
+    except Exception:
+        logger.info("Telegram callback acknowledgement failed",
+                    extra={"event": "callback_ack_failed"})
 
 
 app = create_app()

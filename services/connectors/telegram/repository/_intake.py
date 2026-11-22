@@ -1418,4 +1418,9 @@ class _TelegramIntakeMixin:
     def get_context(self, context_id: str) -> dict[str, Any] | None:
         context_id = _identifier(context_id, "context_id")
         snapshot = self.client.collection(SESSIONS).document(context_id).get()
-        return snapshot.to_dict() if snapshot.exists else None
+        if not snapshot.exists:
+            return None
+        context = snapshot.to_dict() or {}
+        context.setdefault("pending_clarification_id", None)
+        context.setdefault("clarification_generation", 0)
+        return context

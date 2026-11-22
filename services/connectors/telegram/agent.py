@@ -7,6 +7,7 @@ from copy import deepcopy
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import inspect
 import json
 import logging
@@ -18,6 +19,11 @@ from core.operations import registry
 from services.connectors.telegram.tools import get_tool_catalog
 
 _PERSISTED_ROUNDS = "_telegram_tool_loop_rounds"
+_PRESENT_SEARCH_ANSWER = "present_search_answer"
+_PRESENTATION_READ_TOOLS = frozenset({
+    "query", "get_transcript", "list_recent_transcripts", "list_folders",
+})
+_PRESENTATION_FAILURE = "The requested search presentation could not be validated."
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -128,14 +134,301 @@ def _aggregate_usage(rounds: list[dict[str, Any]]) -> dict[str, int]:
     return totals
 
 
-def _rounds_from_record(record: Any) -> list[dict[str, Any]]:
+def _rounds_without_response(
+    record: Any, calls: list[Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Validate application-route-only records that have no model response."""
+    route = _field(record, "application_route")
+    if isinstance(route, Mapping) and "contextual" in route:
+        contextual = route.get("contextual")
+        executable = {"name", "arguments", "ordinal", "target_doc_id"}.issubset(route)
+        if (not isinstance(contextual, Mapping)
+                or (not executable and calls)
+                or (executable and type(route.get("ordinal")) is not int)):
+            return [], True
+        if executable:
+            matching = [call for call in calls if isinstance(call, Mapping)
+                        and type(call.get("ordinal")) is int
+                        and call.get("ordinal") == route.get("ordinal")]
+            if (len(matching) != 1
+                    or matching[0].get("name") != route.get("name")
+                    or matching[0].get("arguments") != route.get("arguments")
+                    or ("call_id" in route and matching[0].get("id") != route["call_id"])):
+                return [], True
+    return [], False
+
+
+def _decode_recorded_rounds(
+    record: Any, response: Any, calls: list[Any],
+) -> tuple[list[Any] | None, bool]:
+    """Decode the persisted envelope or a legacy raw model response."""
+    if isinstance(response, Mapping) and _PERSISTED_ROUNDS in response:
+        if (type(response.get(_PERSISTED_ROUNDS)) is not int
+                or response[_PERSISTED_ROUNDS] != 1
+                or set(response) != {_PERSISTED_ROUNDS, "rounds"}
+                or not isinstance(response.get("rounds"), list)
+                or not response["rounds"]):
+            return None, True
+        return response["rounds"], False
+
+    response_calls = _calls_from(response)
+    route = _field(record, "application_route")
+    app_slot = (isinstance(route, Mapping)
+                and isinstance(route.get("contextual"), Mapping)
+                and {"name", "arguments", "ordinal", "target_doc_id"}.issubset(route)
+                and _field(record, "application_route_round") is None
+                and any(isinstance(call, Mapping)
+                        and call.get("ordinal") == route.get("ordinal")
+                        and call.get("round") == -1 for call in calls))
+    native_count = len(calls) - (1 if app_slot else 0)
+    if (native_count < 0 or len(response_calls) != native_count
+            or any(call.get("name") == _PRESENT_SEARCH_ANSWER
+                   for call in response_calls)):
+        return None, True
+    return [{"response": response, "call_start": 0, "call_count": native_count}], False
+
+
+def _validate_recorded_round(
+    saved_round: Any, *, index: int, expected_start: int,
+    application_ordinal: Any, server_application_slot: bool,
+) -> tuple[int, bool] | None:
+    """Validate one round's native calls and optional terminal annotation."""
+    if (not isinstance(saved_round, Mapping)
+            or set(saved_round) not in (
+                {"response", "call_start", "call_count"},
+                {"response", "call_start", "call_count", "terminal"},
+            )
+            or "response" not in saved_round
+            or type(saved_round.get("call_start")) is not int
+            or type(saved_round.get("call_count")) is not int
+            or saved_round["call_start"] != expected_start
+            or saved_round["call_count"] < 0):
+        return None
+    call_count = saved_round["call_count"]
+    if (server_application_slot
+            and saved_round["call_start"] == application_ordinal
+            and call_count > 0):
+        return None
+    native_calls = _calls_from(saved_round["response"])
+    terminal_round = "terminal" in saved_round
+    if terminal_round:
+        terminal = saved_round["terminal"]
+        if not isinstance(terminal, Mapping):
+            return None
+        status = terminal.get("status")
+        failed_shape = {"status", "round_index", "arguments_sha256"}
+        success_shape = {*failed_shape, "manifest_sha256", "manifest"}
+        if (type(terminal.get("round_index")) is not int
+                or terminal["round_index"] != index
+                or type(terminal.get("round_index")) is bool
+                or (status == "ok" and set(terminal) != success_shape)
+                or (status == "failed" and set(terminal) != failed_shape)
+                or status not in {"ok", "failed"}
+                or call_count != 0):
+            return None
+        arg_digest = terminal.get("arguments_sha256")
+        if arg_digest is not None and not _is_sha256(arg_digest):
+            return None
+        if status == "ok":
+            if (not _is_sha256(terminal.get("manifest_sha256"))
+                    or not isinstance(terminal.get("manifest"), Mapping)
+                    or len(native_calls) != 1
+                    or native_calls[0].get("name") != _PRESENT_SEARCH_ANSWER):
+                return None
+    elif (len(native_calls) != call_count
+          or any(call.get("name") == _PRESENT_SEARCH_ANSWER for call in native_calls)):
+        return None
+    return call_count, terminal_round
+
+
+def _validate_recorded_round_sequence(
+    rounds: list[Any], record: Any, calls: list[Any],
+) -> bool:
+    """Validate ordinal layout, terminal placement, and complete call coverage."""
+    route = _field(record, "application_route")
+    route_round = _field(record, "application_route_round")
+    if any(not isinstance(saved_round, Mapping) for saved_round in rounds):
+        return False
+    contextual = route.get("contextual") if isinstance(route, Mapping) else None
+    executable = isinstance(route, Mapping) and any(
+        key in route for key in ("name", "arguments", "ordinal", "target_doc_id")
+    )
+    if executable and (type(route.get("ordinal")) is not int or route["ordinal"] < 0):
+        return False
+    metadata_only = isinstance(contextual, Mapping) and not executable
+    server_application_slot = bool(
+        executable and route_round is None
+        and (not isinstance(contextual, Mapping)
+             or any(isinstance(call, Mapping)
+                    and call.get("ordinal") == route.get("ordinal")
+                    and call.get("round") == -1 for call in calls))
+    )
+    expected_start = 0
+    if (server_application_slot and rounds
+            and (not isinstance(rounds[0], Mapping)
+                 or type(rounds[0].get("call_start")) is not int)):
+        return False
+    if (server_application_slot and rounds
+            and rounds[0].get("call_start") != 0):
+        expected_start = route["ordinal"] + 1
+    if isinstance(route, Mapping) and isinstance(contextual, Mapping):
+        if (metadata_only and (route_round is not None
+                               or contextual.get("fixed_plan") is not None)
+                or executable and set(("name", "arguments", "ordinal", "target_doc_id")) - set(route)):
+            return False
+
+    terminal_indexes = []
+    for index, saved_round in enumerate(rounds):
+        if (index and server_application_slot
+                and expected_start == route.get("ordinal")
+                and isinstance(saved_round, Mapping)
+                and type(saved_round.get("call_start")) is int
+                and saved_round.get("call_start") == expected_start + 1):
+            expected_start += 1
+        result = _validate_recorded_round(
+            saved_round, index=index, expected_start=expected_start,
+            application_ordinal=route.get("ordinal") if isinstance(route, Mapping) else None,
+            server_application_slot=server_application_slot,
+        )
+        if result is None:
+            return False
+        call_count, terminal_round = result
+        if terminal_round:
+            terminal_indexes.append(index)
+        expected_start += call_count
+    if server_application_slot and expected_start == route.get("ordinal"):
+        expected_start += 1
+    return expected_start == len(calls) and (
+        not terminal_indexes or terminal_indexes == [len(rounds) - 1]
+    )
+
+
+def _rounds_from_record(record: Any) -> tuple[list[dict[str, Any]], bool]:
     response = _field(record, "model_response")
-    if response is None:
-        return []
-    if isinstance(response, Mapping) and response.get(_PERSISTED_ROUNDS) == 1:
-        return list(response.get("rounds", ()))
     calls = list(_field(record, "tool_calls", ()) or ())
-    return [{"response": response, "call_start": 0, "call_count": len(calls)}]
+    if response is None:
+        return _rounds_without_response(record, calls)
+    rounds, malformed = _decode_recorded_rounds(record, response, calls)
+    if malformed or rounds is None:
+        return [], True
+    if not _validate_recorded_round_sequence(rounds, record, calls):
+        return [], True
+    return [dict(saved_round) for saved_round in rounds], False
+
+
+def _contextual_call_provenance_valid(record: Mapping[str, Any]) -> bool:
+    """Match every saved call to native SDK data or the one declared server call."""
+    route = record.get("application_route")
+    if not isinstance(route, Mapping) or "contextual" not in route:
+        return True
+    executable_fields = {"name", "arguments", "ordinal", "target_doc_id"}
+    executable = executable_fields.issubset(route)
+    if (record.get("application_route_round") is not None
+            or any(key in route for key in executable_fields) != executable):
+        return False
+    calls = record.get("tool_calls", ())
+    if not isinstance(calls, (list, tuple)):
+        return False
+    rounds, failure = _rounds_from_record(record)
+    if failure:
+        return False
+    from core.operations.registry import validate_arguments
+
+    app_ordinal = route.get("ordinal") if executable else None
+    server_application_slot = bool(
+        executable and record.get("application_route_round") is None
+        and any(isinstance(call, Mapping)
+                and call.get("ordinal") == app_ordinal
+                and call.get("round") == -1 for call in calls)
+    )
+    app_seen = False
+    slot = 0
+
+    def skip_application_slot() -> bool:
+        nonlocal slot, app_seen
+        if not server_application_slot or app_seen or slot != app_ordinal:
+            return True
+        if slot >= len(calls):
+            return False
+        call = calls[slot]
+        delivery_id = record.get("delivery_id")
+        if not isinstance(delivery_id, str) or not delivery_id:
+            delivery_id = route.get("contextual", {}).get("operation_id")
+        if not isinstance(delivery_id, str) or not delivery_id:
+            return False
+        expected = {
+            "id": route.get("call_id", f"application-{delivery_id}-{app_ordinal}"),
+            "name": route.get("name"),
+            "arguments": route.get("arguments"), "ordinal": app_ordinal,
+            "round": -1,
+        }
+        if (not isinstance(call, Mapping) or set(call) != set(expected)
+                or any(call.get(key) != value for key, value in expected.items())):
+            return False
+        app_seen = True
+        slot += 1
+        return True
+
+    for round_index, saved_round in enumerate(rounds):
+        native_calls = _calls_from(saved_round.get("response"))
+        call_start = saved_round.get("call_start")
+        call_count = saved_round.get("call_count")
+        if type(call_start) is not int or type(call_count) is not int:
+            return False
+        if "terminal" in saved_round:
+            if (call_count != 0 or len(native_calls) > 1
+                    or any(call.get("name") != _PRESENT_SEARCH_ANSWER
+                           for call in native_calls)
+                    or (saved_round["terminal"].get("status") == "ok"
+                        and len(native_calls) != 1)):
+                return False
+            # A validated terminal presentation call is a private model
+            # artifact; it never occupies a shared tool-call ordinal.
+            continue
+        for local_index, native in enumerate(native_calls):
+            if (local_index >= call_count
+                    or not skip_application_slot() or slot >= len(calls)):
+                return False
+            saved = calls[slot]
+            try:
+                arguments = validate_arguments(native.get("name"), native.get("arguments"))
+            except (TypeError, ValueError):
+                return False
+            if (not isinstance(saved, Mapping)
+                    or set(saved) != {
+                        "id", "name", "arguments", "thought_signature", "ordinal", "round",
+                    }
+                    or saved.get("ordinal") != slot
+                    or saved.get("round") != round_index
+                    or saved.get("id") != native.get("id")
+                    or saved.get("name") != native.get("name")
+                    or saved.get("arguments") != arguments
+                    or saved.get("thought_signature") != native.get("thought_signature")):
+                return False
+            slot += 1
+        if len(native_calls) != call_count:
+            return False
+    if not skip_application_slot():
+        return False
+    if executable and not server_application_slot:
+        if (not isinstance(app_ordinal, int) or app_ordinal < 0
+                or app_ordinal >= len(calls)):
+            return False
+        saved = calls[app_ordinal]
+        if (not isinstance(saved, Mapping)
+                or saved.get("ordinal") != app_ordinal
+                or saved.get("round") is None
+                or type(saved.get("round")) is not int or saved["round"] < 0
+                or saved.get("name") != route.get("name")
+                or saved.get("arguments") != route.get("arguments")
+                or ("call_id" in route and saved.get("id") != route.get("call_id"))):
+            return False
+    return slot == len(calls) and (not server_application_slot or app_seen)
+
+
+def _is_sha256(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value))
 
 
 @dataclass
@@ -145,6 +438,8 @@ class _ToolLoopState:
     tool_results: dict[int, Any] = field(default_factory=dict)
     application_route: dict[str, Any] | None = None
     application_route_round: int | None = None
+    checkpoint_failure: bool = False
+    record: Any = None
 
     @property
     def usage(self) -> dict[str, int]:
@@ -173,8 +468,49 @@ class TelegramAgent:
         executor_factory: Callable[[str, str, Any], Any] | None = None,
         execution_context: Any = None,
         allowed_tools: set[str] | frozenset[str] | None = None,
+        presentation_scope: Mapping[str, Any] | None = None,
+        presentation_sources: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         """Run one operation with an optional per-invocation pinned executor."""
+        presentation_requested = presentation_scope is not None or presentation_sources is not None
+        if isinstance(presentation_scope, Mapping):
+            presentation_scope = dict(presentation_scope)
+
+        state = self._load_state(conversation_id, delivery_id)
+        if state.checkpoint_failure:
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+
+        # Immutable terminal and completed prose checkpoints are replayed before
+        # requiring a fresh presentation capability or constructing collaborators.
+        terminal_replay = self._replay_terminal(
+            state, presentation_scope=presentation_scope,
+            delivery_id=delivery_id, ledger=self.ledger,
+        )
+        if terminal_replay is not None:
+            return terminal_replay
+        if (state.application_route is None and not state.calls and self._has_final_answer(state)
+                and not any("terminal" in row for row in state.rounds)):
+            return self._final_answer(state)
+        if (presentation_requested and self._has_final_answer(state)
+                and all(int(call.get("ordinal", -1)) in state.tool_results
+                        for call in state.calls)):
+            return self._final_answer(state)
+
+        presentation_enabled = presentation_scope is not None or presentation_sources is not None
+        if presentation_enabled:
+            scope_failure = self._validate_presentation_scope(
+                presentation_scope, presentation_sources,
+                delivery_id=delivery_id, ledger=self.ledger,
+            )
+            if scope_failure is not None:
+                return self._failure(scope_failure, state.usage)
+        effective_allowed_tools = allowed_tools
+        if presentation_enabled:
+            effective_allowed_tools = (
+                _PRESENTATION_READ_TOOLS if allowed_tools is None
+                else _PRESENTATION_READ_TOOLS.intersection(allowed_tools)
+            )
+
         if target_doc_id is not None and (not isinstance(target_doc_id, str) or not target_doc_id):
             return self._failure("The operation target is invalid.", {})
         if target_doc_id is not None and executor_factory is None:
@@ -190,17 +526,59 @@ class TelegramAgent:
         if not callable(getattr(executor, "execute", None)):
             return self._failure("The operation tool executor is unavailable.", {})
         contents = list(history)
-        state = self._load_state(conversation_id, delivery_id)
+        application_result_route = None
+        application_result_value = None
         if state.application_route is not None:
-            if state.application_route.get("target_doc_id") not in (None, target_doc_id):
+            contextual = state.application_route.get("contextual")
+            metadata_only = (isinstance(contextual, Mapping)
+                             and not any(key in state.application_route for key in (
+                                 "name", "arguments", "ordinal", "target_doc_id")))
+            if (not metadata_only
+                    and (("contextual" in state.application_route
+                          and state.application_route.get("target_doc_id") != target_doc_id)
+                         or ("contextual" not in state.application_route
+                             and state.application_route.get("target_doc_id") not in (None, target_doc_id)))):
                 return self._failure("The persisted application target changed.", state.usage)
-            application_result = self._application_route_result(state)
-            if application_result is None:
-                return self._failure("The persisted application result is incomplete.", state.usage)
-            self._append_application_context(contents, state.application_route, application_result)
+            if metadata_only:
+                pass
+            else:
+                application_result = self._application_route_result(state)
+                native_pending = self._pending_native_application_result(state)
+                if application_result is None and not native_pending:
+                    return self._failure("The persisted application result is incomplete.", state.usage)
+                server_application_slot = any(
+                    isinstance(contextual, Mapping)
+                    and isinstance(call, Mapping)
+                    and call.get("ordinal") == state.application_route.get("ordinal")
+                    and call.get("round") == -1 for call in state.calls
+                )
+                if native_pending:
+                    # The exact saved native SDK round remains authoritative.
+                    # Replay its recorded call through the existing executor;
+                    # a missing result is the work to resume, not a new route.
+                    pass
+                elif state.application_route_round is None and server_application_slot:
+                    application_result_route = state.application_route
+                    application_result_value = application_result
+                elif state.application_route_round is not None:
+                    self._append_application_context(
+                        contents, state.application_route, application_result,
+                    )
+                elif not isinstance(contextual, Mapping):
+                    # Preserve the historical application-result input for
+                    # legacy pinned routes. Contextual native calls are already
+                    # represented by their real SDK round and declared server
+                    # calls use the deferred server-slot insertion above.
+                    self._append_application_context(
+                        contents, state.application_route, application_result,
+                    )
         replay_failure = self._replay_saved_rounds(
             contents, state, conversation_id=conversation_id, delivery_id=delivery_id,
-            executor=executor, target_doc_id=target_doc_id, allowed_tools=allowed_tools,
+            executor=executor, target_doc_id=target_doc_id,
+            allowed_tools=effective_allowed_tools,
+            allow_completed_disallowed=presentation_enabled,
+            application_result_route=application_result_route,
+            application_result_value=application_result_value,
         )
         if replay_failure:
             return replay_failure
@@ -210,7 +588,10 @@ class TelegramAgent:
         while state.model_round_count < self.max_rounds:
             result = self._run_model_round(
                 contents, state, conversation_id=conversation_id, delivery_id=delivery_id,
-                executor=executor, target_doc_id=target_doc_id, allowed_tools=allowed_tools,
+                executor=executor, target_doc_id=target_doc_id,
+                allowed_tools=effective_allowed_tools,
+                presentation_scope=presentation_scope if presentation_enabled else None,
+                presentation_sources=presentation_sources if presentation_enabled else None,
             )
             if result is not None:
                 return result
@@ -245,14 +626,12 @@ class TelegramAgent:
                 **(execution_context if isinstance(execution_context, Mapping) else {}),
                 "include_link": True,
             }
-        executor = executor_factory(target_doc_id, delivery_id, execution_context)
-        execute = getattr(executor, "execute", None)
-        if not callable(execute):
-            raise TypeError("operation tool executor is unavailable")
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ValueError("operation conversation is invalid")
 
         state = self._load_state(conversation_id, delivery_id)
+        if state.checkpoint_failure:
+            raise ValueError("persisted application checkpoint is invalid")
         adopted_legacy = False
         if state.application_route is None:
             adopted_legacy = self._adopt_legacy_application_route(
@@ -260,9 +639,18 @@ class TelegramAgent:
                 delivery_id=delivery_id,
             )
         if state.application_route is not None:
+            if isinstance(state.application_route.get("contextual"), Mapping):
+                contextual = state.application_route["contextual"]
+                if not any(key in state.application_route for key in (
+                    "name", "arguments", "ordinal", "target_doc_id",
+                )):
+                    raise ValueError("persisted metadata route cannot become an executable tool choice")
             if (state.application_route.get("name") != name
                     or state.application_route.get("arguments") != validated
-                    or state.application_route.get("target_doc_id") not in (None, target_doc_id)):
+                    or ("contextual" in state.application_route
+                        and state.application_route.get("target_doc_id") != target_doc_id)
+                    or ("contextual" not in state.application_route
+                        and state.application_route.get("target_doc_id") not in (None, target_doc_id))):
                 raise ValueError("persisted tool choice does not match the routed operation")
             ordinal = int(state.application_route["ordinal"])
         else:
@@ -280,6 +668,10 @@ class TelegramAgent:
                 conversation_id, delivery_id, route=route, tool_calls=state.calls,
                 application_route_round=None,
             )
+        executor = executor_factory(target_doc_id, delivery_id, execution_context)
+        execute = getattr(executor, "execute", None)
+        if not callable(execute):
+            raise TypeError("operation tool executor is unavailable")
         if adopted_legacy:
             self.ledger.save_application_route(
                 conversation_id, delivery_id, route=state.application_route,
@@ -296,42 +688,281 @@ class TelegramAgent:
         return state.tool_results[ordinal]
 
     def _load_state(self, conversation_id: str, delivery_id: str) -> _ToolLoopState:
-        record = self.ledger.load_turn(conversation_id, delivery_id)
+        try:
+            record = self.ledger.load_turn(conversation_id, delivery_id)
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            return _ToolLoopState(checkpoint_failure=True)
         if record is None:
             return _ToolLoopState()
 
+        raw_calls = _field(record, "tool_calls", [])
+        if raw_calls is None or raw_calls == ():
+            raw_calls = []
+        if not isinstance(raw_calls, (list, tuple)):
+            return _ToolLoopState(checkpoint_failure=True)
+        rounds, checkpoint_failure = _rounds_from_record(record)
+        if checkpoint_failure:
+            return _ToolLoopState(checkpoint_failure=True)
+
         state = _ToolLoopState(
-            rounds=_rounds_from_record(record),
-            calls=list(_field(record, "tool_calls", ()) or ()),
+            rounds=rounds,
+            calls=list(raw_calls),
+            record=record,
         )
+        if any(not isinstance(call, Mapping)
+               or type(call.get("ordinal")) is not int
+               or call.get("name") == _PRESENT_SEARCH_ANSWER
+               for call in state.calls):
+            return _ToolLoopState(checkpoint_failure=True)
         route = _field(record, "application_route")
         if isinstance(route, Mapping):
+            if "contextual" in route:
+                contextual = route.get("contextual")
+                fields = {"contextual"}
+                executable_fields = {"name", "arguments", "ordinal", "target_doc_id"}
+                if executable_fields.issubset(route):
+                    fields |= executable_fields
+                    if "call_id" in route:
+                        fields.add("call_id")
+                if (set(route) != fields or not isinstance(contextual, Mapping)
+                        or type(contextual.get("schema_version")) is not int
+                        or contextual.get("schema_version") != 1
+                        or not isinstance(contextual.get("summary"), Mapping)):
+                    return _ToolLoopState(checkpoint_failure=True)
+                if not executable_fields.issubset(route) and state.calls:
+                    # Metadata decisions never create a server call. Any calls must
+                    # have appeared in validated native rounds, not round=-1.
+                    if any(call.get("round") == -1 for call in state.calls):
+                        return _ToolLoopState(checkpoint_failure=True)
             state.application_route = dict(route)
             round_index = _field(record, "application_route_round")
+            if round_index is not None and type(round_index) is not int:
+                return _ToolLoopState(checkpoint_failure=True)
             state.application_route_round = round_index if type(round_index) is int else None
+        if any(call.get("ordinal") != index for index, call in enumerate(state.calls)):
+            return _ToolLoopState(checkpoint_failure=True)
         saved_results = _field(record, "tool_results", {}) or {}
         if isinstance(saved_results, Mapping):
-            state.tool_results = {int(ordinal): result
-                                  for ordinal, result in saved_results.items()}
+            try:
+                state.tool_results = {int(ordinal): result
+                                      for ordinal, result in saved_results.items()}
+            except (TypeError, ValueError, OverflowError):
+                return _ToolLoopState(checkpoint_failure=True)
         return state
+
+    @staticmethod
+    def _pending_native_application_result(state: _ToolLoopState) -> bool:
+        """Allow replay only for a complete contextual native call lacking its result."""
+        route = state.application_route
+        record = state.record
+        contextual = route.get("contextual") if isinstance(route, Mapping) else None
+        if (not isinstance(contextual, Mapping)
+                or state.application_route_round is not None
+                or not isinstance(route.get("ordinal"), int)
+                or any(key not in route for key in (
+                    "name", "arguments", "ordinal", "target_doc_id",
+                ))):
+            return False
+        ordinal = route["ordinal"]
+        calls = state.calls
+        if ordinal >= len(calls) or ordinal in state.tool_results:
+            return False
+        call = calls[ordinal]
+        if (not isinstance(call, Mapping) or call.get("round") is None
+                or type(call.get("round")) is not int or call["round"] < 0
+                or call.get("name") != route.get("name")
+                or call.get("arguments") != route.get("arguments")):
+            return False
+        return bool(
+            isinstance(record, Mapping)
+            and _contextual_call_provenance_valid(record)
+        )
+
+    @staticmethod
+    def _validate_presentation_scope(
+        scope: Mapping[str, Any] | None, sources: Callable[[], Any] | None, *,
+        delivery_id: str, ledger: Any,
+    ) -> str | None:
+        required = {
+            "context_id", "conversation_id", "producing_operation_id",
+            "presentation_id", "answer_turn_id",
+        }
+        if not isinstance(scope, Mapping) or not callable(sources) or set(scope) != required:
+            return "The search presentation capability is incomplete."
+        if any(not isinstance(scope.get(key), str) or not scope[key].strip()
+               for key in required):
+            return "The search presentation capability is invalid."
+        if scope["producing_operation_id"] != delivery_id:
+            return "The search presentation operation binding changed."
+        ledger_context_id = getattr(ledger, "context_id", None)
+        if isinstance(ledger_context_id, str) and ledger_context_id != scope["context_id"]:
+            return "The search presentation context binding changed."
+        return None
+
+    @staticmethod
+    def _presentation_tool_declaration() -> dict[str, Any]:
+        selector = {
+            "type": "object",
+            "properties": {
+                "doc_id": {"type": "string"},
+                "source_id": {"type": "string"},
+                "operation_id": {"type": "string"},
+                "checkpoint_conversation_id": {"type": "string"},
+                "call_id": {"type": "string"},
+                "ordinal": {"type": "integer", "minimum": 0},
+                "order_index": {"type": "integer", "minimum": 0},
+                "range_start": {"type": "integer", "minimum": 0},
+                "range_end": {"type": "integer", "minimum": 0},
+                "reference": {"type": "object"},
+            },
+            "required": ["doc_id"], "additionalProperties": False,
+        }
+        source_refs = {"type": "array", "items": deepcopy(selector)}
+        return {
+            "name": _PRESENT_SEARCH_ANSWER,
+            "description": (
+                "Finish a search answer using only verified read evidence. "
+                "Choose ordered paragraph, document_list, and exact quote blocks."
+            ),
+            "parameters_json_schema": {
+                "type": "object",
+                "properties": {
+                    "blocks": {
+                        "type": "array", "minItems": 1,
+                        "items": {
+                            "oneOf": [
+                                {"type": "object", "properties": {
+                                    "type": {"const": "paragraph"},
+                                    "text": {"type": "string"},
+                                    "source_refs": deepcopy(source_refs),
+                                }, "required": ["type", "text", "source_refs"],
+                                 "additionalProperties": False},
+                                {"type": "object", "properties": {
+                                    "type": {"const": "document_list"},
+                                    "list_id": {"type": "string"},
+                                    "entries": {"type": "array", "minItems": 1,
+                                        "items": {"type": "object", "properties": {
+                                            "doc_id": {"type": "string"},
+                                            "label": {"type": "string"},
+                                            "source_refs": deepcopy(source_refs),
+                                            "position": {"type": "integer", "minimum": 1},
+                                        }, "required": ["doc_id", "label", "source_refs"],
+                                         "additionalProperties": False}},
+                                }, "required": ["type", "list_id", "entries"],
+                                 "additionalProperties": False},
+                                {"type": "object", "properties": {
+                                    "type": {"const": "quote"},
+                                    "text": {"type": "string"},
+                                    "doc_id": {"type": "string"},
+                                    "source_refs": deepcopy(source_refs),
+                                }, "required": ["type", "text", "doc_id", "source_refs"],
+                                 "additionalProperties": False},
+                            ],
+                        },
+                    },
+                },
+                "required": ["blocks"], "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
+    def _presentation_digest(value: Any) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _replay_terminal(
+        self, state: _ToolLoopState, *, presentation_scope: Mapping[str, Any] | None,
+        delivery_id: str, ledger: Any,
+    ) -> dict[str, Any] | None:
+        terminals = [(index, saved) for index, saved in enumerate(state.rounds)
+                     if "terminal" in saved]
+        if not terminals:
+            return None
+        if len(terminals) != 1 or terminals[0][0] != len(state.rounds) - 1:
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        index, saved_round = terminals[0]
+        terminal = saved_round["terminal"]
+        if (not isinstance(terminal, Mapping)
+                or type(saved_round.get("call_count")) is not int
+                or saved_round.get("call_count") != 0
+                or type(saved_round.get("call_start")) is not int
+                or saved_round.get("call_start") != len(state.calls)
+                or type(terminal.get("round_index")) is not int
+                or terminal.get("round_index") != index
+                or any(type(call.get("ordinal")) is not int
+                       or call.get("ordinal") not in state.tool_results
+                       for call in state.calls)):
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        native_calls = _calls_from(saved_round.get("response"))
+        terminal_calls = [call for call in native_calls
+                          if call.get("name") == _PRESENT_SEARCH_ANSWER]
+        try:
+            arguments_digest = (self._presentation_digest(terminal_calls[0].get("arguments"))
+                                if terminal_calls else None)
+        except (TypeError, ValueError):
+            arguments_digest = None
+        if terminal.get("arguments_sha256") != arguments_digest:
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        status = terminal.get("status")
+        if status == "failed":
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        if status != "ok":
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        if (len(native_calls) != 1 or len(terminal_calls) != 1
+                or terminal_calls[0] is not native_calls[0]):
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        manifest = terminal.get("manifest")
+        try:
+            from services.connectors.telegram.runtime.presentation import validate_presentation_manifest
+
+            if self._presentation_digest(manifest) != terminal.get("manifest_sha256"):
+                raise ValueError("presentation manifest digest does not match")
+            validated = validate_presentation_manifest(
+                manifest, expected_scope=presentation_scope,
+            ).to_dict()
+            if (validated.get("producing_operation_id") != delivery_id
+                    or (isinstance(getattr(ledger, "context_id", None), str)
+                        and validated.get("context_id") != ledger.context_id)):
+                raise ValueError("presentation scope does not match its checkpoint")
+        except (TypeError, ValueError):
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        return {
+            "status": "ok", "answer": validated["body"], "usage": state.usage,
+            "tool_results": dict(state.tool_results), "presentation_manifest": validated,
+        }
 
     def _replay_saved_rounds(
         self, contents: list[Any], state: _ToolLoopState, *,
         conversation_id: str, delivery_id: str, executor: Any,
         target_doc_id: str | None,
         allowed_tools: set[str] | frozenset[str] | None = None,
+        allow_completed_disallowed: bool = False,
+        application_result_route: Mapping[str, Any] | None = None,
+        application_result_value: Any = None,
     ) -> dict[str, Any] | None:
+        application_result_added = application_result_route is None
         for round_index, saved_round in enumerate(state.rounds):
             if round_index == state.application_route_round:
                 continue
             response = saved_round["response"]
             call_start = int(saved_round.get("call_start", 0))
             call_count = int(saved_round.get("call_count", 0))
+            if (not application_result_added
+                    and call_start > application_result_route.get("ordinal", 0)):
+                self._append_application_context(
+                    contents, application_result_route, application_result_value,
+                )
+                application_result_added = True
             round_calls = state.calls[call_start:call_start + call_count]
             if not round_calls and _calls_from(response):
                 return self._failure("The persisted tool request is incomplete.", state.usage)
             if allowed_tools is not None and any(
-                    call.get("name") not in allowed_tools for call in round_calls):
+                    call.get("name") not in allowed_tools
+                    and not (allow_completed_disallowed
+                             and type(call.get("ordinal")) is int
+                             and call["ordinal"] in state.tool_results)
+                    for call in round_calls):
                 return self._failure("The persisted tool request is not allowed.", state.usage)
 
             self._append_model_response(contents, response)
@@ -342,13 +973,27 @@ class TelegramAgent:
             )
             if failure:
                 return failure
+        if not application_result_added:
+            self._append_application_context(
+                contents, application_result_route, application_result_value,
+            )
         return None
 
     @staticmethod
     def _has_final_answer(state: _ToolLoopState) -> bool:
         model_rounds = [saved_round for index, saved_round in enumerate(state.rounds)
                         if index != state.application_route_round]
-        return bool(model_rounds and int(model_rounds[-1].get("call_count", 0)) == 0)
+        if not model_rounds:
+            return False
+        last = model_rounds[-1]
+        route = state.application_route
+        if (isinstance(route, Mapping) and "contextual" in route
+                and "ordinal" in route and state.application_route_round is None
+                and last.get("call_start", 0) <= route.get("ordinal", -1)):
+            return False
+        return ("terminal" not in last
+                and type(last.get("call_count")) is int and last.get("call_count") == 0
+                and not _calls_from(last.get("response")))
 
     @staticmethod
     def _final_answer(state: _ToolLoopState) -> dict[str, Any]:
@@ -363,13 +1008,45 @@ class TelegramAgent:
         conversation_id: str, delivery_id: str, executor: Any,
         target_doc_id: str | None,
         allowed_tools: set[str] | frozenset[str] | None = None,
+        presentation_scope: Mapping[str, Any] | None = None,
+        presentation_sources: Callable[[], Any] | None = None,
     ) -> dict[str, Any] | None:
         catalog = self._scoped_tool_catalog(target_doc_id)
+        mode = "tool_loop"
+        if presentation_scope is not None and presentation_sources is not None:
+            mode = "tool_loop_presented"
+            catalog = [tool for tool in catalog if tool["name"] in _PRESENTATION_READ_TOOLS]
         if allowed_tools is not None:
             catalog = [tool for tool in catalog if tool["name"] in allowed_tools]
+        if mode == "tool_loop_presented":
+            catalog.append(self._presentation_tool_declaration())
         response = self.model.generate(
-            contents=contents, mode="tool_loop", tools=catalog,
+            contents=contents, mode=mode, tools=catalog,
         )
+        native_calls = _calls_from(response)
+        terminal_calls = [call for call in native_calls
+                          if call.get("name") == _PRESENT_SEARCH_ANSWER]
+        if terminal_calls and mode == "tool_loop_presented":
+            if len(native_calls) != 1 or len(terminal_calls) != 1:
+                self._persist_terminal_failure(
+                    response, terminal_calls[0].get("arguments"), state,
+                    conversation_id, delivery_id,
+                )
+                return self._failure(_PRESENTATION_FAILURE, state.usage)
+            return self._complete_terminal(
+                response, terminal_calls[0], state, conversation_id=conversation_id,
+                delivery_id=delivery_id, presentation_scope=presentation_scope,
+                presentation_sources=presentation_sources,
+            )
+        if mode == "tool_loop_presented" and any(
+                call.get("name") not in _PRESENTATION_READ_TOOLS for call in native_calls):
+            self._persist_model_round(response, [], state, conversation_id, delivery_id)
+            return self._failure("The requested tool operation was invalid.", state.usage)
+        if mode == "tool_loop_presented" and not native_calls:
+            self._persist_terminal_failure(
+                response, None, state, conversation_id, delivery_id,
+            )
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
         try:
             calls = self._validate_calls(response, state, target_doc_id=target_doc_id,
                                          allowed_tools=allowed_tools)
@@ -397,6 +1074,62 @@ class TelegramAgent:
         if not calls:
             return self._final_answer(state)
         return None
+
+    def _persist_terminal_failure(
+        self, response: Any, arguments: Any, state: _ToolLoopState,
+        conversation_id: str, delivery_id: str,
+    ) -> None:
+        try:
+            arguments_sha256 = self._presentation_digest(arguments)
+        except (TypeError, ValueError):
+            arguments_sha256 = None
+        self._persist_model_round(
+            response, [], state, conversation_id, delivery_id,
+            terminal={"status": "failed", "round_index": len(state.rounds),
+                      "arguments_sha256": arguments_sha256},
+        )
+
+    def _complete_terminal(
+        self, response: Any, call: Mapping[str, Any], state: _ToolLoopState, *,
+        conversation_id: str, delivery_id: str,
+        presentation_scope: Mapping[str, Any] | None,
+        presentation_sources: Callable[[], Any] | None,
+    ) -> dict[str, Any]:
+        arguments = call.get("arguments")
+        if (not isinstance(arguments, Mapping) or set(arguments) != {"blocks"}
+                or presentation_scope is None or presentation_sources is None):
+            self._persist_terminal_failure(
+                response, arguments, state, conversation_id, delivery_id,
+            )
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+        if callable(presentation_sources):
+            verified_exchanges = presentation_sources()
+        else:
+            verified_exchanges = None
+        try:
+            from services.connectors.telegram.runtime.presentation import build_presentation_manifest
+
+            manifest = build_presentation_manifest(
+                scope=presentation_scope, blocks=arguments["blocks"],
+                verified_exchanges=verified_exchanges,
+            ).to_dict()
+        except (TypeError, ValueError):
+            self._persist_terminal_failure(
+                response, arguments, state, conversation_id, delivery_id,
+            )
+            return self._failure(_PRESENTATION_FAILURE, state.usage)
+
+        self._persist_model_round(
+            response, [], state, conversation_id, delivery_id,
+            terminal={"status": "ok", "round_index": len(state.rounds),
+                      "arguments_sha256": self._presentation_digest(arguments),
+                      "manifest_sha256": self._presentation_digest(manifest),
+                      "manifest": manifest},
+        )
+        return {
+            "status": "ok", "answer": manifest["body"], "usage": state.usage,
+            "tool_results": dict(state.tool_results), "presentation_manifest": manifest,
+        }
 
     @staticmethod
     def _scoped_tool_catalog(target_doc_id: str | None) -> list[dict[str, Any]]:
@@ -428,23 +1161,38 @@ class TelegramAgent:
             if (target_doc_id is not None and "doc_id" in arguments
                     and arguments["doc_id"] != target_doc_id):
                 raise ValueError("tool target does not match the routed operation")
+            ordinal = next_ordinal + index
+            route = state.application_route
+            if (isinstance(route, Mapping)
+                    and isinstance(route.get("contextual"), Mapping)
+                    and registry.OPERATIONS[call["name"]].write):
+                if (route.get("name") != call["name"]
+                        or route.get("arguments") != arguments
+                        or route.get("ordinal") != ordinal
+                        or route.get("target_doc_id") != target_doc_id):
+                    raise ValueError("tool call exceeds the saved contextual action")
             validated.append({**call, "arguments": arguments,
-                              "ordinal": next_ordinal + index, "round": round_index})
+                              "ordinal": ordinal, "round": round_index})
         return validated
 
     def _persist_model_round(
         self, response: Any, calls: list[dict[str, Any]], state: _ToolLoopState,
         conversation_id: str, delivery_id: str,
+        *, terminal: Mapping[str, Any] | None = None,
     ) -> Any:
         serialized = _serialize_response(response)
-        all_rounds = state.rounds + [{
+        new_round = {
             "response": serialized,
             "call_start": len(state.calls),
             "call_count": len(calls),
-        }]
+        }
+        if terminal is not None:
+            new_round["terminal"] = deepcopy(dict(terminal))
+        all_rounds = state.rounds + [new_round]
         self.ledger.save_turn(
             conversation_id, delivery_id,
             model_response=(serialized if not state.rounds and state.application_route is None
+                            and terminal is None
                             else self._persisted_response(all_rounds)),
             tool_calls=state.calls + calls,
             application_route=state.application_route,
@@ -545,6 +1293,9 @@ class TelegramAgent:
         tool_results: dict[int, Any], *, conversation_id: str, delivery_id: str,
         executor: Any, target_doc_id: str | None,
     ) -> dict[str, Any] | None:
+        prepare_batch = getattr(executor, "prepare_native_batch", None)
+        if callable(prepare_batch):
+            prepare_batch(calls)
         for call in calls:
             ordinal = int(call["ordinal"])
             if ordinal in tool_results:
@@ -897,7 +1648,8 @@ class TelegramCommandProcessor:
                 await _call_sync_or_async(
                     self.agent.dispatch_tool_choice,
                     name=choice["name"], arguments=choice["arguments"],
-                    target_doc_id=target_doc_id, conversation_id=conversation_id,
+                    target_doc_id=target_doc_id,
+                    conversation_id=conversation_id,
                     delivery_id=operation_id,
                     executor_factory=self.executor_factory,
                     execution_context=execution_context,
@@ -935,6 +1687,9 @@ class TelegramCommandProcessor:
             text=replay.text, repository=self.repository, router=route, agent=run_agent,
             notifications=self.notifications, queue=self.queue,
             selection_publisher=self.selection_publisher,
+            defer_route_persistence=getattr(
+                self.agent, "should_defer_route_persistence", None,
+            ),
             owner=_field(lease, "owner"), fence=_field(lease, "fence"), now=lease_now,
         )
 

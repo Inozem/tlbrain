@@ -561,6 +561,31 @@ def test_orchestration_does_not_clear_candidate_for_invalid_route():
     assert not any(event[0] == "candidate_cleared" for event in repository.events)
 
 
+def test_route_persistence_deferral_error_does_not_fall_back_to_legacy_commit():
+    context, repository, router, agent, notifications, queue = _harness(
+        _route("substantive", substantive_text="Move the selected dialog."),
+    )
+    before = repository.snapshot()
+
+    def failed_preparation(_route):
+        raise RuntimeError("contextual preparation failed")
+
+    with pytest.raises(RuntimeError, match="contextual preparation failed"):
+        _process(
+            operation_id="op-deferred-publication", context=context,
+            text="accepted command", repository=repository, router=router,
+            agent=agent, notifications=notifications, queue=queue,
+            defer_route_persistence=failed_preparation,
+            owner="worker", fence=1, now=datetime.now().astimezone(),
+        )
+
+    assert repository.snapshot() == before
+    assert "op-deferred-publication" not in repository.route_records
+    assert not any(event[0] == "candidate_cleared" for event in repository.events)
+    assert agent.prompts == []
+    assert notifications.attempts == []
+
+
 @pytest.mark.parametrize("route", [
     {"status": "ok", "kind": "save", "confirmed": True},
     {

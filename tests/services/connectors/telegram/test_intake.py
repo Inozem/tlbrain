@@ -10,7 +10,9 @@ updates and publishes the durable outbox item returned by the repository.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -782,6 +784,7 @@ def test_receipt_save_callback_reserves_typed_fifo_once_and_clears_same_card(
     result = intake.handle_callback(callback)
     assert result.accepted is True
     assert result.operation_id
+    assert result.notification_id == accepted.notification_id
     command = _read_doc(
         client, f"telegram_sessions/{accepted.context_id}/commands/90",
     )
@@ -894,26 +897,54 @@ def test_new_receipt_invalidates_an_older_ready_card_callback(firestore_fake):
     assert context["pending_receipt_groups"] == 1
 
 
-def test_default_webhook_answers_save_callback_after_durable_reservation(firestore_fake):
+@pytest.mark.parametrize("edit_times_out", [False, True])
+def test_default_webhook_answers_save_callback_after_durable_reservation(
+    firestore_fake, edit_times_out,
+):
     repository, _client = _repository(firestore_fake)
     current = [NOW]
     intake, accepted, ready, callback = _ready_receipt_callback(
         repository, current=current,
     )
 
+    task_publisher = intake.publisher
+    queued_before_callback = list(task_publisher.outbox_ids)
+    save_outbox_queued = threading.Event()
+    original_publish = task_publisher.publish
+
+    def publish_and_signal(outbox_id):
+        original_publish(outbox_id)
+        if outbox_id.startswith("tgcard-saving-"):
+            save_outbox_queued.set()
+
+    task_publisher.publish = publish_and_signal
+
     class Bot:
         def __init__(self):
             self.answered = []
+            self.edited = []
 
         async def answer_callback_query(self, query_id, *, text=None):
             self.answered.append((query_id, text))
             return True
 
+        async def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None,
+                                    presentation=None):
+            assert await asyncio.to_thread(save_outbox_queued.wait, 2)
+            self.edited.append((chat_id, message_id, text, reply_markup))
+            if edit_times_out:
+                raise TimeoutError("synthetic edit timeout")
+            return {"message_id": message_id}
+
     bot = Bot()
     app_module = importlib.import_module("services.connectors.telegram.app.main")
+    from services.connectors.telegram.notifications import TelegramNotificationPublisher
+
+    notification_publisher = TelegramNotificationPublisher(repository, bot, clock=lambda: current[0])
     app = app_module.create_app(
         intake=intake, webhook_secret="synthetic-webhook-secret",
         telegram_enabled=True, telegram_client=bot,
+        notification_publisher=notification_publisher,
     )
 
     async def post():
@@ -927,11 +958,73 @@ def test_default_webhook_answers_save_callback_after_durable_reservation(firesto
 
     response = asyncio.run(post())
     assert response.status_code == 200
-    assert bot.answered == [(callback["callback_query"]["id"], None)]
+    assert bot.answered == [(callback["callback_query"]["id"], "Save accepted.")]
+    assert bot.edited == [(
+        42, 189, f"Dialog #{ready['dialog_number']}: Saving…", {"inline_keyboard": []},
+    )]
+    assert task_publisher.outbox_ids[:len(queued_before_callback)] == queued_before_callback
+    newly_queued = task_publisher.outbox_ids[len(queued_before_callback):]
+    assert all(isinstance(outbox_id, str) and outbox_id for outbox_id in newly_queued)
+    assert len(newly_queued) == 2
+    assert save_outbox_queued.is_set()
+    assert all(_read_doc(_client, f"task_outbox/{outbox_id}") is not None
+               for outbox_id in newly_queued)
     card = repository.get_notification(accepted.notification_id)
     assert card["body"] == f"Dialog #{ready['dialog_number']}: Saving…"
+    assert card["message_id"] == 189
+    if edit_times_out:
+        assert card["state"] == "retry"
+        assert card["last_outcome"] == "unknown"
+    else:
+        assert card["state"] == "delivered"
     receipt = repository.get_update_receipt(accepted.context_id, callback["update_id"])
     assert receipt["accepted"] is True
+
+
+def test_webhook_callback_technical_failure_answers_without_claiming_acceptance(firestore_fake):
+    repository, _client = _repository(firestore_fake)
+    intake = _intake(repository, _Publisher())
+    class Bot:
+        def __init__(self):
+            self.answered = []
+
+        async def answer_callback_query(self, query_id, *, text=None):
+            self.answered.append((query_id, text))
+            return True
+
+    bot = Bot()
+
+    def fail_callback(_update):
+        raise RuntimeError("private detail")
+
+    intake.handle_callback = fail_callback
+    app_module = importlib.import_module("services.connectors.telegram.app.main")
+    app = app_module.create_app(
+        intake=intake, webhook_secret="synthetic-webhook-secret",
+        telegram_enabled=True, telegram_client=bot,
+    )
+    callback = {
+        "update_id": 701,
+        "callback_query": {"id": "technical-query", "from": {"id": 7}, "data": "s:token",
+                           "message": {"message_id": 1, "date": 1793320100,
+                                       "chat": {"id": 42, "type": "private"}}},
+    }
+
+    async def post():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://telegram.test") as http:
+            return await http.post(
+                "/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "synthetic-webhook-secret"},
+                json=callback,
+            )
+
+    response = asyncio.run(post())
+    assert response.status_code == 503
+    assert bot.answered == [(
+        "technical-query", "Could not confirm Save. Check the card before trying again.",
+    )]
+    assert firestore_fake.documents == {}
 
 
 def test_webhook_persists_thinking_card_and_schedules_close_from_canonical_outbox(
@@ -1460,4 +1553,485 @@ def test_malformed_forward_origin_is_not_intaken_as_a_command(firestore_fake):
     update["message"]["forward_origin"] = "malformed-forward-metadata"
 
     assert intake.handle_update(update) is None
+    assert firestore_fake.documents == {}
+
+
+def test_command_persists_trusted_transport_fields_and_old_context_defaults(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    context_ref = client.collection("telegram_sessions").document("42_default")
+    context_ref.set({"chat_id": 42, "thread_id": None, "active_conversation_id": "keep"})
+
+    assert repository.get_context("42_default")["pending_clarification_id"] is None
+    assert repository.get_context("42_default")["clarification_generation"] == 0
+    assert context_ref.get().to_dict() == {
+        "chat_id": 42, "thread_id": None, "active_conversation_id": "keep",
+    }
+
+    update = _command(501, "ordinary question")
+    update["message"].update(message_id=901, date=int(NOW.timestamp()))
+    result = _intake(repository, _Publisher(), clock=lambda: NOW).handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/501")
+    receipt = _read_doc(client, "telegram_sessions/42_default/updates/501")
+    assert result.accepted is True
+    assert command["message_id"] == 901
+    assert command["message_date"] == NOW
+    assert command["reply_to_message_id"] is None
+    assert command["observed_clarification_id"] is None
+    assert command["observed_clarification_generation"] is None
+    assert command["observed_presentation_id"] is None
+    assert command["observed_question_delivery_ref"] is None
+    assert receipt["message_id"] is None
+
+
+@pytest.mark.parametrize("bad_generation", [True, -1, 1.5, "1"])
+def test_context_rejects_invalid_clarification_generation(bad_generation):
+    model = importlib.import_module("services.connectors.telegram.models")
+    with pytest.raises(ValueError):
+        model.TelegramContext(chat_id=42, clarification_generation=bad_generation)
+
+
+@pytest.mark.parametrize("bad_id", ["", "bad/id", True, 7])
+def test_context_rejects_invalid_pending_clarification_id(bad_id):
+    model = importlib.import_module("services.connectors.telegram.models")
+    with pytest.raises(ValueError):
+        model.TelegramContext(chat_id=42, pending_clarification_id=bad_id)
+
+
+def test_plain_answer_captures_exact_current_question_delivery_once(firestore_fake):
+    repository, client = _repository(firestore_fake)
+    context_ref = client.collection("telegram_sessions").document("42_default")
+    context_ref.set({"pending_clarification_id": "clarify-1", "clarification_generation": 2})
+    clarification_ref = context_ref.collection("clarifications").document("clarify-1")
+    clarification_ref.set({
+        "protocol": "clarification-v1", "clarification_id": "clarify-1",
+        "context_id": "42_default", "actor_id": 7, "state": "waiting", "generation": 2,
+        "created_at": NOW,
+    })
+    body = "Which document did you mean?"
+    created_at = NOW + timedelta(seconds=1)
+    delivered_at = NOW + timedelta(seconds=3)
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    clarification_ref.collection("questions").document("2").set({
+        "clarification_id": "clarify-1", "context_id": "42_default", "actor_id": 7,
+        "generation": 2, "created_at": created_at,
+        "prompt_notification_id": "prompt-1", "prompt_notification_revision": 4,
+        "prompt_digest": digest,
+    })
+    client.collection("notification_outbox").document("prompt-1").set({
+        "notification_id": "prompt-1", "kind": "clarification", "context_id": "42_default",
+        "actor_id": 7, "clarification_id": "clarify-1", "generation": 2,
+        "chat_id": 42, "thread_id": None, "revision": 4, "body": body,
+        "message_id": 777, "state": "delivered", "delivered_at": delivered_at,
+    })
+    current = NOW + timedelta(seconds=10)
+    update = _command(502, "the second one")
+    update["message"]["date"] = int((NOW + timedelta(seconds=5)).timestamp())
+    intake = _intake(repository, _Publisher(), clock=lambda: current)
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/502")
+    assert command["observed_clarification_id"] == "clarify-1"
+    assert command["observed_clarification_generation"] == 2
+    assert command["observed_question_delivery_ref"] == {
+        "context_id": "42_default", "actor_id": 7, "clarification_id": "clarify-1",
+        "generation": 2,
+        "question_ref": "telegram_sessions/42_default/clarifications/clarify-1/questions/2",
+        "notification_id": "prompt-1", "notification_revision": 4, "message_id": 777,
+        "prompt_digest": digest, "delivered_at": delivered_at,
+        "observed_at": current, "binding_kind": "plain",
+    }
+
+    context_ref.update({"pending_clarification_id": "clarify-2", "clarification_generation": 3})
+    client.collection("notification_outbox").document("prompt-1").update({"state": "failed"})
+    intake.handle_update(update)
+    assert _read_doc(client, "telegram_sessions/42_default/commands/502") == command
+
+
+def test_explicit_reply_requires_matching_scoped_prompt_and_malformed_reply_is_rejected(
+    firestore_fake,
+):
+    repository, client = _repository(firestore_fake)
+    context_ref = client.collection("telegram_sessions").document("42_default")
+    context_ref.set({"pending_clarification_id": "clarify-1", "clarification_generation": 1})
+    clarification_ref = context_ref.collection("clarifications").document("clarify-1")
+    clarification_ref.set({
+        "protocol": "clarification-v1", "clarification_id": "clarify-1",
+        "context_id": "42_default", "actor_id": 7, "state": "waiting", "generation": 1,
+        "created_at": NOW - timedelta(seconds=4),
+    })
+    body = "Which one?"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    clarification_ref.collection("questions").document("1").set({
+        "clarification_id": "clarify-1", "context_id": "42_default", "actor_id": 7,
+        "generation": 1, "created_at": NOW - timedelta(seconds=3),
+        "prompt_notification_id": "prompt-2", "prompt_notification_revision": 1,
+        "prompt_digest": digest,
+    })
+    client.collection("notification_outbox").document("prompt-2").set({
+        "notification_id": "prompt-2", "kind": "clarification", "context_id": "42_default",
+        "actor_id": 7, "clarification_id": "clarify-1", "generation": 1,
+        "chat_id": 42, "thread_id": None, "revision": 1, "body": body,
+        "message_id": 800, "state": "delivered", "delivered_at": NOW - timedelta(seconds=2),
+    })
+    update = _command(503, "reply")
+    update["message"]["date"] = int((NOW - timedelta(seconds=1)).timestamp())
+    update["message"]["reply_to_message"] = {
+        "message_id": 800, "chat": {"id": 42, "type": "private"},
+    }
+    _intake(repository, _Publisher(), clock=lambda: NOW + timedelta(seconds=1)).handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/503")
+    assert command["reply_to_message_id"] == 800
+    assert command["observed_question_delivery_ref"]["binding_kind"] == "explicit_reply"
+
+    malformed = _command(504, "cannot degrade to plain")
+    malformed["message"]["reply_to_message"] = {"message_id": True}
+    assert _intake(repository, _Publisher(), clock=lambda: NOW).handle_update(malformed) is None
+    assert _read_doc(client, "telegram_sessions/42_default/commands/504") is None
+
+
+_OMIT_ROW_FIELD = object()
+
+
+def _seed_question_case(
+    firestore_fake, *, update_id=601, thread_id=None, now=None, message_date=None,
+    parent_overrides=None, question_overrides=None, notification_overrides=None,
+    notification_present=True,
+):
+    """Seed planned clarification rows as fixtures; this does not test their producer."""
+    repository, client = _repository(firestore_fake)
+    now = now or NOW + timedelta(seconds=10)
+    message_date = message_date or NOW + timedelta(seconds=5)
+    context_id = f"42_{thread_id}" if thread_id is not None else "42_default"
+    context_ref = client.collection("telegram_sessions").document(context_id)
+    context_ref.set({"pending_clarification_id": "clarify-fixture", "clarification_generation": 1})
+    clarification_ref = context_ref.collection("clarifications").document("clarify-fixture")
+    parent = {
+        "protocol": "clarification-v1", "clarification_id": "clarify-fixture",
+        "context_id": context_id, "actor_id": 7, "state": "waiting", "generation": 1,
+        "created_at": NOW,
+    }
+    for key, value in (parent_overrides or {}).items():
+        if value is _OMIT_ROW_FIELD:
+            parent.pop(key, None)
+        else:
+            parent[key] = value
+    clarification_ref.set(parent)
+    body = "Which document did you mean?"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    question = {
+        "clarification_id": "clarify-fixture", "context_id": context_id,
+        "actor_id": 7, "generation": 1, "created_at": NOW + timedelta(seconds=1),
+        "prompt_notification_id": "prompt-fixture", "prompt_notification_revision": 4,
+        "prompt_digest": digest,
+    }
+    for key, value in (question_overrides or {}).items():
+        if value is _OMIT_ROW_FIELD:
+            question.pop(key, None)
+        else:
+            question[key] = value
+    clarification_ref.collection("questions").document("1").set(question)
+    notification = {
+        "notification_id": "prompt-fixture", "kind": "clarification",
+        "context_id": context_id, "actor_id": 7, "clarification_id": "clarify-fixture",
+        "generation": 1, "chat_id": 42, "thread_id": thread_id, "revision": 4,
+        "body": body, "message_id": 777, "state": "delivered",
+        "delivered_at": NOW + timedelta(seconds=3),
+    }
+    for key, value in (notification_overrides or {}).items():
+        if value is _OMIT_ROW_FIELD:
+            notification.pop(key, None)
+        else:
+            notification[key] = value
+    notification_ref = client.collection("notification_outbox").document("prompt-fixture")
+    if notification_present:
+        notification_ref.set(notification)
+
+    update = _command(update_id, "a possible clarification answer")
+    update["message"]["date"] = int(message_date.timestamp()) if isinstance(message_date, datetime) else message_date
+    if thread_id is not None:
+        update["message"]["message_thread_id"] = thread_id
+    intake = _intake(repository, _Publisher(), clock=lambda: now)
+    return repository, client, intake, update, context_ref, notification_ref
+
+
+@pytest.mark.parametrize(("notification_overrides", "notification_present"), [
+    ({"state": "pending"}, True), ({"state": "delivery_unknown"}, True), ({}, False),
+])
+def test_question_without_known_settled_delivery_is_only_a_hint(
+    firestore_fake, notification_overrides, notification_present,
+):
+    _, client, intake, update, _, _ = _seed_question_case(
+        firestore_fake, notification_overrides=notification_overrides,
+        notification_present=notification_present,
+    )
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/601")
+    assert command["observed_clarification_id"] == "clarify-fixture"
+    assert command["observed_clarification_generation"] == 1
+    assert command["observed_question_delivery_ref"] is None
+
+
+@pytest.mark.parametrize(("parent_overrides", "question_overrides", "notification_overrides", "now", "message_date"), [
+    ({"created_at": _OMIT_ROW_FIELD}, {}, {}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=5)),
+    ({"created_at": datetime(2026, 10, 22)}, {}, {}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=5)),
+    ({"created_at": NOW + timedelta(seconds=11)}, {}, {}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=5)),
+    ({}, {"created_at": _OMIT_ROW_FIELD}, {}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=5)),
+    ({}, {"created_at": datetime(2026, 10, 22)}, {}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=5)),
+    ({}, {}, {"delivered_at": _OMIT_ROW_FIELD}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=5)),
+    ({}, {}, {"delivered_at": datetime(2026, 10, 22)}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=5)),
+    ({}, {}, {"delivered_at": NOW + timedelta(seconds=11)}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=15)),
+    ({}, {}, {}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=3)),
+    ({}, {"created_at": NOW + timedelta(seconds=6)}, {}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=5)),
+    ({}, {"created_at": NOW + timedelta(seconds=11)}, {"delivered_at": NOW + timedelta(seconds=12)}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=9)),
+    ({}, {}, {}, NOW + timedelta(seconds=10), NOW + timedelta(seconds=15)),
+])
+def test_incomparable_or_late_timing_never_creates_plain_delivery_proof(
+    firestore_fake, parent_overrides, question_overrides, notification_overrides, now, message_date,
+):
+    _, client, intake, update, _, _ = _seed_question_case(
+        firestore_fake, parent_overrides=parent_overrides,
+        question_overrides=question_overrides,
+        notification_overrides=notification_overrides, now=now, message_date=message_date,
+    )
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/601")
+    assert command["observed_question_delivery_ref"] is None
+
+
+@pytest.mark.parametrize(("parent_field", "bad_value"), [
+    ("protocol", "unknown"), ("state", "claimed"), ("actor_id", 8),
+    ("context_id", "foreign_context"), ("generation", 2),
+])
+def test_mismatched_clarification_parent_yields_no_hint_or_proof(firestore_fake, parent_field, bad_value):
+    _, client, intake, update, _, _ = _seed_question_case(
+        firestore_fake, parent_overrides={parent_field: bad_value},
+    )
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/601")
+    assert command["observed_clarification_id"] is None
+    assert command["observed_clarification_generation"] is None
+    assert command["observed_question_delivery_ref"] is None
+
+
+@pytest.mark.parametrize(("question_field", "bad_value"), [
+    ("actor_id", 8), ("context_id", "foreign_context"), ("generation", True),
+])
+def test_mismatched_question_identity_has_no_delivery_proof(firestore_fake, question_field, bad_value):
+    _, client, intake, update, _, _ = _seed_question_case(
+        firestore_fake, question_overrides={question_field: bad_value},
+    )
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/601")
+    assert command["observed_clarification_id"] == "clarify-fixture"
+    assert command["observed_question_delivery_ref"] is None
+
+
+@pytest.mark.parametrize(("notification_field", "bad_value"), [
+    ("actor_id", 8), ("context_id", "foreign_context"), ("chat_id", 43),
+    ("thread_id", 9), ("revision", 5), ("body", "tampered prompt"),
+    ("generation", True),
+])
+def test_mismatched_notification_identity_has_no_delivery_proof(
+    firestore_fake, notification_field, bad_value,
+):
+    _, client, intake, update, _, _ = _seed_question_case(
+        firestore_fake, notification_overrides={notification_field: bad_value},
+    )
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/601")
+    assert command["observed_clarification_id"] == "clarify-fixture"
+    assert command["observed_question_delivery_ref"] is None
+
+
+def test_topic_scoped_delivery_is_bound_and_foreign_replies_are_rejected(firestore_fake):
+    _, client, intake, update, _, _ = _seed_question_case(
+        firestore_fake, thread_id=9, update_id=602,
+    )
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_9/commands/602")
+    assert command["observed_question_delivery_ref"]["binding_kind"] == "plain"
+
+    for update_id, reply in (
+        (603, {"message_id": 777, "chat": {"id": 99, "type": "private"}}),
+        (604, {"message_id": 777, "message_thread_id": 10}),
+        (605, {"message_id": True}),
+    ):
+        malformed = _command(update_id, "foreign or malformed reply")
+        malformed["message"]["message_thread_id"] = 9
+        malformed["message"]["reply_to_message"] = reply
+        assert intake.handle_update(malformed) is None
+        assert _read_doc(client, f"telegram_sessions/42_9/commands/{update_id}") is None
+
+
+def test_stale_explicit_reply_does_not_fall_back_to_current_question_hint(firestore_fake):
+    _, client, intake, update, _, _ = _seed_question_case(firestore_fake, update_id=606)
+    update["message"]["reply_to_message"] = {"message_id": 776}
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/606")
+    assert command["observed_clarification_id"] is None
+    assert command["observed_clarification_generation"] is None
+    assert command["observed_question_delivery_ref"] is None
+
+
+@pytest.mark.parametrize("message_date", [None, 10 ** 1000])
+def test_missing_or_unrepresentable_transport_date_stays_nullable(firestore_fake, message_date):
+    _, client, intake, update, _, _ = _seed_question_case(firestore_fake, update_id=607)
+    update["message"]["date"] = message_date
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/607")
+    assert command["message_date"] is None
+    assert command["observed_clarification_id"] == "clarify-fixture"
+    assert command["observed_question_delivery_ref"] is None
+
+
+def test_model_observed_fields_are_ignored_and_generation_zero_has_no_binding(firestore_fake):
+    _, client, intake, update, context_ref, _ = _seed_question_case(
+        firestore_fake, update_id=608,
+    )
+    update["message"].update({
+        "observed_clarification_id": "forged", "observed_clarification_generation": 99,
+        "observed_presentation_id": "forged-presentation",
+        "observed_question_delivery_ref": {"binding_kind": "plain"},
+    })
+    context_ref.update({"clarification_generation": 0})
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/608")
+    assert command["observed_clarification_id"] is None
+    assert command["observed_clarification_generation"] is None
+    assert command["observed_question_delivery_ref"] is None
+
+
+def test_valid_question_proof_wins_over_forged_observation_fields(firestore_fake):
+    _, client, intake, update, _, _ = _seed_question_case(firestore_fake, update_id=608)
+    update["message"].update({
+        "observed_clarification_id": "forged", "observed_clarification_generation": 99,
+        "observed_presentation_id": "forged-presentation",
+        "observed_question_delivery_ref": {"binding_kind": "explicit_reply"},
+    })
+    intake.handle_update(update)
+    command = _read_doc(client, "telegram_sessions/42_default/commands/608")
+    assert command["observed_clarification_id"] == "clarify-fixture"
+    assert command["observed_clarification_generation"] == 1
+    assert command["observed_question_delivery_ref"]["binding_kind"] == "plain"
+    assert command["observed_presentation_id"] is None
+
+
+@pytest.mark.parametrize("explicit_reply", [False, True])
+def test_late_delivery_settlement_never_rebinds_replay_but_a_new_message_can_bind(
+    firestore_fake, explicit_reply,
+):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    helper_module_name = "_telegram_test_notifications_helper"
+    helper_module = sys.modules.get(helper_module_name)
+    if helper_module is None:
+        helper_path = Path(__file__).with_name("test_notifications.py")
+        helper_spec = importlib.util.spec_from_file_location(helper_module_name, helper_path)
+        helper_module = importlib.util.module_from_spec(helper_spec)
+        sys.modules[helper_module_name] = helper_module
+        helper_spec.loader.exec_module(helper_module)
+    client, repository, _accepted, pending = helper_module._publish_t011_clarification(
+        firestore_fake, update_id=99021, chat_id=42, user_id=7, thread_id=None,
+    )
+    context_ref = client.collection("telegram_sessions").document("42_default")
+    notification_id = "tgclarif-" + hashlib.sha256(
+        f"{pending.clarification_id}:1".encode("utf-8")
+    ).hexdigest()
+    update = _command(609 if not explicit_reply else 611, "a possible clarification answer")
+    update["message"]["date"] = int((NOW + timedelta(seconds=5)).timestamp())
+    intake = _intake(repository, _Publisher(), clock=lambda: NOW + timedelta(seconds=10))
+    if explicit_reply:
+        update["message"]["reply_to_message"] = {"message_id": 777}
+    intake.handle_update(update)
+    command_path = f"telegram_sessions/42_default/commands/{update['update_id']}"
+    original = _read_doc(client, command_path)
+    assert original["observed_clarification_id"] == (
+        None if explicit_reply else pending.clarification_id
+    )
+    assert original["observed_question_delivery_ref"] is None
+
+    reserved = repository.reserve_notification_attempt(
+        notification_id, attempt_id="fixture-send", now=NOW + timedelta(seconds=11),
+    )
+    assert reserved is not None and reserved["reserved"] is True
+    settled = repository.settle_notification_attempt(
+        notification_id, attempt_id="fixture-send",
+        revision=reserved["attempt_revision"], outcome="sent",
+        message_id=777, now=NOW + timedelta(seconds=12),
+        clarification_binding=reserved["clarification_binding"],
+    )
+    assert settled is not None and settled["state"] == "delivered"
+
+    later_clock_intake = _intake(
+        repository, _Publisher(), clock=lambda: NOW + timedelta(seconds=20),
+    )
+    later_clock_intake.handle_update(update)
+    assert _read_doc(client, command_path) == original
+
+    later = _command(612 if explicit_reply else 610, "a later answer")
+    later["message"]["date"] = int((NOW + timedelta(seconds=15)).timestamp())
+    if explicit_reply:
+        later["message"]["reply_to_message"] = {"message_id": 777}
+    later_intake = _intake(repository, _Publisher(), clock=lambda: NOW + timedelta(seconds=20))
+    later_intake.handle_update(later)
+    later_command = _read_doc(
+        client, f"telegram_sessions/42_default/commands/{later['update_id']}",
+    )
+    assert later_command["observed_question_delivery_ref"]["notification_id"] == notification_id
+    assert later_command["observed_question_delivery_ref"]["message_id"] == 777
+    assert later_command["observed_question_delivery_ref"]["binding_kind"] == (
+        "explicit_reply" if explicit_reply else "plain"
+    )
+
+    context_ref.update({"pending_clarification_id": "clarify-next", "clarification_generation": 2})
+    context_ref.collection("clarifications").document("clarify-next").set({
+        "protocol": "clarification-v1", "clarification_id": "clarify-next",
+        "context_id": "42_default", "actor_id": 7, "state": "waiting",
+        "generation": 2, "created_at": NOW + timedelta(seconds=21),
+    })
+    context_ref.collection("clarifications").document("clarify-next").collection(
+        "questions",
+    ).document("2").set({
+        "clarification_id": "clarify-next", "context_id": "42_default", "actor_id": 7,
+        "generation": 2, "created_at": NOW + timedelta(seconds=22),
+        "prompt_notification_id": "prompt-next", "prompt_notification_revision": 1,
+        "prompt_digest": hashlib.sha256(b"A future question").hexdigest(),
+    })
+    later_clock_intake.handle_update(update)
+    assert _read_doc(client, command_path) == original
+
+
+def test_clarification_pointer_clear_patch_is_narrow_and_cas_checked():
+    helper = importlib.import_module(
+        "services.connectors.telegram.repository._common"
+    )._pending_clarification_clear_patch
+    context = {
+        "pending_clarification_id": "clarify-1", "clarification_generation": 2,
+        "active_conversation_id": "conversation", "last_doc_id": "doc",
+    }
+    assert helper(context, clarification_id="clarify-old", generation=2) is None
+    assert helper(context, clarification_id="clarify-1", generation=3) is None
+    assert helper(context, clarification_id="clarify-1", generation=True) is None
+    assert helper(context, clarification_id="clarify-1", generation=2) == {
+        "pending_clarification_id": None,
+    }
+    updated_context = {**context, **helper(
+        context, clarification_id="clarify-1", generation=2,
+    )}
+    assert updated_context == {
+        "pending_clarification_id": None, "clarification_generation": 2,
+        "active_conversation_id": "conversation", "last_doc_id": "doc",
+    }
+
+
+@pytest.mark.parametrize("field", ["message_id", "reply_to_message_id"])
+def test_command_transport_ids_reject_boolean_values(firestore_fake, field):
+    repository, _ = _repository(firestore_fake)
+    arguments = {field: True}
+    with pytest.raises(ValueError):
+        repository.accept_command(
+            505, chat_id=42, user_id=7, command=parse_command("hello"),
+            now=NOW, **arguments,
+        )
     assert firestore_fake.documents == {}

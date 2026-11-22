@@ -2396,12 +2396,12 @@ def test_default_asgi_leading_context_accepts_six_forwards_while_dispatch_routes
         worker.join(8)
 
     repository = TelegramRepository(runtime.db)
-    assert route_results and route_results[0].get("kind") == "annotation", route_results
+    assert route_results and route_results[0].get("action") == "annotation", route_results
     assert len(route_results) == 1, "a valid pinned annotation should resume without reclassification"
     operation = (runtime.db.collection("telegram_sessions").document(dispatch["context_id"])
                  .collection("operations").document(dispatch["operation_id"]).get().to_dict())
     assert route_results, (route_context, operation)
-    assert operation["state"] == "completed", operation
+    assert operation["state"] == "completed"
     assert operation["route_control"]["kind"] == "annotation"
     draft_id = operation["route_control"]["target_draft_id"]
     assert isinstance(draft_id, str)
@@ -2572,6 +2572,10 @@ def test_default_router_later_context_attaches_to_current_saved_dialog(
         "77_default", conversation_id, kind="document", doc_id=doc_id,
         dialog_number=number, now=runtime.clock(),
     )
+    runtime.db.collection("telegram_sessions").document("77_default").update({
+        "active_conversation_id": conversation_id,
+        "selected_dialog_number": number,
+    })
     note = "Dmitry uses ‘the project’ to mean Project Jupiter."
     runtime.route_response(
         "annotation", target_ref=doc_id, dialog_number=number, substantive_text=note,
@@ -2599,7 +2603,7 @@ def test_default_router_later_context_attaches_to_current_saved_dialog(
     assert response.status_code == 200, response.text
     operation = (runtime.db.collection("telegram_sessions").document("77_default")
                  .collection("operations").document(dispatch["operation_id"]).get().to_dict())
-    assert operation["route_control"]["kind"] == "annotation"
+    assert operation["route_control"]["kind"] == "annotation", operation
     assert operation["route_control"]["target_doc_id"] == doc_id
     annotations = repository.list_conversation_annotations("77_default", conversation_id)
     assert len(annotations) == 1 and annotations[0]["text"] == note, {
@@ -2608,7 +2612,11 @@ def test_default_router_later_context_attaches_to_current_saved_dialog(
                            runtime.db.collection("notification_outbox").stream()],
         "sent": runtime.sent,
     }
-    assert annotations[0]["state"] == "applied"
+    assert annotations[0]["state"] == "applied", {
+        "operation_state": operation.get("state"),
+        "route": operation.get("route_control"),
+        "annotation": annotations[0], "sent": runtime.sent,
+    }
     assert annotations[0]["doc_id"] == doc_id
     fact_upserts = [event for event in sdk_fakes.trace
                     if event["boundary"] == "qdrant" and event["operation"] == "upsert"]

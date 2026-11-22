@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import ipaddress
+import json
 import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -286,7 +287,177 @@ class _GeminiModels:
         if extra:
             raise TypeError(f"Unsupported Gemini generate_content options: {', '.join(sorted(extra))}")
         _record("gemini", "generate_content", **kwargs)
-        return _script("gemini", "generate_content")
+        response = _script("gemini", "generate_content")
+        return _adapt_scripted_route_response(response, kwargs)
+
+
+def _member(value: Any, name: str, default: Any = None) -> Any:
+    return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+
+def _model_replace(value: Any, name: str, item: Any) -> Any:
+    if isinstance(value, dict):
+        result = dict(value)
+        result[name] = item
+        return result
+    copier = getattr(value, "model_copy", None)
+    if callable(copier):
+        return copier(update={name: item})
+    clone = copy.copy(value)
+    setattr(clone, name, item)
+    return clone
+
+
+def _routing_prompt(contents: Any) -> dict[str, Any] | None:
+    """Extract only the JSON route prompt from the actual SDK request contents."""
+    safe = _json_safe_fake(contents)
+    items = safe if isinstance(safe, list) else [safe]
+    for item in items:
+        parts = item.get("parts", []) if isinstance(item, dict) else []
+        for part in parts:
+            text = part.get("text") if isinstance(part, dict) else None
+            if not isinstance(text, str):
+                continue
+            try:
+                value = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            if (isinstance(value, dict) and isinstance(value.get("command"), str)
+                    and isinstance(value.get("context"), dict)
+                    and isinstance(value.get("documents"), list)
+                    and isinstance(value.get("response_schema"), dict)):
+                return value
+    return None
+
+
+def _json_safe_fake(value: Any) -> Any:
+    """Small SDK fake serializer supporting mappings and actual genai model objects."""
+    if value is None or type(value) in (str, bool, int, float):
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe_fake(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_fake(item) for item in value]
+    converter = getattr(value, "to_json_dict", None)
+    if callable(converter):
+        return _json_safe_fake(converter())
+    dumper = getattr(value, "model_dump", None)
+    if callable(dumper):
+        try:
+            return _json_safe_fake(dumper(mode="json", exclude_none=False))
+        except TypeError:
+            return _json_safe_fake(dumper())
+    if hasattr(value, "__dict__"):
+        return {key: _json_safe_fake(item) for key, item in vars(value).items()
+                if not key.startswith("_")}
+    return value
+
+
+def _route_declaration_present(config: Any) -> bool:
+    """Require the fresh route_command declaration, not a generic agent call."""
+    for tool in _member(config, "tools", []) or []:
+        declarations = _member(tool, "function_declarations", []) or []
+        for declaration in declarations:
+            if _member(declaration, "name") != "route_command":
+                continue
+            schema = _json_safe_fake(_member(declaration, "parameters_json_schema"))
+            if not isinstance(schema, dict):
+                schema = _json_safe_fake(_member(declaration, "parameters"))
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            required = set(schema.get("required", [])) if isinstance(schema, dict) else set()
+            if (isinstance(props, dict) and "action" in props and "disposition" in props
+                    and "target_ref" not in props
+                    and {"action", "disposition", "substantive_text", "document_selector"}
+                    <= required):
+                return True
+    return False
+
+
+def _rewrite_route_call(parts: Any, *, prompt: dict[str, Any]) -> tuple[Any, bool]:
+    if not isinstance(parts, (tuple, list)):
+        return parts, False
+    try:
+        from services.connectors.telegram.sessions import _valid_persisted_route
+        from tests.fixtures.semantic_routing import legacy_route_fixture_to_semantic
+    except Exception:
+        return parts, False
+    legacy_fields = {
+        "kind", "target_ref", "dialog_number", "result_refs", "substantive_text",
+        "tool_choice", "certainty", "target_operation_id",
+    }
+    context = prompt.get("context", {})
+    active_conversation_id = context.get("active_conversation_id")
+    active_cards = [card for card in prompt.get("documents", [])
+                    if isinstance(card, dict)
+                    and card.get("conversation_id") == active_conversation_id
+                    and isinstance(card.get("doc_id"), str)]
+    active_doc_id = active_cards[0]["doc_id"] if len({card["doc_id"] for card in active_cards}) == 1 else None
+    active_numbers = {card.get("dialog_number") for card in active_cards
+                      if type(card.get("dialog_number")) is int}
+    active_dialog_number = next(iter(active_numbers)) if len(active_numbers) == 1 else None
+    captured_draft = context.get("captured_collecting_draft")
+    source_bound = bool(
+        isinstance(captured_draft, dict)
+        or context.get("forwarding_source_bound") is True
+    )
+    source_bound_dialog_number = None
+    if isinstance(captured_draft, dict):
+        source_bound_dialog_number = captured_draft.get("dialog_number")
+    elif source_bound:
+        number = context.get("forwarding_dialog_number")
+        source_bound_dialog_number = number if type(number) is int else None
+    converted, changed = [], False
+    known_doc_ids = [card.get("doc_id") for card in prompt.get("documents", [])
+                     if isinstance(card, dict) and isinstance(card.get("doc_id"), str)]
+    for part in parts:
+        call = _member(part, "function_call")
+        args = _member(call, "args") if call is not None else None
+        if (_member(call, "name") == "route_command" and isinstance(args, dict)
+                and set(args) == legacy_fields):
+            _normalized, legacy_status = _valid_persisted_route(args)
+            if legacy_status in {"ok", "uncertain"}:
+                semantic = legacy_route_fixture_to_semantic(
+                    args, prompt["command"], active_doc_id=active_doc_id,
+                    active_dialog_number=active_dialog_number,
+                    source_bound_draft=source_bound,
+                    source_bound_dialog_number=source_bound_dialog_number,
+                    known_doc_ids=known_doc_ids,
+                    contextual_evidence=context.get("contextual_evidence"),
+                    presentation_refs=context.get("presentation_refs"),
+                )
+                call = _model_replace(call, "args", semantic)
+                part = _model_replace(part, "function_call", call)
+                changed = True
+        converted.append(part)
+    return (type(parts)(converted) if isinstance(parts, tuple) else converted), changed
+
+
+def _adapt_scripted_route_response(response: Any, kwargs: dict[str, Any]) -> Any:
+    """Migrate only valid legacy route_command test replies using the real prompt."""
+    config = kwargs.get("config")
+    if not _route_declaration_present(config):
+        return response
+    prompt = _routing_prompt(kwargs.get("contents"))
+    if prompt is None:
+        return response
+    candidates = _member(response, "candidates")
+    if isinstance(candidates, (tuple, list)):
+        rewritten_candidates, changed = [], False
+        for candidate in candidates:
+            content = _member(candidate, "content")
+            parts = _member(content, "parts")
+            new_parts, part_changed = _rewrite_route_call(parts, prompt=prompt)
+            if part_changed:
+                content = _model_replace(content, "parts", new_parts)
+                candidate = _model_replace(candidate, "content", content)
+                changed = True
+            rewritten_candidates.append(candidate)
+        if changed:
+            return _model_replace(response, "candidates", rewritten_candidates)
+        return response
+    parts = _member(response, "parts")
+    rewritten, changed = _rewrite_route_call(parts, prompt=prompt)
+    return _model_replace(response, "parts", rewritten) if changed else response
 
 
 class _GeminiFiles:

@@ -476,11 +476,12 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
     catalog_before = deepcopy(get_tool_catalog()["tools"])
     wire_requests = []
     route = {
-        "kind": "annotation", "target_ref": None,
-        "target_operation_id": None, "dialog_number": None,
-        "result_refs": [], "substantive_text": "The project reference means the Atlas migration.",
-        "tool_choice": None,
-        "certainty": "certain",
+        "disposition": "execute", "action": "annotation",
+        "substantive_text": "The project reference means the Atlas migration.",
+        "document_selector": None, "folder_selector": None, "folder_name": None,
+        "explicit_references": [], "missing_slots": [], "evidence_refs": [],
+        "clarification_id": None, "clarification_generation": None,
+        "target_operation_id": None, "tool_choice": None, "certainty": "certain",
     }
 
     def respond(request):
@@ -518,23 +519,20 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
 
         request = json.loads(wire_requests[0].content)
         route_prompt = json.loads(request["contents"][0]["parts"][0]["text"])
-        assert "metadata and past saves alone are not explicit document selection" in route_prompt["instruction"]
-        assert "target_ref=null, target_operation_id=null, and dialog_number=null" in route_prompt["instruction"]
+        assert "metadata and past saves alone are not explicit document selection" in route_prompt["instruction"].lower()
+        assert "document_selector, folder_selector, and target_operation_id to null" in route_prompt["instruction"]
         assert "declarative topic or title supplied with forwarding" in route_prompt["instruction"]
-        assert "A named project alone does not authorize corpus search" in route_prompt["instruction"]
+        assert "a named project alone does not authorize corpus search" in route_prompt["instruction"].lower()
         declaration = request["tools"][0]["functionDeclarations"][0]
         schema = _wire_parameters_schema(declaration)
         assert request["toolConfig"]["functionCallingConfig"]["mode"] == "ANY"
         assert declaration["name"] == "route_command"
         assert schema["additionalProperties"] is False
-        assert schema["properties"]["target_ref"] == {"type": "null"}
-        assert schema["properties"]["target_operation_id"] == {"type": "null"}
-        assert route_prompt["response_schema"]["properties"]["target_ref"] == {
-            "type": "null",
-        }
-        assert route_prompt["response_schema"]["properties"]["target_operation_id"] == {
-            "type": "null",
-        }
+        assert schema["properties"]["target_operation_id"]["anyOf"] == [
+            {"type": "string", "minLength": 1}, {"type": "null"},
+        ]
+        assert "target_ref" not in schema["properties"]
+        assert route_prompt["response_schema"] == schema
         tool_choice_schema = schema["properties"]["tool_choice"]
         assert tool_choice_schema["anyOf"][-1] == {"type": "null"}
         choices = tool_choice_schema["anyOf"][:-1]
@@ -562,55 +560,27 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         assert utterances["minItems"] == 1
         assert utterances["items"]["required"] == ["speaker", "text"]
 
-        variants = {item["properties"]["kind"]["enum"][0]: item
+        variants = {item["properties"]["action"]["enum"][0]: item
                     for item in schema["anyOf"]}
-        assert tuple(variants) == (
-            "pure_switch", "search", "substantive", "save", "retry", "annotation",
-        )
+        assert set(variants) == {"pure_switch", "search", "substantive", "save", "retry",
+                                 "annotation", "move_transcript", "create_folder",
+                                 "create_then_move"}
         assert set(schema["required"]) == {
-            "kind", "target_ref", "target_operation_id", "dialog_number",
-            "result_refs", "substantive_text", "tool_choice", "certainty",
+            "disposition", "action", "substantive_text", "document_selector",
+            "folder_selector", "folder_name", "explicit_references", "missing_slots",
+            "evidence_refs", "clarification_id", "clarification_generation",
+            "target_operation_id", "tool_choice", "certainty",
         }
-        for kind in ("pure_switch", "save", "retry"):
-            assert variants[kind]["properties"]["tool_choice"] == {"type": "null"}
+        assert variants["create_folder"]["properties"]["document_selector"] == {"type": "null"}
+        assert "document_selector" in variants["move_transcript"]["properties"]
+        assert "folder_selector" in variants["create_then_move"]["properties"]
         search_choice = variants["search"]["properties"]["tool_choice"]
         assert search_choice["properties"]["name"]["enum"] == ["query"]
         assert search_choice["properties"]["arguments"] == catalog["query"]
         assert "substantive_text" in variants["search"]["required"]
         assert "tool_choice" in variants["search"]["required"]
-        for kind in ("search", "save", "retry"):
-            assert variants[kind]["properties"]["target_operation_id"] == {"type": "null"}
-        assert variants["retry"]["properties"]["dialog_number"] == {
-            "type": "integer", "minimum": 1,
-        }
-        for kind in ("pure_switch", "substantive", "save"):
-            assert variants[kind]["properties"]["dialog_number"] == {
-                "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
-            }
-        assert variants["search"]["properties"]["target_ref"] == {"type": "null"}
-        assert variants["search"]["properties"]["result_refs"] == {
-            "type": "array", "maxItems": 0, "items": {"type": "string"},
-        }
-        assert variants["search"]["properties"]["dialog_number"] == {"type": "null"}
-        assert variants["substantive"]["properties"]["substantive_text"] == {
-            "type": "string", "minLength": 1, "pattern": r".*\S.*",
-        }
-        assert variants["annotation"]["properties"]["substantive_text"] == {
-            "type": "string", "minLength": 1, "pattern": r".*\S.*",
-        }
-        assert variants["annotation"]["properties"]["target_operation_id"] == {
-            "type": "null",
-        }
-        assert variants["annotation"]["properties"]["tool_choice"] == {
-            "type": "null",
-        }
-        assert variants["annotation"]["properties"]["result_refs"] == {
-            "type": "array", "maxItems": 0, "items": {"type": "string"},
-        }
-        assert variants["annotation"]["properties"]["dialog_number"] == (
-            variants["substantive"]["properties"]["dialog_number"]
-        )
-        assert schema["properties"]["target_ref"] == {"type": "null"}
+        assert variants["search"]["properties"]["document_selector"] == {"type": "null"}
+        assert "dialog_number" in repr(schema["properties"]["document_selector"])
         assert utterances["items"]["additionalProperties"] is False
         assert by_name["list_folders"]["properties"]["arguments"] == catalog["list_folders"]
         assert by_name["list_folders"]["properties"]["arguments"].get("required", []) == []
@@ -618,14 +588,8 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         assert by_name["get_transcript"]["properties"]["link_requested"] == {
             "type": "boolean",
         }
-        for field_name, field_type in (
-            ("dialog_number", "integer"), ("tool_choice", "object"),
-            ("substantive_text", "string"),
-        ):
-            nullable_schema = schema["properties"][field_name]
-            assert nullable_schema["anyOf"][0]["type"] == field_type
-            null_schema = nullable_schema["anyOf"][-1] if field_name == "tool_choice" else nullable_schema["anyOf"][1]
-            assert null_schema == {"type": "null"}
+        assert schema["properties"]["tool_choice"]["anyOf"][-1] == {"type": "null"}
+        assert schema["properties"]["document_selector"]["anyOf"][-1] == {"type": "null"}
         assert "parameters" not in declaration
         assert "additional_properties" not in json.dumps(schema)
         assert wire_requests[0].url.path.endswith(f"models/{MODEL}:generateContent")
@@ -634,7 +598,7 @@ def test_router_json_schema_uses_parameters_json_schema_on_real_sdk_wire(monkeyp
         http_client.close()
 
 
-def test_router_selector_schema_uses_only_supplied_candidates_on_real_sdk_wire(monkeypatch):
+def test_router_schema_stays_static_with_unrelated_candidates_on_real_sdk_wire(monkeypatch):
     import httpx
     from core.integrations.gemini.agent import GeminiAgent
     from services.connectors.telegram.runtime.routing import GeminiCommandRouter, _ROUTE_SCHEMA
@@ -650,10 +614,13 @@ def test_router_selector_schema_uses_only_supplied_candidates_on_real_sdk_wire(m
             "role": "model", "parts": [{"functionCall": {
                 "id": "synthetic-route-call", "name": "route_command",
                 "args": {
-                    "kind": "substantive", "target_ref": "synthetic-doc",
-                    "target_operation_id": "synthetic-predecessor",
-                    "dialog_number": None, "result_refs": [],
+                    "disposition": "execute", "action": "substantive",
                     "substantive_text": "summarize this document",
+                    "document_selector": {"kind": "active_document"},
+                    "folder_selector": None, "folder_name": None,
+                    "explicit_references": [], "missing_slots": [], "evidence_refs": [],
+                    "clarification_id": None, "clarification_generation": None,
+                    "target_operation_id": "synthetic-predecessor",
                     "tool_choice": None, "certainty": "certain",
                 },
             }}],
@@ -669,24 +636,16 @@ def test_router_selector_schema_uses_only_supplied_candidates_on_real_sdk_wire(m
             operation_candidates=[{"operation_id": "synthetic-predecessor"}],
             context_metadata={"last_doc_id": "synthetic-doc"},
         )
-        assert result["target_ref"] == "synthetic-doc"
+        assert result["action"] == "substantive"
         request = json.loads(wire_requests[0].content)
         prompt = json.loads(request["contents"][0]["parts"][0]["text"])
         declaration = request["tools"][0]["functionDeclarations"][0]
         wire_schema = _wire_parameters_schema(declaration)
-        expected_ref = {"anyOf": [
-            {"type": "string", "enum": [
-                "synthetic-doc", "synthetic-recent-doc", "last",
-            ]}, {"type": "null"},
-        ]}
-        expected_operation = {"anyOf": [
-            {"type": "string", "enum": ["synthetic-predecessor"]},
-            {"type": "null"},
-        ]}
-        assert wire_schema["properties"]["target_ref"] == expected_ref
-        assert wire_schema["properties"]["target_operation_id"] == expected_operation
-        assert prompt["response_schema"]["properties"]["target_ref"] == expected_ref
-        assert prompt["response_schema"]["properties"]["target_operation_id"] == expected_operation
+        assert wire_schema == prompt["response_schema"] == schema_before
+        assert "target_ref" not in wire_schema["properties"]
+        assert "enum" not in wire_schema["properties"]["target_operation_id"]["anyOf"][0]
+        assert "synthetic-doc" not in repr(wire_schema)
+        assert "synthetic-predecessor" not in repr(wire_schema)
         assert _ROUTE_SCHEMA == schema_before
         assert get_tool_catalog()["tools"] == catalog_before
     finally:

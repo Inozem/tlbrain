@@ -17,6 +17,13 @@ import pytest
 pytestmark = pytest.mark.offline
 
 
+def _fresh_http_route_fixture(route, contents):
+    """Adapt a legacy fake route only at its real HTTP request boundary."""
+    from tests.fixtures.semantic_routing import legacy_route_fixture_from_prompt
+
+    return legacy_route_fixture_from_prompt(route, contents)
+
+
 def test_create_app_selects_lazy_managed_default_without_provider_construction():
     from services.connectors.telegram.app.main import create_app
 
@@ -1537,9 +1544,12 @@ def test_default_app_later_annotation_targets_accepted_draft_independent_of_focu
     requested_number = (number if selector == "correct_number" else
                         number + 30 if selector == "unknown_number" else None)
     runtime.route_response("annotation", dialog_number=requested_number, substantive_text=note_text)
+    clarification_text = "I mean the forwarded conversation, not those search results."
+    if selector == "unknown_number":
+        clarification_text += f" Use local dialog #{requested_number}."
     response = asyncio.run(runtime.webhook({"update_id": 11020, "message": {
         **common, "message_id": 12020, "date": 1793320600,
-        "text": "I mean the forwarded conversation, not those search results.",
+        "text": clarification_text,
     }}))
     assert response.status_code == 200, response.text
     dispatch = next(item["body"] for item in reversed(runtime.task_requests)
@@ -1763,7 +1773,7 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
     route = {
         "kind": "substantive", "target_ref": "doc-selected",
         "target_operation_id": None, "dialog_number": number, "result_refs": [],
-        "substantive_text": "What is the milestone date in the saved notes?",
+        "substantive_text": "What is the milestone date in the saved notes for doc-selected?",
         "tool_choice": {
             "name": "list_recent_transcripts", "arguments": {"folder_path": ["Client"]},
         },
@@ -1787,10 +1797,11 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
             assert "An unrelated prior question." in serialized_contents
             assert "An unrelated prior answer." in serialized_contents
             assert "They moved the launch to May." not in serialized_contents
-            assert "What is the milestone date in the saved notes?" in serialized_contents
+            assert "What is the milestone date in the saved notes" in serialized_contents
+            fresh_route = _fresh_http_route_fixture(route, payload["contents"])
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
-                    "functionCall": {"name": "route_command", "args": route},
+                    "functionCall": {"name": "route_command", "args": fresh_route},
                     "thoughtSignature": "c3ludGhldGljLXJvdXRlLXNpZw==",
                 }],
             }}]})
@@ -1898,6 +1909,19 @@ def test_default_asgi_selected_document_routes_tool_then_answers_over_real_gemin
     assert not any("Starting to process dialog" in str(payload.get("text", ""))
                    for method, payload in sent)
     assert operation["route_control"]["tool_choice"]["name"] == "list_recent_transcripts"
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    saved_route = FirestoreAgentLedger(
+        db, context_id=context_id, operation_id=dispatch["operation_id"],
+        owner="read-only", fence=0, clock=lambda: now,
+    ).load_turn("conversation-selected", dispatch["operation_id"])
+    assert saved_route["application_route"]["name"] == "list_recent_transcripts"
+    assert saved_route["application_route"]["arguments"] == {"folder_path": ["Client"]}
+    assert saved_route["application_route"]["ordinal"] == 0
+    assert saved_route["tool_calls"] == [{
+        "id": f"application-{dispatch['operation_id']}-0",
+        "name": "list_recent_transcripts", "arguments": {"folder_path": ["Client"]},
+        "ordinal": 0, "round": -1,
+    }]
     turns = repository.list_turns(context_id, "conversation-selected")
     assert [turn["role"] for turn in turns] == ["user", "model", "user", "model"]
     assert turns[-2]["operation_id"] == dispatch["operation_id"]
@@ -2010,6 +2034,11 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
                {"speaker": "Pavel K", "text": long_source, "order_index": 4},
                {"speaker": "Maya", "text": "Pavel K was also mentioned in a later note.", "order_index": 5},
            ]}]}], {"total_matches": 2, "returned_segments": 2, "truncated": False}),
+        ([{"doc_id": "doc-launch", "folder_path": ["Client"],
+           "dialog_date": "2026-05-15", "segments": [{"range": [4, 5], "dialog": [
+               {"speaker": "Pavel K", "text": long_source, "order_index": 4},
+               {"speaker": "Maya", "text": "Pavel K was also mentioned in a later note.", "order_index": 5},
+           ]}]}], {"total_matches": 2, "returned_segments": 2, "truncated": False}),
     ]
     tool_calls = []
     original_invoke = registry.invoke_operation
@@ -2065,7 +2094,7 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
                 history_text = json.dumps(route_prompt["conversation_history"], ensure_ascii=False)
                 assert long_source in history_text
                 assert "search_exchange_ref" not in history_text
-            route = routes[route_index]
+            route = _fresh_http_route_fixture(routes[route_index], payload["contents"])
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
                     "functionCall": {"name": "route_command", "args": route},
@@ -2078,6 +2107,7 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
             assert long_source in serialized_contents
             assert {item["name"] for item in declarations} == {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
+                "present_search_answer",
             }
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
@@ -2092,11 +2122,36 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
         if tool_loop_count == 2:
             assert long_source in serialized_contents
             assert "functionResponse" in serialized_contents
+            assert "The launch date remains May 15." in serialized_contents
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"id": "read-call-2", "name": "query",
+                                     "args": first_route["tool_choice"]["arguments"]},
+                    "thoughtSignature": "c3ludGhldGljLXNlYXJjaC1yZWFk",
+                }],
+            }}]})
+        if tool_loop_count == 3:
+            assert long_source in serialized_contents
+            assert "functionResponse" in serialized_contents
             answer = "Pavel K was a participant and contributed the May 15 date."
-        elif tool_loop_count == 3:
+        elif tool_loop_count == 4:
             answer = "Pavel K again appears as a participant in the same source evidence."
         else:
             raise AssertionError("unexpected model generation")
+        if any(item.get("name") == "present_search_answer" for item in declarations):
+            refs = ([{"doc_id": "doc-launch", "order_index": 4,
+                      "call_id": "read-call-2", "ordinal": 2}]
+                    if tool_loop_count == 3 else [])
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"id": f"presented-{tool_loop_count}",
+                                     "name": "present_search_answer", "args": {
+                        "blocks": [{"type": "paragraph", "text": answer,
+                                    "source_refs": refs}],
+                    }},
+                    "thoughtSignature": "c3ludGhldGljLXByZXNlbnQ=",
+                }],
+            }}]})
         return httpx.Response(200, json={"candidates": [{"content": {
             "role": "model", "parts": [{"text": answer}],
         }}]})
@@ -2151,14 +2206,42 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
     assert first_control["tool_choice"]["arguments"] == first_route["tool_choice"]["arguments"]
     assert first_control["search_protocol"] == "agent-v1"
     assert first_control["search_session_id"] == search_session_id
+    first_presentation_id = "search-presentation-" + hashlib.sha256(
+        first_dispatch["operation_id"].encode(),
+    ).hexdigest()
+    first_manifest = repository.get_presentation_manifest(
+        context_id, search_session_id, first_presentation_id,
+    )
+    assert first_manifest is not None
+    in_agent_source = next(
+        source for source in first_manifest["sources"]
+        if source["call_id"] == "read-call-2"
+    )
+    assert in_agent_source["ordinal"] == 2
+    first_header = (db.collection("telegram_sessions").document(context_id)
+                    .collection("conversations").document(search_session_id)
+                    .collection("presentations").document(first_presentation_id)
+                    .get().to_dict())
+    anchored_turn_id = first_header["source_turn_refs"][in_agent_source["source_id"]]
+    in_agent_turn = next(
+        turn for turn in repository.list_turns(context_id, search_session_id)
+        if turn["turn_id"] == anchored_turn_id
+    )
+    in_agent_exchange_ref = next(
+        part["reference"] for part in in_agent_turn["parts"]
+        if part.get("type") == "search_exchange_ref"
+    )
+    assert in_agent_turn["operation_id"] == first_dispatch["operation_id"]
+    assert in_agent_exchange_ref["payload"]["sha256"] == in_agent_source["reference"]["payload"]["sha256"]
 
     second_dispatch = deliver_command(25002, 182, "And Pavel K?")
     assert second_dispatch["operation_id"] != first_dispatch["operation_id"]
-    assert len(wire_requests) == 5, (tool_calls, sent)
+    assert len(wire_requests) == 6, (tool_calls, sent)
     assert [call[0:2] for call in tool_calls] == [
         ("query", first_route["tool_choice"]["arguments"]),
         ("get_transcript", {"doc_id": "doc-launch", "folder_path": ["Client"],
                             "date_from": "2026-01-01", "date_to": "2026-12-31"}),
+        ("query", first_route["tool_choice"]["arguments"]),
         ("query", second_route["tool_choice"]["arguments"]),
     ]
     assert all(call[2] is not None for call in tool_calls)
@@ -2171,7 +2254,7 @@ def test_default_asgi_contextual_search_uses_model_args_and_hydrates_full_tool_h
     ]
     turns = repository.list_turns(context_id, search_session_id)
     assert [turn["role"] for turn in turns if turn["operation_id"] == first_dispatch["operation_id"]] == [
-        "user", "tool", "tool", "tool", "model",
+        "user", "tool", "tool", "tool", "tool", "tool", "model",
     ]
     first_tool = next(turn for turn in turns if turn["operation_id"] == first_dispatch["operation_id"]
                       and turn.get("role") == "tool"
@@ -2267,7 +2350,8 @@ def test_default_asgi_malformed_route_error_survives_delivery_replay_and_uncerta
     def gemini_response(request):
         wire_requests.append(request)
         assert route_responses, "unexpected extra Gemini generation"
-        route = route_responses.pop(0)
+        payload = json.loads(request.content)
+        route = _fresh_http_route_fixture(route_responses.pop(0), payload["contents"])
         return httpx.Response(200, json={"candidates": [{"content": {
             "role": "model", "parts": [{"functionCall": {
                 "name": "route_command", "args": route,
@@ -2544,9 +2628,10 @@ def test_default_asgi_selected_document_routes_query_then_answers_over_real_gemi
         if generation_requests == 1:
             assert payload["tools"][0]["functionDeclarations"][0]["name"] == "route_command"
             assert payload["generationConfig"]["thinkingConfig"]["thinking_level"] == "MINIMAL"
+            fresh_route = _fresh_http_route_fixture(route, payload["contents"])
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
-                    "functionCall": {"name": "route_command", "args": route},
+                    "functionCall": {"name": "route_command", "args": fresh_route},
                     "thoughtSignature": "c3ludGhldGljLXJvdXRlLXNpZw==",
                 }],
             }}]})
@@ -2883,9 +2968,10 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
             else:
                 assert "The milestone date is June 12." in serialized_contents
             assert payload["generationConfig"]["thinkingConfig"]["thinking_level"] == "MINIMAL"
+            fresh_route = _fresh_http_route_fixture(routes[route_count - 1], payload["contents"])
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
-                    "functionCall": {"name": "route_command", "args": routes[route_count - 1]},
+                    "functionCall": {"name": "route_command", "args": fresh_route},
                     "thoughtSignature": "c3ludGhldGljLXJvdXRlLXNpZw==",
                 }],
             }}]})
@@ -2894,6 +2980,7 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
             assert "application-tool-result-data" in serialized_contents
             assert {item["name"] for item in payload["tools"][0]["functionDeclarations"]} == {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
+                "present_search_answer",
             }
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
@@ -2920,6 +3007,7 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
             assert "application-tool-result-data" in serialized_contents
             assert {item["name"] for item in payload["tools"][0]["functionDeclarations"]} == {
                 "query", "get_transcript", "list_recent_transcripts", "list_folders",
+                "present_search_answer",
             }
             return httpx.Response(200, json={"candidates": [{"content": {
                 "role": "model", "parts": [{
@@ -2939,6 +3027,18 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
                   "Pavel K's confirmed transcript evidence is the June 12 milestone."
                   if route_count == 2 else
                   "I found no matching schedule notes in the selected evidence.")
+        if any(item.get("name") == "present_search_answer" for item in
+               payload.get("tools", [{}])[0].get("functionDeclarations", [])):
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{
+                    "functionCall": {"id": f"presented-{route_count}",
+                                     "name": "present_search_answer", "args": {
+                        "blocks": [{"type": "paragraph", "text": answer,
+                                    "source_refs": []}],
+                    }},
+                    "thoughtSignature": "c3ludGhldGljLXByZXNlbnQ=",
+                }],
+            }}]})
         return httpx.Response(200, json={"candidates": [{"content": {
             "role": "model", "parts": [{"text": answer}],
         }}]})
@@ -3076,6 +3176,16 @@ def test_default_asgi_selected_dialog_search_creates_isolated_session_over_real_
             "date_from": "2026-01-01", "date_to": "2026-12-31",
         }, "link_requested": False,
     }
+    global_conversation_id = "telegram-global-" + hashlib.sha256(
+        f"{dispatch['context_id']}\0{dispatch['operation_id']}".encode()
+    ).hexdigest()
+    from services.connectors.telegram.runtime.ledger import FirestoreAgentLedger
+    saved_search_route = FirestoreAgentLedger(
+        db, context_id=context_id, operation_id=dispatch["operation_id"],
+        owner="read-only", fence=0, clock=lambda: now,
+    ).load_turn(global_conversation_id, dispatch["operation_id"])
+    assert saved_search_route["application_route"]["name"] == "query"
+    assert saved_search_route["tool_calls"][0]["round"] == -1
     search_session_id = operation["route_control"]["search_session_id"]
     search_conversation = repository.get_conversation(context_id, search_session_id)
     assert search_conversation.kind.value == "search"

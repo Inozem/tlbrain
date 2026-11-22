@@ -10,6 +10,7 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -37,9 +38,31 @@ from core.operations.retries import RetryGovernor, RetryBudgetExceeded, UnknownO
 from services.connectors.telegram.commands import TelegramCommand, parse_command
 from services.connectors.telegram.repository import NOTIFICATIONS, SESSIONS, TelegramRepository
 from services.connectors.telegram.repository._common import _document_ref
+from services.connectors.telegram.repository._clarifications import (
+    PreparedClarificationCompletion, is_prepared_clarification_completion,
+)
 
 
-Processor = Callable[[str, Any, OperationLease], Awaitable[QueueOperationState]]
+@dataclass(frozen=True, slots=True)
+class TelegramQueueCompletion:
+    """Explicit terminal result metadata returned by trusted server processors."""
+
+    result_type: str
+    clarification: PreparedClarificationCompletion | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result_type, str) or self.result_type not in {
+            "clarification", "action", "ordinary",
+        }:
+            raise ValueError("unsupported Telegram queue completion result_type")
+        if self.result_type == "clarification":
+            if not is_prepared_clarification_completion(self.clarification):
+                raise TypeError("clarification completion requires a prepared repository value")
+        elif self.clarification is not None:
+            raise ValueError("only clarification completion accepts a prepared clarification")
+
+
+Processor = Callable[[str, Any, OperationLease], Awaitable[QueueOperationState | TelegramQueueCompletion]]
 Clock = Callable[[], datetime]
 _SYNC_POOL = ThreadPoolExecutor(thread_name_prefix="telegram-firestore")
 MAX_EXECUTION_SLICE_SECONDS = 480.0
@@ -371,7 +394,7 @@ class TelegramQueueWorker:
         )
 
     async def _process(self, context_id: str, operation: Any, lease: OperationLease,
-                       retry_governor: RetryGovernor) -> QueueOperationState:
+                       retry_governor: RetryGovernor) -> QueueOperationState | TelegramQueueCompletion:
         """Pass durable attempt context and, when requested, the separate command input."""
         try:
             parameters = inspect.signature(self.processor).parameters.values()
@@ -963,7 +986,7 @@ class TelegramQueueWorker:
 
     async def _settle_processor_result(
         self, context_id: str, context_ref: Any, lease: OperationLease,
-        result: QueueOperationState | None,
+        result: QueueOperationState | TelegramQueueCompletion | None,
     ) -> bool:
         """Release a yielded head or settle a terminal result and wake the next head."""
         if result is None:
@@ -988,6 +1011,29 @@ class TelegramQueueWorker:
             )
             return False
 
+        explicit_completion = result if isinstance(result, TelegramQueueCompletion) else None
+        if explicit_completion is not None and explicit_completion.result_type == "clarification":
+            if not is_prepared_clarification_completion(explicit_completion.clarification):
+                raise TypeError("clarification completion requires a repository-prepared value")
+            def prepare_wakeup(transaction: Any, next_id: str, next_data: dict[str, Any],
+                               updated_context: dict[str, Any]) -> list[Any]:
+                wake_now = self.clock()
+                wake_writes: list[Any] = []
+                _ensure_wakeup_in_transaction(
+                    self.client, transaction, updated_context,
+                    context_id=context_id, operation_id=next_id,
+                    schedule_at=wake_now, now=wake_now, prepared_writes=wake_writes,
+                )
+                return wake_writes
+
+            settled = await _offload_sync(
+                TelegramRepository(self.client).complete_with_clarification,
+                context_id, lease.operation_id, owner=lease.owner, fence=lease.fence,
+                completion=explicit_completion.clarification, now=self.clock(),
+                clock=self.clock, prepare_wakeup=prepare_wakeup,
+            )
+            return bool(settled)
+
         settle_now = self.clock()
 
         def wake_next(transaction: Any, next_id: str | None, next_data: dict[str, Any] | None,
@@ -1001,12 +1047,34 @@ class TelegramQueueWorker:
                     schedule_at=settle_now, now=settle_now,
                 )
 
-        settle = complete_head if result is QueueOperationState.COMPLETED else fail_head
-        settled = await _offload_sync(settle,
-            self.client, context_ref, operation_id=lease.operation_id,
-            owner=lease.owner, fence=lease.fence, now=settle_now,
-            after_advance=wake_next,
+        terminal_state = (
+            QueueOperationState.COMPLETED if explicit_completion is not None
+            else result
         )
+        settle = complete_head if terminal_state is QueueOperationState.COMPLETED else fail_head
+
+        def record_result_type(transaction: Any, next_id: str | None,
+                               next_data: dict[str, Any] | None,
+                               updated_context: dict[str, Any],
+                               operation_data: dict[str, Any]) -> None:
+            if explicit_completion is not None:
+                operation_data["result_type"] = explicit_completion.result_type
+            wake_next(transaction, next_id, next_data, updated_context)
+
+        if explicit_completion is None:
+            # Preserve the legacy enum settlement call shape exactly.
+            settled = await _offload_sync(
+                settle, self.client, context_ref,
+                operation_id=lease.operation_id, owner=lease.owner,
+                fence=lease.fence, now=settle_now, after_advance=wake_next,
+            )
+        else:
+            settled = await _offload_sync(
+                settle, self.client, context_ref,
+                operation_id=lease.operation_id, owner=lease.owner,
+                fence=lease.fence, now=settle_now, clock=self.clock,
+                after_advance_with_operation=record_result_type,
+            )
         if not settled:
             return False
         return True
@@ -1014,7 +1082,7 @@ class TelegramQueueWorker:
     async def _run_with_heartbeat(
         self, context_id: str, operation: Any, lease: OperationLease, context_ref: Any,
         retry_governor: RetryGovernor,
-    ) -> QueueOperationState | None:
+    ) -> QueueOperationState | TelegramQueueCompletion | None:
         processor_task = asyncio.create_task(self._process(context_id, operation, lease, retry_governor))
 
         async def beat() -> bool:
@@ -1043,6 +1111,8 @@ class TelegramQueueWorker:
             result = await processor_task
             if result is QueueOperationState.RUNNING:
                 return QueueOperationState.RUNNING
+            if isinstance(result, TelegramQueueCompletion):
+                return result
             if not isinstance(result, QueueOperationState) or not result.is_terminal:
                 raise ValueError("processor must return a terminal or RUNNING QueueOperationState")
             return result
