@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
 
+from google.api_core.exceptions import Aborted
+
 from services.connectors.telegram.client import TelegramAPIError
 from services.connectors.telegram.formatting import delivery_presentation
 from services.connectors.telegram.notification_diagnostics import (
@@ -283,14 +285,35 @@ class TelegramNotificationPublisher:
         }
         if reservation.get("clarification_binding") is not None:
             settlement_kwargs["clarification_binding"] = reservation["clarification_binding"]
-        settled = await storage_call(
-            _offload_repository_call, self.repository.settle_notification_attempt,
-            notification_id, diagnostic_notification_id=notification_id,
-            diagnostic_attempt_id=attempt_id, diagnostic_operation_id=delivery.operation_id,
-            diagnostic_action=delivery.action, diagnostic_revision=delivery.revision,
-            diagnostic_known_message=delivery.known_message, diagnostic_message_id=delivery.known_message_id,
-            phase="settlement", **settlement_kwargs,
-        )
+        try:
+            settled = await storage_call(
+                _offload_repository_call, self.repository.settle_notification_attempt,
+                notification_id, diagnostic_notification_id=notification_id,
+                diagnostic_attempt_id=attempt_id, diagnostic_operation_id=delivery.operation_id,
+                diagnostic_action=delivery.action, diagnostic_revision=delivery.revision,
+                diagnostic_known_message=delivery.known_message, diagnostic_message_id=delivery.known_message_id,
+                phase="settlement", **settlement_kwargs,
+            )
+        except Aborted:
+            if not (
+                reservation.get("receipt_card") is True
+                and delivery.action == "send"
+                and delivery.outcome == "sent"
+                and delivery.message_id is not None
+                and delivery.known_message_id == delivery.message_id
+            ):
+                raise
+            # Telegram accepted this receipt-card send and its message ID is
+            # known. Retry only the same fenced ledger settlement; never send
+            # again or consume another notification attempt.
+            settled = await storage_call(
+                _offload_repository_call, self.repository.settle_notification_attempt,
+                notification_id, diagnostic_notification_id=notification_id,
+                diagnostic_attempt_id=attempt_id, diagnostic_operation_id=delivery.operation_id,
+                diagnostic_action=delivery.action, diagnostic_revision=delivery.revision,
+                diagnostic_known_message=delivery.known_message, diagnostic_message_id=delivery.known_message_id,
+                phase="settlement", **settlement_kwargs,
+            )
         if settled is None:
             return "not_found"
         if not settled.get("settled"):

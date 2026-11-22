@@ -623,6 +623,54 @@ def test_receipt_notification_closes_quiet_group_and_edits_ready_save_card(fires
     assert len(callback_data.encode("utf-8")) <= 64
 
 
+def test_ready_receipt_send_retries_aborted_settlement_without_resending(
+    firestore_fake, monkeypatch,
+):
+    from google.api_core.exceptions import Aborted
+
+    repo = TelegramRepository(firestore_fake.client_class())
+    clock, telegram = _Clock(), _Telegram()
+    accepted = repo.accept_forward(
+        100, chat_id=42, thread_id=5, user_id=7,
+        message={"message_id": 110, "text": "one"}, now=clock(),
+    )
+    original_settlement = repo.settle_notification_attempt
+    settlement_calls = []
+
+    def abort_once(notification_id, **kwargs):
+        settlement_calls.append((notification_id, kwargs.copy()))
+        if len(settlement_calls) == 1:
+            raise Aborted("synthetic transaction contention")
+        return original_settlement(notification_id, **kwargs)
+
+    monkeypatch.setattr(repo, "settle_notification_attempt", abort_once)
+    publisher = TelegramNotificationPublisher(repo, telegram, clock=clock)
+    clock.advance(1.1)
+
+    assert _run(publisher.publish(accepted.notification_id)) == "delivered"
+
+    row = repo.get_notification(accepted.notification_id)
+    assert len(telegram.sent) == 1
+    assert row["message_id"] == 901
+    assert row["state"] == "delivered"
+    assert len(settlement_calls) == 2
+    assert settlement_calls[0] == settlement_calls[1]
+    assert settlement_calls[0][1]["outcome"] == "sent"
+    assert settlement_calls[0][1]["message_id"] == 901
+
+    callback_data = row["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    assert callback_data == f"s:{row['receipt_control_token']}"
+    save = repo.accept_receipt_save_callback(
+        200, chat_id=42, user_id=7, thread_id=5, message_id=901,
+        control_token=row["receipt_control_token"], now=clock(),
+    )
+    assert save.accepted is True
+
+    assert _run(publisher.publish(accepted.notification_id)) == "delivered"
+    assert len(telegram.sent) == 1
+    assert repo.get_notification(accepted.notification_id)["send_attempts_started"] == 1
+
+
 def test_slow_transport_matched_burst_reuses_delivered_card_across_close_epochs(firestore_fake):
     client = firestore_fake.client_class()
     repo = TelegramRepository(client)
